@@ -26,6 +26,8 @@ jobs:
       - name: npm install, build, and test
         run: |
           npm install
+      - name:  build, and test
+        run: |     
           npm run build --if-present
           npm run test --if-present
 
@@ -62,4 +64,5 @@ jobs:
           app-name: 'kpi-form'
           slot-name: 'Production'
           package: .
+
           
