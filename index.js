@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-
+const cron = require("node-cron");
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -243,13 +243,20 @@ const sendKPIEmail = async (responsibleId, week) => {
 app.listen(port, async () => {
     console.log(`Server running on port ${port}`);
 
-    const forcedWeek = "37-25"; 
-    try {
-        const resps = await pool.query(`SELECT id FROM public."Responsible"`);
-        for (let r of resps.rows) {
-            await sendKPIEmail(r.id, forcedWeek);
+    // Schedule: Every day at 17:45 Tunisia time
+    cron.schedule("45 16 * * *", async () => {
+        const forcedWeek = "37-25";  // Or dynamically use getCurrentWeekNumber()
+        try {
+            const resps = await pool.query(`SELECT id FROM public."Responsible"`);
+            for (let r of resps.rows) {
+                await sendKPIEmail(r.id, forcedWeek);
+            }
+            console.log("✅ All KPI emails sent at 17:45 Africa/Tunis time");
+        } catch (err) {
+            console.error("❌ Error sending scheduled emails:", err.message);
         }
-    } catch (err) {
-        console.error("Error fetching responsibles or sending emails:", err.message);
-    }
+    }, {
+        scheduled: true,
+        timezone: "Africa/Tunis"
+    });
 });
