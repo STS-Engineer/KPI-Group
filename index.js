@@ -54,12 +54,12 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
 
   const kpiRes = await pool.query(
     `
-        SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id, 
-               k.indicator_title, k.indicator_sub_title, k.unit
-        FROM public.kpi_values kv
-        JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
-        WHERE kv.responsible_id = $1 AND kv.week = $2
-        ORDER BY k.kpi_id ASC
+      SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id, 
+             k.indicator_title, k.indicator_sub_title, k.unit
+      FROM public.kpi_values kv
+      JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
+      WHERE kv.responsible_id = $1 AND kv.week = $2
+      ORDER BY k.kpi_id ASC
     `,
     [responsibleId, week]
   );
@@ -72,34 +72,37 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
   if (!responsible) throw new Error("Responsible not found");
   if (!kpis.length) return `<p>No KPIs found for week ${week}</p>`;
 
-  // Group KPIs by indicator_title
   const groupedKpis = {};
   kpis.forEach((kpi) => {
-    if (!groupedKpis[kpi.indicator_title])
-      groupedKpis[kpi.indicator_title] = [];
+    if (!groupedKpis[kpi.indicator_title]) groupedKpis[kpi.indicator_title] = [];
     groupedKpis[kpi.indicator_title].push(kpi);
   });
 
   let kpiFields = "";
   Object.keys(groupedKpis).forEach((title) => {
     kpiFields += `
-        <div style="margin-bottom:25px;padding:15px;border:1px solid #ddd;border-radius:8px;">
-            <h3 style="margin:0 0 15px 0;font-size:18px;color:#0078D7;font-weight:700;">
-                ${title}
-            </h3>
-        `;
+      <div style="margin-bottom:25px;padding:15px;border:1px solid #ddd;border-radius:8px;">
+        <h3 style="margin:0 0 15px 0;font-size:18px;color:#0078D7;font-weight:700;">
+          ${title}
+        </h3>
+    `;
     groupedKpis[title].forEach((kpi) => {
       kpiFields += `
-            <div style="margin-bottom:15px;">
-                <label style="display:block;margin-bottom:5px;color:#555;font-size:14px;">
-                    ${kpi.indicator_sub_title || ""} (${kpi.unit || ""}):
-                </label>
-                <input type="text" name="value_${kpi.kpi_values_id}" placeholder="Enter value"
-                    value="${kpi.value || ""}"
-                    style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
-                           font-size:14px;box-sizing:border-box;" />
-            </div>
-            `;
+        <div style="margin-bottom:15px;">
+          <label style="display:block;margin-bottom:5px;color:#555;font-size:14px;">
+            ${kpi.indicator_sub_title || ""} (${kpi.unit || ""}):
+          </label>
+          <input type="text" 
+            name="value_${kpi.kpi_values_id}" 
+            data-indicator="${kpi.indicator_title}" 
+            data-subtitle="${kpi.indicator_sub_title || ''}" 
+            data-unit="${kpi.unit || ''}"
+            placeholder="Enter value"
+            value="${kpi.value || ""}"
+            style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
+                   font-size:14px;box-sizing:border-box;" />
+        </div>
+      `;
     });
     kpiFields += `</div>`;
   });
@@ -109,131 +112,148 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
     <html>
     <head><meta charset="utf-8"><title>KPI Form</title></head>
     <body style="font-family: 'Segoe UI', sans-serif; background:#f4f4f4; padding:20px;">
-        <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;
-                    border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
-            <div style="display:flex;align-items:center;justify-content:flex-start;
-                        gap:25px;margin-bottom:30px;">
-                <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
-                    alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;">
-                <h2 style="color:#0078D7;font-size:22px;margin:0;font-weight:700;text-align:center;width:100%;">
-                    KPI Submission Form - Week ${week}
-                </h2>
-            </div>
-
-            <form action="https://kpi-form.azurewebsites.net/api/submit-kpi" method="POST">
-                <div style="margin-bottom:20px;">
-                    <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">
-                        Responsible Name
-                    </label>
-                    <input type="text" name="responsible_name" value="${responsible.name}" readonly
-                        style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
-                               font-size:14px;background:#f9f9f9;" />
-                </div>
-                <div style="margin-bottom:20px;">
-                    <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Plant</label>
-                    <input type="text" name="plant" value="${responsible.plant_name}" readonly
-                        style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
-                               font-size:14px;background:#f9f9f9;" />
-                </div>
-                <div style="margin-bottom:20px;">
-                    <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Department</label>
-                    <input type="text" name="department" value="${responsible.department_name}" readonly
-                        style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
-                               font-size:14px;background:#f9f9f9;" />
-                </div>
-                <div style="margin-bottom:20px;">
-                    <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Week</label>
-                    <input type="text" name="week" value="${week}" readonly
-                        style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
-                               font-size:14px;background:#f9f9f9;" />
-                </div>
-
-                ${kpiFields}
-
-                <input type="hidden" name="responsible_id" value="${responsible.responsible_id}" />
-                <input type="hidden" name="week" value="${week}" />
-
-                <button type="submit"
-                    style="width:100%;padding:12px;background:#0078D7;color:#fff;font-size:16px;
-                           font-weight:600;border:none;border-radius:8px;cursor:pointer;">
-                    Submit KPI
-                </button>
-            </form>
+      <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;
+                  border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
+        <div style="display:flex;align-items:center;justify-content:flex-start; gap:25px;margin-bottom:30px;">
+          <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
+               alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;">
+          <h2 style="color:#0078D7;font-size:22px;margin:0;font-weight:700;text-align:center;width:100%;">
+            KPI Submission Form - Week ${week}
+          </h2>
         </div>
+
+        <form action="https://kpi-form.azurewebsites.net/confirm-kpi" method="GET">
+          <input type="hidden" name="responsible_id" value="${responsible.responsible_id}" />
+          <input type="hidden" name="week" value="${week}" />
+
+          <div style="margin-bottom:20px;">
+            <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Responsible Name</label>
+            <input type="text" name="responsible_name" value="${responsible.name}" readonly
+              style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
+                     font-size:14px;background:#f9f9f9;" />
+          </div>
+
+          <div style="margin-bottom:20px;">
+            <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Plant</label>
+            <input type="text" name="plant" value="${responsible.plant_name}" readonly
+              style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
+                     font-size:14px;background:#f9f9f9;" />
+          </div>
+
+          <div style="margin-bottom:20px;">
+            <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Department</label>
+            <input type="text" name="department" value="${responsible.department_name}" readonly
+              style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;
+                     font-size:14px;background:#f9f9f9;" />
+          </div>
+
+          ${kpiFields}
+
+          <button type="submit"
+            style="width:100%;padding:12px;background:#0078D7;color:#fff;font-size:16px;
+                   font-weight:600;border:none;border-radius:8px;cursor:pointer;">
+            Submit KPI
+          </button>
+        </form>
+      </div>
     </body>
     </html>
-    `;
+  `;
 };
 
-// ---------- Submit KPI endpoint ----------
-app.post("/api/submit-kpi", async (req, res) => {
+// ---------- Confirm KPI page ----------
+app.get("/confirm-kpi", async (req, res) => {
   try {
-    const { responsible_id, ...values } = req.body;
-    const keys = Object.keys(values).filter((k) => k.startsWith("value_"));
-    for (let key of keys) {
-      const kpiValuesId = key.split("_")[1];
-      await pool.query(
-        `UPDATE public."kpi_values" SET value=$1 WHERE kpi_values_id=$2`,
-        [values[key], kpiValuesId]
-      );
-    }
-    res.json({ status: "success", message: "✅ KPI values submitted successfully!" });
-  } catch (err) {
-    console.error(err);
-    res
-      .status(500)
-      .json({ status: "error", message: "❌ Error submitting KPI values." });
-  }
-});
+    const params = req.query;
+    const responsibleId = params.responsible_id;
+    const week = params.week;
 
-// ---------- Get KPIs by responsible grouped by indicator_title ----------
-app.get("/api/kpis/:responsibleId", async (req, res) => {
-  try {
-    const responsibleId = req.params.responsibleId;
-    const week = "37-25"; // fixed week or dynamically use getCurrentWeekNumber()
+    const { kpis } = await getResponsibleWithKPIs(responsibleId, week);
 
-    // Fetch KPIs and Responsible
-    const { responsible, kpis } = await getResponsibleWithKPIs(
-      responsibleId,
-      week
-    );
-
-    if (!kpis.length) {
-      return res.json({ status: "success", responsible, groupedKpis: {} });
-    }
-
-    // Group KPIs by indicator_title
-    const groupedKpis = {};
+    // Generate hidden inputs for all KPIs and redirect form
+    let hiddenInputs = "";
     kpis.forEach((kpi) => {
-      if (!groupedKpis[kpi.indicator_title])
-        groupedKpis[kpi.indicator_title] = [];
-      groupedKpis[kpi.indicator_title].push({
-        kpi_values_id: kpi.kpi_values_id,
-        kpi_id: kpi.kpi_id,
-        indicator_sub_title: kpi.indicator_sub_title,
-        unit: kpi.unit,
-        value: kpi.value,
-      });
+      const valueKey = `value_${kpi.kpi_values_id}`;
+      const value = params[valueKey] || "";
+      hiddenInputs += `
+        <input type="hidden" name="${valueKey}" value="${value}" />
+        <input type="hidden" name="indicator_${kpi.kpi_values_id}" value="${kpi.indicator_sub_title}" />
+        <input type="hidden" name="unit_${kpi.kpi_values_id}" value="${kpi.unit}" />
+      `;
     });
 
-    res.json({ status: "success", responsible, groupedKpis });
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="utf-8"><title>Confirm KPI Submission</title></head>
+      <body style="font-family:'Segoe UI',sans-serif;padding:30px;background:#f4f4f4;">
+        <h2>KPI Values Submitted for Responsible ID ${responsibleId} - Week ${week}</h2>
+        <form id="redirectForm" action="/handle-kpi" method="POST">
+          <input type="hidden" name="responsible_id" value="${responsibleId}" />
+          <input type="hidden" name="week" value="${week}" />
+          ${hiddenInputs}
+        </form>
+        <p>Redirecting to handle the submitted KPI values...</p>
+        <script>
+          setTimeout(() => document.getElementById('redirectForm').submit(), 1000);
+        </script>
+      </body>
+      </html>
+    `);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ status: "error", message: err.message });
+    res.status(500).send("Error generating confirmation page.");
   }
 });
 
-// ---------- Send KPI email ----------
+// ---------- Handle KPI submission ----------
+app.post("/handle-kpi", async (req, res) => {
+  try {
+    const { responsible_id, week, ...values } = req.body;
+
+    const kpiData = Object.entries(values)
+      .filter(([key]) => key.startsWith("value_"))
+      .map(([key, value]) => {
+        const id = key.split("_")[1];
+        return {
+          kpi_values_id: id,
+          value,
+          indicator_sub_title: values[`indicator_${id}`],
+          unit: values[`unit_${id}`]
+        };
+      });
+
+    // Save all KPI values to DB
+    for (let kpi of kpiData) {
+      if (kpi.value && kpi.value.trim() !== "") {
+        await pool.query(
+          `UPDATE public."kpi_values" SET value=$1 WHERE kpi_values_id=$2`,
+          [kpi.value, kpi.kpi_values_id]
+        );
+      }
+    }
+
+    // Render page showing filled values
+    let html = `<h2>KPI Values Saved for Responsible ID ${responsible_id} - Week ${week}</h2>`;
+    kpiData.forEach(kpi => {
+      html += `<p><strong>${kpi.indicator_sub_title} (${kpi.unit}):</strong> ${kpi.value}</p>`;
+    });
+
+    res.send(html);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error handling KPI submission.");
+  }
+});
+
+// ---------- Send KPI Email ----------
 const sendKPIEmail = async (responsibleId, week) => {
   try {
-    // 🔹 Try to "lock" sending by updating rows only if they are still NULL
     const lockRes = await pool.query(
       `
       UPDATE public.kpi_values
-      SET value = value  -- dummy update (no change)
-      WHERE responsible_id = $1
-        AND week = $2
-        AND value IS NULL
+      SET value = value
+      WHERE responsible_id = $1 AND week = $2 AND value IS NULL
       RETURNING kpi_values_id
       `,
       [responsibleId, week]
@@ -244,13 +264,8 @@ const sendKPIEmail = async (responsibleId, week) => {
       return;
     }
 
-    // Now fetch responsible + KPIs to build the email
     const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week);
-
-    if (!kpis.length) {
-      console.log(`No KPIs for Responsible ID ${responsibleId}`);
-      return;
-    }
+    if (!kpis.length) return;
 
     const html = generateEmailHtml({ responsible, kpis, week });
     const transporter = createTransporter();
@@ -263,35 +278,25 @@ const sendKPIEmail = async (responsibleId, week) => {
 
     console.log(`✅ Email sent to ${responsible.email}: ${info.messageId}`);
   } catch (err) {
-    console.error(
-      `❌ Failed to send email to responsible ID ${responsibleId}:`,
-      err.message
-    );
+    console.error(`❌ Failed to send email to responsible ID ${responsibleId}:`, err.message);
   }
 };
 
-
-// ---------- Schedule weekly email ----------
+// ---------- Schedule weekly KPI email ----------
 let cronRunning = false;
-
 cron.schedule(
-  "24 17 * * *",
+  "54 16 * * *",
   async () => {
-    if (cronRunning) {
-      console.log("⏭️ Cron already running, skip...");
-      return;
-    }
+    if (cronRunning) return;
     cronRunning = true;
 
     const forcedWeek = "W39";
     try {
-      const resps = await pool.query(
-        `SELECT responsible_id FROM public."Responsible"`
-      );
+      const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
       for (let r of resps.rows) {
         await sendKPIEmail(r.responsible_id, forcedWeek);
       }
-      console.log("✅ All KPI emails sent at 17:45 Africa/Tunis time");
+      console.log("✅ All KPI emails sent");
     } catch (err) {
       console.error("❌ Error sending scheduled emails:", err.message);
     } finally {
@@ -300,6 +305,5 @@ cron.schedule(
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
-
 
 app.listen(port, () => console.log(`Server running on port ${port}`));
