@@ -144,16 +144,24 @@ const sendKPIEmail = async (responsibleId, week) => {
     const transporter = createTransporter();
 
     await transporter.sendMail({
-      from: `"AVOCarbon Administration" <${process.env.SMTP_USER}>`,
+      from: '"AVOCarbon Administration" <administration.STS@avocarbon.com>', // ✅ match auth user
       to: responsible.email,
       subject: `KPI Submission – ${responsible.name} – ${week}`,
       html,
     });
+
     console.log(`✅ Email sent to ${responsible.email} (${week})`);
   } catch (err) {
-    console.error(`❌ Failed to send email for Responsible ID ${responsibleId}: ${err.message}`);
+    console.error("❌ sendMail failed", {
+      message: err.message,
+      code: err.code,
+      command: err.command,
+      response: err.response,
+      responseCode: err.responseCode,
+    });
   }
 };
+
 
 // -------------------- Manual trigger routes (for testing) --------------------
 app.get("/send-kpi-emails", async (req, res) => {
@@ -398,7 +406,7 @@ app.get("/kpi-submitted", async (req, res) => {
 // -------------------- Weekly Cron (Mondays 09:00 Africa/Tunis) --------------------
 let cronRunning = false;
 cron.schedule(
-  "50 11 * * *",
+  "05 12 * * *",
   async () => {
     if (cronRunning) return;
     cronRunning = true;
