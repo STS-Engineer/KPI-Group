@@ -12,6 +12,9 @@ const cron = require("node-cron");
 const app = express();
 const port = Number(process.env.PORT || 5000);
 
+// Ensure local time matches business timezone
+process.env.TZ = "Africa/Tunis";
+
 // -------------------- Middleware --------------------
 app.use(cors());
 app.use(bodyParser.json());
@@ -81,17 +84,34 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
-    host: "smtp.office365.com", // ✅ use smtp.office365.com
-    port: 587,                  // ✅ Microsoft requires 587 STARTTLS, not 25
-    secure: false,              // STARTTLS
+    host: "smtp.office365.com", // Microsoft 365 submission endpoint
+    port: 587,                  // STARTTLS
+    secure: false,              // use STARTTLS
     auth: {
-      user: "administration.STS@avocarbon.com",  // your mailbox
-      pass: "shnlgdyfbcztbhxn",                  // app password or account password (if no MFA)
+      user: "administration.STS@avocarbon.com",  // mailbox
+      pass: "shnlgdyfbcztbhxn",                  // app password or regular (if no MFA)
     },
     tls: { ciphers: "TLSv1.2" },
-    logger: true,  // turn on for debugging
+    logger: true,  // enable while debugging
     debug: true,
   });
+
+// Verify SMTP on boot so you see clear errors
+(async () => {
+  try {
+    const t = createTransporter();
+    await t.verify();
+    console.log("✅ SMTP ready");
+  } catch (e) {
+    console.error("❌ SMTP verify failed:", {
+      message: e.message,
+      code: e.code,
+      command: e.command,
+      response: e.response,
+      responseCode: e.responseCode,
+    });
+  }
+})();
 
 const generateEmailHtml = ({ responsible, kpis, week }) => {
   const formUrl =
@@ -100,7 +120,7 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
     `&week=${encodeURIComponent(week)}`;
 
   const list = (kpis || [])
-    .map(k => {
+    .map((k) => {
       const label = `${escapeHTML(k.indicator_title)}${k.indicator_sub_title ? " - " + escapeHTML(k.indicator_sub_title) : ""}`;
       const unit = k.unit ? " " + escapeHTML(k.unit) : "";
       const val = k.value == null ? "—" : escapeHTML(k.value);
@@ -144,7 +164,7 @@ const sendKPIEmail = async (responsibleId, week) => {
     const transporter = createTransporter();
 
     await transporter.sendMail({
-      from: '"AVOCarbon Administration" <administration.STS@avocarbon.com>', // ✅ match auth user
+      from: '"AVOCarbon Administration" <administration.STS@avocarbon.com>', // match auth user or ensure Send As rights
       to: responsible.email,
       subject: `KPI Submission – ${responsible.name} – ${week}`,
       html,
@@ -153,28 +173,58 @@ const sendKPIEmail = async (responsibleId, week) => {
     console.log(`✅ Email sent to ${responsible.email} (${week})`);
   } catch (err) {
     console.error("❌ sendMail failed", {
-      message: err.message,
-      code: err.code,
-      command: err.command,
-      response: err.response,
-      responseCode: err.responseCode,
+      message: err?.message,
+      code: err?.code,
+      command: err?.command,
+      response: err?.response,
+      responseCode: err?.responseCode,
     });
+    throw err;
   }
 };
 
-
 // -------------------- Manual trigger routes (for testing) --------------------
+app.get("/send-test-email", async (req, res) => {
+  const to = req.query.to;
+  if (!to) return res.status(400).send("Missing ?to=email");
+  try {
+    const t = createTransporter();
+    await t.sendMail({
+      from: '"AVOCarbon Administration" <administration.STS@avocarbon.com>',
+      to,
+      subject: "SMTP test",
+      text: "If you received this, SMTP works ✅",
+    });
+    res.send(`Test email sent to ${escapeHTML(to)}`);
+  } catch (e) {
+    res.status(500).send(JSON.stringify({
+      message: e.message, code: e.code, response: e.response, responseCode: e.responseCode
+    }));
+  }
+});
+
+// Send to ONE responsible now: /send-kpi-email?responsible_id=123&week=W39
+app.get("/send-kpi-email", async (req, res) => {
+  try {
+    const { responsible_id, week } = req.query;
+    if (!responsible_id || !week) throw new Error("Missing responsible_id or week");
+    await sendKPIEmail(responsible_id, week);
+    res.send(`Sent to responsible_id=${escapeHTML(responsible_id)} for ${escapeHTML(week)}`);
+  } catch (e) {
+    res.status(500).send(`Error: ${escapeHTML(e.message)}`);
+  }
+});
+
+// Send to EVERY responsible now (bulk): /send-kpi-emails?week=W39
 app.get("/send-kpi-emails", async (req, res) => {
   try {
     const week = req.query.week || currentISOWeekTag(new Date());
+    console.log(`[MANUAL] Sending emails for ${week} at ${new Date().toISOString()}`);
     const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
-    for (const r of resps.rows) {
-      // fire-and-forget, but we await in loop to keep it simple/loggable
-      await sendKPIEmail(r.responsible_id, week);
-    }
-    res.send(`Emails queued for week ${escapeHTML(week)}.`);
-  } catch (err) {
-    res.status(500).send(`Error: ${escapeHTML(err.message)}`);
+    for (const r of resps.rows) await sendKPIEmail(r.responsible_id, week);
+    res.send(`Queued emails for week ${escapeHTML(week)}`);
+  } catch (e) {
+    res.status(500).send(`Error: ${escapeHTML(e.message)}`);
   }
 });
 
@@ -403,13 +453,15 @@ app.get("/kpi-submitted", async (req, res) => {
   }
 });
 
-// -------------------- Weekly Cron (Mondays 09:00 Africa/Tunis) --------------------
+// -------------------- Daily Cron at 14:51 Africa/Tunis --------------------
 let cronRunning = false;
 cron.schedule(
-  "05 12 * * *",
+  "55 14 * * *",
   async () => {
     if (cronRunning) return;
     cronRunning = true;
+
+    console.log(`[CRON] Triggered at ${new Date().toISOString()} (Africa/Tunis 14:51)`);
     const week = currentISOWeekTag(new Date());
     try {
       const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
@@ -425,6 +477,22 @@ cron.schedule(
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
+
+// Optional: Startup catch-up (run once if server starts within 7 mins after 14:51)
+(function startupCatchup() {
+  const TARGET_HOUR = 14, TARGET_MIN = 51, GRACE_MIN = 7;
+  const now = new Date(), hh = now.getHours(), mm = now.getMinutes();
+  if (hh === TARGET_HOUR && mm >= TARGET_MIN && mm < TARGET_MIN + GRACE_MIN) {
+    console.log(`[CRON] Startup catch-up: running at ${now.toISOString()}`);
+    (async () => {
+      const week = currentISOWeekTag(new Date());
+      const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
+      for (const r of resps.rows) await sendKPIEmail(r.responsible_id, week);
+    })().catch(e => console.error("[CRON] catch-up error:", e));
+  } else {
+    console.log(`[CRON] Startup: no catch-up (now ${hh}:${String(mm).padStart(2,"0")} local)`);
+  }
+})();
 
 // -------------------- Start --------------------
 app.listen(port, () => console.log(`Server running on port ${port}`));
