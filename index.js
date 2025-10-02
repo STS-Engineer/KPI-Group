@@ -78,15 +78,19 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
 };
 
 // -------------------- Email (template + sender) --------------------
+// ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
-    host: "avocarbon-com.mail.protection.outlook.com",
-    port: 25,
-    secure: false,
+    host: "smtp.office365.com", // ✅ use smtp.office365.com
+    port: 587,                  // ✅ Microsoft requires 587 STARTTLS, not 25
+    secure: false,              // STARTTLS
     auth: {
-      user: "administration.STS@avocarbon.com",
-      pass: "shnlgdyfbcztbhxn",
+      user: "administration.STS@avocarbon.com",  // your mailbox
+      pass: "shnlgdyfbcztbhxn",                  // app password or account password (if no MFA)
     },
+    tls: { ciphers: "TLSv1.2" },
+    logger: true,  // turn on for debugging
+    debug: true,
   });
 
 const generateEmailHtml = ({ responsible, kpis, week }) => {
@@ -394,7 +398,7 @@ app.get("/kpi-submitted", async (req, res) => {
 // -------------------- Weekly Cron (Mondays 09:00 Africa/Tunis) --------------------
 let cronRunning = false;
 cron.schedule(
-  "37 11 * * *",
+  "50 11 * * *",
   async () => {
     if (cronRunning) return;
     cronRunning = true;
