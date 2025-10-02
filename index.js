@@ -157,12 +157,28 @@ app.get("/kpi-review", async (req, res) => {
         <script>
           const kpiValues = ${JSON.stringify(kpiValues)};
           const container = document.getElementById('kpiContainer');
-          Object.keys(kpiValues).forEach(k => {
-            const div = document.createElement('div');
-            div.style.marginBottom = "10px";
-            div.textContent = k + ": " + kpiValues[k];
-            container.appendChild(div);
+           Object.keys(kpiValues).forEach(k => {
+          const div = document.createElement('div');
+          div.style.marginBottom = "10px";
+
+          const label = document.createElement('label');
+          label.textContent = k;
+          label.style.display = 'block';
+          label.style.marginBottom = '4px';
+
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.name = k;
+          input.value = kpiValues[k];
+          input.style.width = '100%';
+          input.style.padding = '8px';
+          input.style.border = '1px solid #ccc';
+          input.style.borderRadius = '4px';
+          div.appendChild(label);
+          div.appendChild(input);
+          container.appendChild(div);
           });
+
 
           setTimeout(async () => {
             try {
@@ -252,7 +268,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "38 10 * * *", // daily 09:51 Africa/Tunis
+  "48 10 * * *", // daily 09:51 Africa/Tunis
   async () => {
     if (cronRunning) return;
     cronRunning = true;
