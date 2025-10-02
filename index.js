@@ -285,7 +285,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly KPI email ----------
 let cronRunning = false;
 cron.schedule(
-  "54 16 * * *",
+  "38 08 * * *",
   async () => {
     if (cronRunning) return;
     cronRunning = true;
