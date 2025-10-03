@@ -27,19 +27,21 @@ const pool = new Pool({
 const createTransporter = () =>
   nodemailer.createTransport({
     host: "smtp.office365.com",
-    port: 587,       // TLS port
-    secure: false,   // false for TLS
+    port: 587,            // TLS port
+    secure: false,        // false for TLS
     auth: {
       user: "administration.STS@avocarbon.com",
       pass: "shnlgdyfbcztbhxn",
     },
+    requireTLS: true,     // enforce TLS
     tls: {
-      ciphers: "SSLv3",
+      ciphers: "TLSv1.2",
       rejectUnauthorized: false,
     },
-    logger: true,
-    debug: true,
+    logger: true,         // prints SMTP logs
+    debug: true,          // prints debug info
   });
+
 
 
 // ---------- Fetch Responsible + KPIs ----------
