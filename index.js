@@ -100,7 +100,7 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
     <div class="container">
       <h2>KPI Submission Form - Week ${week}</h2>
 
-      <form action="https://kpi-form.azurewebsites.net/process-kpi" method="GET">
+      <form action="/process-kpi" method="GET">
         <input type="hidden" name="responsible_id" value="${responsible.responsible_id}" />
         <input type="hidden" name="week" value="${week}" />
 
@@ -182,7 +182,7 @@ app.get("/process-kpi", async (req, res) => {
             const statusEl = document.getElementById('status');
 
             try {
-              const resp = await fetch('https://kpi-form.azurewebsites.net/api/submit-kpi', {
+              const resp = await fetch('/api/submit-kpi', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify(body)
@@ -191,7 +191,7 @@ app.get("/process-kpi", async (req, res) => {
               if (data.status === 'success') {
                 statusEl.textContent = '✅ KPI saved! Redirecting...';
                 setTimeout(() => {
-                  window.location.href = 'https://kpi-form.azurewebsites.net/kpi-submitted?responsible_id=${responsible_id}&week=${week}';
+                  window.location.href = '/kpi-submitted?responsible_id=${responsible_id}&week=${week}';
                 }, 1000);
               } else {
                 statusEl.textContent = '❌ Error: ' + data.message;
@@ -281,7 +281,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "43 13 * * *", // daily at 17:29 Africa/Tunis
+  "48 13 * * *", // daily at 17:29 Africa/Tunis
   async () => {
     if (cronRunning) return;
     cronRunning = true;
