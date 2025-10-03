@@ -24,16 +24,20 @@ const pool = new Pool({
 });
 
 // ---------- Nodemailer ----------
+
 const createTransporter = () =>
   nodemailer.createTransport({
-    host: "avocarbon-com.mail.protection.outlook.com",
-    port: 25,
-    secure: false,
+    host: "smtp.office365.com",   // ✅ must be this
+    port: 587,                    // ✅ works from Azure
+    secure: false,                // STARTTLS
+    requireTLS: true,
     auth: {
       user: "administration.STS@avocarbon.com",
-      pass: "shnlgdyfbcztbhxn",
+      pass: "shnlgdyfbcztbhxn", 
     },
   });
+
+
 
 // ---------- Fetch Responsible + KPIs ----------
 const getResponsibleWithKPIs = async (responsibleId, week) => {
@@ -41,7 +45,7 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     `
     SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
            p.name AS plant_name, d.name AS department_name
-    FROM public."Responsible" r
+     public."Responsible" r
     JOIN public."Plant" p ON r.plant_id = p.plant_id
     JOIN public."Department" d ON r.department_id = d.department_id
     WHERE r.responsible_id = $1
@@ -56,7 +60,7 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     `
     SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id, 
            k.indicator_title, k.indicator_sub_title, k.unit
-    FROM public.kpi_values kv
+     public.kpi_values kv
     JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
     WHERE kv.responsible_id = $1 AND kv.week = $2
     ORDER BY k.kpi_id ASC
@@ -158,7 +162,7 @@ app.get("/process-kpi", async (req, res) => {
     if (!responsible_id || !week || !kpi_payload)
       return res.status(400).send("Missing parameters");
 
-    const kpis = JSON.parse(Buffer.from(kpi_payload, "base64").toString());
+    const kpis = JSON.parse(Buffer.(kpi_payload, "base64").toString());
 
     res.send(`
       <!DOCTYPE html>
@@ -281,7 +285,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "50 14 * * *", // daily at 17:29 Africa/Tunis
+  "04 15 * * *", // daily at 17:29 Africa/Tunis
   async () => {
     if (cronRunning) return;
     cronRunning = true;
