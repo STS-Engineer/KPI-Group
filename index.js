@@ -182,7 +182,7 @@ app.get("/process-kpi", async (req, res) => {
             const statusEl = document.getElementById('status');
 
             try {
-              const resp = await fetch('/api/submit-kpi', {
+              const resp = await fetch('https://kpi-form.azurewebsites.net/api/submit-kpi', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify(body)
@@ -191,7 +191,7 @@ app.get("/process-kpi", async (req, res) => {
               if (data.status === 'success') {
                 statusEl.textContent = '✅ KPI saved! Redirecting...';
                 setTimeout(() => {
-                  window.location.href = '/kpi-submitted?responsible_id=${responsible_id}&week=${week}';
+                  window.location.href = 'https://kpi-form.azurewebsites.net/kpi-submitted?responsible_id=${responsible_id}&week=${week}';
                 }, 1000);
               } else {
                 statusEl.textContent = '❌ Error: ' + data.message;
@@ -281,7 +281,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "32 12 * * *", // daily at 17:29 Africa/Tunis
+  "38 12 * * *", // daily at 17:29 Africa/Tunis
   async () => {
     if (cronRunning) return;
     cronRunning = true;
