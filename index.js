@@ -290,7 +290,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "05 14 * * *", // daily at 17:29 Africa/Tunis
+  "14 14 * * *", // daily at 17:29 Africa/Tunis
   async () => {
     if (cronRunning) return;
     cronRunning = true;
