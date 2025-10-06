@@ -117,19 +117,55 @@ app.get("/redirect", async (req, res) => {
     const { responsible_id, week, ...values } = req.query;
     const kpiValues = Object.entries(values)
       .filter(([key]) => key.startsWith("value_"))
-      .map(([key, val]) => ({ kpi_values_id: key.split("_")[1], value: val }));
+      .map(([key, val]) => ({
+        kpi_values_id: key.split("_")[1],
+        value: val,
+      }));
 
     for (let item of kpiValues) {
-      await pool.query(
-        `UPDATE public."kpi_values" SET value=$1 WHERE kpi_values_id=$2`,
-        [item.value, item.kpi_values_id]
+      // 1️⃣ Get the old value
+      const oldRes = await pool.query(
+        `SELECT value, kpi_id FROM public."kpi_values" WHERE kpi_values_id = $1`,
+        [item.kpi_values_id]
       );
+
+      if (oldRes.rows.length) {
+        const { value: old_value, kpi_id } = oldRes.rows[0];
+
+        // 2️⃣ Insert into history table
+        await pool.query(
+          `
+          INSERT INTO public.kpi_values_hist 
+          (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          `,
+          [
+            item.kpi_values_id,
+            responsible_id,
+            kpi_id,
+            week,
+            old_value,
+            item.value,
+          ]
+        );
+
+        // 3️⃣ Update current value
+        await pool.query(
+          `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
+          [item.value, item.kpi_values_id]
+        );
+      }
     }
 
+    // 4️⃣ Redirect to dashboard after submission
     res.redirect(`/dashboard?responsible_id=${responsible_id}&week=${week}`);
   } catch (err) {
     console.error("❌ Error in /redirect:", err.message);
-    res.status(500).send(`<h2 style="color:red;">❌ Failed to submit KPI values</h2><p>${err.message}</p>`);
+    res
+      .status(500)
+      .send(
+        `<h2 style="color:red;">❌ Failed to submit KPI values</h2><p>${err.message}</p>`
+      );
   }
 });
 
@@ -499,6 +535,114 @@ app.get("/dashboard", async (req, res) => {
 });
 
 
+
+app.get("/dashboard-history", async (req, res) => {
+  try {
+    const { responsible_id, week } = req.query;
+
+    const histRes = await pool.query(
+      `
+      SELECT h.hist_id, h.kpi_id, h.week, h.old_value, h.new_value, h.updated_at,
+             k.indicator_title, k.indicator_sub_title, k.unit
+      FROM public.kpi_values_hist h
+      JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+      WHERE h.responsible_id = $1
+      ORDER BY h.updated_at DESC
+      `,
+      [responsible_id]
+    );
+
+    const rows = histRes.rows;
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>KPI History Dashboard</title>
+        <style>
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f4f6f9;
+            padding: 20px;
+            margin: 0;
+          }
+          .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+          }
+          h1 {
+            text-align: center;
+            color: #0078D7;
+            margin-bottom: 30px;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+          }
+          th, td {
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            text-align: center;
+          }
+          th {
+            background: #0078D7;
+            color: white;
+            font-weight: 600;
+          }
+          tr:nth-child(even) {
+            background: #f8f9fa;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>KPI Value History</h1>
+          <table>
+            <thead>
+              <tr>
+                <th>Indicator</th>
+                <th>Sub Title</th>
+                <th>Week</th>
+                <th>Old Value</th>
+                <th>New Value</th>
+                <th>Unit</th>
+                <th>Updated At</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows
+                .map(
+                  (r) => `
+                  <tr>
+                    <td>${r.indicator_title}</td>
+                    <td>${r.indicator_sub_title || "-"}</td>
+                    <td>${r.week}</td>
+                    <td>${r.old_value ?? "—"}</td>
+                    <td>${r.new_value ?? "—"}</td>
+                    <td>${r.unit || ""}</td>
+                    <td>${new Date(r.updated_at).toLocaleString()}</td>
+                  </tr>`
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("❌ Error loading dashboard-history:", err.message);
+    res.send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+
 // ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week) => {
   try {
@@ -520,7 +664,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "10 14 * * *",
+  "27 14 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
