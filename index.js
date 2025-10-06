@@ -135,8 +135,7 @@ app.get("/redirect", async (req, res) => {
 
 // ---------- Modern Web form page ----------
 // ... (previous imports and setup remain the same)
-
-// ---------- Modern Web form page with logo ----------
+// ---------- Modern Web form page with design-matched layout ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -150,43 +149,175 @@ app.get("/form", async (req, res) => {
         <meta charset="utf-8">
         <title>KPI Form - Week ${week}</title>
         <style>
-          body { font-family:'Segoe UI',sans-serif; background:#f4f6f9; padding:40px; }
-          .container { max-width:750px; margin:0 auto; background:#fff; padding:30px; border-radius:12px; box-shadow:0 8px 20px rgba(0,0,0,0.1); }
-          h1 { text-align:center; color:#0078D7; margin-bottom:20px; }
-          .logo { display:block; margin:0 auto 20px; width:80px; height:80px; object-fit:contain; }
-          .info-card { background:#f0f4f8; padding:15px 20px; border-radius:10px; margin-bottom:25px; box-shadow:0 4px 8px rgba(0,0,0,0.05); }
-          .info-card p { margin:5px 0; font-size:14px; }
-          .kpi-card { margin-bottom:20px; padding:20px; border-radius:12px; background:#fff; box-shadow:0 4px 12px rgba(0,0,0,0.08); transition:0.2s; }
-          .kpi-card:hover { transform:translateY(-2px); box-shadow:0 6px 16px rgba(0,0,0,0.12); }
-          .kpi-card label { font-weight:600; color:#333; display:block; margin-bottom:8px; }
-          .kpi-card input { width:100%; padding:12px; font-size:14px; border-radius:8px; border:1px solid #ccc; box-shadow:inset 0 1px 3px rgba(0,0,0,0.08); transition:0.2s; }
-          .kpi-card input:focus { border-color:#0078D7; box-shadow:0 0 5px rgba(0,120,215,0.3); outline:none; }
-          .submit-btn { display:block; width:100%; padding:14px; background:#0078D7; color:#fff; font-size:16px; font-weight:bold; border:none; border-radius:8px; cursor:pointer; box-shadow:0 4px 10px rgba(0,120,215,0.3); transition:0.2s; }
-          .submit-btn:hover { background:#005ea0; box-shadow:0 6px 12px rgba(0,120,215,0.4); }
+          body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: #f4f6f9; 
+            padding: 20px;
+            margin: 0;
+          }
+          .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background: #fff; 
+            border-radius: 8px; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+          }
+          .header { 
+            background: #0078D7; 
+            color: white; 
+            padding: 20px; 
+            text-align: center;
+          }
+          .header h1 { 
+            margin: 0; 
+            font-size: 24px;
+            font-weight: 600;
+          }
+          .form-section { 
+            padding: 30px;
+          }
+          .info-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 25px;
+            border-left: 4px solid #0078D7;
+          }
+          .info-row {
+            display: flex;
+            margin-bottom: 15px;
+            align-items: center;
+          }
+          .info-label {
+            font-weight: 600;
+            color: #333;
+            width: 120px;
+            font-size: 14px;
+          }
+          .info-value {
+            flex: 1;
+            padding: 8px 12px;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+          }
+          .kpi-section {
+            margin-top: 30px;
+          }
+          .kpi-section h3 {
+            color: #0078D7;
+            margin-bottom: 20px;
+            font-size: 18px;
+            border-bottom: 2px solid #0078D7;
+            padding-bottom: 8px;
+          }
+          .kpi-card {
+            background: #fff;
+            border: 1px solid #e1e5e9;
+            border-radius: 6px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+          }
+          .kpi-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+            font-size: 15px;
+          }
+          .kpi-subtitle {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 10px;
+          }
+          .kpi-input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+          }
+          .kpi-input:focus {
+            border-color: #0078D7;
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(0,120,215,0.1);
+          }
+          .submit-btn {
+            background: #0078D7;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 4px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: block;
+            width: 100%;
+            margin-top: 20px;
+          }
+          .submit-btn:hover {
+            background: #005ea6;
+          }
+          .unit-label {
+            color: #888;
+            font-size: 12px;
+            margin-top: 5px;
+          }
         </style>
       </head>
       <body>
         <div class="container">
-          <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
-               alt="AVOCarbon Logo" class="logo" />
-          <h1>KPI Form - Week ${week}</h1>
-          <div class="info-card">
-            <p><strong>Responsible:</strong> ${responsible.name}</p>
-            <p><strong>Department:</strong> ${responsible.department_name}</p>
-            <p><strong>Plant:</strong> ${responsible.plant_name}</p>
-            <p><strong>Week:</strong> ${week}</p>
+          <div class="header">
+            <h1>KPI Submission Form - Week ${week}</h1>
           </div>
-          <form action="/redirect" method="GET">
-            <input type="hidden" name="responsible_id" value="${responsible_id}" />
-            <input type="hidden" name="week" value="${week}" />
-            ${kpis.map(kpi => `
-              <div class="kpi-card">
-                <label>${kpi.indicator_title} - ${kpi.indicator_sub_title || ''} (${kpi.unit || ''})</label>
-                <input type="text" name="value_${kpi.kpi_values_id}" value="${kpi.value || ''}" placeholder="Enter value" />
+          
+          <div class="form-section">
+            <div class="info-section">
+              <div class="info-row">
+                <div class="info-label">Responsible Name</div>
+                <div class="info-value">${responsible.name}</div>
               </div>
-            `).join('')}
-            <button type="submit" class="submit-btn">Submit KPI</button>
-          </form>
+              <div class="info-row">
+                <div class="info-label">Plant</div>
+                <div class="info-value">${responsible.plant_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Department</div>
+                <div class="info-value">${responsible.department_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Week</div>
+                <div class="info-value">${week}</div>
+              </div>
+            </div>
+
+            <div class="kpi-section">
+              <h3>KPI Values</h3>
+              <form action="/redirect" method="GET">
+                <input type="hidden" name="responsible_id" value="${responsible_id}" />
+                <input type="hidden" name="week" value="${week}" />
+                ${kpis.map(kpi => `
+                  <div class="kpi-card">
+                    <div class="kpi-title">${kpi.indicator_title}</div>
+                    ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ''}
+                    <input 
+                      type="text" 
+                      name="value_${kpi.kpi_values_id}" 
+                      value="${kpi.value || ''}" 
+                      placeholder="Enter value" 
+                      class="kpi-input"
+                    />
+                    ${kpi.unit ? `<div class="unit-label">Unit: ${kpi.unit}</div>` : ''}
+                  </div>
+                `).join('')}
+                <button type="submit" class="submit-btn">Submit KPI Values</button>
+              </form>
+            </div>
+          </div>
         </div>
       </body>
       </html>
@@ -197,6 +328,7 @@ app.get("/form", async (req, res) => {
 });
 
 // ---------- Modern Dashboard with logo ----------
+// ---------- Modern Dashboard with design-matched layout ----------
 app.get("/dashboard", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -210,42 +342,152 @@ app.get("/dashboard", async (req, res) => {
         <meta charset="utf-8">
         <title>KPI Dashboard - Week ${week}</title>
         <style>
-          body { font-family:'Segoe UI',sans-serif; background:#f4f6f9; padding:40px; }
-          .container { max-width:900px; margin:0 auto; }
-          .logo { display:block; margin:0 auto 20px; width:80px; height:80px; object-fit:contain; }
-          h1 { text-align:center; color:#0078D7; margin-bottom:20px; }
-          .info-card { background:#f0f4f8; padding:15px 20px; border-radius:10px; margin-bottom:25px; box-shadow:0 4px 8px rgba(0,0,0,0.05); }
-          .info-card p { margin:5px 0; font-size:14px; }
-          .kpi-grid { display:flex; flex-wrap:wrap; gap:20px; }
-          .kpi-card { flex:1 1 200px; background:#fff; padding:20px; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.08); transition:0.2s; }
-          .kpi-card:hover { transform:translateY(-2px); box-shadow:0 6px 16px rgba(0,0,0,0.12); }
-          .kpi-card h3 { margin-top:0; color:#0078D7; font-size:16px; }
-          .kpi-card p { margin:5px 0; color:#555; }
-          .kpi-value { font-size:18px; font-weight:bold; color:#333; margin-top:10px; }
-          .kpi-missing { color:#d9534f; }
+          body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: #f4f6f9; 
+            padding: 20px;
+            margin: 0;
+          }
+          .container { 
+            max-width: 900px; 
+            margin: 0 auto;
+          }
+          .header { 
+            background: #0078D7; 
+            color: white; 
+            padding: 20px; 
+            text-align: center;
+            border-radius: 8px 8px 0 0;
+          }
+          .header h1 { 
+            margin: 0; 
+            font-size: 24px;
+            font-weight: 600;
+          }
+          .content { 
+            background: #fff; 
+            padding: 30px;
+            border-radius: 0 0 8px 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+          }
+          .info-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 25px;
+            border-left: 4px solid #0078D7;
+          }
+          .info-row {
+            display: flex;
+            margin-bottom: 15px;
+            align-items: center;
+          }
+          .info-label {
+            font-weight: 600;
+            color: #333;
+            width: 120px;
+            font-size: 14px;
+          }
+          .info-value {
+            flex: 1;
+            padding: 8px 12px;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+          }
+          .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+          }
+          .kpi-card {
+            background: #fff;
+            border: 1px solid #e1e5e9;
+            border-radius: 6px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            transition: transform 0.2s, box-shadow 0.2s;
+          }
+          .kpi-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+          }
+          .kpi-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+            font-size: 15px;
+          }
+          .kpi-subtitle {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 15px;
+          }
+          .kpi-value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #0078D7;
+            margin: 10px 0;
+          }
+          .kpi-missing {
+            color: #d9534f;
+            font-style: italic;
+          }
+          .kpi-unit {
+            color: #888;
+            font-size: 12px;
+            margin-top: 5px;
+          }
+          .section-title {
+            color: #0078D7;
+            font-size: 20px;
+            margin: 30px 0 20px 0;
+            border-bottom: 2px solid #0078D7;
+            padding-bottom: 8px;
+          }
         </style>
       </head>
       <body>
         <div class="container">
-          <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
-               alt="AVOCarbon Logo" class="logo" />
-          <h1>KPI Dashboard - Week ${week}</h1>
-          <div class="info-card">
-            <p><strong>Responsible:</strong> ${responsible.name}</p>
-            <p><strong>Department:</strong> ${responsible.department_name}</p>
-            <p><strong>Plant:</strong> ${responsible.plant_name}</p>
-            <p><strong>Week:</strong> ${week}</p>
+          <div class="header">
+            <h1>KPI Dashboard - Week ${week}</h1>
           </div>
-          <div class="kpi-grid">
-            ${kpis.map(kpi => `
-              <div class="kpi-card">
-                <h3>${kpi.indicator_title}</h3>
-                <p>${kpi.indicator_sub_title || ''}</p>
-                <p class="kpi-value ${kpi.value ? '' : 'kpi-missing'}">
-                  ${kpi.value || 'Not filled'} ${kpi.unit || ''}
-                </p>
+          
+          <div class="content">
+            <div class="info-section">
+              <div class="info-row">
+                <div class="info-label">Responsible Name</div>
+                <div class="info-value">${responsible.name}</div>
               </div>
-            `).join('')}
+              <div class="info-row">
+                <div class="info-label">Plant</div>
+                <div class="info-value">${responsible.plant_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Department</div>
+                <div class="info-value">${responsible.department_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Week</div>
+                <div class="info-value">${week}</div>
+              </div>
+            </div>
+
+            <div class="section-title">KPI Values</div>
+            <div class="kpi-grid">
+              ${kpis.map(kpi => `
+                <div class="kpi-card">
+                  <div class="kpi-title">${kpi.indicator_title}</div>
+                  ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ''}
+                  <div class="kpi-value ${kpi.value ? '' : 'kpi-missing'}">
+                    ${kpi.value || 'Not filled'}
+                  </div>
+                  ${kpi.unit ? `<div class="kpi-unit">${kpi.unit}</div>` : ''}
+                </div>
+              `).join('')}
+            </div>
           </div>
         </div>
       </body>
@@ -278,7 +520,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "44 12 * * *",
+  "54 12 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
