@@ -172,7 +172,7 @@ app.get("/redirect", async (req, res) => {
 // ---------- Modern Web form page ----------
 // ... (previous imports and setup remain the same)
 // ---------- Modern Web form page with design-matched layout ----------
-app.get("/form", async (req, res) => {
+("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
     const { responsible, kpis } = await getResponsibleWithKPIs(responsible_id, week);
@@ -364,175 +364,106 @@ app.get("/form", async (req, res) => {
 });
 
 // ---------- Modern Dashboard with logo ----------
-// ---------- Modern Dashboard with design-matched layout ----------
+// ---------- Modern Dashboard by Week ----------
 app.get("/dashboard", async (req, res) => {
   try {
-    const { responsible_id, week } = req.query;
-    const { responsible, kpis } = await getResponsibleWithKPIs(responsible_id, week);
-    if (!kpis.length) return res.send("<p>No KPIs found for this week.</p>");
+    const { responsible_id } = req.query;
 
-    res.send(`
+    // 1️⃣ Fetch responsible info
+    const resResp = await pool.query(
+      `
+      SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1
+      `,
+      [responsible_id]
+    );
+    const responsible = resResp.rows[0];
+    if (!responsible) throw new Error("Responsible not found");
+
+    // 2️⃣ Fetch all KPI values for this responsible, grouped by week
+    const kpiRes = await pool.query(
+      `
+      SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id,
+             k.indicator_title, k.indicator_sub_title, k.unit
+      FROM public.kpi_values kv
+      JOIN public."Kpi" k ON kv.kpi_id = k.kpi_id
+      WHERE kv.responsible_id = $1
+      ORDER BY kv.week ASC, k.kpi_id ASC
+      `,
+      [responsible_id]
+    );
+
+    // 3️⃣ Group KPIs by week
+    const weeks = {};
+    kpiRes.rows.forEach(kpi => {
+      if (!weeks[kpi.week]) weeks[kpi.week] = [];
+      weeks[kpi.week].push(kpi);
+    });
+
+    // 4️⃣ Generate HTML
+    let html = `
       <!DOCTYPE html>
       <html>
       <head>
         <meta charset="utf-8">
-        <title>KPI Dashboard - Week ${week}</title>
+        <title>KPI Dashboard - ${responsible.name}</title>
         <style>
-          body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: #f4f6f9; 
-            padding: 20px;
-            margin: 0;
-          }
-          .container { 
-            max-width: 900px; 
-            margin: 0 auto;
-          }
-          .header { 
-            background: #0078D7; 
-            color: white; 
-            padding: 20px; 
-            text-align: center;
-            border-radius: 8px 8px 0 0;
-          }
-          .header h1 { 
-            margin: 0; 
-            font-size: 24px;
-            font-weight: 600;
-          }
-          .content { 
-            background: #fff; 
-            padding: 30px;
-            border-radius: 0 0 8px 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-          }
-          .info-section {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 6px;
-            margin-bottom: 25px;
-            border-left: 4px solid #0078D7;
-          }
-          .info-row {
-            display: flex;
-            margin-bottom: 15px;
-            align-items: center;
-          }
-          .info-label {
-            font-weight: 600;
-            color: #333;
-            width: 120px;
-            font-size: 14px;
-          }
-          .info-value {
-            flex: 1;
-            padding: 8px 12px;
-            background: white;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-          }
-          .kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 20px;
-            margin-top: 30px;
-          }
-          .kpi-card {
-            background: #fff;
-            border: 1px solid #e1e5e9;
-            border-radius: 6px;
-            padding: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-            transition: transform 0.2s, box-shadow 0.2s;
-          }
-          .kpi-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-          }
-          .kpi-title {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 5px;
-            font-size: 15px;
-          }
-          .kpi-subtitle {
-            color: #666;
-            font-size: 13px;
-            margin-bottom: 15px;
-          }
-          .kpi-value {
-            font-size: 18px;
-            font-weight: bold;
-            color: #0078D7;
-            margin: 10px 0;
-          }
-          .kpi-missing {
-            color: #d9534f;
-            font-style: italic;
-          }
-          .kpi-unit {
-            color: #888;
-            font-size: 12px;
-            margin-top: 5px;
-          }
-          .section-title {
-            color: #0078D7;
-            font-size: 20px;
-            margin: 30px 0 20px 0;
-            border-bottom: 2px solid #0078D7;
-            padding-bottom: 8px;
-          }
+          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin:0; }
+          .container { max-width: 900px; margin: 0 auto; }
+          .header { background:#0078D7; color:white; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
+          .header h1 { margin:0; font-size:24px; }
+          .content { background:#fff; padding:30px; border-radius:0 0 8px 8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
+          .info-section { background:#f8f9fa; padding:20px; border-radius:6px; margin-bottom:25px; border-left:4px solid #0078D7; }
+          .info-row { display:flex; margin-bottom:10px; }
+          .info-label { width:120px; font-weight:600; color:#333; }
+          .info-value { flex:1; background:white; padding:8px 12px; border:1px solid #ddd; border-radius:4px; }
+          .week-section { margin-bottom:30px; }
+          .week-title { color:#0078D7; font-size:18px; margin-bottom:10px; font-weight:600; border-bottom:2px solid #0078D7; padding-bottom:5px; }
+          .kpi-card { background:#fff; border:1px solid #e1e5e9; border-radius:6px; padding:15px; margin-bottom:15px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+          .kpi-title { font-weight:600; color:#333; margin-bottom:5px; }
+          .kpi-subtitle { color:#666; font-size:13px; margin-bottom:10px; }
+          .kpi-value { font-size:16px; font-weight:bold; color:#0078D7; }
+          .kpi-unit { color:#888; font-size:12px; margin-top:5px; }
         </style>
       </head>
       <body>
         <div class="container">
           <div class="header">
-            <h1>KPI Dashboard - Week ${week}</h1>
+            <h1>KPI Dashboard - ${responsible.name}</h1>
           </div>
-          
           <div class="content">
             <div class="info-section">
-              <div class="info-row">
-                <div class="info-label">Responsible Name</div>
-                <div class="info-value">${responsible.name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Plant</div>
-                <div class="info-value">${responsible.plant_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Department</div>
-                <div class="info-value">${responsible.department_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Week</div>
-                <div class="info-value">${week}</div>
-              </div>
+              <div class="info-row"><div class="info-label">Responsible</div><div class="info-value">${responsible.name}</div></div>
+              <div class="info-row"><div class="info-label">Plant</div><div class="info-value">${responsible.plant_name}</div></div>
+              <div class="info-row"><div class="info-label">Department</div><div class="info-value">${responsible.department_name}</div></div>
             </div>
+    `;
 
-            <div class="section-title">KPI Values</div>
-            <div class="kpi-grid">
-              ${kpis.map(kpi => `
-                <div class="kpi-card">
+    for (const [week, items] of Object.entries(weeks)) {
+      html += `<div class="week-section"><div class="week-title">${week}</div>`;
+      items.forEach(kpi => {
+        html += `<div class="kpi-card">
                   <div class="kpi-title">${kpi.indicator_title}</div>
                   ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ''}
-                  <div class="kpi-value ${kpi.value ? '' : 'kpi-missing'}">
-                    ${kpi.value || 'Not filled'}
-                  </div>
+                  <div class="kpi-value">${kpi.value || 'Not filled'}</div>
                   ${kpi.unit ? `<div class="kpi-unit">${kpi.unit}</div>` : ''}
-                </div>
-              `).join('')}
-            </div>
-          </div>
-        </div>
-      </body>
-      </html>
-    `);
+                 </div>`;
+      });
+      html += `</div>`;
+    }
+
+    html += `</div></div></body></html>`;
+    res.send(html);
+
   } catch (err) {
     res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
+
 
 
 
@@ -664,12 +595,12 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "27 14 * * *",
+  "41 14 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
 
-    const forcedWeek = "W39";
+    const forcedWeek = "W41";
     try {
       const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
       for (let r of resps.rows) {
