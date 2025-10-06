@@ -25,7 +25,7 @@ const pool = new Pool({
 
 // ---------- Nodemailer ----------
 const createTransporter = () =>
-  nodemailer.createTransport({
+  nodemailer.createTransporter({
     host: "avocarbon-com.mail.protection.outlook.com",
     port: 25,
     secure: false,
@@ -104,6 +104,9 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
     kpiFields += `</div>`;
   });
 
+  // Use your actual domain here
+  const redirectUrl = "https://kpi-form.azurewebsites.net/redirect";
+
   return `
   <!DOCTYPE html>
   <html>
@@ -119,7 +122,7 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
         </h2>
       </div>
 
-      <form onsubmit="event.preventDefault(); handleFormSubmit(this)">
+      <form method="GET" action="${redirectUrl}">
         <div style="margin-bottom:20px;">
           <label style="display:block;margin-bottom:5px;color:#555;font-weight:600;">Responsible Name</label>
           <input type="text" name="responsible_name" value="${responsible.name}" readonly
@@ -153,19 +156,6 @@ const generateEmailHtml = ({ responsible, kpis, week }) => {
         </button>
       </form>
     </div>
-
-    <script>
-      function handleFormSubmit(form) {
-        const params = [];
-        for (let i = 0; i < form.elements.length; i++) {
-          const el = form.elements[i];
-          if (!el.name) continue;
-          params.push(encodeURIComponent(el.name) + "=" + encodeURIComponent(el.value));
-        }
-        const redirectUrl = "https://kpi-form.azurewebsites.net/redirect?" + params.join("&");
-        window.location.href = redirectUrl;
-      }
-    </script>
   </body>
   </html>
   `;
@@ -211,6 +201,9 @@ app.get("/redirect", async (req, res) => {
       }
     }, 1000);
 
+    // Replace 'https://your-homepage.com' with your actual homepage URL (e.g., 'https://avocarbon.com')
+    const homepageUrl = "https://your-homepage.com";
+
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -220,7 +213,10 @@ app.get("/redirect", async (req, res) => {
         <p>Please wait while we save your KPI data for week ${week}.</p>
         <script>
           setTimeout(() => {
-            document.body.innerHTML = '<h2 style="color:green;">✅ KPI values submitted successfully!</h2>';
+            document.body.innerHTML = '<h2 style="color:green;">✅ KPI values submitted successfully!</h2><p>Redirecting to homepage in 2 seconds...</p>';
+            setTimeout(() => {
+              window.location.href = '${homepageUrl}';
+            }, 2000);
           }, 1500);
         </script>
       </body>
@@ -262,7 +258,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "42 09 * * *",
+  "51 09 * * *",
   async () => {
     if (cronRunning) {
       console.log("⏭️ Cron already running, skip...");
