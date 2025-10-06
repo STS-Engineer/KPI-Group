@@ -137,6 +137,7 @@ app.get("/redirect", async (req, res) => {
 });
 
 // ---------- Web form page ----------
+// ---------- Web form page ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -144,33 +145,72 @@ app.get("/form", async (req, res) => {
 
     if (!kpis.length) return res.send("<p>No KPIs found for this week.</p>");
 
+    // Prefilled info section
+    const infoSection = `
+      <div style="background:#f0f4f8;padding:15px;border-radius:10px;margin-bottom:25px;box-shadow:0 4px 8px rgba(0,0,0,0.05);">
+        <p><strong>Responsible:</strong> ${responsible.name}</p>
+        <p><strong>Department:</strong> ${responsible.department_name}</p>
+        <p><strong>Plant:</strong> ${responsible.plant_name}</p>
+        <p><strong>Week:</strong> ${week}</p>
+      </div>
+    `;
+
+    // KPI fields with modern styling
     let kpiFields = "";
     kpis.forEach((kpi) => {
       kpiFields += `
-        <div style="margin-bottom:15px;">
-          <label>${kpi.indicator_title} - ${kpi.indicator_sub_title || ""} (${kpi.unit || ""})</label>
-          <input type="text" name="value_${kpi.kpi_values_id}" value="${kpi.value || ""}" style="width:100%;padding:8px;margin-top:4px;" />
+        <div style="margin-bottom:20px;">
+          <label style="display:block;margin-bottom:6px;font-weight:600;color:#333;">
+            ${kpi.indicator_title} - ${kpi.indicator_sub_title || ""} (${kpi.unit || ""})
+          </label>
+          <input type="text" name="value_${kpi.kpi_values_id}" value="${kpi.value || ""}"
+            style="width:100%;padding:12px;border:1px solid #ccc;border-radius:8px;font-size:14px;
+                   background:#fff;box-shadow:inset 0 1px 3px rgba(0,0,0,0.1);transition:0.2s;"
+            onfocus="this.style.borderColor='#0078D7';this.style.boxShadow='0 0 5px rgba(0,120,215,0.3)';"
+            onblur="this.style.borderColor='#ccc';this.style.boxShadow='inset 0 1px 3px rgba(0,0,0,0.1)';"
+          />
         </div>
       `;
     });
 
     res.send(`
-      <div style="max-width:600px;margin:0 auto;padding:25px;font-family:'Segoe UI',sans-serif;">
-        <h2 style="color:#0078D7;">KPI Form - Week ${week}</h2>
-        <form action="/redirect" method="GET">
-          <input type="hidden" name="responsible_id" value="${responsible_id}" />
-          <input type="hidden" name="week" value="${week}" />
-          ${kpiFields}
-          <button type="submit" style="padding:12px 20px;background:#0078D7;color:white;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">
-            Submit KPI
-          </button>
-        </form>
-      </div>
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>KPI Form - Week ${week}</title>
+      </head>
+      <body style="font-family:'Segoe UI',sans-serif;background:#f4f6f9;padding:40px;">
+        <div style="max-width:700px;margin:0 auto;background:#fff;padding:30px;border-radius:12px;
+                    box-shadow:0 8px 20px rgba(0,0,0,0.1);">
+          <h1 style="text-align:center;color:#0078D7;margin-bottom:25px;">KPI Form - Week ${week}</h1>
+
+          ${infoSection}
+
+          <form action="/redirect" method="GET">
+            <input type="hidden" name="responsible_id" value="${responsible_id}" />
+            <input type="hidden" name="week" value="${week}" />
+
+            ${kpiFields}
+
+            <div style="text-align:center;margin-top:30px;">
+              <button type="submit"
+                      style="padding:14px 25px;background:#0078D7;color:white;font-size:16px;
+                             font-weight:bold;border:none;border-radius:8px;cursor:pointer;
+                             box-shadow:0 4px 10px rgba(0,120,215,0.3);transition:0.2s;">
+                Submit KPI
+              </button>
+            </div>
+          </form>
+        </div>
+      </body>
+      </html>
     `);
   } catch (err) {
-    res.send(`<p>Error: ${err.message}</p>`);
+    res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
+
 
 // ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week) => {
@@ -195,7 +235,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "58 11 * * *",
+  "04 12 * * *",
   async () => {
     if (cronRunning) {
       console.log("⏭️ Cron already running, skip...");
