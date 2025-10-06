@@ -169,10 +169,8 @@ app.get("/redirect", async (req, res) => {
   }
 });
 
-// ---------- Modern Web form page ----------
-// ... (previous imports and setup remain the same)
-// ---------- Modern Web form page with design-matched layout ----------
-("/form", async (req, res) => {
+// ---------- Modern Web  page ----------
+app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
     const { responsible, kpis } = await getResponsibleWithKPIs(responsible_id, week);
@@ -363,7 +361,6 @@ app.get("/redirect", async (req, res) => {
   }
 });
 
-// ---------- Modern Dashboard with logo ----------
 // ---------- Modern Dashboard by Week ----------
 app.get("/dashboard", async (req, res) => {
   try {
@@ -595,7 +592,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "46 14 * * *",
+  "59 14 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
