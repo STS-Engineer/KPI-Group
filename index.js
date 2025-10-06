@@ -592,12 +592,12 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "59 14 * * *",
+  "09 15 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
 
-    const forcedWeek = "W41";
+    const forcedWeek = "W40";
     try {
       const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
       for (let r of resps.rows) {
