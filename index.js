@@ -112,6 +112,7 @@ const generateEmailHtml = ({ responsible, week }) => {
 
 
 // ---------- Redirect handler ----------
+
 app.get("/redirect", async (req, res) => {
   try {
     const { responsible_id, week, ...values } = req.query;
@@ -157,17 +158,55 @@ app.get("/redirect", async (req, res) => {
       }
     }
 
-    // 4️⃣ Redirect to dashboard after submission
-    res.redirect(`/dashboard?responsible_id=${responsible_id}&week=${week}`);
+    // 4️⃣ Instead of redirecting to dashboard, show success message
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>KPI Submitted</title>
+        <style>
+          body { 
+            font-family:'Segoe UI',sans-serif; 
+            background:#f4f4f4; 
+            display:flex; 
+            justify-content:center; 
+            align-items:center; 
+            height:100vh; 
+            margin:0; 
+          }
+          .success-container {
+            background:#fff; 
+            padding:40px; 
+            border-radius:10px; 
+            box-shadow:0 4px 15px rgba(0,0,0,0.1);
+            text-align:center;
+          }
+          h1 { color:#28a745; font-size:28px; margin-bottom:20px; }
+          p { font-size:16px; color:#333; margin-bottom:30px; }
+          a { display:inline-block; padding:12px 25px; background:#0078D7; color:white; text-decoration:none; border-radius:6px; font-weight:bold; }
+          a:hover { background:#005ea6; }
+        </style>
+      </head>
+      <body>
+        <div class="success-container">
+          <h1>✅ KPI Submitted Successfully!</h1>
+          <p>Your KPI values for week ${week} have been saved.</p>
+          <a href="/dashboard?responsible_id=${responsible_id}">Go to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+
   } catch (err) {
     console.error("❌ Error in /redirect:", err.message);
-    res
-      .status(500)
-      .send(
-        `<h2 style="color:red;">❌ Failed to submit KPI values</h2><p>${err.message}</p>`
-      );
+    res.status(500).send(`
+      <h2 style="color:red;">❌ Failed to submit KPI values</h2>
+      <p>${err.message}</p>
+    `);
   }
 });
+
 
 // ---------- Modern Web  page ----------
 app.get("/form", async (req, res) => {
@@ -592,7 +631,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "23 15 * * *",
+  "13 16 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
