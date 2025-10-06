@@ -68,28 +68,48 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
 };
 
 // ---------- Generate Email HTML with Button ----------
-const generateEmailHtml = ({ responsible, week }) => `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>KPI Form</title></head>
-<body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-  <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;
-              border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);text-align:center;">
-    <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
-         alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
-    <h2 style="color:#0078D7;font-size:22px;margin-bottom:25px;">KPI Submission - Week ${week}</h2>
-    <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
-       style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
-              border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
-      Fill KPI Form
-    </a>
-    <p style="margin-top:20px;font-size:12px;color:#888;">
-      Click the button above to fill your KPIs for week ${week}.
-    </p>
-  </div>
-</body>
-</html>
-`;
+const generateEmailHtml = ({ responsible, week }) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="utf-8"><title>KPI Form</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;
+                border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);text-align:center;">
+      
+      <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
+           alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
+      
+      <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - Week ${week}</h2>
+
+      <div style="text-align:left;background:#f0f4f8;padding:15px;border-radius:8px;margin-bottom:20px;">
+        <label><strong>Responsible:</strong></label>
+        <input type="text" value="${responsible.name}" readonly
+               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
+        <label><strong>Department:</strong></label>
+        <input type="text" value="${responsible.department_name}" readonly
+               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
+        <label><strong>Plant:</strong></label>
+        <input type="text" value="${responsible.plant_name}" readonly
+               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
+      </div>
+
+      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
+         style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
+                border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
+        Fill KPI Form
+      </a>
+
+      <p style="margin-top:20px;font-size:12px;color:#888;">
+        Click the button above to fill your KPIs for week ${week}.
+      </p>
+    </div>
+  </body>
+  </html>
+  `;
+};
+
+
 
 // ---------- Redirect handler ----------
 app.get("/redirect", async (req, res) => {
@@ -114,6 +134,9 @@ app.get("/redirect", async (req, res) => {
 });
 
 // ---------- Modern Web form page ----------
+// ... (previous imports and setup remain the same)
+
+// ---------- Modern Web form page with logo ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -129,7 +152,8 @@ app.get("/form", async (req, res) => {
         <style>
           body { font-family:'Segoe UI',sans-serif; background:#f4f6f9; padding:40px; }
           .container { max-width:750px; margin:0 auto; background:#fff; padding:30px; border-radius:12px; box-shadow:0 8px 20px rgba(0,0,0,0.1); }
-          h1 { text-align:center; color:#0078D7; margin-bottom:30px; }
+          h1 { text-align:center; color:#0078D7; margin-bottom:20px; }
+          .logo { display:block; margin:0 auto 20px; width:80px; height:80px; object-fit:contain; }
           .info-card { background:#f0f4f8; padding:15px 20px; border-radius:10px; margin-bottom:25px; box-shadow:0 4px 8px rgba(0,0,0,0.05); }
           .info-card p { margin:5px 0; font-size:14px; }
           .kpi-card { margin-bottom:20px; padding:20px; border-radius:12px; background:#fff; box-shadow:0 4px 12px rgba(0,0,0,0.08); transition:0.2s; }
@@ -143,6 +167,8 @@ app.get("/form", async (req, res) => {
       </head>
       <body>
         <div class="container">
+          <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
+               alt="AVOCarbon Logo" class="logo" />
           <h1>KPI Form - Week ${week}</h1>
           <div class="info-card">
             <p><strong>Responsible:</strong> ${responsible.name}</p>
@@ -170,7 +196,7 @@ app.get("/form", async (req, res) => {
   }
 });
 
-// ---------- Modern Dashboard ----------
+// ---------- Modern Dashboard with logo ----------
 app.get("/dashboard", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -186,7 +212,8 @@ app.get("/dashboard", async (req, res) => {
         <style>
           body { font-family:'Segoe UI',sans-serif; background:#f4f6f9; padding:40px; }
           .container { max-width:900px; margin:0 auto; }
-          h1 { text-align:center; color:#0078D7; margin-bottom:30px; }
+          .logo { display:block; margin:0 auto 20px; width:80px; height:80px; object-fit:contain; }
+          h1 { text-align:center; color:#0078D7; margin-bottom:20px; }
           .info-card { background:#f0f4f8; padding:15px 20px; border-radius:10px; margin-bottom:25px; box-shadow:0 4px 8px rgba(0,0,0,0.05); }
           .info-card p { margin:5px 0; font-size:14px; }
           .kpi-grid { display:flex; flex-wrap:wrap; gap:20px; }
@@ -200,6 +227,8 @@ app.get("/dashboard", async (req, res) => {
       </head>
       <body>
         <div class="container">
+          <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
+               alt="AVOCarbon Logo" class="logo" />
           <h1>KPI Dashboard - Week ${week}</h1>
           <div class="info-card">
             <p><strong>Responsible:</strong> ${responsible.name}</p>
@@ -227,6 +256,7 @@ app.get("/dashboard", async (req, res) => {
   }
 });
 
+
 // ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week) => {
   try {
@@ -248,7 +278,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "35 12 * * *",
+  "44 12 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
