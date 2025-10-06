@@ -247,7 +247,7 @@ const sendKPIEmail = async (responsibleId, week) => {
     const html = generateEmailHtml({ responsible, kpis, week });
     const transporter = createTransporter();
     const info = await transporter.sendMail({
-      from: '<administration.STS@avocarbon.com>',
+      from: 'Administration STS',
       to: responsible.email,
       subject: `KPI Form for ${responsible.name} - Week ${week}`,
       html,
@@ -262,7 +262,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "16 09 * * *",
+  "19 09 * * *",
   async () => {
     if (cronRunning) {
       console.log("⏭️ Cron already running, skip...");
