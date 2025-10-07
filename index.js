@@ -630,27 +630,27 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
-cron.schedule(
-  "30 17 * * *",
-  async () => {
-    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-    cronRunning = true;
+// cron.schedule(
+//   "30 17 * * *",
+//   async () => {
+//     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+//     cronRunning = true;
 
-    const forcedWeek = "W39";
-    try {
-      const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
-      for (let r of resps.rows) {
-        await sendKPIEmail(r.responsible_id, forcedWeek);
-      }
-      console.log("✅ All KPI emails sent");
-    } catch (err) {
-      console.error("❌ Error sending scheduled emails:", err.message);
-    } finally {
-      cronRunning = false;
-    }
-  },
-  { scheduled: true, timezone: "Africa/Tunis" }
-);
+//     const forcedWeek = "W39";
+//     try {
+//       const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
+//       for (let r of resps.rows) {
+//         await sendKPIEmail(r.responsible_id, forcedWeek);
+//       }
+//       console.log("✅ All KPI emails sent");
+//     } catch (err) {
+//       console.error("❌ Error sending scheduled emails:", err.message);
+//     } finally {
+//       cronRunning = false;
+//     }
+//   },
+//   { scheduled: true, timezone: "Africa/Tunis" }
+// );
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
