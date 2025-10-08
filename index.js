@@ -15,10 +15,10 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "adminavo",
-  host: "avo-adb-001.postgres.database.azure.com",
+  user: "administrationSTS",
+  host: "avo-adb-002.postgres.database.azure.com",
   database: "indicatordb",
-  password: "$#fKcdXPg4@ue8AW",
+  password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
@@ -81,18 +81,6 @@ const generateEmailHtml = ({ responsible, week }) => {
            alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
       
       <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - Week ${week}</h2>
-
-      <div style="text-align:left;background:#f0f4f8;padding:15px;border-radius:8px;margin-bottom:20px;">
-        <label><strong>Responsible:</strong></label>
-        <input type="text" value="${responsible.name}" readonly
-               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
-        <label><strong>Department:</strong></label>
-        <input type="text" value="${responsible.department_name}" readonly
-               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
-        <label><strong>Plant:</strong></label>
-        <input type="text" value="${responsible.plant_name}" readonly
-               style="width:100%;padding:8px;border-radius:6px;border:1px solid #ccc;background:#e9ecef;" />
-      </div>
 
       <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
          style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
@@ -629,28 +617,38 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email ----------
+// ---------- Schedule weekly email ----------
 let cronRunning = false;
-// cron.schedule(
-//   "30 17 * * *",
-//   async () => {
-//     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-//     cronRunning = true;
+cron.schedule(
+  "16 09 * * *",
+  async () => {
+    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+    cronRunning = true;
 
-//     const forcedWeek = "W39";
-//     try {
-//       const resps = await pool.query(`SELECT responsible_id FROM public."Responsible"`);
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
-//       console.log("✅ All KPI emails sent");
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       cronRunning = false;
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+    const forcedWeek = "2025-W40"; // or dynamically compute current week
+    try {
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
+
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
+
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      cronRunning = false;
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
+
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
