@@ -625,7 +625,7 @@ cron.schedule(
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
 
-    const forcedWeek = "2025-W40"; // or dynamically compute current week
+    const forcedWeek = "2025-Week45"; // or dynamically compute current week
     try {
       // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
