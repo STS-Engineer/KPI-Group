@@ -80,7 +80,7 @@ const generateEmailHtml = ({ responsible, week }) => {
       <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
            alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
       
-      <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - Week ${week}</h2>
+      <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - ${week}</h2>
 
       <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
          style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
