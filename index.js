@@ -179,7 +179,7 @@ app.get("/redirect", async (req, res) => {
       <body>
         <div class="success-container">
           <h1>✅ KPI Submitted Successfully!</h1>
-          <p>Your KPI values for week ${week} have been saved.</p>
+          <p>Your KPI values for ${week} have been saved.</p>
           <a href="/dashboard?responsible_id=${responsible_id}">Go to Dashboard</a>
         </div>
       </body>
