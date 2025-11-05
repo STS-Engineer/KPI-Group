@@ -620,7 +620,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "48 11 * * *",
+  "06 12 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
