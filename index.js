@@ -607,7 +607,7 @@ const sendKPIEmail = async (responsibleId, week) => {
     const info = await transporter.sendMail({
       from: '"Administration STS" <administration.STS@avocarbon.com>',
       to: responsible.email,
-      subject: `KPI Form for ${responsible.name} - Week ${week}`,
+      subject: `KPI Form for ${responsible.name} - ${week}`,
       html,
     });
     console.log(`✅ Email sent to ${responsible.email}: ${info.messageId}`);
