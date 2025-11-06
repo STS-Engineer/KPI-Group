@@ -333,7 +333,12 @@ app.get("/form", async (req, res) => {
       <body>
         <div class="container">
           <div class="header">
-            <h1>KPI Submission Form - Week ${week}</h1>
+          <h2 style="color:#0078D7;font-size:22px;margin-bottom:5px;">
+             KPI Submission - ${week}
+           </h2>
+          <h3 style="color:#555;font-size:16px;margin-bottom:20px;">
+            Plant: ${responsible.plant_name}
+          </h3>
           </div>
           
           <div class="form-section">
