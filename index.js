@@ -15,10 +15,10 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "adminavo",
-  host: "avo-adb-001.postgres.database.azure.com",
+  user: "administrationSTS",
+  host: "avo-adb-002.postgres.database.azure.com",
   database: "indicatordb",
-  password: "$#fKcdXPg4@ue8AW",
+  password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
@@ -620,7 +620,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "06 12 * * *",
+  "30 09 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
