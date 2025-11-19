@@ -15,10 +15,10 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "adminavo",
-  host: "avo-adb-001.postgres.database.azure.com",
+  user: "administrationSTS",
+  host: "avo-adb-002.postgres.database.azure.com",
   database: "indicatordb",
-  password: "$#fKcdXPg4@ue8AW",
+  password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
@@ -625,12 +625,12 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 let cronRunning = false;
 cron.schedule(
-  "15 10 * * *",
+  "30 10 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
 
-    const forcedWeek = "2025-Week45"; // or dynamically compute current week
+    const forcedWeek = "2025-Week47"; // or dynamically compute current week
     try {
       // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
