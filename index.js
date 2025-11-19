@@ -81,7 +81,11 @@ const generateEmailHtml = ({ responsible, week }) => {
            alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
       
       <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - ${week}</h2>
-
+    
+      <h3 style="color:#0078D7;font-size:16px;margin-bottom:20px;">
+            Plant: ${responsible.plant_name}
+      </h3>
+          
       <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
          style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
                 border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
@@ -336,9 +340,6 @@ app.get("/form", async (req, res) => {
           <h2 style="color:#0078D7;font-size:22px;margin-bottom:5px;">
              KPI Submission - ${week}
            </h2>
-          <h3 style="color:#555;font-size:16px;margin-bottom:20px;">
-            Plant: ${responsible.plant_name}
-          </h3>
           </div>
           
           <div class="form-section">
