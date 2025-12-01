@@ -411,30 +411,35 @@ app.get("/dashboard", async (req, res) => {
       `,
       [responsible_id]
     );
+
     const responsible = resResp.rows[0];
     if (!responsible) throw new Error("Responsible not found");
 
-    // 2️⃣ Fetch all KPI values for this responsible, grouped by week
+    // 2️⃣ Fetch ALL historical KPI submissions for this responsible, ALL weeks
     const kpiRes = await pool.query(
       `
-      SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id,
+      SELECT DISTINCT ON (h.week, h.kpi_id)
+             h.hist_id, h.kpi_values_id, h.new_value as value, h.week, 
+             h.kpi_id, h.updated_at,
              k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.kpi_values kv
-      JOIN public."Kpi" k ON kv.kpi_id = k.kpi_id
-      WHERE kv.responsible_id = $1
-      ORDER BY kv.week ASC, k.kpi_id ASC
+      FROM public.kpi_values_hist h
+      JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+      WHERE h.responsible_id = $1
+      ORDER BY h.week DESC, h.kpi_id ASC, h.updated_at DESC
       `,
       [responsible_id]
     );
 
-    // 3️⃣ Group KPIs by week
-    const weeks = {};
+    // 3️⃣ Group KPIs by week - FIX: Use Map to preserve order and handle duplicates properly
+    const weekMap = new Map();
     kpiRes.rows.forEach(kpi => {
-      if (!weeks[kpi.week]) weeks[kpi.week] = [];
-      weeks[kpi.week].push(kpi);
+      if (!weekMap.has(kpi.week)) {
+        weekMap.set(kpi.week, []);
+      }
+      weekMap.get(kpi.week).push(kpi);
     });
 
-    // 4️⃣ Generate HTML
+    // 4️⃣ Build Dashboard HTML
     let html = `
       <!DOCTYPE html>
       <html>
@@ -447,17 +452,35 @@ app.get("/dashboard", async (req, res) => {
           .header { background:#0078D7; color:white; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
           .header h1 { margin:0; font-size:24px; }
           .content { background:#fff; padding:30px; border-radius:0 0 8px 8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
+
           .info-section { background:#f8f9fa; padding:20px; border-radius:6px; margin-bottom:25px; border-left:4px solid #0078D7; }
           .info-row { display:flex; margin-bottom:10px; }
           .info-label { width:120px; font-weight:600; color:#333; }
           .info-value { flex:1; background:white; padding:8px 12px; border:1px solid #ddd; border-radius:4px; }
-          .week-section { margin-bottom:30px; }
-          .week-title { color:#0078D7; font-size:18px; margin-bottom:10px; font-weight:600; border-bottom:2px solid #0078D7; padding-bottom:5px; }
+
+          .week-section { margin-bottom:30px; border:1px solid #e1e5e9; border-radius:8px; padding:20px; background:#fafbfc; }
+          .week-title { color:#0078D7; font-size:20px; margin-bottom:15px; font-weight:600; border-bottom:2px solid #0078D7; padding-bottom:8px; }
+
           .kpi-card { background:#fff; border:1px solid #e1e5e9; border-radius:6px; padding:15px; margin-bottom:15px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
           .kpi-title { font-weight:600; color:#333; margin-bottom:5px; }
           .kpi-subtitle { color:#666; font-size:13px; margin-bottom:10px; }
           .kpi-value { font-size:16px; font-weight:bold; color:#0078D7; }
           .kpi-unit { color:#888; font-size:12px; margin-top:5px; }
+          .kpi-date { color:#999; font-size:11px; margin-top:3px; font-style:italic; }
+          .no-data { color:#999; font-style:italic; }
+          
+          .summary { 
+            background:#e7f3ff; 
+            padding:15px; 
+            border-radius:6px; 
+            margin-bottom:25px;
+            border-left:4px solid #0078D7;
+          }
+          .summary-text {
+            margin:0;
+            color:#333;
+            font-size:14px;
+          }
         </style>
       </head>
       <body>
@@ -473,27 +496,55 @@ app.get("/dashboard", async (req, res) => {
             </div>
     `;
 
-    for (const [week, items] of Object.entries(weeks)) {
-      html += `<div class="week-section"><div class="week-title">${week}</div>`;
-      items.forEach(kpi => {
-        html += `<div class="kpi-card">
-                  <div class="kpi-title">${kpi.indicator_title}</div>
-                  ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ''}
-                  <div class="kpi-value">${kpi.value || 'Not filled'}</div>
-                  ${kpi.unit ? `<div class="kpi-unit">${kpi.unit}</div>` : ''}
-                 </div>`;
-      });
-      html += `</div>`;
+    // 5️⃣ Loop through WEEKS using Map
+    if (weekMap.size === 0) {
+      html += `<div class="no-data">No KPI data available yet.</div>`;
+    } else {
+      for (const [week, items] of weekMap) {
+        html += `
+          <div class="week-section">
+            <div class="week-title">📅 Week ${week}</div>
+        `;
+
+        items.forEach(kpi => {
+          const hasValue = kpi.value !== null && kpi.value !== undefined && kpi.value !== '';
+          const submittedDate = kpi.updated_at ? new Date(kpi.updated_at).toLocaleString('en-GB', {
+            day: '2-digit',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+          }) : '';
+          
+          html += `
+            <div class="kpi-card">
+              <div class="kpi-title">${kpi.indicator_title}</div>
+              ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ""}
+              <div class="kpi-value ${!hasValue ? 'no-data' : ''}">${hasValue ? kpi.value : "Not filled yet"}</div>
+              ${kpi.unit ? `<div class="kpi-unit">Unit: ${kpi.unit}</div>` : ""}
+              ${submittedDate ? `<div class="kpi-date">Last updated: ${submittedDate}</div>` : ""}
+            </div>
+          `;
+        });
+
+        html += `</div>`;
+      }
     }
 
-    html += `</div></div></body></html>`;
+    html += `
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
     res.send(html);
 
   } catch (err) {
-    res.send(`<p style="color:red;">Error: ${err.message}</p>`);
+    console.error("Dashboard error:", err);
+    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
 });
-
 
 
 
@@ -624,36 +675,36 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
-// let cronRunning = false;
-// cron.schedule(
-//   "30 10 * * *",
-//   async () => {
-//     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-//     cronRunning = true;
+let cronRunning = false;
+cron.schedule(
+  "20 11 * * *",
+  async () => {
+    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+    cronRunning = true;
 
-//     const forcedWeek = "2025-Week47"; // or dynamically compute current week
-//     try {
-//       // ✅ Send only to responsibles who actually have KPI records for that week
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-//         WHERE kv.week = $1
-//       `, [forcedWeek]);
+    const forcedWeek = "2025-Week48"; // or dynamically compute current week
+    try {
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
 
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
 
-//       console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       cronRunning = false;
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      cronRunning = false;
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 
 // ---------- Start server ----------
