@@ -1290,101 +1290,101 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 let reportCronRunning = false;
-cron.schedule(
-  "43 11 * * *", // Every Friday at 9:00 AM
-  async () => {
-    if (reportCronRunning) {
-      console.log("⏭️ Weekly report cron already running, skipping...");
-      return;
-    }
+// cron.schedule(
+//   "43 11 * * *", // Every Friday at 9:00 AM
+//   async () => {
+//     if (reportCronRunning) {
+//       console.log("⏭️ Weekly report cron already running, skipping...");
+//       return;
+//     }
 
-    reportCronRunning = true;
+//     reportCronRunning = true;
 
-    try {
-      // Calculate current week
-      const now = new Date();
-      const year = now.getFullYear();
+//     try {
+//       // Calculate current week
+//       const now = new Date();
+//       const year = now.getFullYear();
 
-      // Get week number function
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
+//       // Get week number function
+//       const getWeekNumber = (date) => {
+//         const d = new Date(date);
+//         d.setHours(0, 0, 0, 0);
+//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//         const yearStart = new Date(d.getFullYear(), 0, 1);
+//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//         return weekNo;
+//       };
 
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `${year}-Week${weekNumber}`;
-      const previousWeek = `${year}-Week${weekNumber - 1}`;
+//       const weekNumber = getWeekNumber(now);
+//       const currentWeek = `${year}-Week${weekNumber}`;
+//       const previousWeek = `${year}-Week${weekNumber - 1}`;
 
-      console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
+//       console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
 
-      // Get all responsibles who have ANY KPI history data
-      const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id, r.email, r.name
-        FROM public."Responsible" r
-        JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
-        WHERE r.email IS NOT NULL
-          AND r.email != ''
-        GROUP BY r.responsible_id, r.email, r.name
-        HAVING COUNT(h.hist_id) > 0
-        ORDER BY r.responsible_id
-      `);
+//       // Get all responsibles who have ANY KPI history data
+//       const resps = await pool.query(`
+//         SELECT DISTINCT r.responsible_id, r.email, r.name
+//         FROM public."Responsible" r
+//         JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
+//         WHERE r.email IS NOT NULL
+//           AND r.email != ''
+//         GROUP BY r.responsible_id, r.email, r.name
+//         HAVING COUNT(h.hist_id) > 0
+//         ORDER BY r.responsible_id
+//       `);
 
-      console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
+//       console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
 
-      const results = [];
-      for (const [index, resp] of resps.rows.entries()) {
-        try {
-          await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-          console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
-          results.push({
-            responsible_id: resp.responsible_id,
-            name: resp.name,
-            status: 'success'
-          });
+//       const results = [];
+//       for (const [index, resp] of resps.rows.entries()) {
+//         try {
+//           await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
+//           console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
+//           results.push({
+//             responsible_id: resp.responsible_id,
+//             name: resp.name,
+//             status: 'success'
+//           });
 
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
-          results.push({
-            responsible_id: resp.responsible_id,
-            name: resp.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
+//           // Add delay to avoid rate limiting
+//           await new Promise(resolve => setTimeout(resolve, 1500));
+//         } catch (err) {
+//           console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
+//           results.push({
+//             responsible_id: resp.responsible_id,
+//             name: resp.name,
+//             status: 'error',
+//             message: err.message
+//           });
+//         }
+//       }
 
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
+//       const succeeded = results.filter(r => r.status === 'success').length;
+//       console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
 
-      // Log summary
-      console.log('\n=== REPORT SUMMARY ===');
-      console.log(`Total responsibles: ${results.length}`);
-      console.log(`Successfully sent: ${succeeded}`);
-      console.log(`Failed: ${results.length - succeeded}`);
+//       // Log summary
+//       console.log('\n=== REPORT SUMMARY ===');
+//       console.log(`Total responsibles: ${results.length}`);
+//       console.log(`Successfully sent: ${succeeded}`);
+//       console.log(`Failed: ${results.length - succeeded}`);
 
-      if (results.length - succeeded > 0) {
-        const failed = results.filter(r => r.status === 'error');
-        console.log('Failed responsibles:');
-        failed.forEach(f => console.log(`  - ${f.name}: ${f.message}`));
-      }
+//       if (results.length - succeeded > 0) {
+//         const failed = results.filter(r => r.status === 'error');
+//         console.log('Failed responsibles:');
+//         failed.forEach(f => console.log(`  - ${f.name}: ${f.message}`));
+//       }
 
-    } catch (error) {
-      console.error("❌ Error in weekly report cron job:", error.message);
-    } finally {
-      reportCronRunning = false;
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
+//     } catch (error) {
+//       console.error("❌ Error in weekly report cron job:", error.message);
+//     } finally {
+//       reportCronRunning = false;
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "Africa/Tunis"
+//   }
+// );
 
 
 
@@ -2226,73 +2226,73 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   }
 };
 // ---------- Update Cron Job for Department Reports ----------
-cron.schedule(
-  "50 15 * * *", // Adjust time as needed
-  async () => {
-    try {
-      const now = new Date();
-      const year = now.getFullYear();
+// cron.schedule(
+//   "50 15 * * *", // Adjust time as needed
+//   async () => {
+//     try {
+//       const now = new Date();
+//       const year = now.getFullYear();
 
-      // Get week number
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
+//       // Get week number
+//       const getWeekNumber = (date) => {
+//         const d = new Date(date);
+//         d.setHours(0, 0, 0, 0);
+//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//         const yearStart = new Date(d.getFullYear(), 0, 1);
+//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//         return weekNo;
+//       };
 
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `${year}-Week${weekNumber}`;
+//       const weekNumber = getWeekNumber(now);
+//       const currentWeek = `${year}-Week${weekNumber}`;
 
-      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+//       console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
 
-      // Get all plants with managers
-      const plantsRes = await pool.query(`
-        SELECT plant_id, name, manager_email 
-        FROM public."Plant" 
-        WHERE manager_email IS NOT NULL AND manager_email != ''
-      `);
+//       // Get all plants with managers
+//       const plantsRes = await pool.query(`
+//         SELECT plant_id, name, manager_email 
+//         FROM public."Plant" 
+//         WHERE manager_email IS NOT NULL AND manager_email != ''
+//       `);
 
-      console.log(`Found ${plantsRes.rows.length} plants with managers`);
+//       console.log(`Found ${plantsRes.rows.length} plants with managers`);
 
-      const results = [];
-      for (const [index, plant] of plantsRes.rows.entries()) {
-        try {
-          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'success'
-          });
+//       const results = [];
+//       for (const [index, plant] of plantsRes.rows.entries()) {
+//         try {
+//           console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'success'
+//           });
 
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
+//           // Add delay to avoid rate limiting
+//           await new Promise(resolve => setTimeout(resolve, 1500));
+//         } catch (err) {
+//           console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'error',
+//             message: err.message
+//           });
+//         }
+//       }
 
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+//       const succeeded = results.filter(r => r.status === 'success').length;
+//       console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
 
-    } catch (error) {
-      console.error("❌ Error in department KPI report cron job:", error.message);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
+//     } catch (error) {
+//       console.error("❌ Error in department KPI report cron job:", error.message);
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "Africa/Tunis"
+//   }
+// );
 
 
 // ---------- Start server ----------
