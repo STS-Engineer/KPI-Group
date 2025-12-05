@@ -2226,73 +2226,73 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   }
 };
 // ---------- Update Cron Job for Department Reports ----------
-cron.schedule(
-  "25 10 * * *", // Adjust time as needed
-  async () => {
-    try {
-      const now = new Date();
-      const year = now.getFullYear();
+// cron.schedule(
+//   "25 10 * * *", // Adjust time as needed
+//   async () => {
+//     try {
+//       const now = new Date();
+//       const year = now.getFullYear();
 
-      // Get week number
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
+//       // Get week number
+//       const getWeekNumber = (date) => {
+//         const d = new Date(date);
+//         d.setHours(0, 0, 0, 0);
+//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//         const yearStart = new Date(d.getFullYear(), 0, 1);
+//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//         return weekNo;
+//       };
 
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `${year}-Week${weekNumber}`;
+//       const weekNumber = getWeekNumber(now);
+//       const currentWeek = `${year}-Week${weekNumber}`;
 
-      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+//       console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
 
-      // Get all plants with managers
-      const plantsRes = await pool.query(`
-        SELECT plant_id, name, manager_email 
-        FROM public."Plant" 
-        WHERE manager_email IS NOT NULL AND manager_email != ''
-      `);
+//       // Get all plants with managers
+//       const plantsRes = await pool.query(`
+//         SELECT plant_id, name, manager_email 
+//         FROM public."Plant" 
+//         WHERE manager_email IS NOT NULL AND manager_email != ''
+//       `);
 
-      console.log(`Found ${plantsRes.rows.length} plants with managers`);
+//       console.log(`Found ${plantsRes.rows.length} plants with managers`);
 
-      const results = [];
-      for (const [index, plant] of plantsRes.rows.entries()) {
-        try {
-          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'success'
-          });
+//       const results = [];
+//       for (const [index, plant] of plantsRes.rows.entries()) {
+//         try {
+//           console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'success'
+//           });
 
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
+//           // Add delay to avoid rate limiting
+//           await new Promise(resolve => setTimeout(resolve, 1500));
+//         } catch (err) {
+//           console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'error',
+//             message: err.message
+//           });
+//         }
+//       }
 
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+//       const succeeded = results.filter(r => r.status === 'success').length;
+//       console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
 
-    } catch (error) {
-      console.error("❌ Error in department KPI report cron job:", error.message);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
+//     } catch (error) {
+//       console.error("❌ Error in department KPI report cron job:", error.message);
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "Africa/Tunis"
+//   }
+// );
 
 
 // ---------- Start server ----------
