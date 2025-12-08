@@ -675,7 +675,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
-// let cronRunning = false;
+let cronRunning = false;
 cron.schedule(
   "00 10 * * *",
   async () => {
