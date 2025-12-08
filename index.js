@@ -673,52 +673,110 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email (FIXED - No duplicates) ----------
-let cronRunning = false;
-cron.schedule(
-  "55 14 * * *",
-  async () => {
-    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-    cronRunning = true;
 
-    const forcedWeek = "2025-Week49"; // or dynamically compute current week
+// ---------- Schedule weekly email (COMPLETELY FIXED) ----------
+let cronRunning = false;
+const sentEmailsCache = new Set(); // Track sent emails to prevent duplicates
+
+// Clear cache every hour to prevent memory issues
+setInterval(() => {
+  sentEmailsCache.clear();
+  console.log('📧 Email cache cleared');
+}, 3600000); // 1 hour
+
+cron.schedule(
+  "04 15 * * *",
+  async () => {
+    if (cronRunning) {
+      console.log("⏭️ Cron already running, skip...");
+      return;
+    }
+    
+    cronRunning = true;
+    const forcedWeek = "2025-Week49";
+    const runId = `${forcedWeek}_${Date.now()}`; // Unique run identifier
+
     try {
-      // ✅ FIXED: Use DISTINCT to get each responsible only once
+      console.log(`\n========== EMAIL SENDING STARTED ==========`);
+      console.log(`Run ID: ${runId}`);
+      console.log(`Week: ${forcedWeek}`);
+      console.log(`Time: ${new Date().toLocaleString()}`);
+      console.log(`===========================================\n`);
+
+      // ✅ FIXED: Get unique responsibles with explicit DISTINCT
       const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id, r.email, r.name
+        SELECT DISTINCT ON (r.responsible_id) 
+               r.responsible_id, 
+               r.email, 
+               r.name
         FROM public."Responsible" r
-        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        INNER JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
         WHERE kv.week = $1
+          AND r.email IS NOT NULL
+          AND r.email != ''
         ORDER BY r.responsible_id
       `, [forcedWeek]);
 
-      console.log(`📧 Sending KPI emails to ${resps.rows.length} responsibles for week ${forcedWeek}...`);
+      console.log(`📧 Found ${resps.rows.length} unique responsibles with KPIs for ${forcedWeek}\n`);
+
+      // Debug: Show all responsibles found
+      console.log('Responsibles to email:');
+      resps.rows.forEach((r, i) => {
+        console.log(`  ${i + 1}. ${r.name} (${r.email}) - ID: ${r.responsible_id}`);
+      });
+      console.log('');
 
       let successCount = 0;
       let failCount = 0;
+      let skippedCount = 0;
 
       for (let [index, r] of resps.rows.entries()) {
+        const cacheKey = `${r.responsible_id}_${forcedWeek}`;
+        
+        // Check if already sent in this run
+        if (sentEmailsCache.has(cacheKey)) {
+          console.log(`  [${index + 1}/${resps.rows.length}] ⏭️  SKIPPED ${r.name} - Already sent in this run`);
+          skippedCount++;
+          continue;
+        }
+
         try {
-          console.log(`  [${index + 1}/${resps.rows.length}] Sending to ${r.name} (${r.email})...`);
+          console.log(`  [${index + 1}/${resps.rows.length}] 📤 Sending to ${r.name} (${r.email})...`);
+          
           await sendKPIEmail(r.responsible_id, forcedWeek);
+          
+          // Mark as sent
+          sentEmailsCache.add(cacheKey);
           successCount++;
           
-          // Add small delay to avoid overwhelming email server
-          await new Promise(resolve => setTimeout(resolve, 500));
+          console.log(`  [${index + 1}/${resps.rows.length}] ✅ SUCCESS - Sent to ${r.name}`);
+          
+          // Delay between emails
+          await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (emailErr) {
-          console.error(`  ❌ Failed to send to ${r.name}:`, emailErr.message);
+          console.error(`  [${index + 1}/${resps.rows.length}] ❌ FAILED - ${r.name}:`, emailErr.message);
           failCount++;
         }
       }
 
-      console.log(`✅ Email sending completed. Success: ${successCount}, Failed: ${failCount}`);
+      console.log(`\n========== EMAIL SENDING COMPLETED ==========`);
+      console.log(`Total Found: ${resps.rows.length}`);
+      console.log(`✅ Success: ${successCount}`);
+      console.log(`❌ Failed: ${failCount}`);
+      console.log(`⏭️  Skipped: ${skippedCount}`);
+      console.log(`Time: ${new Date().toLocaleString()}`);
+      console.log(`===========================================\n`);
+
     } catch (err) {
-      console.error("❌ Error in scheduled email cron:", err.message);
+      console.error("\n❌ ERROR in scheduled email cron:", err.message);
+      console.error(err.stack);
     } finally {
       cronRunning = false;
     }
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
+
 
 
 // ---------- Generate HTML/CSS Charts ----------
