@@ -683,7 +683,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email to submit kpi----------
 let cronRunning = false;
 cron.schedule(
-  "14 17 * * *",  // Runs at 16:44 Tunis time
+  "15 17 * * *",  // Runs at 16:44 Tunis time
   async () => {
 
     // ✔ Block second execution in the same minute
