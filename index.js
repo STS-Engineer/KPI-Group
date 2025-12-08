@@ -13,6 +13,13 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));   
 
+if (global.kpiCronInitialized) {
+  console.log("⏭️ Cron already initialized, skipping duplicate scheduler.");
+  return;
+}
+global.kpiCronInitialized = true;
+
+
 // ---------- Postgres ----------
 const pool = new Pool({
   user: "adminavo",
@@ -676,41 +683,50 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email to submit kpi----------
 let cronRunning = false;
 cron.schedule(
-  "57 16 * * *",
+  "44 16 * * *",  // Runs at 16:44 Tunis time
   async () => {
-    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-    cronRunning = true;
 
-    const forcedWeek = "2025-Week49"; // or dynamically compute current week
+    // ✔ Block second execution in the same minute
+    const now = Date.now();
+    if (lastRunTimestamp && now - lastRunTimestamp < 60000) {
+      console.log("⏭️ Cron already executed this minute, skipping...");
+      return;
+    }
+    lastRunTimestamp = now;
+
+    const forcedWeek = "2025-Week49"; // TODO: replace with dynamic week calculation if needed
+
     try {
-      // ✅ Send only to responsibles who actually have KPI records for that week
-        const resps = await pool.query(`
+      // ======================================================
+      // 🔍 Fetch a unique list of responsibles with KPI for the week
+      // ======================================================
+      const resps = await pool.query(`
         SELECT r.responsible_id
         FROM public."Responsible" r
         JOIN public.kpi_values kv 
-        ON kv.responsible_id = r.responsible_id
+            ON kv.responsible_id = r.responsible_id
         WHERE kv.week = $1
         GROUP BY r.responsible_id
       `, [forcedWeek]);
 
-      // 2️⃣ Deduplicate at JS level (extra protection)
-      const uniqueRespIds = [...new Set(resps.rows.map(r => r.responsible_id))];
+      // Extra safety deduplication
+      const uniqueResponsibleIds = [...new Set(resps.rows.map(r => r.responsible_id))];
 
-      // 3️⃣ Send email only once per responsible
-      for (let responsibleId of uniqueRespIds) {
+      // ======================================================
+      // ✉️ Send email to each responsible only ONCE
+      // ======================================================
+      for (let responsibleId of uniqueResponsibleIds) {
         await sendKPIEmail(responsibleId, forcedWeek);
       }
 
-      console.log(`✅ KPI emails sent to ${uniqueRespIds.length} responsibles`);
+      console.log(`✅ KPI emails sent to ${uniqueResponsibleIds.length} responsibles`);
+
     } catch (err) {
       console.error("❌ Error sending scheduled emails:", err.message);
-    } finally {
-      cronRunning = false;
     }
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
-
 
 
 // ---------- Generate HTML/CSS Charts ----------
