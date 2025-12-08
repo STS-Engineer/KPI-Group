@@ -13,11 +13,7 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));   
 
-if (global.kpiCronInitialized) {
-  console.log("⏭️ Cron already initialized, skipping duplicate scheduler.");
-  return;
-}
-global.kpiCronInitialized = true;
+
 
 
 // ---------- Postgres ----------
@@ -1294,7 +1290,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 };
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
-let reportCronRunning = false;
+// let reportCronRunning = false;
 // cron.schedule(
 //   "43 11 * * *", // Every Friday at 9:00 AM
 //   async () => {
