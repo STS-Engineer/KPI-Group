@@ -1365,26 +1365,51 @@ cron.schedule(
 // ---------- Schedule weekly email to submit kpi----------
 let cronRunning = false;
 cron.schedule(
-  "55 15 * * *",
+  "35 15 * * *",
   async () => {
     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
     cronRunning = true;
 
-    const forcedWeek = "2025-Week49"; // or dynamically compute current week
+    const forcedWeek = "2025-Week49";
+    
     try {
-      // ✅ Send only to responsibles who actually have KPI records for that week
+      // Get all responsibles
       const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id
+        SELECT r.responsible_id, r.email, r.name
         FROM public."Responsible" r
         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
         WHERE kv.week = $1
+          AND r.email IS NOT NULL
+          AND r.email != ''
       `, [forcedWeek]);
 
-      for (let r of resps.rows) {
-        await sendKPIEmail(r.responsible_id, forcedWeek);
+      // Deduplicate by responsible_id
+      const uniqueResps = [];
+      const seenIds = new Set();
+      
+      resps.rows.forEach(r => {
+        if (!seenIds.has(r.responsible_id)) {
+          seenIds.add(r.responsible_id);
+          uniqueResps.push(r);
+        }
+      });
+
+      console.log(`📧 Sending ${uniqueResps.length} unique emails (from ${resps.rows.length} total records)`);
+
+      for (let r of uniqueResps) {
+        try {
+          await sendKPIEmail(r.responsible_id, forcedWeek);
+          console.log(`✅ Email sent to ${r.name} (${r.email})`);
+          
+          // Small delay
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (err) {
+          console.error(`❌ Failed for ${r.name}:`, err.message);
+        }
       }
 
-      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+      console.log(`✅ KPI emails sent to ${uniqueResps.length} responsibles`);
+      
     } catch (err) {
       console.error("❌ Error sending scheduled emails:", err.message);
     } finally {
@@ -1393,7 +1418,6 @@ cron.schedule(
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
-
 
 
 // ========== UPDATED QUERY TO GET WEEKLY DATA ==========
