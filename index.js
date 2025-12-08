@@ -4,14 +4,14 @@ const { Pool } = require("pg");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
-const cron = require("node-cron"); 
+const cron = require("node-cron");
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));   
+app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
@@ -22,6 +22,7 @@ const pool = new Pool({
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
+
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
@@ -34,7 +35,7 @@ const createTransporter = () =>
     },
   });
 
-// ---------- Fetch Responsible + their KPIs ----------
+// ---------- Fix getResponsibleWithKPIs function ----------
 const getResponsibleWithKPIs = async (responsibleId, week) => {
   const resResp = await pool.query(
     `
@@ -54,7 +55,14 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
   const kpiRes = await pool.query(
     `
     SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id, 
-           k.indicator_title, k.indicator_sub_title, k.unit
+           k.indicator_title, k.indicator_sub_title, k.unit,
+           -- Get latest update time from history or use current time
+           COALESCE(
+             (SELECT MAX(updated_at) 
+              FROM public.kpi_values_hist 
+              WHERE kpi_values_id = kv.kpi_values_id),
+             NOW()
+           ) as last_updated
     FROM public.kpi_values kv
     JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
     WHERE kv.responsible_id = $1 AND kv.week = $2
@@ -394,6 +402,7 @@ app.get("/form", async (req, res) => {
 });
 
 // ---------- Modern Dashboard by Week ----------
+// ---------- Modern Dashboard by Week ----------
 app.get("/dashboard", async (req, res) => {
   try {
     const { responsible_id } = req.query;
@@ -493,6 +502,7 @@ app.get("/dashboard", async (req, res) => {
               <div class="info-row"><div class="info-label">Plant</div><div class="info-value">${responsible.plant_name}</div></div>
               <div class="info-row"><div class="info-label">Department</div><div class="info-value">${responsible.department_name}</div></div>
             </div>
+            
     `;
 
     // 5️⃣ Loop through WEEKS using Map
@@ -514,7 +524,7 @@ app.get("/dashboard", async (req, res) => {
             hour: '2-digit',
             minute: '2-digit'
           }) : '';
-          
+
           html += `
             <div class="kpi-card">
               <div class="kpi-title">${kpi.indicator_title}</div>
@@ -544,7 +554,6 @@ app.get("/dashboard", async (req, res) => {
     res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
 });
-
 
 
 app.get("/dashboard-history", async (req, res) => {
@@ -628,8 +637,8 @@ app.get("/dashboard-history", async (req, res) => {
             </thead>
             <tbody>
               ${rows
-                .map(
-                  (r) => `
+        .map(
+          (r) => `
                   <tr>
                     <td>${r.indicator_title}</td>
                     <td>${r.indicator_sub_title || "-"}</td>
@@ -639,8 +648,8 @@ app.get("/dashboard-history", async (req, res) => {
                     <td>${r.unit || ""}</td>
                     <td>${new Date(r.updated_at).toLocaleString()}</td>
                   </tr>`
-                )
-                .join("")}
+        )
+        .join("")}
             </tbody>
           </table>
         </div>
@@ -671,40 +680,6 @@ const sendKPIEmail = async (responsibleId, week) => {
     console.error(`❌ Failed to send email to responsible ID ${responsibleId}:`, err.message);
   }
 };
-
-// ---------- Schedule weekly email ----------
-// ---------- Schedule weekly email to submit kpi----------
-let cronRunning = false;
-cron.schedule(
-  "15 15 * * *",
-  async () => {
-    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-    cronRunning = true;
-
-    const forcedWeek = "2025-Week49"; // or dynamically compute current week
-    try {
-      // ✅ Send only to responsibles who actually have KPI records for that week
-      const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id
-        FROM public."Responsible" r
-        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-        WHERE kv.week = $1
-      `, [forcedWeek]);
-
-      for (let r of resps.rows) {
-        await sendKPIEmail(r.responsible_id, forcedWeek);
-      }
-
-      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-    } catch (err) {
-      console.error("❌ Error sending scheduled emails:", err.message);
-    } finally {
-      cronRunning = false;
-    }
-  },
-  { scheduled: true, timezone: "Africa/Tunis" }
-);
-
 
 
 // ---------- Generate HTML/CSS Charts ----------
@@ -1167,7 +1142,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
             <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
               Start filling your KPI forms to track your performance over time.
             </p>
-            <a href="http://localhost:5000/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
+            <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
                style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
                       background: #28a745; color: white; text-decoration: none; 
                       border-radius: 6px; font-weight: 600; font-size: 14px;">
@@ -1290,102 +1265,134 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 let reportCronRunning = false;
-// cron.schedule(
-//   "43 11 * * *", // Every Friday at 9:00 AM
-//   async () => {
-//     if (reportCronRunning) {
-//       console.log("⏭️ Weekly report cron already running, skipping...");
-//       return;
-//     }
+cron.schedule(
+  "45 15 * * *", // Every Friday at 9:00 AM
+  async () => {
+    if (reportCronRunning) {
+      console.log("⏭️ Weekly report cron already running, skipping...");
+      return;
+    }
 
-//     reportCronRunning = true;
+    reportCronRunning = true;
 
-//     try {
-//       // Calculate current week
-//       const now = new Date();
-//       const year = now.getFullYear();
+    try {
+      // Calculate current week
+      const now = new Date();
+      const year = now.getFullYear();
 
-//       // Get week number function
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      // Get week number function
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
-//       const previousWeek = `${year}-Week${weekNumber - 1}`;
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `${year}-Week${weekNumber}`;
+      const previousWeek = `${year}-Week${weekNumber - 1}`;
 
-//       console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
+      console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
 
-//       // Get all responsibles who have ANY KPI history data
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id, r.email, r.name
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
-//         WHERE r.email IS NOT NULL
-//           AND r.email != ''
-//         GROUP BY r.responsible_id, r.email, r.name
-//         HAVING COUNT(h.hist_id) > 0
-//         ORDER BY r.responsible_id
-//       `);
+      // Get all responsibles who have ANY KPI history data
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id, r.email, r.name
+        FROM public."Responsible" r
+        JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
+        WHERE r.email IS NOT NULL
+          AND r.email != ''
+        GROUP BY r.responsible_id, r.email, r.name
+        HAVING COUNT(h.hist_id) > 0
+        ORDER BY r.responsible_id
+      `);
 
-//       console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
+      console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
 
-//       const results = [];
-//       for (const [index, resp] of resps.rows.entries()) {
-//         try {
-//           await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-//           console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'success'
-//           });
+      const results = [];
+      for (const [index, resp] of resps.rows.entries()) {
+        try {
+          await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
+          console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'success'
+          });
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
 
-//       // Log summary
-//       console.log('\n=== REPORT SUMMARY ===');
-//       console.log(`Total responsibles: ${results.length}`);
-//       console.log(`Successfully sent: ${succeeded}`);
-//       console.log(`Failed: ${results.length - succeeded}`);
+      // Log summary
+      console.log('\n=== REPORT SUMMARY ===');
+      console.log(`Total responsibles: ${results.length}`);
+      console.log(`Successfully sent: ${succeeded}`);
+      console.log(`Failed: ${results.length - succeeded}`);
 
-//       if (results.length - succeeded > 0) {
-//         const failed = results.filter(r => r.status === 'error');
-//         console.log('Failed responsibles:');
-//         failed.forEach(f => console.log(`  - ${f.name}: ${f.message}`));
-//       }
+      if (results.length - succeeded > 0) {
+        const failed = results.filter(r => r.status === 'error');
+        console.log('Failed responsibles:');
+        failed.forEach(f => console.log(`  - ${f.name}: ${f.message}`));
+      }
 
-//     } catch (error) {
-//       console.error("❌ Error in weekly report cron job:", error.message);
-//     } finally {
-//       reportCronRunning = false;
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
+    } catch (error) {
+      console.error("❌ Error in weekly report cron job:", error.message);
+    } finally {
+      reportCronRunning = false;
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
+// ---------- Schedule weekly email ----------
+// ---------- Schedule weekly email to submit kpi----------
+let cronRunning = false;
+cron.schedule(
+  "55 15 * * *",
+  async () => {
+    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+    cronRunning = true;
+
+    const forcedWeek = "2025-Week49"; // or dynamically compute current week
+    try {
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
+
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
+
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      cronRunning = false;
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 
 
@@ -1587,7 +1594,6 @@ const getDepartmentKPIReport = async (plantId, week) => {
   }
 };
 
-// ========== UPDATED CHART FUNCTION WITH WEEKLY BAR CHART ==========
 // ========== UPDATED CHART FUNCTION WITH WEEKLY BAR CHART ==========
 const createIndividualKPIChart = (kpi) => {
   const color = getDepartmentColor(kpi.department);
@@ -2226,74 +2232,73 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   }
 };
 // ---------- Update Cron Job for Department Reports ----------
-// cron.schedule(
-//   "25 10 * * *", // Adjust time as needed
-//   async () => {
-//     try {
-//       const now = new Date();
-//       const year = now.getFullYear();
+cron.schedule(
+  "45 15 * * *", // Adjust time as needed
+  async () => {
+    try {
+      const now = new Date();
+      const year = now.getFullYear();
 
-//       // Get week number
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      // Get week number
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `${year}-Week${weekNumber}`;
 
-//       console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
 
-//       // Get all plants with managers
-//       const plantsRes = await pool.query(`
-//         SELECT plant_id, name, manager_email 
-//         FROM public."Plant" 
-//         WHERE manager_email IS NOT NULL AND manager_email != ''
-//       `);
+      // Get all plants with managers
+      const plantsRes = await pool.query(`
+        SELECT plant_id, name, manager_email 
+        FROM public."Plant" 
+        WHERE manager_email IS NOT NULL AND manager_email != ''
+      `);
 
-//       console.log(`Found ${plantsRes.rows.length} plants with managers`);
+      console.log(`Found ${plantsRes.rows.length} plants with managers`);
 
-//       const results = [];
-//       for (const [index, plant] of plantsRes.rows.entries()) {
-//         try {
-//           console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'success'
-//           });
+      const results = [];
+      for (const [index, plant] of plantsRes.rows.entries()) {
+        try {
+          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'success'
+          });
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
 
-//     } catch (error) {
-//       console.error("❌ Error in department KPI report cron job:", error.message);
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
-
+    } catch (error) {
+      console.error("❌ Error in department KPI report cron job:", error.message);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
