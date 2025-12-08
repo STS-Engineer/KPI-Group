@@ -680,54 +680,36 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email ----------
-// ---------- Schedule weekly email to submit kpi----------
 let cronRunning = false;
 cron.schedule(
-  "20 17 * * *",  // Runs at 16:44 Tunis time
+  "27 17 * * *",
   async () => {
+    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+    cronRunning = true;
 
-    // ✔ Block second execution in the same minute
-    const now = Date.now();
-    if (lastRunTimestamp && now - lastRunTimestamp < 60000) {
-      console.log("⏭️ Cron already executed this minute, skipping...");
-      return;
-    }
-    lastRunTimestamp = now;
-
-    const forcedWeek = "2025-Week49"; // TODO: replace with dynamic week calculation if needed
-
+    const forcedWeek = "2025-Week49"; // or dynamically compute current week
     try {
-      // ======================================================
-      // 🔍 Fetch a unique list of responsibles with KPI for the week
-      // ======================================================
+      // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
-        SELECT r.responsible_id
+        SELECT DISTINCT r.responsible_id
         FROM public."Responsible" r
-        JOIN public.kpi_values kv 
-            ON kv.responsible_id = r.responsible_id
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
         WHERE kv.week = $1
-        GROUP BY r.responsible_id
       `, [forcedWeek]);
 
-      // Extra safety deduplication
-      const uniqueResponsibleIds = [...new Set(resps.rows.map(r => r.responsible_id))];
-
-      // ======================================================
-      // ✉️ Send email to each responsible only ONCE
-      // ======================================================
-      for (let responsibleId of uniqueResponsibleIds) {
-        await sendKPIEmail(responsibleId, forcedWeek);
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
       }
 
-      console.log(`✅ KPI emails sent to ${uniqueResponsibleIds.length} responsibles`);
-
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
     } catch (err) {
       console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      cronRunning = false;
     }
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
-
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
