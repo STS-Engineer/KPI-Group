@@ -15,14 +15,13 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "administrationSTS",
-  host: "avo-adb-002.postgres.database.azure.com",
+  user: "adminavo",
+  host: "avo-adb-001.postgres.database.azure.com",
   database: "indicatordb",
-  password: "St$@0987",
+  password: "$#fKcdXPg4@ue8AW",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
-
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
@@ -673,38 +672,53 @@ const sendKPIEmail = async (responsibleId, week) => {
   }
 };
 
-// ---------- Schedule weekly email ----------
-// ---------- Schedule weekly email ----------
-// let cronRunning = false;
-// cron.schedule(
-//   "20 10 * * *",
-//   async () => {
-//     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-//     cronRunning = true;
+// ---------- Schedule weekly email (FIXED - No duplicates) ----------
+let cronRunning = false;
+cron.schedule(
+  "55 14 * * *",
+  async () => {
+    if (cronRunning) return console.log("⏭️ Cron already running, skip...");
+    cronRunning = true;
 
-//     const forcedWeek = "2025-Week49"; // or dynamically compute current week
-//     try {
-//       // ✅ Send only to responsibles who actually have KPI records for that week
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-//         WHERE kv.week = $1
-//       `, [forcedWeek]);
+    const forcedWeek = "2025-Week49"; // or dynamically compute current week
+    try {
+      // ✅ FIXED: Use DISTINCT to get each responsible only once
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id, r.email, r.name
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+        ORDER BY r.responsible_id
+      `, [forcedWeek]);
 
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
+      console.log(`📧 Sending KPI emails to ${resps.rows.length} responsibles for week ${forcedWeek}...`);
 
-//       console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       cronRunning = false;
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+      let successCount = 0;
+      let failCount = 0;
+
+      for (let [index, r] of resps.rows.entries()) {
+        try {
+          console.log(`  [${index + 1}/${resps.rows.length}] Sending to ${r.name} (${r.email})...`);
+          await sendKPIEmail(r.responsible_id, forcedWeek);
+          successCount++;
+          
+          // Add small delay to avoid overwhelming email server
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (emailErr) {
+          console.error(`  ❌ Failed to send to ${r.name}:`, emailErr.message);
+          failCount++;
+        }
+      }
+
+      console.log(`✅ Email sending completed. Success: ${successCount}, Failed: ${failCount}`);
+    } catch (err) {
+      console.error("❌ Error in scheduled email cron:", err.message);
+    } finally {
+      cronRunning = false;
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 
 // ---------- Generate HTML/CSS Charts ----------
