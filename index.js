@@ -18,13 +18,54 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "administrationSTS",
-  host: "avo-adb-002.postgres.database.azure.com",
+  user: "adminavo",
+  host: "avo-adb-001.postgres.database.azure.com",
   database: "indicatordb",
-  password: "St$@0987",
+  password: "$#fKcdXPg4@ue8AW",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
+
+
+// ---------- Job Lock Helper ----------
+const acquireJobLock = async (lockId, ttlMinutes = 9) => {
+  const instanceId = process.env.WEBSITE_INSTANCE_ID || `instance_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  try {
+    // 1. Clean up expired locks
+    await pool.query(`DELETE FROM public.job_locks WHERE expires_at < NOW()`);
+
+    // 2. Try to acquire lock
+    const lockResult = await pool.query(
+      `INSERT INTO public.job_locks (lock_id, acquired_at, instance_id, expires_at)
+       VALUES ($1, NOW(), $2, NOW() + INTERVAL '${ttlMinutes} minutes')
+       ON CONFLICT (lock_id) 
+       DO NOTHING
+       RETURNING lock_id, instance_id`,
+      [lockId, instanceId]
+    );
+
+    return lockResult.rows.length > 0 
+      ? { acquired: true, instanceId }
+      : { acquired: false, instanceId };
+      
+  } catch (error) {
+    console.error(`❌ Error acquiring lock ${lockId}:`, error.message);
+    return { acquired: false, instanceId, error: error.message };
+  }
+};
+
+const releaseJobLock = async (lockId, instanceId) => {
+  try {
+    await pool.query(
+      `DELETE FROM public.job_locks WHERE lock_id = $1 AND instance_id = $2`,
+      [lockId, instanceId]
+    );
+    console.log(`🔓 Instance ${instanceId} released lock ${lockId}`);
+  } catch (error) {
+    console.error(`⚠️ Could not release lock ${lockId}:`, error.message);
+  }
+};
 
 // ---------- Nodemailer ----------
 const createTransporter = () =>
@@ -677,36 +718,48 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email ----------
-// let cronRunning = false;
-// cron.schedule(
-//   "27 17 * * *",
-//   async () => {
-//     if (cronRunning) return console.log("⏭️ Cron already running, skip...");
-//     cronRunning = true;
+// ---------- Schedule weekly email ----------
+cron.schedule(
+  "51 09 * * *",
+  async () => {
+    const lockId = 'kpi_form_email_job';
+    
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
+    
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
+    
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    
+    try {
+      const forcedWeek = "2025-Week50"; // or dynamically compute current week
+      
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
 
-//     const forcedWeek = "2025-Week49"; // or dynamically compute current week
-//     try {
-//       // ✅ Send only to responsibles who actually have KPI records for that week
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-//         WHERE kv.week = $1
-//       `, [forcedWeek]);
+      console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
+      
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
 
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
-
-//       console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       cronRunning = false;
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
@@ -1290,103 +1343,95 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 };
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
-// let reportCronRunning = false;
-// cron.schedule(
-//   "43 11 * * *", // Every Friday at 9:00 AM
-//   async () => {
-//     if (reportCronRunning) {
-//       console.log("⏭️ Weekly report cron already running, skipping...");
-//       return;
-//     }
+// ---------- Schedule Weekly Reports ----------
+cron.schedule(
+  "43 11 * * *", // Every Friday at 9:00 AM
+  async () => {
+    const lockId = 'weekly_report_job';
+    
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
+    
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
+    
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    
+    try {
+      // Calculate current week
+      const now = new Date();
+      const year = now.getFullYear();
 
-//     reportCronRunning = true;
+      // Get week number function
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//     try {
-//       // Calculate current week
-//       const now = new Date();
-//       const year = now.getFullYear();
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `${year}-Week${weekNumber}`;
+      const previousWeek = `${year}-Week${weekNumber - 1}`;
 
-//       // Get week number function
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
-//       const previousWeek = `${year}-Week${weekNumber - 1}`;
+      // Get all responsibles who have ANY KPI history data
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id, r.email, r.name
+        FROM public."Responsible" r
+        JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
+        WHERE r.email IS NOT NULL
+          AND r.email != ''
+        GROUP BY r.responsible_id, r.email, r.name
+        HAVING COUNT(h.hist_id) > 0
+        ORDER BY r.responsible_id
+      `);
 
-//       console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
+      console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
 
-//       // Get all responsibles who have ANY KPI history data
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id, r.email, r.name
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
-//         WHERE r.email IS NOT NULL
-//           AND r.email != ''
-//         GROUP BY r.responsible_id, r.email, r.name
-//         HAVING COUNT(h.hist_id) > 0
-//         ORDER BY r.responsible_id
-//       `);
+      const results = [];
+      for (const [index, resp] of resps.rows.entries()) {
+        try {
+          await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
+          console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'success'
+          });
 
-//       console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const results = [];
-//       for (const [index, resp] of resps.rows.entries()) {
-//         try {
-//           await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-//           console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'success'
-//           });
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
-
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
-
-//       // Log summary
-//       console.log('\n=== REPORT SUMMARY ===');
-//       console.log(`Total responsibles: ${results.length}`);
-//       console.log(`Successfully sent: ${succeeded}`);
-//       console.log(`Failed: ${results.length - succeeded}`);
-
-//       if (results.length - succeeded > 0) {
-//         const failed = results.filter(r => r.status === 'error');
-//         console.log('Failed responsibles:');
-//         failed.forEach(f => console.log(`  - ${f.name}: ${f.message}`));
-//       }
-
-//     } catch (error) {
-//       console.error("❌ Error in weekly report cron job:", error.message);
-//     } finally {
-//       reportCronRunning = false;
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
-
+    } catch (error) {
+      console.error("❌ Error in weekly report cron job:", error.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
 
 
@@ -2227,74 +2272,88 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   }
 };
 // ---------- Update Cron Job for Department Reports ----------
-// cron.schedule(
-//   "25 10 * * *", // Adjust time as needed
-//   async () => {
-//     try {
-//       const now = new Date();
-//       const year = now.getFullYear();
+// ---------- Schedule Department Reports ----------
+cron.schedule(
+  "25 10 * * *", // Adjust time as needed
+  async () => {
+    const lockId = 'department_report_job';
+    
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
+    
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
+    
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    
+    try {
+      const now = new Date();
+      const year = now.getFullYear();
 
-//       // Get week number
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      // Get week number
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `${year}-Week${weekNumber}`;
 
-//       console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
 
-//       // Get all plants with managers
-//       const plantsRes = await pool.query(`
-//         SELECT plant_id, name, manager_email 
-//         FROM public."Plant" 
-//         WHERE manager_email IS NOT NULL AND manager_email != ''
-//       `);
+      // Get all plants with managers
+      const plantsRes = await pool.query(`
+        SELECT plant_id, name, manager_email 
+        FROM public."Plant" 
+        WHERE manager_email IS NOT NULL AND manager_email != ''
+      `);
 
-//       console.log(`Found ${plantsRes.rows.length} plants with managers`);
+      console.log(`Found ${plantsRes.rows.length} plants with managers`);
 
-//       const results = [];
-//       for (const [index, plant] of plantsRes.rows.entries()) {
-//         try {
-//           console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'success'
-//           });
+      const results = [];
+      for (const [index, plant] of plantsRes.rows.entries()) {
+        try {
+          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'success'
+          });
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
 
-//     } catch (error) {
-//       console.error("❌ Error in department KPI report cron job:", error.message);
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
-
+    } catch (error) {
+      console.error("❌ Error in department KPI report cron job:", error.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
