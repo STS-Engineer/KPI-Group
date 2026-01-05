@@ -172,7 +172,7 @@ app.get("/redirect", async (req, res) => {
         // 2️⃣ Insert into history table
         await pool.query(
           `
-          INSERT INTO public.kpi_values_hist 
+          INSERT INTO public.kpi_values_hist26 
           (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value)
           VALUES ($1, $2, $3, $4, $5, $6)
           `,
@@ -466,7 +466,7 @@ app.get("/dashboard", async (req, res) => {
              h.hist_id, h.kpi_values_id, h.new_value as value, h.week, 
              h.kpi_id, h.updated_at,
              k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.kpi_values_hist h
+      FROM public.kpi_values_hist26 h
       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
       WHERE h.responsible_id = $1
       ORDER BY h.week DESC, h.kpi_id ASC, h.updated_at DESC
@@ -600,7 +600,7 @@ app.get("/dashboard-history", async (req, res) => {
       `
       SELECT h.hist_id, h.kpi_id, h.week, h.old_value, h.new_value, h.updated_at,
              k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.kpi_values_hist h
+      FROM public.kpi_values_hist26 h
       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
       WHERE h.responsible_id = $1
       ORDER BY h.updated_at DESC
@@ -719,47 +719,47 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
-// cron.schedule(
-//   "20 10 * * *",
-//   async () => {
-//     const lockId = 'kpi_form_email_job';
+cron.schedule(
+  "00 11 * * *",
+  async () => {
+    const lockId = 'kpi_form_email_job';
     
-//     // Try to acquire lock
-//     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
     
-//     if (!lock.acquired) {
-//       console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-//       return;
-//     }
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
     
-//     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
-//     try {
-//       const forcedWeek = "2025-Week51"; // or dynamically compute current week
+    try {
+      const forcedWeek = "2026-Week01"; // or dynamically compute current week
       
-//       // ✅ Send only to responsibles who actually have KPI records for that week
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-//         WHERE kv.week = $1
-//       `, [forcedWeek]);
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
 
-//       console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
+      console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
       
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
 
-//       console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId);
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
@@ -995,7 +995,7 @@ const generateVerticalBarChart = (chartData) => {
 
 const generateWeeklyReportData = async (responsibleId, reportWeek) => {
   try {
-    // Get historical data from kpi_values_hist table
+    // Get historical data from kpi_values_hist26 table
     const histRes = await pool.query(
       `
       WITH KpiHistory AS (
@@ -1008,7 +1008,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           k.indicator_sub_title,
           k.unit,
           ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
-        FROM public.kpi_values_hist h
+        FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
         WHERE h.responsible_id = $1
           AND h.new_value IS NOT NULL
@@ -1209,7 +1209,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
     } else {
       // Check if there's any data at all
       const checkRes = await pool.query(
-        `SELECT COUNT(*) FROM public.kpi_values_hist WHERE responsible_id = $1`,
+        `SELECT COUNT(*) FROM public.kpi_values_hist26 WHERE responsible_id = $1`,
         [responsibleId]
       );
 
@@ -1384,7 +1384,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 //       const resps = await pool.query(`
 //         SELECT DISTINCT r.responsible_id, r.email, r.name
 //         FROM public."Responsible" r
-//         JOIN public.kpi_values_hist h ON r.responsible_id = h.responsible_id
+//         JOIN public.kpi_values_hist26 h ON r.responsible_id = h.responsible_id
 //         WHERE r.email IS NOT NULL
 //           AND r.email != ''
 //         GROUP BY r.responsible_id, r.email, r.name
@@ -1473,7 +1473,7 @@ const getDepartmentKPIReport = async (plantId, week) => {
             PARTITION BY h.kpi_id, h.responsible_id, h.week 
             ORDER BY h.updated_at DESC
           ) as rn
-        FROM public.kpi_values_hist h
+        FROM public.kpi_values_hist26 h
         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
         JOIN public."Department" d ON r.department_id = d.department_id
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
@@ -1510,7 +1510,7 @@ const getDepartmentKPIReport = async (plantId, week) => {
           COUNT(*) as data_points,
           -- Extract week number for sorting
           CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
-        FROM public.kpi_values_hist h
+        FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
         WHERE r.plant_id = $1 
