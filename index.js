@@ -1730,7 +1730,7 @@ const createIndividualKPIChart = (kpi) => {
         
         <!-- Week label -->
         <div style="font-size: 10px; color: #495057; font-weight: 600; margin-top: 6px;">
-            W${weekLabel}/25
+            W${weekLabel}/26
         </div>
       </td>
     `;
@@ -2274,7 +2274,7 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
 cron.schedule(
-  "56 19 * * *", // Adjust time as needed
+  "02 20 * * *", // Adjust time as needed
   async () => {
     const lockId = 'department_report_job';
     
