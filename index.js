@@ -906,7 +906,7 @@ const generateVerticalBarChart = (chartData) => {
                 ${stats.current}
               </div>
               <div style="font-size: 10px; color: #999;">
-                ${currentWeek.replace('2025-Week', 'Week ') || 'Current'}
+                ${currentWeek.replace('2026-Week', 'Week ') || 'Current'}
               </div>
             </td>
             
@@ -1139,7 +1139,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
 
       // Format week labels for display (simplify if too many)
       const displayWeekLabels = weekLabels.map(week => {
-        if (week.includes('2025-Week')) {
+        if (week.includes('2026-Week')) {
           return `W${week.split('-Week')[1]}`;
         } else if (week.includes('Week')) {
           return `W${week.replace('Week', '')}`;
@@ -1262,7 +1262,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
             <td style="background: #0078D7; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
               <h1 style="margin: 0; color: white; font-size: 24px; font-weight: 300;">📊 KPI Performance Report</h1>
               <p style="margin: 10px 0 0 0; color: rgba(255,255,255,0.9); font-size: 16px;">
-                ${reportWeek.replace('2025-Week', 'Week ')} • Monthly View
+                ${reportWeek.replace('2026-Week', 'Week ')} • Monthly View
               </p>
             </td>
           </tr>
@@ -1517,7 +1517,7 @@ const getDepartmentKPIReport = async (plantId, week) => {
           AND h.new_value IS NOT NULL
           AND h.new_value != ''
           AND h.new_value ~ '^[0-9.]+$'
-          AND h.week LIKE '2025-Week%'
+          AND h.week LIKE '2026-Week%'
         GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, h.week
       )
       SELECT * FROM WeeklyKPIData
@@ -1708,7 +1708,7 @@ const createIndividualKPIChart = (kpi) => {
   const bars = last12Values.map((value, index) => {
     const heightPercent = (value / yAxisMax) * 100;
     const barHeightPx = Math.round((heightPercent / 100) * 160); // Convert to pixels
-    const weekLabel = last12Weeks[index].replace('2025-Week', '');
+    const weekLabel = last12Weeks[index].replace('2026-Week', '');
 
     return `
       <td align="center" valign="bottom" style="padding: 0 2px; vertical-align: bottom; height: 180px;">
@@ -2076,7 +2076,7 @@ const generateManagerReportHtml = (reportData) => {
           </h1>
           <div style="font-size: 14px; color: #6c757d;">
             Plant: <strong style="color: #495057;">${plant.plant_name}</strong> • 
-            Week: <strong style="color: #495057;">${week.replace('2025-Week', 'W')}</strong> • 
+            Week: <strong style="color: #495057;">${week.replace('2026-Week', 'W')}</strong> • 
             Manager: <strong style="color: #495057;">${plant.manager || 'N/A'}</strong>
           </div>
         </div>
@@ -2131,7 +2131,7 @@ const generateManagerReportHtml = (reportData) => {
             font-weight: 800;
             color: #6f42c1;
             margin-bottom: 5px;
-          ">${week.replace('2025-Week', 'W')}</div>
+          ">${week.replace('2026-Week', 'W')}</div>
           <div style="font-size: 12px; color: #6c757d; font-weight: 500;">Current Week</div>
         </div>
       </div>
@@ -2184,7 +2184,7 @@ const generateManagerReportHtml = (reportData) => {
         <div>
           <div style="font-size: 11px; opacity: 0.6; margin-bottom: 5px;">Week</div>
           <div style="font-size: 13px; font-weight: 500;">
-            ${week.replace('2025-Week', 'Week ')}
+            ${week.replace('2026-Week', 'Week ')}
           </div>
         </div>
       </div>
@@ -2258,7 +2258,7 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
     const mailOptions = {
       from: '"AVOCarbon Plant Analytics" <administration.STS@avocarbon.com>',
       to: reportData.plant.manager_email,
-      subject: `📊 Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${prevWeek.replace('2025-Week', '')}`,
+      subject: `📊 Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${prevWeek.replace('2026-Week', '')}`,
       html: emailHtml
     };
 
@@ -2273,87 +2273,87 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 };
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
-// cron.schedule(
-//   "00 10 * * *", // Adjust time as needed
-//   async () => {
-//     const lockId = 'department_report_job';
+cron.schedule(
+  "56 19 * * *", // Adjust time as needed
+  async () => {
+    const lockId = 'department_report_job';
     
-//     // Try to acquire lock
-//     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
     
-//     if (!lock.acquired) {
-//       console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-//       return;
-//     }
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
     
-//     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
-//     try {
-//       const now = new Date();
-//       const year = now.getFullYear();
+    try {
+      const now = new Date();
+    
 
-//       // Get week number
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      // Get week number
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `2026-Week${weekNumber}`;
 
-//       console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
 
-//       // Get all plants with managers
-//       const plantsRes = await pool.query(`
-//         SELECT plant_id, name, manager_email 
-//         FROM public."Plant" 
-//         WHERE manager_email IS NOT NULL AND manager_email != ''
-//       `);
+      // Get all plants with managers
+      const plantsRes = await pool.query(`
+        SELECT plant_id, name, manager_email 
+        FROM public."Plant" 
+        WHERE manager_email IS NOT NULL AND manager_email != ''
+      `);
 
-//       console.log(`Found ${plantsRes.rows.length} plants with managers`);
+      console.log(`Found ${plantsRes.rows.length} plants with managers`);
 
-//       const results = [];
-//       for (const [index, plant] of plantsRes.rows.entries()) {
-//         try {
-//           console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'success'
-//           });
+      const results = [];
+      for (const [index, plant] of plantsRes.rows.entries()) {
+        try {
+          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'success'
+          });
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-//           results.push({
-//             plant_id: plant.plant_id,
-//             name: plant.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+          results.push({
+            plant_id: plant.plant_id,
+            name: plant.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
 
-//     } catch (error) {
-//       console.error("❌ Error in department KPI report cron job:", error.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId);
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
+    } catch (error) {
+      console.error("❌ Error in department KPI report cron job:", error.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
