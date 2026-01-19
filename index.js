@@ -719,47 +719,47 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
-// cron.schedule(
-//   "00 11 * * *",
-//   async () => {
-//     const lockId = 'kpi_form_email_job';
+cron.schedule(
+  "30 8 * * *",
+  async () => {
+    const lockId = 'kpi_form_email_job';
     
-//     // Try to acquire lock
-//     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
     
-//     if (!lock.acquired) {
-//       console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-//       return;
-//     }
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
     
-//     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
-//     try {
-//       const forcedWeek = "2026-Week01"; // or dynamically compute current week
+    try {
+      const forcedWeek = "2026-Week3"; // or dynamically compute current week
       
-//       // ✅ Send only to responsibles who actually have KPI records for that week
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-//         WHERE kv.week = $1
-//       `, [forcedWeek]);
+      // ✅ Send only to responsibles who actually have KPI records for that week
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id
+        FROM public."Responsible" r
+        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
+        WHERE kv.week = $1
+      `, [forcedWeek]);
 
-//       console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
+      console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
       
-//       for (let r of resps.rows) {
-//         await sendKPIEmail(r.responsible_id, forcedWeek);
-//       }
+      for (let r of resps.rows) {
+        await sendKPIEmail(r.responsible_id, forcedWeek);
+      }
 
-//       console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
-//     } catch (err) {
-//       console.error("❌ Error sending scheduled emails:", err.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId);
-//     }
-//   },
-//   { scheduled: true, timezone: "Africa/Tunis" }
-// );
+      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+    } catch (err) {
+      console.error("❌ Error sending scheduled emails:", err.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  { scheduled: true, timezone: "Africa/Tunis" }
+);
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
