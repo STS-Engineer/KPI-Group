@@ -2286,7 +2286,7 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
 cron.schedule(
-  "00 14 * * *", // Adjust time as needed
+  "00 15 * * *", // Adjust time as needed
   async () => {
     const lockId = 'department_report_job';
     
