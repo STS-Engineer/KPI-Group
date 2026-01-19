@@ -2286,17 +2286,12 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
 cron.schedule(
-  "29 12 * * *", // Adjust time as needed
+  "34 12 * * *", // Adjust time as needed
   async () => {
     const lockId = 'department_report_job';
     
     // Try to acquire lock
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
-    
-    if (!lock.acquired) {
-      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-      return;
-    }
     
     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
