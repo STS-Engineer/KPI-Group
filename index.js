@@ -1344,94 +1344,94 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 // ---------- Schedule Weekly Reports ----------
-// cron.schedule(
-//   "43 11 * * *", // Every Friday at 9:00 AM
-//   async () => {
-//     const lockId = 'weekly_report_job';
+cron.schedule(
+  "00 10 * * *", // Every Friday at 9:00 AM
+  async () => {
+    const lockId = 'weekly_report_job';
     
-//     // Try to acquire lock
-//     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
+    // Try to acquire lock
+    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
     
-//     if (!lock.acquired) {
-//       console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-//       return;
-//     }
+    if (!lock.acquired) {
+      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
+      return;
+    }
     
-//     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
+    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
-//     try {
-//       // Calculate current week
-//       const now = new Date();
-//       const year = now.getFullYear();
+    try {
+      // Calculate current week
+      const now = new Date();
+      const year = now.getFullYear();
 
-//       // Get week number function
-//       const getWeekNumber = (date) => {
-//         const d = new Date(date);
-//         d.setHours(0, 0, 0, 0);
-//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//         const yearStart = new Date(d.getFullYear(), 0, 1);
-//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//         return weekNo;
-//       };
+      // Get week number function
+      const getWeekNumber = (date) => {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+        const yearStart = new Date(d.getFullYear(), 0, 1);
+        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+        return weekNo;
+      };
 
-//       const weekNumber = getWeekNumber(now);
-//       const currentWeek = `${year}-Week${weekNumber}`;
-//       const previousWeek = `${year}-Week${weekNumber - 1}`;
+      const weekNumber = getWeekNumber(now);
+      const currentWeek = `${year}-Week${weekNumber}`;
+      const previousWeek = `${year}-Week${weekNumber - 1}`;
 
-//       console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
+      console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
 
-//       // Get all responsibles who have ANY KPI history data
-//       const resps = await pool.query(`
-//         SELECT DISTINCT r.responsible_id, r.email, r.name
-//         FROM public."Responsible" r
-//         JOIN public.kpi_values_hist26 h ON r.responsible_id = h.responsible_id
-//         WHERE r.email IS NOT NULL
-//           AND r.email != ''
-//         GROUP BY r.responsible_id, r.email, r.name
-//         HAVING COUNT(h.hist_id) > 0
-//         ORDER BY r.responsible_id
-//       `);
+      // Get all responsibles who have ANY KPI history data
+      const resps = await pool.query(`
+        SELECT DISTINCT r.responsible_id, r.email, r.name
+        FROM public."Responsible" r
+        JOIN public.kpi_values_hist26 h ON r.responsible_id = h.responsible_id
+        WHERE r.email IS NOT NULL
+          AND r.email != ''
+        GROUP BY r.responsible_id, r.email, r.name
+        HAVING COUNT(h.hist_id) > 0
+        ORDER BY r.responsible_id
+      `);
 
-//       console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
+      console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
 
-//       const results = [];
-//       for (const [index, resp] of resps.rows.entries()) {
-//         try {
-//           await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-//           console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'success'
-//           });
+      const results = [];
+      for (const [index, resp] of resps.rows.entries()) {
+        try {
+          await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
+          console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'success'
+          });
 
-//           // Add delay to avoid rate limiting
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
-//           results.push({
-//             responsible_id: resp.responsible_id,
-//             name: resp.name,
-//             status: 'error',
-//             message: err.message
-//           });
-//         }
-//       }
+          // Add delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (err) {
+          console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
+          results.push({
+            responsible_id: resp.responsible_id,
+            name: resp.name,
+            status: 'error',
+            message: err.message
+          });
+        }
+      }
 
-//       const succeeded = results.filter(r => r.status === 'success').length;
-//       console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
+      const succeeded = results.filter(r => r.status === 'success').length;
+      console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
 
-//     } catch (error) {
-//       console.error("❌ Error in weekly report cron job:", error.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId);
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "Africa/Tunis"
-//   }
-// );
+    } catch (error) {
+      console.error("❌ Error in weekly report cron job:", error.message);
+    } finally {
+      await releaseJobLock(lockId, lock.instanceId);
+    }
+  },
+  {
+    scheduled: true,
+    timezone: "Africa/Tunis"
+  }
+);
 
 
 
