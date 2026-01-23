@@ -735,7 +735,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 //     console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
 //     try {
-//       const forcedWeek = "2026-Week3"; // or dynamically compute current week
+//       const forcedWeek = "2026-Week4"; // or dynamically compute current week
       
 //       // ✅ Send only to responsibles who actually have KPI records for that week
 //       const resps = await pool.query(`
