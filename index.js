@@ -1338,19 +1338,12 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 // ---------- Schedule Weekly Reports ----------
 cron.schedule(
-  "00 10 * * 1", // Every Friday at 9:00 AM
+  "16 10 * * 1", // Every Friday at 9:00 AM
   async () => {
     const lockId = 'weekly_report_job';
     
     // Try to acquire lock
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
-    
-    if (!lock.acquired) {
-      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-      return;
-    }
-    
-    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
     try {
       // Calculate current week
@@ -2286,17 +2279,9 @@ cron.schedule(
     // Try to acquire lock
     const lock = await acquireJobLock(lockId, 30); // 60 minute TTL
 
-    if (!lock.acquired) {
-      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-      return;
-    }
-    
-    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
-    
     try {
       const now = new Date();
     
-
       // Get week number
       const getWeekNumber = (date) => {
         const d = new Date(date);
