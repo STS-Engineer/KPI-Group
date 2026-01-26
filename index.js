@@ -720,19 +720,12 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "35 8 * * 1",
+  "45 8 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     
     // Try to acquire lock
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
-    
-    if (!lock.acquired) {
-      console.log(`⏭️ Job ${lockId} already running in another instance, skipping.`);
-      return;
-    }
-    
-    console.log(`🔒 Instance ${lock.instanceId} acquired lock for ${lockId}`);
     
     try {
       const forcedWeek = "2026-Week4"; // or dynamically compute current week
