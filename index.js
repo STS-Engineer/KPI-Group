@@ -728,7 +728,7 @@ cron.schedule(
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
     
     try {
-      const forcedWeek = "2026-Week4"; // or dynamically compute current week
+      const forcedWeek = "2026-Week5"; // or dynamically compute current week
       
       // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
