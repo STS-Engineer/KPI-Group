@@ -28,40 +28,37 @@ const pool = new Pool({
 
 
 // ---------- Job Lock Helper ----------
+// ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
+// ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
 const acquireJobLock = async (lockId, ttlMinutes = 9) => {
   const instanceId = process.env.WEBSITE_INSTANCE_ID || `instance_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
   try {
-    // 1. Clean up expired locks
-    await pool.query(`DELETE FROM public.job_locks WHERE expires_at < NOW()`);
-
-    // 2. Try to acquire lock
-    const lockResult = await pool.query(
-      `INSERT INTO public.job_locks (lock_id, acquired_at, instance_id, expires_at)
-       VALUES ($1, NOW(), $2, NOW() + INTERVAL '${ttlMinutes} minutes')
-       ON CONFLICT (lock_id) 
-       DO NOTHING
-       RETURNING lock_id, instance_id`,
-      [lockId, instanceId]
-    );
-
-    return lockResult.rows.length > 0 
-      ? { acquired: true, instanceId }
-      : { acquired: false, instanceId };
-      
+    // Convert lockId string to a consistent integer hash
+    const lockHash = Math.abs(lockId.split('').reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0));
+    
+    // Try to acquire PostgreSQL advisory lock (non-blocking)
+    const result = await pool.query('SELECT pg_try_advisory_lock($1) as acquired', [lockHash]);
+    
+    if (result.rows[0].acquired) {
+      console.log(`🔒 Instance ${instanceId} acquired lock ${lockId} (hash: ${lockHash})`);
+      return { acquired: true, instanceId, lockHash };
+    } else {
+      console.log(`⏭️ Instance ${instanceId} failed to acquire lock ${lockId} - another instance is running this job`);
+      return { acquired: false, instanceId, lockHash };
+    }
   } catch (error) {
     console.error(`❌ Error acquiring lock ${lockId}:`, error.message);
     return { acquired: false, instanceId, error: error.message };
   }
 };
 
-const releaseJobLock = async (lockId, instanceId) => {
+const releaseJobLock = async (lockId, instanceId, lockHash) => {
   try {
-    await pool.query(
-      `DELETE FROM public.job_locks WHERE lock_id = $1 AND instance_id = $2`,
-      [lockId, instanceId]
-    );
-    console.log(`🔓 Instance ${instanceId} released lock ${lockId}`);
+    if (lockHash) {
+      await pool.query('SELECT pg_advisory_unlock($1)', [lockHash]);
+      console.log(`🔓 Instance ${instanceId} released lock ${lockId}`);
+    }
   } catch (error) {
     console.error(`⚠️ Could not release lock ${lockId}:`, error.message);
   }
@@ -719,17 +716,22 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
+// ---------- Schedule weekly email ----------
 cron.schedule(
-  "45 8 * * 1",
+  "30 8 * * *",
   async () => {
     const lockId = 'kpi_form_email_job';
-    
-    // Try to acquire lock
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
-    
+
+    // Exit immediately if we didn't get the lock
+    if (!lock.acquired) {
+      console.log(`⏭️ [KPI Form Email] Skipping - lock held by another instance`);
+      return;
+    }
+
     try {
       const forcedWeek = "2026-Week5"; // or dynamically compute current week
-      
+
       // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
         SELECT DISTINCT r.responsible_id
@@ -738,17 +740,17 @@ cron.schedule(
         WHERE kv.week = $1
       `, [forcedWeek]);
 
-      console.log(`📧 Sending KPI form emails to ${resps.rows.length} responsibles...`);
-      
+      console.log(`📧 [KPI Form Email] Sending to ${resps.rows.length} responsibles for week ${forcedWeek}...`);
+
       for (let r of resps.rows) {
         await sendKPIEmail(r.responsible_id, forcedWeek);
       }
 
-      console.log(`✅ KPI emails sent to ${resps.rows.length} responsibles`);
+      console.log(`✅ [KPI Form Email] Successfully sent ${resps.rows.length} emails`);
     } catch (err) {
-      console.error("❌ Error sending scheduled emails:", err.message);
+      console.error("❌ [KPI Form Email] Error:", err.message);
     } finally {
-      await releaseJobLock(lockId, lock.instanceId);
+      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
     }
   },
   { scheduled: true, timezone: "Africa/Tunis" }
@@ -1337,14 +1339,19 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 // ---------- Schedule Weekly Reports ----------
+// ---------- Schedule Weekly Reports ----------
 cron.schedule(
-  "16 10 * * 1", // Every Friday at 9:00 AM
+  "00 10 * * *", // Every Friday at 8:16 PM
   async () => {
     const lockId = 'weekly_report_job';
-    
-    // Try to acquire lock
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
-    
+
+    // Exit immediately if we didn't get the lock
+    if (!lock.acquired) {
+      console.log(`⏭️ [Weekly Report] Skipping - lock held by another instance`);
+      return;
+    }
+
     try {
       // Calculate current week
       const now = new Date();
@@ -1364,7 +1371,7 @@ cron.schedule(
       const currentWeek = `${year}-Week${weekNumber}`;
       const previousWeek = `${year}-Week${weekNumber - 1}`;
 
-      console.log(`Current week: ${currentWeek}, Previous week: ${previousWeek}`);
+      console.log(`📊 [Weekly Report] Current week: ${currentWeek}, Reporting on: ${previousWeek}`);
 
       // Get all responsibles who have ANY KPI history data
       const resps = await pool.query(`
@@ -1378,13 +1385,13 @@ cron.schedule(
         ORDER BY r.responsible_id
       `);
 
-      console.log(`📊 Sending weekly reports for week ${previousWeek} to ${resps.rows.length} responsibles...`);
+      console.log(`📊 [Weekly Report] Sending to ${resps.rows.length} responsibles for week ${previousWeek}...`);
 
       const results = [];
       for (const [index, resp] of resps.rows.entries()) {
         try {
           await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-          console.log(`  [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
+          console.log(`  ✅ [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
           results.push({
             responsible_id: resp.responsible_id,
             name: resp.name,
@@ -1394,7 +1401,7 @@ cron.schedule(
           // Add delay to avoid rate limiting
           await new Promise(resolve => setTimeout(resolve, 1500));
         } catch (err) {
-          console.error(`  [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
+          console.error(`  ❌ [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
           results.push({
             responsible_id: resp.responsible_id,
             name: resp.name,
@@ -1405,12 +1412,12 @@ cron.schedule(
       }
 
       const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ Weekly reports completed. Sent: ${succeeded}/${results.length}`);
+      console.log(`✅ [Weekly Report] Completed. Sent: ${succeeded}/${results.length}`);
 
     } catch (error) {
-      console.error("❌ Error in weekly report cron job:", error.message);
+      console.error("❌ [Weekly Report] Error:", error.message);
     } finally {
-      await releaseJobLock(lockId, lock.instanceId);
+      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
     }
   },
   {
@@ -2271,17 +2278,22 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 };
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
+// ---------- Schedule Department Reports ----------
 cron.schedule(
-  "00 11 * * 1", // Adjust time as needed
+  "00 11 * * *", // Every day at 8:02 PM
   async () => {
     const lockId = 'department_report_job';
-    
-    // Try to acquire lock
-    const lock = await acquireJobLock(lockId, 30); // 60 minute TTL
+    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
+
+    // Exit immediately if we didn't get the lock
+    if (!lock.acquired) {
+      console.log(`⏭️ [Department Report] Skipping - lock held by another instance`);
+      return;
+    }
 
     try {
       const now = new Date();
-    
+
       // Get week number
       const getWeekNumber = (date) => {
         const d = new Date(date);
@@ -2295,7 +2307,7 @@ cron.schedule(
       const weekNumber = getWeekNumber(now);
       const currentWeek = `2026-Week${weekNumber}`;
 
-      console.log(`📊 Starting department KPI reports for week ${currentWeek}...`);
+      console.log(`📊 [Department Report] Starting for week ${currentWeek}...`);
 
       // Get all plants with managers
       const plantsRes = await pool.query(`
@@ -2304,13 +2316,14 @@ cron.schedule(
         WHERE manager_email IS NOT NULL AND manager_email != ''
       `);
 
-      console.log(`Found ${plantsRes.rows.length} plants with managers`);
+      console.log(`📊 [Department Report] Found ${plantsRes.rows.length} plants with managers`);
 
       const results = [];
       for (const [index, plant] of plantsRes.rows.entries()) {
         try {
-          console.log(`  [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+          console.log(`  🏭 [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+          console.log(`  ✅ [${index + 1}/${plantsRes.rows.length}] Sent to ${plant.name}`);
           results.push({
             plant_id: plant.plant_id,
             name: plant.name,
@@ -2320,7 +2333,7 @@ cron.schedule(
           // Add delay to avoid rate limiting
           await new Promise(resolve => setTimeout(resolve, 1500));
         } catch (err) {
-          console.error(`  [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+          console.error(`  ❌ [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
           results.push({
             plant_id: plant.plant_id,
             name: plant.name,
@@ -2331,12 +2344,12 @@ cron.schedule(
       }
 
       const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ Department KPI reports completed. Sent: ${succeeded}/${results.length}`);
+      console.log(`✅ [Department Report] Completed. Sent: ${succeeded}/${results.length}`);
 
     } catch (error) {
-      console.error("❌ Error in department KPI report cron job:", error.message);
+      console.error("❌ [Department Report] Error:", error.message);
     } finally {
-      await releaseJobLock(lockId, lock.instanceId);
+      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
     }
   },
   {
