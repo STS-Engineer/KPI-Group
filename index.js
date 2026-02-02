@@ -2279,84 +2279,84 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
 // ---------- Schedule Department Reports ----------
-cron.schedule(
-  "00 11 * * 1", // Every day at 8:02 PM
-  async () => {
-    const lockId = 'department_report_job';
-    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
+// cron.schedule(
+//   "00 11 * * 1", // Every day at 8:02 PM
+//   async () => {
+//     const lockId = 'department_report_job';
+//     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
 
-    // Exit immediately if we didn't get the lock
-    if (!lock.acquired) {
-      console.log(`⏭️ [Department Report] Skipping - lock held by another instance`);
-      return;
-    }
+//     // Exit immediately if we didn't get the lock
+//     if (!lock.acquired) {
+//       console.log(`⏭️ [Department Report] Skipping - lock held by another instance`);
+//       return;
+//     }
 
-    try {
-      const now = new Date();
+//     try {
+//       const now = new Date();
 
-      // Get week number
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
+//       // Get week number
+//       const getWeekNumber = (date) => {
+//         const d = new Date(date);
+//         d.setHours(0, 0, 0, 0);
+//         d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//         const yearStart = new Date(d.getFullYear(), 0, 1);
+//         const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//         return weekNo;
+//       };
 
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `2026-Week${weekNumber}`;
+//       const weekNumber = getWeekNumber(now);
+//       const currentWeek = `2026-Week${weekNumber}`;
 
-      console.log(`📊 [Department Report] Starting for week ${currentWeek}...`);
+//       console.log(`📊 [Department Report] Starting for week ${currentWeek}...`);
 
-      // Get all plants with managers
-      const plantsRes = await pool.query(`
-        SELECT plant_id, name, manager_email 
-        FROM public."Plant" 
-        WHERE manager_email IS NOT NULL AND manager_email != ''
-      `);
+//       // Get all plants with managers
+//       const plantsRes = await pool.query(`
+//         SELECT plant_id, name, manager_email 
+//         FROM public."Plant" 
+//         WHERE manager_email IS NOT NULL AND manager_email != ''
+//       `);
 
-      console.log(`📊 [Department Report] Found ${plantsRes.rows.length} plants with managers`);
+//       console.log(`📊 [Department Report] Found ${plantsRes.rows.length} plants with managers`);
 
-      const results = [];
-      for (const [index, plant] of plantsRes.rows.entries()) {
-        try {
-          console.log(`  🏭 [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-          console.log(`  ✅ [${index + 1}/${plantsRes.rows.length}] Sent to ${plant.name}`);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'success'
-          });
+//       const results = [];
+//       for (const [index, plant] of plantsRes.rows.entries()) {
+//         try {
+//           console.log(`  🏭 [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
+//           await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+//           console.log(`  ✅ [${index + 1}/${plantsRes.rows.length}] Sent to ${plant.name}`);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'success'
+//           });
 
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  ❌ [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
+//           // Add delay to avoid rate limiting
+//           await new Promise(resolve => setTimeout(resolve, 1500));
+//         } catch (err) {
+//           console.error(`  ❌ [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
+//           results.push({
+//             plant_id: plant.plant_id,
+//             name: plant.name,
+//             status: 'error',
+//             message: err.message
+//           });
+//         }
+//       }
 
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ [Department Report] Completed. Sent: ${succeeded}/${results.length}`);
+//       const succeeded = results.filter(r => r.status === 'success').length;
+//       console.log(`✅ [Department Report] Completed. Sent: ${succeeded}/${results.length}`);
 
-    } catch (error) {
-      console.error("❌ [Department Report] Error:", error.message);
-    } finally {
-      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
+//     } catch (error) {
+//       console.error("❌ [Department Report] Error:", error.message);
+//     } finally {
+//       await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "Africa/Tunis"
+//   }
+// );
 
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
