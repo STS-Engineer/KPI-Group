@@ -19,7 +19,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ---------- Postgres ----------
 const pool = new Pool({
   user: "administrationSTS",
-  host: "avo-adb-002.postgres.database.azure.com",
+  host: "avo-adb-002.postgres.database.azure.com",    
   database: "indicatordb",
   password: "St$@0987",
   port: 5432,
