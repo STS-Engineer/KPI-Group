@@ -718,7 +718,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "30 8 * * *",
+  "30 8 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
@@ -1341,7 +1341,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // ---------- Schedule Weekly Reports ----------
 // ---------- Schedule Weekly Reports ----------
 cron.schedule(
-  "00 10 * * *", // Every Friday at 8:16 PM
+  "00 10 * * 1", // Every Friday at 8:16 PM
   async () => {
     const lockId = 'weekly_report_job';
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
@@ -2280,7 +2280,7 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 // ---------- Schedule Department Reports ----------
 // ---------- Schedule Department Reports ----------
 cron.schedule(
-  "00 11 * * *", // Every day at 8:02 PM
+  "00 11 * * 1", // Every day at 8:02 PM
   async () => {
     const lockId = 'department_report_job';
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
