@@ -18,10 +18,10 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // ---------- Postgres ----------
 const pool = new Pool({
-  user: "adminavo",
-  host: "avo-adb-001.postgres.database.azure.com",    
+  user: "administrationSTS",
+  host: "avo-adb-002.postgres.database.azure.com",    
   database: "indicatordb",
-  password: "$#fKcdXPg4@ue8AW",
+  password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
@@ -718,7 +718,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "24 8 * * 1",
+  "40 8 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
