@@ -730,7 +730,7 @@ cron.schedule(
     }
 
     try {
-      const forcedWeek = "2026-Week6"; // or dynamically compute current week
+      const forcedWeek = "2026-Week7"; // or dynamically compute current week
 
       // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
