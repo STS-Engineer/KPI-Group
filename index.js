@@ -718,7 +718,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 // ---------- Schedule weekly email ----------
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "40 8 * * 1",
+  "30 8 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
