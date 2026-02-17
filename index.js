@@ -2749,42 +2749,49 @@ app.get('/api/plants/:plantId/weekly-values', async (req, res) => {
   try {
     const { plantId } = req.params;
     const { week } = req.query;
-
     const result = await pool.query(`
-            SELECT 
-                k.kpi_id,
-                k.indicator_title,
-                k.indicator_sub_title,
-                k.unit,
-                r.responsible_id,
-                r.name as responsible_name,
-                d.name as department_name,
-                kv.week,
-                kv.value,
-                kv.target_snapshot as target,
-                kv.low_limit_snapshot as low_limit,
-                kv.high_limit_snapshot as high_limit,
-                kv."Date" as value_date,
-                CASE 
-                    WHEN kv.value IS NULL THEN 'No Data'
-                    WHEN kv.high_limit_snapshot IS NOT NULL AND kv.value >= kv.high_limit_snapshot THEN 'Above Target'
-                    WHEN kv.low_limit_snapshot IS NOT NULL AND kv.value <= kv.low_limit_snapshot THEN 'Below Target'
-                    ELSE 'Within Target'
-                END as status
-            FROM "Responsible" r
-            INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
-            INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
-            LEFT JOIN "Department" d ON d.department_id = r.department_id
-            WHERE r.plant_id = $1
-                AND ($2::varchar IS NULL OR kv.week = $2)
-            ORDER BY k.indicator_title, r.name
-        `, [plantId, week || null]);
+      SELECT 
+        k.kpi_id,
+        k.indicator_title,
+        k.indicator_sub_title,
+        k.unit,
+        r.responsible_id,
+        r.name as responsible_name,
+        d.name as department_name,
+        kv.week,
+        kv.value,
+        kv.target_snapshot as target,
+        kv.low_limit_snapshot as low_limit,
+        kv.high_limit_snapshot as high_limit,
+        kv."Date" as value_date,
+        CASE 
+          WHEN kv.value IS NULL OR kv.value = '' 
+               THEN 'No Data'
+          WHEN kv.value ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               AND kv.high_limit_snapshot IS NOT NULL
+               AND kv.value::numeric >= kv.high_limit_snapshot 
+               THEN 'Above Target'
+          WHEN kv.value ~ '^-?[0-9]+(\\.[0-9]+)?$'
+               AND kv.low_limit_snapshot IS NOT NULL
+               AND kv.value::numeric <= kv.low_limit_snapshot  
+               THEN 'Below Target'
+          ELSE 'Within Target'
+        END as status
+      FROM "Responsible" r
+      INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
+      INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
+      LEFT JOIN "Department" d ON d.department_id = r.department_id
+      WHERE r.plant_id = $1
+        AND ($2::varchar IS NULL OR kv.week = $2)
+      ORDER BY k.indicator_title, r.name
+    `, [plantId, week || null]);
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching weekly values:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // 10. Get plant statistics
 app.get('/api/stats', async (req, res) => {
@@ -2892,29 +2899,20 @@ app.get('/api/plants/:plantId/performance', async (req, res) => {
   const { week } = req.query;
   try {
     const result = await pool.query(`
-      WITH RECURSIVE plant_tree AS (
-        SELECT plant_id FROM "Plant" WHERE parent_id IS NULL
-        UNION ALL
-        SELECT p.plant_id FROM "Plant" p JOIN plant_tree pt ON p.parent_id = pt.plant_id
-      )
-      SELECT k.indicator_title, k.good_direction,
-        CASE
-          WHEN k.good_direction = 'UP'   AND kv.value < kv.low_limit_snapshot  THEN 'RED'
-          WHEN k.good_direction = 'DOWN' AND kv.value > kv.high_limit_snapshot THEN 'RED'
-          ELSE 'GREEN'
-        END AS performance_status,
+      SELECT
+        indicator_title,
+        good_direction,
+        performance_status,
         COUNT(*) AS count
-      FROM plant_tree pt
-      JOIN "Responsible" r ON r.plant_id        = pt.plant_id
-      JOIN kpi_values   kv ON kv.responsible_id = r.responsible_id
-      JOIN "Kpi"         k ON k.kpi_id          = kv.kpi_id
-      WHERE pt.plant_id = $1
-        AND kv.week     = $2
-      GROUP BY k.indicator_title, k.good_direction, performance_status
-      ORDER BY k.indicator_title
+      FROM kpi_performance_view
+      WHERE plant_id = $1
+        AND week     = $2
+      GROUP BY indicator_title, good_direction, performance_status
+      ORDER BY indicator_title
     `, [plantId, week]);
     res.json(result.rows);
   } catch (err) {
+    console.error('Error fetching performance:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2924,27 +2922,23 @@ app.get('/api/plants/:plantId/indicators/:kpiId/performance', async (req, res) =
   const { week } = req.query;
   try {
     const result = await pool.query(`
-      SELECT kv.kpi_id, kv.responsible_id,
-        CASE
-          WHEN k.good_direction = 'UP'   AND kv.value < kv.low_limit_snapshot  THEN 'RED'
-          WHEN k.good_direction = 'DOWN' AND kv.value > kv.high_limit_snapshot THEN 'RED'
-          ELSE 'GREEN'
-        END AS performance_status,
-        k.good_direction
-      FROM kpi_values   kv
-      JOIN "Responsible" r ON r.responsible_id = kv.responsible_id
-      JOIN "Kpi"         k ON k.kpi_id         = kv.kpi_id
-      WHERE r.plant_id = $1
-        AND kv.kpi_id  = $2
-        AND kv.week    = $3
-      ORDER BY r.name
+      SELECT
+        kpi_id,
+        responsible_id,
+        performance_status,
+        good_direction
+      FROM kpi_performance_view
+      WHERE plant_id = $1
+        AND kpi_id   = $2
+        AND week     = $3
+      ORDER BY responsible_name
     `, [plantId, kpiId, week]);
     res.json(result.rows);
   } catch (err) {
+    console.error('Error fetching KPI performance:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
 
 
 // ---------- Start server ----------
