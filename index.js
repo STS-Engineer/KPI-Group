@@ -2358,5 +2358,594 @@ cron.schedule(
   }
 );
 
+// ========== PLANT HIERARCHY APIs ==========
+
+// 1. Get all root plants (plants without parent/owner)
+// 1. Get all root plants (plants without parent/owner) - UPDATED
+app.get('/api/plants/roots', async (req, res) => {
+  try {
+    const result = await pool.query(`
+            SELECT 
+                p.plant_id,
+                p.name,
+                p.manager,
+                p.manager_email,
+                p.created_at,
+                -- Count responsible persons
+                COUNT(DISTINCT r.responsible_id) as responsible_count,
+                -- Count child plants
+                COUNT(DISTINCT c.plant_id) as child_plant_count,
+                -- Count total KPIs for all children
+                COALESCE(
+                    (SELECT COUNT(DISTINCT kv.kpi_id)
+                     FROM "Plant" p2
+                     LEFT JOIN "Responsible" r2 ON r2.plant_id = p2.plant_id
+                     LEFT JOIN kpi_values kv ON kv.responsible_id = r2.responsible_id
+                     WHERE p2.parent_id = p.plant_id
+                     AND kv.kpi_id IS NOT NULL),
+                    0
+                ) as total_child_kpis
+            FROM "Plant" p
+            LEFT JOIN "Responsible" r ON r.plant_id = p.plant_id
+            LEFT JOIN "Plant" c ON c.parent_id = p.plant_id
+            WHERE p.parent_id IS NULL
+            GROUP BY p.plant_id, p.name, p.manager, p.manager_email, p.created_at
+            ORDER BY p.name
+        `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching root plants:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+// 2. Get child plants for a parent plant
+// Update your SQL query to include has_children flag:
+app.get('/api/plants/:plantId/children', async (req, res) => {
+  try {
+    const { plantId } = req.params;
+    const result = await pool.query(`
+            SELECT 
+                p.plant_id,
+                p.name,
+                p.manager,
+                p.manager_email,
+                p.created_at,
+                p.parent_id,
+                -- Check if this plant has children
+                EXISTS(
+                    SELECT 1 FROM "Plant" c 
+                    WHERE c.parent_id = p.plant_id
+                ) as has_children,
+                COUNT(DISTINCT r.responsible_id) as responsible_count,
+                -- Only count KPIs if no children
+                CASE WHEN EXISTS(
+                    SELECT 1 FROM "Plant" c WHERE c.parent_id = p.plant_id
+                ) THEN 0
+                ELSE COALESCE(
+                    (SELECT COUNT(DISTINCT kv.kpi_id)
+                     FROM "Responsible" r2
+                     LEFT JOIN kpi_values kv ON kv.responsible_id = r2.responsible_id
+                     WHERE r2.plant_id = p.plant_id
+                     AND kv.kpi_id IS NOT NULL), 
+                    0
+                ) END as kpi_count
+            FROM "Plant" p
+            LEFT JOIN "Responsible" r ON r.plant_id = p.plant_id
+            WHERE p.parent_id = $1
+            GROUP BY p.plant_id, p.name, p.manager, p.manager_email, p.created_at, p.parent_id
+            ORDER BY p.name
+        `, [plantId]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+// ========== KPI APIs ==========
+
+// 3. Get indicators for a plant (FIXED - removed DISTINCT from JSON)
+
+app.get('/api/plants/:plantId/indicators', async (req, res) => {
+  try {
+    const { plantId } = req.params;
+    const { week } = req.query;
+
+    const result = await pool.query(`
+            SELECT 
+                k.kpi_id,
+                k.indicator_title,
+                k.indicator_sub_title,
+                k.unit,
+                k.good_direction,
+                k.tolerance_percent,
+                k.created_at,
+                -- Count responsible persons for this KPI in this plant
+                COUNT(DISTINCT r.responsible_id) as responsible_count,
+                -- Count values for this KPI
+                COUNT(DISTINCT kv.kpi_values_id) as value_count,
+                -- Get current week values
+                COALESCE(
+                    (SELECT json_agg(jsonb_build_object(
+                        'value_id', kv2.kpi_values_id,
+                        'week', kv2.week,
+                        'value', kv2.value,
+                        'target', kv2.target_snapshot
+                    ))
+                    FROM kpi_values kv2
+                    WHERE kv2.kpi_id = k.kpi_id 
+                        AND kv2.week = COALESCE($2, '2026-Week5')
+                        AND EXISTS (
+                            SELECT 1 FROM "Responsible" r2 
+                            WHERE r2.responsible_id = kv2.responsible_id 
+                            AND r2.plant_id = $1
+                        )
+                    LIMIT 10),
+                    '[]'
+                ) as current_week_values
+            FROM "Kpi" k
+            -- Get KPIs through responsible persons in this plant
+            INNER JOIN "Responsible" r ON r.plant_id = $1
+            INNER JOIN kpi_values kv ON kv.kpi_id = k.kpi_id AND kv.responsible_id = r.responsible_id
+            GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, 
+                     k.good_direction, k.tolerance_percent, k.created_at
+            ORDER BY k.indicator_title
+        `, [plantId, week || '2026-Week5']);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching indicators:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. Get indicator subtitles with details (SIMPLIFIED VERSION)
+app.get('/api/plants/:plantId/indicators/:kpiId/subtitles', async (req, res) => {
+  try {
+    const { plantId, kpiId } = req.params;
+    const { week } = req.query;
+
+    const result = await pool.query(`
+      SELECT 
+        k.kpi_id,
+        k.indicator_title,
+        COALESCE(k.indicator_sub_title, 'No subtitle') as indicator_subtitle,
+        k.unit,
+        k.good_direction,
+        k.tolerance_percent,
+        r.responsible_id,
+        r.name as responsible_name,
+        r.email as responsible_email,
+        r.phone as responsible_phone,
+        r.created_at as responsible_created,
+        d.name as department_name,
+        kvh.hist_id,
+        kvh.old_value,
+        kvh.new_value as value,
+        kvh.week,
+        kvh.updated_at as value_date,
+        CASE 
+            WHEN kvh.new_value IS NULL THEN 'No Data'
+            WHEN k.good_direction = 'high' AND kvh.new_value::numeric >= k.tolerance_percent THEN 'Above Target'
+            WHEN k.good_direction = 'low' AND kvh.new_value::numeric <= k.tolerance_percent THEN 'Below Target'
+            ELSE 'Within Target'
+        END as status,
+        ROUND(
+            CASE 
+                WHEN k.tolerance_percent > 0 
+                THEN ((kvh.new_value::numeric - k.tolerance_percent) / k.tolerance_percent) * 100
+                ELSE NULL
+            END, 2
+        ) as deviation_percent
+      FROM "Kpi" k
+      INNER JOIN "Responsible" r ON r.plant_id = $1
+      LEFT JOIN "Department" d ON d.department_id = r.department_id
+      LEFT JOIN kpi_values_hist26 kvh 
+        ON kvh.kpi_id = k.kpi_id 
+        AND kvh.responsible_id = r.responsible_id
+        AND ($2::varchar IS NULL OR kvh.week = $2)
+      WHERE k.kpi_id = $3
+      ORDER BY k.indicator_sub_title, r.name
+    `, [plantId, week || null, kpiId]);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching KPI history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 5. Get all departments
+app.get('/api/departments', async (req, res) => {
+  try {
+    const result = await pool.query(`
+            SELECT 
+                d.department_id,
+                d.name,
+                d.created_at,
+                d.updated_at,
+                COUNT(DISTINCT r.responsible_id) as responsible_count
+            FROM "Department" d
+            LEFT JOIN "Responsible" r ON r.department_id = d.department_id
+            GROUP BY d.department_id, d.name, d.created_at, d.updated_at
+            ORDER BY d.name
+        `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching departments:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. Get responsible persons for a plant
+app.get('/api/plants/:plantId/responsible', async (req, res) => {
+  try {
+    const { plantId } = req.params;
+    const result = await pool.query(`
+            SELECT 
+                r.responsible_id,
+                r.name,
+                r.email,
+                r.phone,
+                r.created_at,
+                d.name as department_name,
+                COUNT(DISTINCT kv.kpi_values_id) as kpi_value_count
+            FROM "Responsible" r
+            LEFT JOIN "Department" d ON d.department_id = r.department_id
+            LEFT JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
+            WHERE r.plant_id = $1
+            GROUP BY r.responsible_id, r.name, r.email, r.phone, 
+                     r.created_at, d.department_id, d.name
+            ORDER BY r.name
+        `, [plantId]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching responsible persons:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 7. Get complete plant hierarchy (SIMPLIFIED)
+app.get('/api/plants/hierarchy', async (req, res) => {
+  try {
+    const result = await pool.query(`
+            WITH RECURSIVE plant_tree AS (
+                SELECT 
+                    plant_id,
+                    name,
+                    manager,
+                    manager_email,
+                    parent_id,
+                    created_at,
+                    0 as level,
+                    name as path_name
+                FROM "Plant"
+                WHERE parent_id IS NULL
+                
+                UNION ALL
+                
+                SELECT 
+                    p.plant_id,
+                    p.name,
+                    p.manager,
+                    p.manager_email,
+                    p.parent_id,
+                    p.created_at,
+                    pt.level + 1,
+                    pt.path_name || ' > ' || p.name
+                FROM "Plant" p
+                INNER JOIN plant_tree pt ON p.parent_id = pt.plant_id
+            )
+            SELECT 
+                pt.plant_id,
+                pt.name,
+                pt.manager,
+                pt.manager_email,
+                pt.parent_id,
+                pt.level,
+                pt.path_name,
+                (
+                    SELECT COUNT(*)
+                    FROM "Responsible" r
+                    WHERE r.plant_id = pt.plant_id
+                ) as responsible_count,
+                (
+                    SELECT COUNT(*)
+                    FROM "Plant" c
+                    WHERE c.parent_id = pt.plant_id
+                ) as child_count
+            FROM plant_tree pt
+            ORDER BY pt.path_name
+        `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching plant hierarchy:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 8. Search across plants, KPIs, and responsible persons
+app.get('/api/search', async (req, res) => {
+  try {
+    const { q, type } = req.query;
+    if (!q) {
+      return res.json([]);
+    }
+
+    const searchTerm = `%${q}%`;
+
+    if (type === 'plant') {
+      const result = await pool.query(`
+                SELECT 
+                    'plant' as type,
+                    plant_id as id,
+                    name,
+                    manager as subtitle,
+                    'Plant' as category
+                FROM "Plant"
+                WHERE name ILIKE $1 OR manager ILIKE $1
+                LIMIT 10
+            `, [searchTerm]);
+      res.json(result.rows);
+    } else if (type === 'kpi') {
+      const result = await pool.query(`
+                SELECT 
+                    'kpi' as type,
+                    kpi_id as id,
+                    indicator_title as name,
+                    COALESCE(indicator_sub_title, 'No subtitle') as subtitle,
+                    'KPI' as category
+                FROM "Kpi"
+                WHERE indicator_title ILIKE $1 OR indicator_sub_title ILIKE $1
+                LIMIT 10
+            `, [searchTerm]);
+      res.json(result.rows);
+    } else {
+      // General search
+      const plants = await pool.query(`
+                SELECT 
+                    'plant' as type,
+                    plant_id as id,
+                    name,
+                    manager as subtitle,
+                    'Plant' as category
+                FROM "Plant"
+                WHERE name ILIKE $1 OR manager ILIKE $1
+                LIMIT 5
+            `, [searchTerm]);
+
+      const kpis = await pool.query(`
+                SELECT 
+                    'kpi' as type,
+                    kpi_id as id,
+                    indicator_title as name,
+                    COALESCE(indicator_sub_title, 'No subtitle') as subtitle,
+                    'KPI' as category
+                FROM "Kpi"
+                WHERE indicator_title ILIKE $1 OR indicator_sub_title ILIKE $1
+                LIMIT 5
+            `, [searchTerm]);
+
+      const responsible = await pool.query(`
+                SELECT 
+                    'responsible' as type,
+                    responsible_id as id,
+                    name,
+                    email as subtitle,
+                    'Responsible Person' as category
+                FROM "Responsible"
+                WHERE name ILIKE $1 OR email ILIKE $1
+                LIMIT 5
+            `, [searchTerm]);
+
+      res.json([...plants.rows, ...kpis.rows, ...responsible.rows]);
+    }
+  } catch (error) {
+    console.error('Error searching:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 9. Get weekly KPI values for a plant
+app.get('/api/plants/:plantId/weekly-values', async (req, res) => {
+  try {
+    const { plantId } = req.params;
+    const { week } = req.query;
+
+    const result = await pool.query(`
+            SELECT 
+                k.kpi_id,
+                k.indicator_title,
+                k.indicator_sub_title,
+                k.unit,
+                r.responsible_id,
+                r.name as responsible_name,
+                d.name as department_name,
+                kv.week,
+                kv.value,
+                kv.target_snapshot as target,
+                kv.low_limit_snapshot as low_limit,
+                kv.high_limit_snapshot as high_limit,
+                kv."Date" as value_date,
+                CASE 
+                    WHEN kv.value IS NULL THEN 'No Data'
+                    WHEN kv.high_limit_snapshot IS NOT NULL AND kv.value >= kv.high_limit_snapshot THEN 'Above Target'
+                    WHEN kv.low_limit_snapshot IS NOT NULL AND kv.value <= kv.low_limit_snapshot THEN 'Below Target'
+                    ELSE 'Within Target'
+                END as status
+            FROM "Responsible" r
+            INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
+            INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
+            LEFT JOIN "Department" d ON d.department_id = r.department_id
+            WHERE r.plant_id = $1
+                AND ($2::varchar IS NULL OR kv.week = $2)
+            ORDER BY k.indicator_title, r.name
+        `, [plantId, week || null]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching weekly values:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 10. Get plant statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    const stats = await pool.query(`
+            SELECT 
+                (SELECT COUNT(*) FROM "Plant") as total_plants,
+                (SELECT COUNT(*) FROM "Plant" WHERE parent_id IS NULL) as root_plants,
+                (SELECT COUNT(*) FROM "Plant" WHERE parent_id IS NOT NULL) as child_plants,
+                (SELECT COUNT(*) FROM "Kpi") as total_kpis,
+                (SELECT COUNT(*) FROM "Responsible") as total_responsible,
+                (SELECT COUNT(*) FROM "Department") as total_departments,
+                (SELECT COUNT(*) FROM kpi_values) as total_kpi_values,
+                (SELECT COUNT(DISTINCT week) FROM kpi_values) as total_weeks
+        `);
+    res.json(stats.rows[0]);
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 11. Test endpoint
+app.get('/api/test', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() as current_time');
+    res.json({
+      status: 'Server is running',
+      database_time: result.rows[0].current_time,
+      message: 'API server is connected to PostgreSQL'
+    });
+  } catch (error) {
+    console.error('Test endpoint error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 12. Get basic plant information (for debugging)
+app.get('/api/plants', async (req, res) => {
+  try {
+    const result = await pool.query(`
+            SELECT 
+                plant_id,
+                name,
+                manager,
+                parent_id
+            FROM "Plant"
+            ORDER BY name
+            LIMIT 50
+        `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching plants:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 13. Get basic KPI information (for debugging)
+app.get('/api/indicators', async (req, res) => {
+  try {
+    const result = await pool.query(`
+            SELECT 
+                kpi_id,
+                indicator_title,
+                indicator_sub_title,
+                unit
+            FROM "Kpi"
+            ORDER BY indicator_title
+            LIMIT 50
+        `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching indicators:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 14. Get plant with indicators (simpler endpoint for testing)
+app.get('/api/plants/:plantId/indicators-simple', async (req, res) => {
+  try {
+    const { plantId } = req.params;
+
+    const result = await pool.query(`
+            SELECT DISTINCT
+                k.kpi_id,
+                k.indicator_title,
+                k.indicator_sub_title,
+                k.unit,
+                k.good_direction
+            FROM "Responsible" r
+            INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
+            INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
+            WHERE r.plant_id = $1
+            ORDER BY k.indicator_title
+        `, [plantId]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching simple indicators:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/plants/:plantId/performance', async (req, res) => {
+  const { plantId } = req.params;
+  const { week } = req.query;
+  try {
+    const result = await pool.query(`
+      WITH RECURSIVE plant_tree AS (
+        SELECT plant_id FROM "Plant" WHERE parent_id IS NULL
+        UNION ALL
+        SELECT p.plant_id FROM "Plant" p JOIN plant_tree pt ON p.parent_id = pt.plant_id
+      )
+      SELECT k.indicator_title, k.good_direction,
+        CASE
+          WHEN k.good_direction = 'UP'   AND kv.value < kv.low_limit_snapshot  THEN 'RED'
+          WHEN k.good_direction = 'DOWN' AND kv.value > kv.high_limit_snapshot THEN 'RED'
+          ELSE 'GREEN'
+        END AS performance_status,
+        COUNT(*) AS count
+      FROM plant_tree pt
+      JOIN "Responsible" r ON r.plant_id        = pt.plant_id
+      JOIN kpi_values   kv ON kv.responsible_id = r.responsible_id
+      JOIN "Kpi"         k ON k.kpi_id          = kv.kpi_id
+      WHERE pt.plant_id = $1
+        AND kv.week     = $2
+      GROUP BY k.indicator_title, k.good_direction, performance_status
+      ORDER BY k.indicator_title
+    `, [plantId, week]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/plants/:plantId/indicators/:kpiId/performance', async (req, res) => {
+  const { plantId, kpiId } = req.params;
+  const { week } = req.query;
+  try {
+    const result = await pool.query(`
+      SELECT kv.kpi_id, kv.responsible_id,
+        CASE
+          WHEN k.good_direction = 'UP'   AND kv.value < kv.low_limit_snapshot  THEN 'RED'
+          WHEN k.good_direction = 'DOWN' AND kv.value > kv.high_limit_snapshot THEN 'RED'
+          ELSE 'GREEN'
+        END AS performance_status,
+        k.good_direction
+      FROM kpi_values   kv
+      JOIN "Responsible" r ON r.responsible_id = kv.responsible_id
+      JOIN "Kpi"         k ON k.kpi_id         = kv.kpi_id
+      WHERE r.plant_id = $1
+        AND kv.kpi_id  = $2
+        AND kv.week    = $3
+      ORDER BY r.name
+    `, [plantId, kpiId, week]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
 // ---------- Start server ----------
 app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
