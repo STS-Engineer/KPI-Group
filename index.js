@@ -4,14 +4,14 @@ const { Pool } = require("pg");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
-const cron = require("node-cron"); 
+const cron = require("node-cron");
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));   
+app.use(bodyParser.urlencoded({ extended: true }));
 
 
 
@@ -27,19 +27,20 @@ const pool = new Pool({
 });
 
 
+
 // ---------- Job Lock Helper ----------
-// ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
+// Remove the old acquireJobLock and releaseJobLock functions
 // ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
 const acquireJobLock = async (lockId, ttlMinutes = 9) => {
   const instanceId = process.env.WEBSITE_INSTANCE_ID || `instance_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  
+
   try {
     // Convert lockId string to a consistent integer hash
     const lockHash = Math.abs(lockId.split('').reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0));
-    
+
     // Try to acquire PostgreSQL advisory lock (non-blocking)
     const result = await pool.query('SELECT pg_try_advisory_lock($1) as acquired', [lockHash]);
-    
+
     if (result.rows[0].acquired) {
       console.log(`🔒 Instance ${instanceId} acquired lock ${lockId} (hash: ${lockHash})`);
       return { acquired: true, instanceId, lockHash };
@@ -63,7 +64,6 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
     console.error(`⚠️ Could not release lock ${lockId}:`, error.message);
   }
 };
-
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
@@ -75,6 +75,8 @@ const createTransporter = () =>
       pass: "shnlgdyfbcztbhxn",
     },
   });
+
+
 
 // ---------- Fetch Responsible + their KPIs ----------
 const getResponsibleWithKPIs = async (responsibleId, week) => {
@@ -127,7 +129,7 @@ const generateEmailHtml = ({ responsible, week }) => {
             Plant: ${responsible.plant_name}
       </h3>
           
-      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
+      <a href="http://localhost:5000/form?responsible_id=${responsible.responsible_id}&week=${week}"
          style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
                 border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
         Fill KPI Form
@@ -142,6 +144,979 @@ const generateEmailHtml = ({ responsible, week }) => {
   `;
 };
 
+// ========== CORRECTIVE ACTION SYSTEM - START ==========
+
+
+const generateCorrectiveActionEmailHtml = ({ responsible, kpi, week, value, target_value }) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="utf-8"><title>Corrective Action Required</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
+      <div style="text-align:center;margin-bottom:25px;">
+        <div style="width:80px;height:80px;margin:0 auto 15px;background:#ff9800;border-radius:50%;display:flex;align-items:center;justify-content:center;">
+          <span style="font-size:40px;">⚠️</span>
+        </div>
+        <h2 style="color:#d32f2f;font-size:22px;margin:0;">Corrective Action Required</h2>
+        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">KPI Below target_value - Week ${week}</p>
+      </div>
+      
+      <div style="background:#f8f9fa;padding:20px;border-radius:6px;margin-bottom:20px;border-left:4px solid #d32f2f;">
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
+          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
+        </div>
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
+          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
+        </div>
+        <div>
+          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
+          <span style="color:#666;font-size:13px;">${responsible.name}</span>
+        </div>
+      </div>
+      
+      <div style="background:#fff3e0;padding:20px;border-radius:6px;margin-bottom:20px;border:1px solid #ffb74d;">
+        <h3 style="color:#e65100;font-size:16px;margin:0 0 15px 0;">KPI Performance Alert</h3>
+        <div style="margin-bottom:10px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Indicator: </span>
+          <span style="color:#666;font-size:13px;">${kpi.indicator_title}</span>
+        </div>
+        <div style="margin-top:15px;display:flex;justify-content:space-around;background:white;padding:15px;border-radius:4px;">
+          <div style="text-align:center;">
+            <div style="font-size:11px;color:#666;margin-bottom:5px;">Current Value</div>
+            <div style="font-size:20px;font-weight:700;color:#d32f2f;">${value}${kpi.unit || ''}</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="font-size:11px;color:#666;margin-bottom:5px;">target_value</div>
+            <div style="font-size:20px;font-weight:700;color:#4caf50;">${target_value}${kpi.unit || ''}</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="font-size:11px;color:#666;margin-bottom:5px;">Gap</div>
+            <div style="font-size:20px;font-weight:700;color:#ff9800;">
+              ${(parseFloat(target_value) - parseFloat(value)).toFixed(2)}${kpi.unit || ''}
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <div style="text-align:center;margin:25px 0;">
+        <a href="http://localhost:5000/corrective-action-form?responsible_id=${responsible.responsible_id}&kpi_id=${kpi.kpi_id}&week=${week}"
+           style="display:inline-block;padding:14px 30px;background:#d32f2f;color:white;border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
+          📝 Fill Corrective Action Form
+        </a>
+      </div>
+      
+      <div style="margin-top:25px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
+        <p style="font-size:11px;color:#999;margin:0;">
+          This is an automated alert from AVOCarbon KPI System<br>
+          Please complete the corrective action form within 24 hours
+        </p>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+};
+
+// ========== ENHANCED CORRECTIVE ACTION SYSTEM WITH EMAIL NOTIFICATIONS ==========
+
+// Generate target update email HTML
+const generateTargetUpdateEmailHtml = ({ responsible, kpi, week, oldTarget, newTarget }) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="utf-8"><title>KPI Target Updated</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
+      
+      <!-- Header -->
+      <div style="text-align:center;margin-bottom:30px;">
+        <div style="width:80px;height:80px;margin:0 auto 15px;background:#4caf50;border-radius:50%;display:flex;align-items:center;justify-content:center;">
+          <span style="font-size:40px;">🎯</span>
+        </div>
+        <h2 style="color:#4caf50;font-size:22px;margin:0;">KPI Target Updated</h2>
+        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Performance Exceeds Expectations</p>
+      </div>
+      
+      <!-- Responsible Info -->
+      <div style="background:#e8f5e9;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #4caf50;">
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
+          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
+        </div>
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
+          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
+        </div>
+        <div>
+          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
+          <span style="color:#666;font-size:13px;">${responsible.name}</span>
+        </div>
+      </div>
+      
+      <!-- KPI Details -->
+      <div style="background:#f5f5f5;padding:20px;border-radius:6px;margin-bottom:25px;">
+        <h3 style="color:#333;font-size:16px;margin:0 0 15px 0;">KPI Information</h3>
+        <div style="margin-bottom:10px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Indicator: </span>
+          <span style="color:#666;font-size:13px;">${kpi.indicator_title}</span>
+        </div>
+        ${kpi.indicator_sub_title ? `
+        <div style="margin-bottom:10px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Sub-title: </span>
+          <span style="color:#666;font-size:13px;">${kpi.indicator_sub_title}</span>
+        </div>
+        ` : ''}
+        ${kpi.unit ? `
+        <div>
+          <span style="font-weight:600;color:#333;font-size:13px;">Unit: </span>
+          <span style="color:#666;font-size:13px;">${kpi.unit}</span>
+        </div>
+        ` : ''}
+      </div>
+      
+      <!-- Target Update Details -->
+      <div style="background:#fff3e0;padding:20px;border-radius:6px;margin-bottom:25px;border:1px solid #ffb74d;">
+        <h3 style="color:#e65100;font-size:16px;margin:0 0 15px 0;">Target Value Updated</h3>
+        <p style="color:#666;font-size:14px;margin:0 0 15px 0;">
+          Your KPI performance exceeded the target value for week ${week}. 
+          The system has automatically updated the target to reflect this achievement.
+        </p>
+        
+        <div style="margin-top:15px;display:flex;justify-content:space-around;background:white;padding:15px;border-radius:4px;">
+          <div style="text-align:center;">
+            <div style="font-size:11px;color:#666;margin-bottom:5px;">Previous Target</div>
+            <div style="font-size:20px;font-weight:700;color:#d32f2f;">${oldTarget}${kpi.unit || ''}</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="font-size:24px;color:#666;margin:8px;">→</div>
+          </div>
+          <div style="text-align:center;">
+            <div style="font-size:11px;color:#666;margin-bottom:5px;">New Target</div>
+            <div style="font-size:20px;font-weight:700;color:#4caf50;">${newTarget}${kpi.unit || ''}</div>
+          </div>
+        </div>
+        
+        <div style="text-align:center;margin-top:15px;padding:10px;background:#e8f5e9;border-radius:4px;">
+          <div style="font-size:20px;font-weight:700;color:#2e7d32;">
+            +${((newTarget - oldTarget) / oldTarget * 100).toFixed(1)}%
+          </div>
+          <div style="font-size:11px;color:#666;">Improvement</div>
+        </div>
+      </div>
+      
+      <!-- Message -->
+      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
+        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">🎉 Congratulations!</h3>
+        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
+          <li>Your KPI performance has exceeded expectations</li>
+          <li>The target has been updated to reflect your achievement</li>
+          <li>Continue maintaining or improving this performance</li>
+          <li><strong>Next target will be based on this new value</strong></li>
+        </ul>
+      </div>
+      
+      <!-- Footer -->
+      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
+        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
+          This is an automated notification from AVOCarbon KPI System<br>
+          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
+          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
+        </p>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+};
+
+// Send target update email
+const sendTargetUpdateEmail = async (responsibleId, kpiId, week, oldTarget, newTarget) => {
+  try {
+    // Get responsible info
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+      [responsibleId]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible || !responsible.email) {
+      console.log(`No email found for responsible ${responsibleId}`);
+      return null;
+    }
+
+    // Get KPI details
+    const kpiRes = await pool.query(
+      `SELECT kpi_id, indicator_title, indicator_sub_title, unit
+       FROM public."Kpi"
+       WHERE kpi_id = $1`,
+      [kpiId]
+    );
+
+    const kpi = kpiRes.rows[0];
+    if (!kpi) {
+      console.log(`KPI ${kpiId} not found`);
+      return null;
+    }
+
+    const html = generateTargetUpdateEmailHtml({
+      responsible,
+      kpi,
+      week,
+      oldTarget,
+      newTarget
+    });
+
+    const transporter = createTransporter();
+    const info = await transporter.sendMail({
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      to: responsible.email,
+      subject: `🎯 Target Updated - ${kpi.indicator_title} - Week ${week}`,
+      html,
+    });
+
+    console.log(`✅ Target update email sent to ${responsible.email} for KPI ${kpiId}`);
+    return info;
+  } catch (err) {
+    console.error(`❌ Failed to send target update email:`, err.message);
+    return null;
+  }
+};
+
+// ========== CONSOLIDATED TARGET UPDATE EMAIL FUNCTIONS ==========
+
+// Generate consolidated target update email HTML
+const generateConsolidatedTargetUpdateEmailHtml = ({ responsible, week, targetUpdates }) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="utf-8"><title>KPI Targets Updated</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
+    <div style="max-width:700px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
+      
+      <!-- Header -->
+      <div style="text-align:center;margin-bottom:30px;">
+        <div style="width:90px;height:90px;margin:0 auto 15px;background:#4caf50;border-radius:50%;display:flex;align-items:center;justify-content:center;">
+          <span style="font-size:45px;">🎯</span>
+        </div>
+        <h2 style="color:#4caf50;font-size:24px;margin:0;">KPI Targets Updated</h2>
+        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Performance Exceeds Expectations</p>
+      </div>
+      
+      <!-- Responsible Info -->
+      <div style="background:#e8f5e9;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #4caf50;">
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
+          <span style="color:#666;font-size:13px;">${responsible.name}</span>
+        </div>
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
+          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
+        </div>
+        <div>
+          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
+          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
+        </div>
+      </div>
+      
+      <!-- Summary Badge -->
+      <div style="background:#fff3e0;padding:15px;border-radius:6px;margin-bottom:25px;text-align:center;border:2px solid #ff9800;">
+        <span style="font-size:32px;font-weight:700;color:#4caf50;">${targetUpdates.length}</span>
+        <span style="font-size:14px;color:#666;display:block;margin-top:5px;">KPI Target${targetUpdates.length > 1 ? 's' : ''} Updated</span>
+      </div>
+      
+      <!-- KPIs List -->
+      <div style="margin-bottom:25px;">
+        <h3 style="color:#333;font-size:16px;margin-bottom:15px;border-bottom:2px solid #e0e0e0;padding-bottom:8px;">
+          📊 Target Updates Summary
+        </h3>
+        
+        ${targetUpdates.map((update, index) => `
+        <div style="background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:15px;margin-bottom:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;">
+            <div style="flex:1;">
+              <div style="font-weight:600;color:#333;font-size:14px;margin-bottom:5px;">
+                ${index + 1}. ${update.indicator_title}
+              </div>
+              ${update.indicator_sub_title ? `
+              <div style="color:#666;font-size:12px;margin-bottom:8px;">
+                ${update.indicator_sub_title}
+              </div>
+              ` : ''}
+            </div>
+          </div>
+          
+          <!-- Performance Summary -->
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;background:white;padding:12px;border-radius:4px;margin-bottom:10px;">
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Old Target</div>
+              <div style="font-size:16px;font-weight:700;color:#d32f2f;">${update.oldTarget} ${update.unit || ''}</div>
+            </div>
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">New Target</div>
+              <div style="font-size:16px;font-weight:700;color:#4caf50;">${update.newTarget} ${update.unit || ''}</div>
+            </div>
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Improvement</div>
+              <div style="font-size:16px;font-weight:700;color:#ff9800;">
+                +${update.improvement}%
+              </div>
+            </div>
+          </div>
+          
+          <!-- Progress Bar -->
+          <div style="margin-top:10px;">
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:#666;margin-bottom:4px;">
+              <span>${update.oldTarget} ${update.unit || ''}</span>
+              <span>+${update.improvement}%</span>
+              <span>${update.newTarget} ${update.unit || ''}</span>
+            </div>
+            <div style="height:6px;background:#e0e0e0;border-radius:3px;overflow:hidden;">
+              <div style="height:100%;background:#4caf50;width:${Math.min(update.improvement, 100)}%;"></div>
+            </div>
+          </div>
+        </div>
+        `).join('')}
+      </div>
+      
+      <!-- Congratulations Section -->
+      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
+        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">🎉 Congratulations!</h3>
+        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
+          <li><strong>${targetUpdates.length} KPI${targetUpdates.length > 1 ? 's' : ''} exceeded their targets</strong></li>
+          <li>Target values have been updated to reflect your achievements</li>
+          <li>Continue maintaining or improving this performance</li>
+          <li>Future targets will be based on these new values</li>
+        </ul>
+      </div>
+      
+      <!-- Next Steps -->
+      <div style="background:#fff8e1;padding:20px;border-radius:6px;margin-bottom:25px;">
+        <h3 style="color:#ff8f00;font-size:15px;margin:0 0 12px 0;">📈 What This Means</h3>
+        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
+          <li>You've set a new standard for these KPIs</li>
+          <li>The system now expects at least this level of performance</li>
+          <li>Your achievement is officially recorded in the system</li>
+          <li>Keep up the excellent work!</li>
+        </ul>
+      </div>
+      
+      <!-- Footer -->
+      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
+        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
+          This is an automated notification from AVOCarbon KPI System<br>
+          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
+          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
+        </p>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+};
+
+// Send consolidated target update email
+const sendConsolidatedTargetUpdateEmail = async (responsibleId, week, targetUpdates) => {
+  try {
+    // Get responsible info
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+      [responsibleId]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible || !responsible.email) {
+      console.log(`No email found for responsible ${responsibleId}`);
+      return null;
+    }
+
+    if (targetUpdates.length === 0) {
+      console.log(`No target updates to send for responsible ${responsibleId}, week ${week}`);
+      return null;
+    }
+
+    // Get KPI details for each update
+    const enhancedUpdates = [];
+    for (const update of targetUpdates) {
+      const kpiRes = await pool.query(
+        `SELECT indicator_title, indicator_sub_title, unit
+         FROM public."Kpi"
+         WHERE kpi_id = $1`,
+        [update.kpiId]
+      );
+
+      if (kpiRes.rows[0]) {
+        const kpi = kpiRes.rows[0];
+        const improvement = ((update.newTarget - update.oldTarget) / update.oldTarget * 100).toFixed(1);
+
+        enhancedUpdates.push({
+          kpiId: update.kpiId,
+          indicator_title: kpi.indicator_title,
+          indicator_sub_title: kpi.indicator_sub_title,
+          unit: kpi.unit || '',
+          oldTarget: update.oldTarget,
+          newTarget: update.newTarget,
+          improvement: improvement
+        });
+      }
+    }
+
+    const html = generateConsolidatedTargetUpdateEmailHtml({
+      responsible,
+      week,
+      targetUpdates: enhancedUpdates
+    });
+
+    const transporter = createTransporter();
+    const info = await transporter.sendMail({
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      to: responsible.email,
+      subject: `🎯 ${targetUpdates.length} KPI Target${targetUpdates.length > 1 ? 's' : ''} Updated - Week ${week}`,
+      html,
+    });
+
+    console.log(`✅ Consolidated target update email sent to ${responsible.email} (${targetUpdates.length} KPIs)`);
+    return info;
+  } catch (err) {
+    console.error(`❌ Failed to send consolidated target update email:`, err.message);
+    return null;
+  }
+};
+
+
+// Modified: Enhanced function with email notifications
+// Modified: Enhanced function to COLLECT target updates for consolidated email
+const checkAndTriggerCorrectiveActions = async (
+  responsibleId,
+  kpiId,
+  week,
+  newValue,
+  histId
+) => {
+  try {
+    // 1️⃣ Get current target value
+    const kpiRes = await pool.query(
+      `SELECT target_value FROM public."Kpi" WHERE kpi_id = $1`,
+      [kpiId]
+    );
+
+    if (!kpiRes.rows.length) return { targetUpdated: false };
+
+    const currentTarget = parseFloat(kpiRes.rows[0].target_value);
+    const numValue = parseFloat(newValue);
+
+    if (isNaN(numValue) || isNaN(currentTarget)) return { targetUpdated: false };
+
+    // 2️⃣ Always update history with current target
+    await pool.query(
+      `UPDATE public.kpi_values_hist26
+       SET target = $1
+       WHERE responsible_id = $2
+         AND kpi_id = $3
+         AND week = $4
+         AND (target IS NULL OR target < $1)`,
+      [numValue, responsibleId, kpiId, week]
+    );
+
+    console.log(`📝 History updated with target: ${currentTarget} for hist_id: ${histId}`);
+
+    // 3️⃣ If value exceeds target → update KPI target and RETURN update info
+    if (numValue > currentTarget) {
+      const oldTarget = currentTarget;
+
+      // ✅ Update KPI target
+      await pool.query(
+        `UPDATE public."Kpi"
+         SET target_value = $1
+         WHERE kpi_id = $2`,
+        [numValue, kpiId]
+      );
+
+      console.log(`🎯 Updated target for KPI ${kpiId}: ${oldTarget} → ${numValue}`);
+
+      // ✅ Return target update info (NO EMAIL SENT HERE)
+      return {
+        targetUpdated: true,
+        updateInfo: {
+          kpiId: kpiId,
+          oldTarget: oldTarget,
+          newTarget: numValue
+        }
+      };
+    }
+
+    // 4️⃣ If value is BELOW target → create corrective action
+    if (numValue < currentTarget) {
+      const existingCA = await pool.query(
+        `SELECT corrective_action_id
+         FROM public.corrective_actions
+         WHERE responsible_id = $1
+           AND kpi_id = $2
+           AND week = $3
+           AND status = 'Open'`,
+        [responsibleId, kpiId, week]
+      );
+
+      if (existingCA.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO public.corrective_actions
+           (responsible_id, kpi_id, week, status)
+           VALUES ($1, $2, $3, 'Open')`,
+          [responsibleId, kpiId, week]
+        );
+
+        console.log(`🔴 Corrective action created for KPI ${kpiId}, Week ${week}`);
+      }
+    }
+
+    return { targetUpdated: false };
+
+  } catch (error) {
+    console.error(`Error checking corrective actions:`, error.message);
+    return { targetUpdated: false, error: error.message };
+  }
+};
+// ========== CORRECTIVE ACTION SYSTEM - END ==========
+
+// ========== BULK CORRECTIVE ACTIONS FORM ==========
+app.get("/corrective-actions-bulk", async (req, res) => {
+  try {
+    const { responsible_id, week } = req.query;
+
+    // Get responsible info
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+      [responsible_id]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible) return res.status(404).send("Responsible not found");
+
+    // Get all open corrective actions
+    const actionsRes = await pool.query(
+      `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
+              kv.value
+       FROM public.corrective_actions ca
+       JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
+       LEFT JOIN public.kpi_values kv ON ca.kpi_id = kv.kpi_id 
+         AND kv.responsible_id = ca.responsible_id 
+         AND kv.week = ca.week
+       WHERE ca.responsible_id = $1 
+         AND ca.week = $2 
+         AND ca.status = 'Open'
+       ORDER BY k.indicator_title`,
+      [responsible_id, week]
+    );
+
+    const actions = actionsRes.rows;
+    if (actions.length === 0) {
+      return res.send(`
+        <div style="text-align:center;padding:60px;font-family:'Segoe UI',sans-serif;">
+          <h2 style="color:#4caf50;">✅ No Open Corrective Actions</h2>
+          <p>All corrective actions for week ${week} have been completed.</p>
+          <a href="/dashboard?responsible_id=${responsible_id}" style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;text-decoration:none;border-radius:6px;font-weight:bold;">Go to Dashboard</a>
+        </div>
+      `);
+    }
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Corrective Actions - Week ${week}</title>
+        <style>
+        body {
+          font-family: 'Segoe UI', sans-serif;
+          margin: 0;
+          padding: 20px;
+          min-height: 100vh;
+          background-image: url("https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600");
+          background-size: cover;
+          background-position: center;
+          background-repeat: no-repeat;
+          background-attachment: fixed;
+         }
+
+        .container {
+           max-width: 1000px;
+           margin: 0 auto;
+           background: rgba(255, 255, 255, 0.95);
+           backdrop-filter: blur(5px);
+           border-radius: 8px;
+           box-shadow: 0 2px 20px rgba(0,0,0,0.3);
+           overflow: hidden;
+           }
+
+          .header { background: linear-gradient(135deg, #d32f2f 0%, #f44336 100%); color: white; padding: 30px; text-align: center; }
+          .header h1 { margin: 0; font-size: 26px; font-weight: 600; }
+          .badge { background: rgba(255,255,255,0.2); display: inline-block; padding: 8px 16px; border-radius: 20px; margin-top: 10px; font-size: 14px; }
+          .form-section { padding: 30px; }
+          .info-box { background: #fff3e0; border-left: 4px solid #ff9800; padding: 20px; margin-bottom: 25px; border-radius: 4px; }
+          .kpi-section { margin-bottom: 30px; border: 2px solid #e0e0e0; border-radius: 8px; padding: 20px; background: #fafafa; }
+          .kpi-header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 15px; padding-bottom: 15px; border-bottom: 2px solid #e0e0e0; }
+          .kpi-title { font-size: 16px; font-weight: 700; color: #333; }
+          .kpi-subtitle { font-size: 13px; color: #666; margin-top: 5px; }
+          .perf-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
+          .stat-box { text-align: center; padding: 12px; background: white; border-radius: 6px; border: 1px solid #e0e0e0; }
+          .stat-label { font-size: 10px; color: #666; text-transform: uppercase; margin-bottom: 5px; }
+          .stat-value { font-size: 20px; font-weight: 700; }
+          .stat-value.current { color: #d32f2f; }
+          .stat-value.target { color: #4caf50; }
+          .stat-value.gap { color: #ff9800; }
+          .form-group { margin-bottom: 20px; }
+          label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; font-size: 13px; }
+          label .required { color: #d32f2f; }
+          textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; font-family: 'Segoe UI', sans-serif; box-sizing: border-box; min-height: 80px; resize: vertical; }
+          textarea:focus { border-color: #d32f2f; outline: none; box-shadow: 0 0 0 2px rgba(211,47,47,0.1); }
+          .help-text { font-size: 11px; color: #666; margin-top: 5px; font-style: italic; }
+          .submit-btn { background: #d32f2f; color: white; border: none; padding: 16px 40px; border-radius: 6px; font-size: 17px; font-weight: 700; cursor: pointer; width: 100%; margin-top: 20px; }
+          .submit-btn:hover { background: #b71c1c; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div style="font-size: 48px; margin-bottom: 15px;">⚠️</div>
+            <h1>Corrective Actions Required</h1>
+            <div class="badge">${actions.length} KPI${actions.length > 1 ? 's' : ''} Below Target - Week ${week}</div>
+          </div>
+
+          <div class="form-section">
+            <div class="info-box">
+              <strong>${responsible.name}</strong> • ${responsible.plant_name} • ${responsible.department_name}
+            </div>
+
+            <form action="/submit-bulk-corrective-actions" method="POST">
+              <input type="hidden" name="responsible_id" value="${responsible_id}">
+              <input type="hidden" name="week" value="${week}">
+
+              ${actions.map((action, index) => `
+                <div class="kpi-section">
+                  <input type="hidden" name="corrective_action_ids[]" value="${action.corrective_action_id}">
+                  
+                  <div class="kpi-header">
+                    <div>
+                      <div style="display:inline-block;width:30px;height:30px;background:#d32f2f;color:white;border-radius:50%;text-align:center;line-height:30px;font-weight:700;margin-right:10px;">${index + 1}</div>
+                      <div style="display:inline-block;vertical-align:top;">
+                        <div class="kpi-title">${action.indicator_title}</div>
+                        ${action.indicator_sub_title ? `<div class="kpi-subtitle">${action.indicator_sub_title}</div>` : ''}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="perf-stats">
+                    <div class="stat-box">
+                      <div class="stat-label">Current</div>
+                      <div class="stat-value current">${action.value || '0'} ${action.unit || ''}</div>
+                    </div>
+                    <div class="stat-box">
+                      <div class="stat-label">Target</div>
+                      <div class="stat-value target">${action.target_value || 'N/A'} ${action.unit || ''}</div>
+                    </div>
+                    <div class="stat-box">
+                      <div class="stat-label">Gap</div>
+                      <div class="stat-value gap">
+                        ${action.target_value ? (parseFloat(action.target_value) - parseFloat(action.value || 0)).toFixed(2) : 'N/A'} ${action.unit || ''}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="form-group">
+                    <label>Root Cause<span class="required">*</span></label>
+                    <textarea name="root_cause_${action.corrective_action_id}" required placeholder="Why did this KPI fall below target?">${action.root_cause || ''}</textarea>
+                  </div>
+
+                  <div class="form-group">
+                    <label>Implemented Solution<span class="required">*</span></label>
+                    <textarea name="solution_${action.corrective_action_id}" required placeholder="What actions have been taken?">${action.implemented_solution || ''}</textarea>
+                  </div>
+
+                  <div class="form-group">
+                    <label>Evidence<span class="required">*</span></label>
+                    <textarea name="evidence_${action.corrective_action_id}" required placeholder="What evidence shows improvement?">${action.evidence || ''}</textarea>
+                    <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
+                  </div>
+                </div>
+              `).join('')}
+
+              <button type="submit" class="submit-btn">
+                ✓ Submit All Corrective Actions (${actions.length})
+              </button>
+            </form>
+          </div>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error loading bulk corrective actions:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+// ========== SUBMIT BULK CORRECTIVE ACTIONS ==========
+app.post("/submit-bulk-corrective-actions", async (req, res) => {
+  try {
+    const { responsible_id, week, corrective_action_ids, ...formData } = req.body;
+
+    const ids = Array.isArray(corrective_action_ids)
+      ? corrective_action_ids
+      : [corrective_action_ids];
+
+    let completedCount = 0;
+
+    for (const caId of ids) {
+      const rootCause = formData[`root_cause_${caId}`];
+      const solution = formData[`solution_${caId}`];
+      const evidence = formData[`evidence_${caId}`];
+
+      if (rootCause && solution && evidence) {
+        await pool.query(
+          `UPDATE public.corrective_actions
+           SET root_cause = $1, 
+               implemented_solution = $2, 
+               evidence = $3,
+               status = 'Completed',
+               updated_date = NOW()
+           WHERE corrective_action_id = $4`,
+          [rootCause, solution, evidence, caId]
+        );
+        completedCount++;
+      }
+    }
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Corrective Actions Submitted</title>
+        <style>
+          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+          .success-container { background: white; padding: 50px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 600px; }
+          h1 { color: #4caf50; font-size: 32px; margin-bottom: 20px; }
+          .count { font-size: 48px; font-weight: 700; color: #4caf50; margin: 20px 0; }
+          p { font-size: 16px; color: #333; margin-bottom: 30px; line-height: 1.6; }
+          a { display: inline-block; padding: 14px 30px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 5px; }
+          a:hover { background: #005ea6; }
+        </style>
+      </head>
+      <body>
+        <div class="success-container">
+          <h1>✅ All Corrective Actions Submitted!</h1>
+          <div class="count">${completedCount}</div>
+          <p>
+            You have successfully completed all corrective actions for week ${week}.<br>
+            The quality team will review your submissions.
+          </p>
+
+          <a href="/corrective-actions-list?responsible_id=${responsible_id}">View Corrective Actions</a>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error submitting bulk corrective actions:", err);
+    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
+  }
+});
+// Generate consolidated corrective action email with ALL KPIs below target
+const generateConsolidatedCorrectiveActionEmail = ({ responsible, week, kpisWithActions }) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="utf-8"><title>Corrective Actions Required</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
+    <div style="max-width:700px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
+      
+      <!-- Header -->
+      <div style="text-align:center;margin-bottom:30px;">
+        <div style="width:90px;height:90px;margin:0 auto 15px;background:#ff9800;border-radius:50%;display:flex;align-items:center;justify-content:center;">
+          <span style="font-size:45px;">⚠️</span>
+        </div>
+        <h2 style="color:#d32f2f;font-size:24px;margin:0;">Corrective Actions Required</h2>
+        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Multiple KPIs Below Target</p>
+      </div>
+      
+      <!-- Responsible Info -->
+      <div style="background:#f8f9fa;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #d32f2f;">
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
+          <span style="color:#666;font-size:13px;">${responsible.name}</span>
+        </div>
+        <div style="margin-bottom:12px;">
+          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
+          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
+        </div>
+        <div>
+          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
+          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
+        </div>
+      </div>
+      
+      <!-- Summary Badge -->
+      <div style="background:#fff3e0;padding:15px;border-radius:6px;margin-bottom:25px;text-align:center;border:2px solid #ff9800;">
+        <span style="font-size:32px;font-weight:700;color:#d32f2f;">${kpisWithActions.length}</span>
+        <span style="font-size:14px;color:#666;display:block;margin-top:5px;">KPIs Requiring Corrective Action</span>
+      </div>
+      
+      <!-- KPIs List -->
+      <div style="margin-bottom:25px;">
+        <h3 style="color:#333;font-size:16px;margin-bottom:15px;border-bottom:2px solid #e0e0e0;padding-bottom:8px;">
+          📊 Performance Summary
+        </h3>
+        
+        ${kpisWithActions.map((kpi, index) => `
+        <div style="background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:15px;margin-bottom:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;">
+            <div style="flex:1;">
+              <div style="font-weight:600;color:#333;font-size:14px;margin-bottom:5px;">
+                ${index + 1}. ${kpi.indicator_title}
+              </div>
+              ${kpi.indicator_sub_title ? `
+              <div style="color:#666;font-size:12px;margin-bottom:8px;">
+                ${kpi.indicator_sub_title}
+              </div>
+              ` : ''}
+            </div>
+          </div>
+          
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;background:white;padding:12px;border-radius:4px;">
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Current</div>
+              <div style="font-size:18px;font-weight:700;color:#d32f2f;">${kpi.value} ${kpi.unit || ''}</div>
+            </div>
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Target</div>
+              <div style="font-size:18px;font-weight:700;color:#4caf50;">${kpi.target_value} ${kpi.unit || ''}</div>
+            </div>
+            <div style="text-align:center;">
+              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Gap</div>
+              <div style="font-size:18px;font-weight:700;color:#ff9800;">
+                ${(parseFloat(kpi.target_value) - parseFloat(kpi.value)).toFixed(2)} ${kpi.unit || ''}
+              </div>
+            </div>
+          </div>
+        </div>
+        `).join('')}
+      </div>
+      
+      <!-- Action Required Section -->
+      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
+        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">📝 What You Need To Do</h3>
+        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
+          <li>Click the button below to access the corrective action form</li>
+          <li>Document the root cause for each underperforming KPI</li>
+          <li>Describe the implemented solutions</li>
+          <li>Provide evidence of improvement actions</li>
+          <li><strong>Complete within 24 hours</strong></li>
+        </ul>
+      </div>
+      
+      <!-- CTA Button -->
+<div style="text-align:center;margin:30px 0;">
+  <a href="http://localhost:5000/corrective-actions-bulk?responsible_id=${responsible.responsible_id}&week=${week}"
+     style="display:inline-block;padding:16px 35px;background:#d32f2f;color:white;
+            border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;
+            box-shadow:0 4px 10px rgba(211,47,47,0.3);">
+    📝 Complete Corrective Actions (${kpisWithActions.length})
+  </a>
+</div>
+      
+      <!-- Footer -->
+      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
+        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
+          This is an automated alert from AVOCarbon KPI System<br>
+          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
+          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
+        </p>
+      </div>
+    </div>
+  </body>
+  </html>
+  `;
+};
+
+// Send consolidated corrective action email
+const sendConsolidatedCorrectiveActionEmail = async (responsibleId, week) => {
+  try {
+    // Get responsible info
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+      [responsibleId]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible) throw new Error("Responsible not found");
+
+    // Get all open corrective actions with KPI details
+    const actionsRes = await pool.query(
+      `SELECT ca.corrective_action_id, ca.kpi_id, ca.week,
+              k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
+              kv.value
+       FROM public.corrective_actions ca
+       JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
+       LEFT JOIN public.kpi_values kv ON ca.kpi_id = kv.kpi_id 
+         AND kv.responsible_id = ca.responsible_id 
+         AND kv.week = ca.week
+       WHERE ca.responsible_id = $1 
+         AND ca.week = $2 
+         AND ca.status = 'Open'
+       ORDER BY k.indicator_title`,
+      [responsibleId, week]
+    );
+
+    if (actionsRes.rows.length === 0) {
+      console.log(`No open corrective actions for responsible ${responsibleId}, week ${week}`);
+      return null;
+    }
+
+    const kpisWithActions = actionsRes.rows;
+
+    const html = generateConsolidatedCorrectiveActionEmail({
+      responsible,
+      week,
+      kpisWithActions
+    });
+
+    const transporter = createTransporter();
+    const info = await transporter.sendMail({
+      from: '"AVOCarbon Quality System" <administration.STS@avocarbon.com>',
+      to: responsible.email,
+      subject: `⚠️ ${kpisWithActions.length} Corrective Action${kpisWithActions.length > 1 ? 's' : ''} Required - Week ${week}`,
+      html,
+    });
+
+    console.log(`✅ Consolidated corrective action email sent to ${responsible.email} (${kpisWithActions.length} KPIs)`);
+    return info;
+  } catch (err) {
+    console.error(`❌ Failed to send consolidated corrective action email:`, err.message);
+    throw err;
+  }
+};
 
 
 // ---------- Redirect handler ----------
@@ -156,8 +1131,11 @@ app.get("/redirect", async (req, res) => {
         value: val,
       }));
 
+    // Arrays to collect updates
+    const targetUpdates = [];
+    let hasCorrectiveActions = false;
+
     for (let item of kpiValues) {
-      // 1️⃣ Get the old value
       const oldRes = await pool.query(
         `SELECT value, kpi_id FROM public."kpi_values" WHERE kpi_values_id = $1`,
         [item.kpi_values_id]
@@ -166,32 +1144,80 @@ app.get("/redirect", async (req, res) => {
       if (oldRes.rows.length) {
         const { value: old_value, kpi_id } = oldRes.rows[0];
 
-        // 2️⃣ Insert into history table
         await pool.query(
-          `
-          INSERT INTO public.kpi_values_hist26 
+          `INSERT INTO public.kpi_values_hist26 
           (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          `,
-          [
-            item.kpi_values_id,
-            responsible_id,
-            kpi_id,
-            week,
-            old_value,
-            item.value,
-          ]
+          VALUES ($1, $2, $3, $4, $5, $6)`,
+          [item.kpi_values_id, responsible_id, kpi_id, week, old_value, item.value]
         );
 
-        // 3️⃣ Update current value
         await pool.query(
           `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
           [item.value, item.kpi_values_id]
         );
+
+        // Get the latest hist_id
+        const histRes = await pool.query(
+          `SELECT hist_id FROM public.kpi_values_hist26 
+           WHERE kpi_values_id = $1 
+             AND responsible_id = $2 
+             AND kpi_id = $3 
+             AND week = $4
+           ORDER BY updated_at DESC LIMIT 1`,
+          [item.kpi_values_id, responsible_id, kpi_id, week]
+        );
+
+        // Check and trigger actions (collects updates but doesn't send emails)
+        if (histRes.rows.length > 0) {
+          const histId = histRes.rows[0].hist_id;
+          const result = await checkAndTriggerCorrectiveActions(responsible_id, kpi_id, week, item.value, histId);
+
+          // Collect target update if it happened
+          if (result.targetUpdated && result.updateInfo) {
+            targetUpdates.push(result.updateInfo);
+          }
+
+          // Check if corrective action was created
+          if (!result.targetUpdated) {
+            const caCheck = await pool.query(
+              `SELECT corrective_action_id FROM public.corrective_actions
+               WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3 AND status = 'Open'`,
+              [responsible_id, kpi_id, week]
+            );
+            if (caCheck.rows.length > 0) {
+              hasCorrectiveActions = true;
+            }
+          }
+        }
       }
     }
 
-    // 4️⃣ Instead of redirecting to dashboard, show success message
+    // ===== SEND ONE CONSOLIDATED EMAIL FOR TARGET UPDATES =====
+    if (targetUpdates.length > 0) {
+      await sendConsolidatedTargetUpdateEmail(responsible_id, week, targetUpdates);
+    }
+
+    // ===== SEND ONE CONSOLIDATED EMAIL FOR CORRECTIVE ACTIONS =====
+    if (hasCorrectiveActions) {
+      await sendConsolidatedCorrectiveActionEmail(responsible_id, week);
+    }
+
+    // Determine success message based on what happened
+    let successMessage = `<h1>✅ KPI Submitted Successfully!</h1>`;
+    let notifications = [];
+
+    if (targetUpdates.length > 0) {
+      notifications.push(`🎯 <strong>${targetUpdates.length} KPI target${targetUpdates.length > 1 ? 's' : ''} updated</strong> - You will receive a consolidated email`);
+    }
+
+    if (hasCorrectiveActions) {
+      notifications.push(`⚠️ <strong>Corrective actions required</strong> - You will receive a consolidated email`);
+    }
+
+    if (notifications.length === 0) {
+      notifications.push(`📊 All KPIs are within targets`);
+    }
+
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -214,18 +1240,60 @@ app.get("/redirect", async (req, res) => {
             border-radius:10px; 
             box-shadow:0 4px 15px rgba(0,0,0,0.1);
             text-align:center;
+            max-width:600px;
           }
           h1 { color:#28a745; font-size:28px; margin-bottom:20px; }
-          p { font-size:16px; color:#333; margin-bottom:30px; }
-          a { display:inline-block; padding:12px 25px; background:#0078D7; color:white; text-decoration:none; border-radius:6px; font-weight:bold; }
-          a:hover { background:#005ea6; }
+          p { font-size:16px; color:#333; margin-bottom:10px; }
+          .notifications {
+            background:#f8f9fa;
+            padding:20px;
+            border-radius:8px;
+            margin:20px 0;
+            text-align:left;
+          }
+          .notification-item {
+            display:flex;
+            align-items:center;
+            margin:10px 0;
+            padding:10px;
+            background:white;
+            border-radius:6px;
+          }
+          .notification-icon {
+            font-size:20px;
+            margin-right:10px;
+          }
+          .notification-text {
+            flex:1;
+          }
+          .btn {
+            display:inline-block;
+            padding:12px 25px;
+            background:#0078D7;
+            color:white;
+            text-decoration:none;
+            border-radius:6px;
+            font-weight:bold;
+            margin:5px;
+          }
+          .btn:hover { background:#005ea6; }
         </style>
       </head>
       <body>
         <div class="success-container">
-          <h1>✅ KPI Submitted Successfully!</h1>
+          ${successMessage}
           <p>Your KPI values for ${week} have been saved.</p>
-          <a href="/dashboard?responsible_id=${responsible_id}">Go to Dashboard</a>
+          
+          <div class="notifications">
+            <p><strong>📧 Email Notifications:</strong></p>
+            ${notifications.map(notif => `
+              <div class="notification-item">
+                <div class="notification-text">${notif}</div>
+              </div>
+            `).join('')}
+          </div>
+          
+          <a href="/dashboard?responsible_id=${responsible_id}" class="btn">Go to Dashboard</a>
         </div>
       </body>
       </html>
@@ -240,8 +1308,8 @@ app.get("/redirect", async (req, res) => {
   }
 });
 
-
 // ---------- Modern Web  page ----------
+// ---------- Modern KPI Form with Loading Spinner ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -351,6 +1419,8 @@ app.get("/form", async (req, res) => {
             outline: none;
             box-shadow: 0 0 0 2px rgba(0,120,215,0.1);
           }
+          
+          /* Submit Button Styles */
           .submit-btn {
             background: #0078D7;
             color: white;
@@ -360,27 +1430,112 @@ app.get("/form", async (req, res) => {
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
-            transition: background-color 0.2s;
-            display: block;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             width: 100%;
             margin-top: 20px;
+            min-height: 48px;
+            gap: 10px;
           }
-          .submit-btn:hover {
+          .submit-btn:hover:not(:disabled) {
             background: #005ea6;
           }
+          .submit-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            opacity: 0.8;
+          }
+          
+          /* Loading Spinner */
+          .spinner {
+            display: none;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+          }
+          
+          .submit-text {
+            display: block;
+          }
+          
+          .submitting .spinner {
+            display: block;
+          }
+          
+          .submitting .submit-text {
+            display: none;
+          }
+          
+          @keyframes spin {
+            to { transform: rotate(360deg); }
+          }
+          
           .unit-label {
             color: #888;
             font-size: 12px;
             margin-top: 5px;
           }
+          
+          /* Overlay for preventing interaction */
+          .form-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            backdrop-filter: blur(3px);
+          }
+          
+          .overlay-spinner {
+            width: 60px;
+            height: 60px;
+            border: 5px solid #f3f3f3;
+            border-radius: 50%;
+            border-top-color: #0078D7;
+            animation: spin 1s linear infinite;
+          }
+          
+          .overlay-message {
+            margin-top: 20px;
+            color: #0078D7;
+            font-weight: 600;
+            font-size: 18px;
+          }
+          
+          .overlay-submessage {
+            margin-top: 10px;
+            color: #666;
+            font-size: 14px;
+            max-width: 300px;
+            text-align: center;
+          }
         </style>
       </head>
       <body>
+        <!-- Loading Overlay -->
+        <div class="form-overlay" id="loadingOverlay">
+          <div style="text-align: center;">
+            <div class="overlay-spinner"></div>
+            <div class="overlay-message" id="overlayMessage">Submitting KPI Values...</div>
+            <div class="overlay-submessage" id="overlaySubmessage">Please wait while we process your submission</div>
+          </div>
+        </div>
+        
         <div class="container">
           <div class="header">
-          <h2 style="color:#0078D7;font-size:22px;margin-bottom:5px;">
-             KPI Submission - ${week}
-           </h2>
+            <h2 style="color:#0078D7;font-size:22px;margin-bottom:5px;">
+              KPI Submission - ${week}
+            </h2>
           </div>
           
           <div class="form-section">
@@ -405,7 +1560,7 @@ app.get("/form", async (req, res) => {
 
             <div class="kpi-section">
               <h3>KPI Values</h3>
-              <form action="/redirect" method="GET">
+              <form id="kpiForm" action="/redirect" method="GET">
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
                 <input type="hidden" name="week" value="${week}" />
                 ${kpis.map(kpi => `
@@ -418,15 +1573,237 @@ app.get("/form", async (req, res) => {
                       value="${kpi.value || ''}" 
                       placeholder="Enter value" 
                       class="kpi-input"
+                      required
                     />
                     ${kpi.unit ? `<div class="unit-label">Unit: ${kpi.unit}</div>` : ''}
                   </div>
                 `).join('')}
-                <button type="submit" class="submit-btn">Submit KPI Values</button>
+                <button type="submit" id="submitBtn" class="submit-btn">
+                  <span class="spinner" id="buttonSpinner"></span>
+                  <span class="submit-text" id="submitText">Submit KPI Values</span>
+                </button>
               </form>
             </div>
           </div>
         </div>
+        
+        <script>
+          document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('kpiForm');
+            const submitBtn = document.getElementById('submitBtn');
+            const buttonSpinner = document.getElementById('buttonSpinner');
+            const submitText = document.getElementById('submitText');
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const overlayMessage = document.getElementById('overlayMessage');
+            const overlaySubmessage = document.getElementById('overlaySubmessage');
+            let isSubmitting = false;
+            
+            // Validate all inputs are filled before submission
+            function validateForm() {
+              const inputs = form.querySelectorAll('.kpi-input');
+              let allValid = true;
+              
+              inputs.forEach(input => {
+                const value = input.value.trim();
+                if (!value || isNaN(parseFloat(value))) {
+                  allValid = false;
+                  input.style.borderColor = '#dc3545';
+                  input.style.boxShadow = '0 0 0 2px rgba(220, 53, 69, 0.1)';
+                } else {
+                  input.style.borderColor = '#ddd';
+                  input.style.boxShadow = '';
+                }
+              });
+              
+              return allValid;
+            }
+            
+            // Show loading state
+            function showLoading() {
+              isSubmitting = true;
+              submitBtn.disabled = true;
+              submitBtn.classList.add('submitting');
+              loadingOverlay.style.display = 'flex';
+            }
+            
+            // Hide loading state
+            function hideLoading() {
+              isSubmitting = false;
+              submitBtn.disabled = false;
+              submitBtn.classList.remove('submitting');
+              loadingOverlay.style.display = 'none';
+              overlayMessage.textContent = 'Submitting KPI Values...';
+              overlayMessage.style.color = '#0078D7';
+              overlaySubmessage.textContent = 'Please wait while we process your submission';
+            }
+            
+            // Show error state
+            function showError(message) {
+              overlayMessage.textContent = 'Submission Failed';
+              overlayMessage.style.color = '#dc3545';
+              overlaySubmessage.textContent = message;
+              
+              // Change button to retry state
+              submitBtn.innerHTML = '<span class="submit-text">Retry Submission</span>';
+              submitBtn.style.background = '#dc3545';
+              submitBtn.disabled = false;
+              submitBtn.classList.remove('submitting');
+              
+              // Re-enable inputs
+              const inputs = form.querySelectorAll('input');
+              inputs.forEach(input => {
+                input.disabled = false;
+              });
+              
+              // Auto-hide overlay after 5 seconds
+              setTimeout(() => {
+                hideLoading();
+                submitBtn.innerHTML = '<span class="spinner" id="buttonSpinner"></span><span class="submit-text" id="submitText">Submit KPI Values</span>';
+                submitBtn.style.background = '#0078D7';
+                // Re-attach event listeners
+                buttonSpinner = document.getElementById('buttonSpinner');
+                submitText = document.getElementById('submitText');
+              }, 5000);
+            }
+            
+            form.addEventListener('submit', function(e) {
+              e.preventDefault();
+              
+              if (isSubmitting) {
+                console.log('Already submitting, ignoring click');
+                return false;
+              }
+              
+              // Validate form
+              if (!validateForm()) {
+                // Show error in overlay instead of alert
+                loadingOverlay.style.display = 'flex';
+                overlayMessage.textContent = 'Validation Error';
+                overlayMessage.style.color = '#dc3545';
+                overlaySubmessage.textContent = 'Please fill in all KPI values with valid numbers';
+                
+                // Hide overlay after 3 seconds
+                setTimeout(() => {
+                  loadingOverlay.style.display = 'none';
+                }, 3000);
+                return false;
+              }
+              
+              // Show loading state IMMEDIATELY
+              showLoading();
+              
+              // Get form data
+              const formData = new FormData(form);
+              const params = new URLSearchParams();
+              
+              // Add all form data to params
+              for (const [key, value] of formData.entries()) {
+                params.append(key, value);
+              }
+              
+              // Store submission time in localStorage to prevent back-button resubmission
+              const submissionId = 'kpi_submission_' + Date.now();
+              localStorage.setItem('last_kpi_submission', submissionId);
+              
+              // Disable all inputs
+              const inputs = form.querySelectorAll('input');
+              inputs.forEach(input => {
+                input.disabled = true;
+              });
+              
+              // Show processing message
+              overlayMessage.textContent = 'Processing submission...';
+              overlaySubmessage.textContent = 'Saving your KPI values to the database';
+              
+              // Submit the form programmatically
+              fetch(form.action + '?' + params.toString(), {
+                method: 'GET',
+                headers: {
+                  'Accept': 'text/html'
+                }
+              })
+              .then(response => {
+                if (response.ok) {
+                  return response.text();
+                }
+                throw new Error('Network response was not ok. Status: ' + response.status);
+              })
+              .then(html => {
+                // Replace entire page with response
+                document.open();
+                document.write(html);
+                document.close();
+              })
+              .catch(error => {
+                console.error('Error:', error);
+                showError(error.message || 'Network error. Please check your connection and try again.');
+              });
+              
+              return false;
+            });
+            
+            // Clear validation on input
+            const inputs = form.querySelectorAll('.kpi-input');
+            inputs.forEach(input => {
+              input.addEventListener('input', function() {
+                this.style.borderColor = '#ddd';
+                this.style.boxShadow = '';
+              });
+              
+              // Allow only numbers and decimals
+              input.addEventListener('keypress', function(e) {
+                const charCode = e.which ? e.which : e.keyCode;
+                if (charCode === 46) {
+                  // Allow decimal point if not already present
+                  if (this.value.indexOf('.') > -1) {
+                    e.preventDefault();
+                  }
+                  return;
+                }
+                if (charCode < 48 || charCode > 57) {
+                  e.preventDefault();
+                }
+              });
+              
+              // Also allow paste and validate
+              input.addEventListener('paste', function(e) {
+                setTimeout(() => {
+                  const value = this.value;
+                  // Remove any non-numeric characters except decimal point
+                  this.value = value.replace(/[^0-9.]/g, '');
+                  // Ensure only one decimal point
+                  const parts = this.value.split('.');
+                  if (parts.length > 2) {
+                    this.value = parts[0] + '.' + parts.slice(1).join('');
+                  }
+                }, 0);
+              });
+            });
+            
+            // Prevent form resubmission on page refresh/back
+            if (localStorage.getItem('last_kpi_submission')) {
+              const lastSubmission = localStorage.getItem('last_kpi_submission');
+              const submissionTime = parseInt(lastSubmission.split('_')[2]);
+              const now = Date.now();
+              
+              // If submission was less than 30 seconds ago, disable form
+              if (now - submissionTime < 30000) {
+                submitBtn.disabled = true;
+                submitBtn.innerHTML = '<span class="submit-text">Already Submitted (Please wait 30 seconds)</span>';
+                submitBtn.style.background = '#6c757d';
+                
+                setTimeout(() => {
+                  localStorage.removeItem('last_kpi_submission');
+                  submitBtn.disabled = false;
+                  submitBtn.innerHTML = '<span class="spinner" id="buttonSpinner"></span><span class="submit-text" id="submitText">Submit KPI Values</span>';
+                  submitBtn.style.background = '#0078D7';
+                }, 30000);
+              } else {
+                localStorage.removeItem('last_kpi_submission');
+              }
+            }
+          });
+        </script>
       </body>
       </html>
     `);
@@ -434,7 +1811,6 @@ app.get("/form", async (req, res) => {
     res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
-
 // ---------- Modern Dashboard by Week ----------
 app.get("/dashboard", async (req, res) => {
   try {
@@ -556,7 +1932,7 @@ app.get("/dashboard", async (req, res) => {
             hour: '2-digit',
             minute: '2-digit'
           }) : '';
-          
+
           html += `
             <div class="kpi-card">
               <div class="kpi-title">${kpi.indicator_title}</div>
@@ -670,8 +2046,8 @@ app.get("/dashboard-history", async (req, res) => {
             </thead>
             <tbody>
               ${rows
-                .map(
-                  (r) => `
+        .map(
+          (r) => `
                   <tr>
                     <td>${r.indicator_title}</td>
                     <td>${r.indicator_sub_title || "-"}</td>
@@ -681,8 +2057,8 @@ app.get("/dashboard-history", async (req, res) => {
                     <td>${r.unit || ""}</td>
                     <td>${new Date(r.updated_at).toLocaleString()}</td>
                   </tr>`
-                )
-                .join("")}
+        )
+        .join("")}
             </tbody>
           </table>
         </div>
@@ -715,10 +2091,9 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email ----------
-// ---------- Schedule weekly email ----------
-// ---------- Schedule weekly email ----------
+
 cron.schedule(
-  "30 8 * * 1",
+  "16 9 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
@@ -758,239 +2133,465 @@ cron.schedule(
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
-  const { title, subtitle, unit, data, weekLabels, currentWeek, stats } = chartData;
+  const {
+    title,
+    subtitle,
+    unit,
+    data,
+    weekLabels,
+    currentWeek,
+    stats,
+    target,
+    min,
+    max
+  } = chartData;
 
-  // Ensure we have data
-  if (!data || data.length === 0 || data.every(val => val <= 0)) {
+  // ✅ Clean values - handle "None" strings from database
+  const cleantarget = target !== null && target !== undefined && target !== 'None' && !isNaN(parseFloat(target)) ? parseFloat(target) : null;
+  const cleanMin = min !== null && min !== undefined && min !== 'None' && !isNaN(parseFloat(min)) ? parseFloat(min) : null;
+  const cleanMax = max !== null && max !== undefined && max !== 'None' && !isNaN(parseFloat(max)) ? parseFloat(max) : null;
+
+  // ✅ FIX: Check if data is valid and has actual values
+  const validData = data ? data.filter(val => val !== null && val !== undefined && !isNaN(parseFloat(val)) && parseFloat(val) > 0) : [];
+
+  if (!data || data.length === 0 || validData.length === 0) {
     return `
-      <div style="margin: 20px 0; background: white; border-radius: 8px; padding: 20px; border: 1px solid #e0e0e0;">
-        <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
-        ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
-        <p style="margin: 15px 0; color: #999; font-size: 14px;">No data available for chart display</p>
+      <table border="0" cellpadding="20" cellspacing="0" width="100%" style="margin: 20px 0; background: white; border-radius: 8px; border: 1px solid #e0e0e0;">
+        <tr><td>
+          <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
+          ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
+          <p style="margin: 15px 0; color: #999; font-size: 14px;">No data available</p>
+        </td></tr>
+      </table>
+    `;
+  }
+
+  // ✅ FIX: Safely get current value
+  const currentValue = validData.length > 0 ? validData[validData.length - 1] : 0;
+  const valueVstargetRatio = cleantarget && cleantarget > 0 ? currentValue / cleantarget : 0;
+  const isValueExtremelySmall = valueVstargetRatio < 0.01;
+
+  // ✅ HELPER: Format large numbers for display
+  const formatLargeNumber = (num) => {
+    if (num === null || num === undefined || isNaN(num)) return 'N/A';
+    if (num >= 1000000) {
+      return (num / 1000000).toFixed(num % 1000000 === 0 ? 0 : 1) + 'M';
+    }
+    if (num >= 1000) {
+      return (num / 1000).toFixed(num % 1000 === 0 ? 0 : 1) + 'k';
+    }
+    if (num < 1) return num.toFixed(2);
+    if (num < 10) return num.toFixed(1);
+    return num.toFixed(num % 1 === 0 ? 0 : 1);
+  };
+
+  //  UPDATED: Calculate Y-axis scaling with null checks
+  const calculateYAxisScaling = () => {
+    // Get all values that need to be displayed
+    const allValues = [...validData];
+    if (cleantarget !== null && cleantarget > 0) allValues.push(cleantarget);
+    if (cleanMin !== null && cleanMin > 0) allValues.push(cleanMin);
+    if (cleanMax !== null && cleanMax > 0) allValues.push(cleanMax);
+
+    if (allValues.length === 0) {
+      return {
+        maxValue: 10,
+        interval: 2,
+        numSteps: 5,
+        useDualScale: false
+      };
+    }
+
+    const dataMax = Math.max(...allValues);
+    const dataMin = Math.min(...allValues.filter(v => v > 0));
+
+    // ✅ CRITICAL FIX: If value is extremely small compared to target
+    if (isValueExtremelySmall && cleantarget && cleantarget > 0) {
+      const valueBasedMax = Math.max(dataMax * 2, 10);
+      return {
+        maxValue: valueBasedMax,
+        interval: valueBasedMax / 4,
+        numSteps: 4,
+        useDualScale: true,
+        targetValue: cleantarget
+      };
+    }
+
+    // Normal scaling for regular cases
+    if (!cleantarget || cleantarget <= 0) {
+      const numSteps = 5;
+      const interval = Math.max(1, Math.ceil(dataMax / numSteps));
+      const maxValue = interval * numSteps;
+      return { maxValue, interval, numSteps, useDualScale: false };
+    }
+
+    const targetNum = cleantarget;
+
+    // Determine scaling based on target value
+    if (targetNum <= 10) {
+      return {
+        maxValue: Math.max(dataMax, Math.ceil(targetNum * 1.2)),
+        interval: Math.ceil(targetNum / 3),
+        numSteps: 3,
+        useDualScale: false
+      };
+    }
+
+    if (targetNum <= 50) {
+      const rounded = Math.max(dataMax, Math.ceil(targetNum / 5) * 5);
+      return {
+        maxValue: rounded,
+        interval: rounded / 4,
+        numSteps: 4,
+        useDualScale: false
+      };
+    }
+
+    if (targetNum <= 200) {
+      const rounded = Math.max(dataMax, Math.ceil(targetNum / 20) * 20);
+      return {
+        maxValue: rounded,
+        interval: rounded / 4,
+        numSteps: 4,
+        useDualScale: false
+      };
+    }
+
+    if (targetNum <= 1000) {
+      const rounded = Math.max(dataMax, Math.ceil(targetNum / 100) * 100);
+      return {
+        maxValue: rounded,
+        interval: rounded / 4,
+        numSteps: 4,
+        useDualScale: false
+      };
+    }
+
+    // For very large targets
+    const rounded = Math.max(dataMax, Math.ceil(targetNum / 500) * 500);
+    return {
+      maxValue: rounded,
+      interval: rounded / 3,
+      numSteps: 3,
+      useDualScale: false
+    };
+  };
+
+  // Calculate scaling
+  const scaling = calculateYAxisScaling();
+  const { maxValue, interval, numSteps, useDualScale } = scaling;
+  const chartHeight = 180;
+  const segmentHeight = chartHeight / numSteps;
+
+  // ✅ IMPROVED: Generate Y-axis with special handling for small values
+  const generateYAxis = () => {
+    let yAxis = '';
+
+    for (let i = numSteps; i >= 0; i--) {
+      const value = i * interval;
+      let displayValue = formatLargeNumber(value);
+
+      // Special indicator for extremely small values
+      if (useDualScale && i === numSteps && cleantarget) {
+        displayValue += ` (target: ${formatLargeNumber(cleantarget)})`;
+      }
+
+      const tolerance = interval / 2;
+      let indicators = '';
+
+      if (cleantarget && Math.abs(value - cleantarget) < tolerance) indicators += ' ';
+      if (cleanMax && Math.abs(value - cleanMax) < tolerance) indicators += ' 📈';
+      if (cleanMin && Math.abs(value - cleanMin) < tolerance) indicators += ' 📉';
+
+      yAxis += `
+        <tr>
+          <td height="${segmentHeight}" valign="top" align="right" 
+              style="font-size: 10px; color: #666; padding-right: 8px;">
+            ${displayValue}${indicators}
+          </td>
+        </tr>
+      `;
+    }
+
+    // Add a note for extremely small values
+    if (useDualScale) {
+      yAxis += `
+        <tr>
+          <td height="20" valign="top" align="right" 
+              style="font-size: 8px; color: #ff9800; padding-right: 8px; font-style: italic;">
+            * Value scale ≠ target scale
+          </td>
+        </tr>
+      `;
+    }
+
+    return yAxis;
+  };
+
+  // ✅ IMPROVED: Calculate segment positions with minimum bar height
+  const getSegmentForValue = (value) => {
+    if (!value || value <= 0 || isNaN(value)) return -1;
+    return Math.round((parseFloat(value) / maxValue) * numSteps);
+  };
+
+  const targetSegment = getSegmentForValue(cleantarget);
+  const maxSegment = cleanMax !== null ? getSegmentForValue(cleanMax) : -1;
+  const minSegment = getSegmentForValue(cleanMin);
+
+  // ✅ CRITICAL FIX: Calculate bar heights with MINIMUM VISIBLE HEIGHT
+  const barSegmentHeights = data.map(value => {
+    if (!value || value <= 0 || isNaN(value)) return 0;
+
+    let segmentHeightRatio = (value / maxValue) * numSteps;
+
+    // ENSURE MINIMUM VISIBLE HEIGHT: At least 2 segments for any non-zero value
+    if (segmentHeightRatio < 0.5 && value > 0) {
+      segmentHeightRatio = 0.5;
+    }
+
+    return Math.max(1, Math.round(segmentHeightRatio));
+  });
+
+  // ✅ UPDATED: Determine bar colors
+  const getBarColor = (value) => {
+    return '#0078D7';  // Sky blue (you can replace with any hex)
+  };
+  //  UPDATED: Generate chart with visible bars
+  const generateChart = () => {
+    let chart = '';
+
+    // Start from one segment above max to show values, go down to 0 (X-axis)
+    for (let seg = numSteps + 1; seg >= 0; seg--) {
+      const hastarget = seg === targetSegment;
+      const hasMax = cleanMax !== null && seg === maxSegment && cleanMax !== cleantarget;
+      const hasMin = seg === minSegment;
+      const hasLine = hastarget || hasMax || hasMin;
+
+      // 🎯 Set dashed line color based on threshold type
+      let lineColor = '';
+      let lineStyle = '';
+      if (hasLine) {
+        lineStyle = '2px dashed';
+        if (hastarget) lineColor = '#28a745';      // Green for target
+        else if (hasMax) lineColor = '#ff9800';    // Orange for Max
+        else if (hasMin) lineColor = '#dc3545';    // Red for Min
+      }
+
+      chart += '<tr>';
+
+      data.forEach((value, idx) => {
+        const barHeight = barSegmentHeights[idx];
+        const barColor = getBarColor(value);
+        const isExtremelySmall = value > 0 && value < (maxValue * 0.01);
+
+        let cellContent = '';
+        let cellBorder = '';
+
+        if (hasLine) {
+          cellBorder = `border-top: ${lineStyle} ${lineColor};`;
+        }
+
+        // Top area: value label
+        if (seg === barHeight + 1 && barHeight > 0) {
+          const displayVal = formatLargeNumber(value);
+          cellContent = `
+          <table border="0" cellpadding="2" cellspacing="0" width="100%">
+            <tr><td align="center" style="font-size: 10px; font-weight: bold; color: #333;">
+              ${displayVal}
+            </td></tr>
+          </table>
+        `;
+        }
+        else if (seg > 0 && seg <= barHeight) {
+          const actualBarHeight = Math.max(segmentHeight, 4);
+          cellContent = `
+          <table border="0" cellpadding="0" cellspacing="0" width="60" align="center">
+            <tr>
+              <td height="${actualBarHeight}" 
+                  style="background-color: ${barColor}; 
+                         border: none; 
+                         padding: 0; 
+                         margin: 0; 
+                         font-size: 1px; 
+                         line-height: ${actualBarHeight}px;
+                         ${isExtremelySmall ? 'border: 1px solid #ff9800;' : ''}">
+                &nbsp;
+              </td>
+            </tr>
+          </table>
+        `;
+          if (isExtremelySmall && seg === 1) {
+            cellContent += `
+            <div style="position: relative; top: -2px; text-align: center;">
+              <div style="display: inline-block; width: 6px; height: 6px; background: #ff9800; border-radius: 50%;"></div>
+            </div>
+          `;
+          }
+        }
+        else if (seg === 0) {
+          const w = weekLabels[idx] || `W${idx + 1}`;
+          cellContent = `
+          <table border="0" cellpadding="2" cellspacing="0" width="100%">
+            <tr><td align="center" style="font-size: 10px; color: #666; padding-top: 6px;">
+              ${w}
+            </td></tr>
+          </table>
+        `;
+        }
+
+        chart += `
+        <td align="center" width="${100 / data.length}%" 
+            style="padding: 0 4px; vertical-align: middle; ${cellBorder} 
+                   height: ${seg >= 0 ? segmentHeight : 'auto'}px; 
+                   line-height: 0; font-size: 0;
+                   position: relative;">
+          ${cellContent}
+        </td>
+      `;
+      });
+
+      chart += '</tr>';
+    }
+
+    return chart;
+  };
+
+  // Add warning for extremely small values
+  let smallValueWarning = '';
+  if (isValueExtremelySmall && cleantarget) {
+    smallValueWarning = `
+      <div style="margin: 10px 0; padding: 10px; background: #fff3cd; border-radius: 6px; border-left: 4px solid #ffc107;">
+        <div style="font-size: 12px; color: #856404; font-weight: 600; margin-bottom: 5px;">
+          ⚠️ Note: Current value (${formatLargeNumber(currentValue)}) is very small compared to target (${formatLargeNumber(cleantarget)})
+        </div>
       </div>
     `;
   }
 
-  // Find max value for scaling
-  const maxValue = Math.max(...data.filter(val => val > 0)) * 1.1;
-  const maxBarHeight = 150; // Maximum height in pixels
+  // ✅ FIX: Safely format stats values
+  const safeStats = {
+    current: stats && stats.current ? formatNumber(stats.current) : 'N/A',
+    average: stats && stats.average ? formatNumber(stats.average) : 'N/A',
+    trend: stats && stats.trend ? stats.trend : '0.0%',
+    dataPoints: stats && stats.dataPoints ? stats.dataPoints : data.length
+  };
 
+  // ✅ Return HTML with visible bars
   return `
-    <!-- Outlook-compatible Bar Chart -->
-    <div style="margin: 20px 0; background: white; border-radius: 8px; padding: 20px; border: 1px solid #e0e0e0; font-family: Arial, sans-serif;">
-      <!-- Chart Header -->
-      <div style="margin-bottom: 20px;">
-        <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
-        ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
-        ${unit ? `<p style="margin: 5px 0 0 0; color: #888; font-size: 12px;">Unit: ${unit}</p>` : ''}
-      </div>
-      
-      <!-- HTML Table Bar Chart -->
-      <div style="margin: 20px 0;">
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse;">
-          <!-- Y-axis labels and bars -->
-          <tr>
-            <td width="40" valign="bottom" style="border-right: 1px solid #ccc; border-bottom: 1px solid #ccc; padding-right: 10px; text-align: right;">
-              <div style="height: ${maxBarHeight}px; position: relative;">
-                ${[1, 0.75, 0.5, 0.25, 0].map((percent, i) => {
-    const value = (percent * maxValue).toFixed(0);
-    const top = (1 - percent) * maxBarHeight;
-    return `
-                    <div style="position: absolute; top: ${top}px; right: 0; transform: translateY(-50%); font-size: 10px; color: #666;">
-                      ${value}
-                    </div>
-                  `;
-  }).join('')}
-              </div>
-            </td>
-            
-            <!-- Bars -->
-            <td valign="bottom" style="border-bottom: 1px solid #ccc; padding-left: 15px;">
-              <table border="0" cellpadding="0" cellspacing="15" width="100%" style="border-collapse: separate;">
-                <tr>
-                  ${data.map((value, index) => {
-    if (value <= 0) {
-      return `
-                        <td valign="bottom" align="center" style="width: ${100 / data.length}%;">
-                          <div style="width: 30px; height: 5px; background-color: #f0f0f0; margin: 0 auto;"></div>
-                          <div style="font-size: 11px; color: #999; margin-top: 8px; text-align: center;">
-                            ${weekLabels[index] || `M${index + 1}`}
-                          </div>
-                          ${index === data.length - 1 ? `
-                            <div style="font-size: 10px; color: #999; margin-top: 2px; text-align: center;">
-                              (No data)
-                            </div>
-                          ` : ''}
-                        </td>
-                      `;
-    }
-
-    const barHeight = (value / maxValue) * maxBarHeight;
-    const isCurrent = index === data.length - 1;
-    const barColor = isCurrent ? '#4CAF50' : '#2196F3';
-
-    return `
-                      <td valign="bottom" align="center" style="width: ${100 / data.length}%;">
-                        <!-- Bar container -->
-                        <div style="position: relative; height: ${maxBarHeight}px;">
-                          <!-- Bar -->
-                          <div style="
-                            position: absolute;
-                            bottom: 0;
-                            left: 50%;
-                            transform: translateX(-50%);
-                            width: 30px;
-                            height: ${barHeight}px;
-                            background-color: ${barColor};
-                            border-radius: 2px;
-                          "></div>
-                          
-                          <!-- Value on top -->
-                          <div style="
-                            position: absolute;
-                            bottom: ${barHeight}px;
-                            left: 50%;
-                            transform: translateX(-50%);
-                            font-size: 11px;
-                            font-weight: bold;
-                            color: #333;
-                            white-space: nowrap;
-                            margin-bottom: 5px;
-                          ">
-                            ${value.toFixed(value >= 100 ? 0 : 2)}
-                          </div>
-                        </div>
-                        
-                        <!-- Month label -->
-                        <div style="font-size: 11px; color: #666; margin-top: 8px; text-align: center;">
-                          ${weekLabels[index] || `M${index + 1}`}
-                        </div>
-                        
-                        <!-- Current indicator -->
-                        ${isCurrent ? `
-                          <div style="font-size: 10px; color: #4CAF50; font-weight: 600; margin-top: 2px; text-align: center;">
-                            Current
-                          </div>
-                        ` : ''}
-                      </td>
-                    `;
-  }).join('')}
-                </tr>
-              </table>
-            </td>
-          </tr>
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin: 20px 0; background: white; border-radius: 8px; border: 1px solid #e0e0e0; font-family: Arial, sans-serif;">
+      <tr><td style="padding: 20px;">
+        
+        <!-- Header -->
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
+          <tr><td>
+            <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
+            ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
+            ${unit ? `<p style="margin: 5px 0 0 0; color: #888; font-size: 12px;">Unit: ${unit}</p>` : ''}
           
-          <!-- X-axis -->
-          <tr>
-            <td style="height: 20px;"></td>
-            <td></td>
-          </tr>
+          </td></tr>
         </table>
-      </div>
-      
-      <!-- Stats Section - Updated to match your image -->
-      <div style="background: #3880c7ff; border-radius: 6px; padding: 15px; margin-top: 20px;">
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse;">
-          <tr>
-            <!-- CURRENT VALUE -->
-            <td width="25%" align="center" style="border-right: 1px solid #e0e0e0; padding: 10px;">
-              <div style="font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;">
-                CURRENT VALUE
-              </div>
-              <div style="font-size: 20px; font-weight: 700; color: #4CAF50; margin-bottom: 3px;">
-                ${stats.current}
-              </div>
-              <div style="font-size: 10px; color: #999;">
-                ${currentWeek.replace('2026-Week', 'Week ') || 'Current'}
-              </div>
-            </td>
-            
-            <!-- AVERAGE -->
-         <td width="25%" align="center" style="border-right: 1px solid #ad9f9cff; padding: 10px; background: #764ba2; border-radius: 12px;">
-           <div style="font-size: 11px; color: rgba(255, 255, 255, 0.85); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; font-weight: 600;">
-            AVERAGE
-             </div>
-          <div style="font-size: 20px; font-weight: 700; color: #ffffff; margin-bottom: 3px;">
-             ${stats.average}
-             </div>
-           <div style="font-size: 10px; color: rgba(255, 255, 255, 0.7);">
-              ${stats.dataPoints || data.length} period${stats.dataPoints !== 1 ? 's' : ''}
-            </div>
-           </td>
-            
-            <!-- MAXIMUM -->
-            <td width="25%" align="center" style="border-right: 1px solid #e0e0e0; padding: 10px;">
-              <div style="font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;">
-                MAXIMUM
-              </div>
-              <div style="font-size: 20px; font-weight: 700; color: #FF9800; margin-bottom: 3px;">
-                ${stats.max}
-              </div>
-              <div style="font-size: 10px; color: #999;">
-                Peak Performance
-              </div>
-            </td>
-            
-            <!-- TREND -->
-            <td width="25%" align="center" style="padding: 10px;">
-              <div style="font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;">
-                TREND
-              </div>
-              <div style="font-size: 20px; font-weight: 700; color: ${stats.trend.startsWith('-') ? '#F44336' : '#4CAF50'}; margin-bottom: 3px;">
-                ${stats.trend}
-              </div>
-              <div style="font-size: 10px; color: #999;">
-                Week over week
-              </div>
-            </td>
-          </tr>
+
+     <!-- Target / Max / Min summary line - CENTERED -->
+     <table border="0" cellpadding="0" cellspacing="0" align="center" style="margin-bottom: 15px;">
+     <tr>
+      ${cleantarget !== null ? `
+      <td style="font-size: 12px; padding: 0 10px;">
+      <span style="font-weight: 600; color: #28a745;">Target:</span> ${formatLargeNumber(cleantarget)}
+      </td>` : ''}
+      ${cleanMax !== null ? `
+      <td style="font-size: 12px; padding: 0 10px;">
+       <span style="font-weight: 600; color: #ff9800;">Max:</span> ${formatLargeNumber(cleanMax)}
+       </td>` : ''}
+      ${cleanMin !== null ? `
+       <td style="font-size: 12px; padding: 0 10px;">
+       <span style="font-weight: 600; color: #dc3545;">Min:</span> ${formatLargeNumber(cleanMin)}
+       </td>` : ''}
+        </tr>
         </table>
-      </div>
-      
-      <!-- Legend -->
-      <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #f0f0f0;">
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse;">
+        
+        <!-- Chart -->
+        <table border="0" cellpadding="0" cellspacing="0" width="100%">
           <tr>
-            <td align="center">
-              <table border="0" cellpadding="0" cellspacing="20" style="border-collapse: collapse; margin: 0 auto;">
-                <tr>
-                  <td>
-                    <table border="0" cellpadding="0" cellspacing="5" style="border-collapse: collapse;">
-                      <tr>
-                        <td width="12" height="12" style="background-color: #2196F3; border-radius: 2px;"></td>
-                        <td style="font-size: 11px; color: #666; padding-left: 5px;">Previous Periods</td>
-                      </tr>
-                    </table>
-                  </td>
-                  <td>
-                    <table border="0" cellpadding="0" cellspacing="5" style="border-collapse: collapse;">
-                      <tr>
-                        <td width="12" height="12" style="background-color: #4CAF50; border-radius: 2px;"></td>
-                        <td style="font-size: 11px; color: #666; padding-left: 5px;">Current Period</td>
-                      </tr>
-                    </table>
-                  </td>
-                  <td>
-                    <table border="0" cellpadding="0" cellspacing="5" style="border-collapse: collapse;">
-                      <tr>
-                        <td width="12" height="12" style="background-color: #f0f0f0; border: 1px solid #ddd; border-radius: 2px;"></td>
-                        <td style="font-size: 11px; color: #666; padding-left: 5px;">No Data</td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
+            <td width="50" valign="top" style="border-right: 2px solid #ccc; padding-right: 10px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height: ${chartHeight}px;">
+                ${generateYAxis()}
+              </table>
+            </td>
+            <td valign="top" style="padding-left: 10px; border-bottom: 2px solid #ccc;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                ${generateChart()}
               </table>
             </td>
           </tr>
         </table>
-      </div>
-    </div>
+        
+        <!-- Stats -->
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background: #FFFFFF; border-radius: 6px; margin-top: 20px;">
+          <tr>
+            <td width="20%" align="center" style="border-right: 1px solid #e0e0e0; padding: 10px;">
+              <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">CURRENT</div>
+              <div style="font-size: 20px; font-weight: 700; color: #4CAF50;">${safeStats.current}</div>
+              <div style="font-size: 10px; color: #999;">${currentWeek ? currentWeek.replace('2026-Week', 'Week ') : 'Current'}</div>
+            </td>
+            <td width="20%" align="center" style="padding: 10px; border-radius: 12px;">
+              <div style="font-size: 11px; color: #8971df; text-transform: uppercase; margin-bottom: 5px; font-weight: 600;">TARGET</div>
+              <div style="font-size: 20px; font-weight: 700; color: ${cleantarget !== null ? '#4CAF50' : '#999'};">
+                ${cleantarget !== null ? formatLargeNumber(cleantarget) : 'N/A'}
+              </div>
+              <div style="font-size: 10px; color: rgba(255,255,255,0.7);">Achievement</div>
+            </td>
+            <td width="20%" align="center" style="border-left: 1px solid #e0e0e0; padding: 10px;">
+              <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">AVERAGE</div>
+              <div style="font-size: 20px; font-weight: 700; color: #8971df;">${safeStats.average}</div>
+              <div style="font-size: 10px; color: #999;">${safeStats.dataPoints} periods</div>
+            </td>
+          
+          </tr>
+        </table>
+        
+        <!-- Legend -->
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #f0f0f0;">
+          <tr><td align="center">
+            <table border="0" cellpadding="8" cellspacing="0">
+              <tr>
+                ${cleantarget !== null ? `
+                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
+                    <td width="20" height="12" style="border-top: 2px dashed #28a745;"></td>
+                    <td style="font-size: 11px; color: #666;">target</td>
+                  </tr></table></td>
+                ` : ''}
+         
+                ${cleanMax !== null ? `
+                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
+                    <td width="20" height="12" style="border-top: 2px dashed #ff9800;"></td>
+                    <td style="font-size: 11px; color: #666;">Max</td>
+                  </tr></table></td>
+                ` : ''}
+                ${cleanMin !== null ? `
+                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
+                    <td width="20" height="12" style="border-top: 2px dashed #dc3545;"></td>
+                    <td style="font-size: 11px; color: #666;">Min</td>
+                  </tr></table></td>
+                ` : ''}
+                ${isValueExtremelySmall ? `
+                <td><table border="0" cellpadding="0" cellspacing="5"><tr>
+                  <td width="12" height="12" style="background-color: #ff9800; border: 1px solid #ff9800;"></td>
+                  <td style="font-size: 11px; color: #666;">Exaggerated for visibility</td>
+                </tr></table></td>
+                ` : ''}
+              </tr>
+            </table>
+          </td></tr>
+        </table>
+        
+      </td></tr>
+    </table>
   `;
 };
 
 const generateWeeklyReportData = async (responsibleId, reportWeek) => {
   try {
-    // Get historical data from kpi_values_hist26 table
+    // Get historical data from kpi_values_hist26 table WITH threshold values
     const histRes = await pool.query(
       `
       WITH KpiHistory AS (
@@ -1002,6 +2603,9 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           k.indicator_title,
           k.indicator_sub_title,
           k.unit,
+          k.target_value,
+          k.minimum_value,
+          k.maximum_value,
           ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
         FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
@@ -1034,11 +2638,14 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           title: row.indicator_title,
           subtitle: row.indicator_sub_title || '',
           unit: row.unit || '',
-          weeklyData: new Map() // Use Map to preserve insertion order
+          target: row.target_value,
+          min: row.minimum_value,
+          max: row.maximum_value,
+          weeklyData: new Map()
         };
       }
 
-      // Parse value
+      // Parse value safely
       const value = parseFloat(row.new_value);
       if (!isNaN(value) && value > 0) {
         kpisData[kpiId].weeklyData.set(row.week, value);
@@ -1048,7 +2655,6 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
 
     // Convert week labels set to sorted array
     const weekLabels = Array.from(weekLabelsSet).sort((a, b) => {
-      // Extract year and week numbers for sorting
       const [yearA, weekA] = a.includes('Week')
         ? [parseInt(a.split('-Week')[0]), parseInt(a.split('-Week')[1])]
         : [0, parseInt(a.replace('Week', ''))];
@@ -1061,7 +2667,6 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
       return weekA - weekB;
     });
 
-    // If no week labels found, return null
     if (weekLabels.length === 0) {
       console.log(`No valid week data found for responsible ${responsibleId}`);
       return null;
@@ -1083,8 +2688,8 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
       });
 
       // Skip if all values are zero
-      const hasData = dataPoints.some(val => val > 0);
-      if (!hasData) {
+      const validDataPoints = dataPoints.filter(val => val > 0 && !isNaN(val));
+      if (validDataPoints.length === 0) {
         continue;
       }
 
@@ -1111,28 +2716,24 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
       }
 
       if (!currentWeek) {
-        continue; // No valid current week found
-      }
-
-      // Calculate statistics
-      const nonZeroData = dataPoints.filter(val => val > 0);
-
-      if (nonZeroData.length === 0) {
         continue;
       }
 
-      const avg = nonZeroData.reduce((sum, val) => sum + val, 0) / nonZeroData.length;
-      const max = Math.max(...nonZeroData);
-      const min = Math.min(...nonZeroData);
+      // Calculate statistics
+      const nonZeroData = validDataPoints;
 
-      // Calculate trend (week-over-week change)
+      const avg = nonZeroData.reduce((sum, val) => sum + val, 0) / nonZeroData.length;
+      const maxValue = Math.max(...nonZeroData);
+      const minValue = Math.min(...nonZeroData);
+
+      // Calculate trend (week-over-week change) safely
       let trend = '0.0%';
       if (previousValue > 0 && currentValue > 0) {
         const trendValue = ((currentValue - previousValue) / previousValue) * 100;
         trend = (trendValue >= 0 ? '+' : '') + trendValue.toFixed(1) + '%';
       }
 
-      // Format week labels for display (simplify if too many)
+      // Format week labels for display
       const displayWeekLabels = weekLabels.map(week => {
         if (week.includes('2026-Week')) {
           return `W${week.split('-Week')[1]}`;
@@ -1151,12 +2752,15 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
         weekLabels: displayWeekLabels,
         fullWeeks: weekLabels,
         currentWeek: currentWeek,
+        target: kpiData.target,
+        min: kpiData.min,
+        max: kpiData.max,
         stats: {
-          current: currentValue.toFixed(kpiData.unit === '%' ? 1 : 2),
-          previous: previousValue > 0 ? previousValue.toFixed(kpiData.unit === '%' ? 1 : 2) : 'N/A',
-          average: avg.toFixed(kpiData.unit === '%' ? 1 : 2),
-          max: max.toFixed(kpiData.unit === '%' ? 1 : 2),
-          min: min > 0 ? min.toFixed(kpiData.unit === '%' ? 1 : 2) : 'N/A',
+          current: currentValue,
+          previous: previousValue > 0 ? previousValue : null,
+          average: avg,
+          max: maxValue,
+          min: minValue > 0 ? minValue : null,
           trend: trend,
           dataPoints: nonZeroData.length,
           totalWeeks: weekLabels.length
@@ -1173,175 +2777,11 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
   }
 };
 
-const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
-  try {
-    // Get responsible info
-    const resResp = await pool.query(
-      `
-      SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1
-      `,
-      [responsibleId]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible) throw new Error(`Responsible ${responsibleId} not found`);
-
-    console.log(`Generating report for ${responsible.name}, week: ${reportWeek}`);
-
-    // Generate charts data with multiple weeks
-    const chartsData = await generateWeeklyReportData(responsibleId, reportWeek);
-
-    let chartsHtml = '';
-    if (chartsData && chartsData.length > 0) {
-      chartsData.forEach(chart => {
-        chartsHtml += generateVerticalBarChart(chart);
-      });
-    } else {
-      // Check if there's any data at all
-      const checkRes = await pool.query(
-        `SELECT COUNT(*) FROM public.kpi_values_hist26 WHERE responsible_id = $1`,
-        [responsibleId]
-      );
-
-      if (parseInt(checkRes.rows[0].count) === 0) {
-        chartsHtml = `
-          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
-            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📊</div>
-            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">No KPI Data Available</p>
-            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
-              Start filling your KPI forms to track your performance over time.
-            </p>
-            <a href="http://localhost:5000/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
-               style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
-                      background: #28a745; color: white; text-decoration: none; 
-                      border-radius: 6px; font-weight: 600; font-size: 14px;">
-              ✏️ Start Tracking KPIs
-            </a>
-          </div>
-        `;
-      } else {
-        chartsHtml = `
-          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
-            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📈</div>
-            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">Insufficient Data</p>
-            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
-              Fill your KPI form for week ${reportWeek} to generate performance charts.
-            </p>
-          </div>
-        `;
-      }
-    }
-
-    const emailHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>KPI Performance Report</title>
-</head>
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background: #f4f6f9; line-height: 1.4;">
-  <!-- Simple container for Outlook -->
-  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background: #f4f6f9;">
-    <tr>
-      <td align="center" style="padding: 20px;">
-        <!-- Main content table -->
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 800px; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-          <!-- Header -->
-          <tr>
-            <td style="background: #0078D7; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
-              <h1 style="margin: 0; color: white; font-size: 24px; font-weight: 300;">📊 KPI Performance Report</h1>
-              <p style="margin: 10px 0 0 0; color: rgba(255,255,255,0.9); font-size: 16px;">
-                ${reportWeek.replace('2026-Week', 'Week ')} • Monthly View
-              </p>
-            </td>
-          </tr>
-          
-          <!-- Responsible Info -->
-          <tr>
-            <td style="padding: 25px 30px; border-bottom: 1px solid #e9ecef;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td width="33%" align="center" style="padding: 10px;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Responsible</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.name}</div>
-                  </td>
-                  <td width="34%" align="center" style="padding: 10px; border-left: 1px solid #e9ecef; border-right: 1px solid #e9ecef;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Plant</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.plant_name}</div>
-                  </td>
-                  <td width="33%" align="center" style="padding: 10px;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Department</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.department_name}</div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          
-          <!-- Charts Section -->
-          <tr>
-            <td style="padding: 30px;">
-              ${chartsHtml}
-            </td>
-          </tr>
-          
-          <!-- Footer -->
-          <tr>
-            <td style="padding: 20px 30px; background: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td align="center" style="color: #666; font-size: 12px;">
-                    <p style="margin: 0 0 5px 0;">
-                      <strong>AVOCarbon KPI System</strong> | Automated Performance Report
-                    </p>
-                    <p style="margin: 0; font-size: 11px; color: #999;">
-                      Generated on ${new Date().toLocaleDateString()} • 
-                      Contact: <a href="mailto:administration.STS@avocarbon.com" style="color: #0078D7; text-decoration: none;">administration.STS@avocarbon.com</a>
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-`;
-
-    // Send email
-    const transporter = createTransporter();
-    const mailOptions = {
-      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `📊 KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
-      html: emailHtml
-    };
-
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`✅ Weekly report sent to ${responsible.email} for week ${reportWeek}`);
-
-    return info;
-
-  } catch (error) {
-    console.error(`❌ Failed to send weekly report to responsible ID ${responsibleId}:`, error.message);
-    throw error;
-  }
-};
-
 // ---------- Schedule Weekly Reports  to send it for each responsible  ----------
 // ---------- Schedule Weekly Reports ----------
 // ---------- Schedule Weekly Reports ----------
 cron.schedule(
-  "00 10 * * 1", // Every Friday at 8:16 PM
+  "20 9 * * 1", // Every Friday at 8:16 PM
   async () => {
     const lockId = 'weekly_report_job';
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
@@ -1428,7 +2868,297 @@ cron.schedule(
 
 
 
-// ========== UPDATED QUERY TO GET WEEKLY DATA ==========
+// ========== FIXED createIndividualKPIChart FUNCTION ==========
+const createIndividualKPIChart = (kpi) => {
+ 
+  const weeklyData = kpi.weeklyData || { weeks: [], values: [] };
+  const weeks = weeklyData.weeks.slice(0, 5).reverse();
+  const values = weeklyData.values.slice(0, 5).reverse();
+
+  // ----- No data / invalid data -----
+  if (!values.length || values.every(v => v <= 0)) {
+    return `<table ...>... no data ...</table>`;  // keep your fallback
+  }
+  const dataValues = values.filter(v => v > 0 && !isNaN(v)).map(v => parseFloat(v));
+  if (dataValues.length === 0) return `<table ...>... invalid data ...</table>`;
+
+  // ----- thresholds -----
+  const targetNum = kpi.target_value && kpi.target_value !== 'None' ? parseFloat(kpi.target_value) : null;
+  const minNum = kpi.minimum_value && kpi.minimum_value !== 'None' ? parseFloat(kpi.minimum_value) : null;
+  const maxNum = kpi.maximum_value && kpi.maximum_value !== 'None' ? parseFloat(kpi.maximum_value) : null;
+
+  // ----- trend -----
+  const currentVal = values[values.length - 1] || 0;
+  const prevVal = values.length >= 2 ? values[values.length - 2] : 0;
+  const trendRaw = prevVal > 0 ? ((currentVal - prevVal) / prevVal * 100) : 0;
+  const trendIcon = Math.abs(trendRaw) < 0.1 ? '→' : (trendRaw > 0 ? '↗' : '↘');
+  const trendColor = trendRaw >= 0 ? '#28a745' : '#dc3545';
+  const trendBg = trendRaw >= 0 ? '#d4edda' : '#f8d7da';
+  const trendDisplay = `${trendRaw >= 0 ? '+' : ''}${trendRaw.toFixed(1)}%`;
+
+  // ----- chart dimensions -----
+  const chartHeight = 200;   // px
+  const numRows = chartHeight; // 1 row per pixel
+  const cellHeight = 1;     // px
+
+  // ----- scale: all values and thresholds -----
+  const allValues = [...dataValues];
+  if (targetNum) allValues.push(targetNum);
+  if (maxNum) allValues.push(maxNum);
+  if (minNum) allValues.push(minNum);
+  const maxData = Math.max(...allValues);
+  const chartMax = (() => {
+    const withPad = maxData * 1.2;
+    if (withPad <= 10) return 10;
+    if (withPad <= 20) return 20;
+    if (withPad <= 50) return 50;
+    if (withPad <= 100) return 100;
+    if (withPad <= 200) return 200;
+    if (withPad <= 500) return 500;
+    if (withPad <= 1000) return 1000;
+    if (withPad <= 2000) return 2000;
+    if (withPad <= 5000) return 5000;
+    return Math.ceil(withPad / 10000) * 10000;
+  })();
+
+  // ----- helper: value → Y pixel position (0 = top, chartHeight = bottom) -----
+  const valueToY = (val) => {
+    if (val <= 0 || isNaN(val)) return chartHeight;
+    const pct = Math.min(100, (val / chartMax) * 100);
+    return (1 - pct / 100) * chartHeight;
+  };
+
+  // ----- helper: format number (no trailing .0) -----
+  const formatNumber = (n) => {
+    if (n == null || isNaN(n)) return '0';
+    const num = parseFloat(n);
+    if (Number.isInteger(num)) return num.toString();
+    const f = num.toFixed(1);
+    return f.endsWith('.0') ? f.slice(0, -2) : f;
+  };
+
+  // ----- Y‑axis: labels + threshold markers at exact Y positions -----
+  const yAxisLabels = [];
+  for (let i = 0; i <= 5; i++) {
+    const val = (5 - i) / 5 * chartMax;
+    const y = valueToY(val);
+    yAxisLabels.push({ label: formatNumber(val), y });
+  }
+
+  const thresholds = [];
+  if (targetNum) thresholds.push({ value: targetNum, label: 'Target', color: '#28a745', y: valueToY(targetNum) });
+  if (maxNum) thresholds.push({ value: maxNum, label: 'Max', color: '#ff9800', y: valueToY(maxNum) });
+  if (minNum) thresholds.push({ value: minNum, label: 'Min', color: '#dc3545', y: valueToY(minNum) });
+
+  const yMarkers = [...yAxisLabels, ...thresholds.map(t => ({ isThreshold: true, ...t }))];
+
+  // Build Y‑axis table (exactly chartHeight tall)
+  let yAxisHTML = `<table cellpadding="0" cellspacing="0" border="0" width="60" height="${chartHeight}" style="border-collapse:collapse;">`;
+  for (let row = 0; row < numRows; row++) {
+    const rowTop = row * cellHeight;
+    const rowBottom = (row + 1) * cellHeight;
+    const marker = yMarkers.find(m => m.y >= rowTop && m.y < rowBottom);
+    let content = '&nbsp;';
+    if (marker) {
+      if (marker.isThreshold) {
+        content = `<span style="display:inline-block; width:8px; height:8px; background:${marker.color}; border-radius:50%; margin-right:4px;"></span>
+                   <span style="font-size:9px; color:${marker.color}; font-weight:600;">${formatNumber(marker.value)}</span>`;
+      } else {
+        content = `<span style="font-size:10px; color:#666;">${marker.label}</span>`;
+      }
+    }
+    yAxisHTML += `<tr><td height="${cellHeight}" valign="top" align="right" style="font-size:1px; line-height:1; padding-right:8px; border-right:2px solid #cbd5e1;">${content}</td></tr>`;
+  }
+  yAxisHTML += `</table>`;
+
+  // ----- Prepare threshold rows for the bar table -----
+  // Map each pixel row (0‑199) to the threshold line(s) that should be drawn there
+  const thresholdAtRow = new Array(numRows).fill(null);
+  thresholds.forEach(th => {
+    // Round to nearest pixel row – best we can do in email
+    const rowIndex = Math.round(th.y);
+    if (rowIndex >= 0 && rowIndex < numRows) {
+      if (!thresholdAtRow[rowIndex]) thresholdAtRow[rowIndex] = [];
+      thresholdAtRow[rowIndex].push(th);
+    }
+  });
+
+  // ----- Build bar chart table row by row -----
+  const barGapPx = 8;        // horizontal gap between bars
+  const colWidth = `${100 / values.length}%`;
+
+  let barRows = '';
+  for (let row = 0; row < numRows; row++) {
+    const rowTop = row * cellHeight;
+    const rowBottom = (row + 1) * cellHeight;
+
+    // 1) Insert threshold line(s) for this row (if any)
+    if (thresholdAtRow[row]) {
+      thresholdAtRow[row].forEach(th => {
+        barRows += `<tr style="height:0; line-height:0; font-size:0;">
+          <td colspan="${values.length}" style="border-top:2px dashed ${th.color}; padding:0; margin:0;"></td>
+        </tr>`;
+      });
+    }
+
+    // 2) Normal bar row
+    barRows += '<tr>';
+    values.forEach((val, idx) => {
+      const barTopY = valueToY(val);
+      const isBarCell = (rowBottom > barTopY);
+      const isTopEdge = (rowTop <= barTopY && rowBottom > barTopY);
+      const displayValue = formatNumber(val);
+      const isCurrent = idx === values.length - 1;
+
+      let content = '';
+      let tdStyle = `padding:0 ${barGapPx / 2}px; margin:0; height:${cellHeight}px; width:${colWidth}; line-height:0; font-size:0; vertical-align:bottom;`;
+
+      if (isBarCell) {
+        content = `<div style="background-color:#0078D7; height:${cellHeight}px; width:100%;"></div>`;
+        if (isTopEdge) {
+          content = `<div style="background-color:#0078D7; font-size:10px; font-weight:700; color:#fff; text-align:center; line-height:12px; height:${cellHeight}px;">${displayValue}</div>`;
+        }
+      } else {
+        content = '<div style="height:' + cellHeight + 'px;">&nbsp;</div>';
+      }
+
+      barRows += `<td style="${tdStyle}">${content}</td>`;
+    });
+    barRows += '</tr>';
+  }
+
+  // Wrap bar rows in a table that is exactly chartHeight tall
+  const barTable = `<table cellpadding="0" cellspacing="0" border="0" width="100%" height="${chartHeight}" style="border-collapse:collapse;">${barRows}</table>`;
+
+  // ----- X‑axis table (placed directly below the bar table, no gap) -----
+  const xAxisRow = `<tr>
+    ${values.map((val, idx) => {
+      const weekLabel = weeks[idx]?.replace('2026-Week', 'W') || `W${idx + 1}`;
+      const isCurrent = idx === values.length - 1;
+      return `<td align="center" style="padding:0 ${barGapPx / 2}px; border-top:2px solid #cbd5e1; font-size:10px; color:#666; font-weight:${isCurrent ? '700' : '500'}; line-height:14px; padding-top:6px;">
+                ${weekLabel}
+                ${isCurrent ? '<div style="width:6px;height:6px;background:#0078D7;border-radius:50%;margin:2px auto 0;"></div>' : ''}
+              </td>`;
+    }).join('')}
+  </tr>`;
+  const xAxisTable = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">${xAxisRow}</table>`;
+
+  // ----- statistics -----
+  const averageValue = dataValues.reduce((a, b) => a + b, 0) / dataValues.length;
+  const currentValue = values[values.length - 1] || 0;
+  const prevValue = values.length >= 2 ? values[values.length - 2] : 0;
+  const trendVal = prevValue > 0 ? ((currentValue - prevValue) / prevValue * 100) : 0;
+  const trendClr = trendVal >= 0 ? '#4CAF50' : '#F44336';
+  const trendDisp = `${trendVal >= 0 ? '+' : ''}${trendVal.toFixed(1)}%`;
+
+  // ----- threshold badges (optional) -----
+  const badgeHTML = thresholds.map(th => {
+    const bg = th.label === 'Target' ? '#e8f5e9' : (th.label === 'Max' ? '#fff3e0' : '#ffebee');
+    return `<td style="padding:0 4px 0 0;">
+              <div style="display:inline-block; background:${bg}; border:1px solid ${th.color}; border-radius:12px; padding:4px 10px;">
+                <span style="font-size:10px; color:${th.color}; font-weight:600;">
+                  ${th.label === 'Target' ? '🎯' : (th.label === 'Max' ? '📈' : '📉')} ${th.label}: ${formatNumber(th.value)}
+                </span>
+              </div>
+            </td>`;
+  }).join('');
+
+  // ----- FINAL HTML -----
+  return `
+<table border="0" cellpadding="0" cellspacing="0" width="100%"
+       style="background:#ffffff; border:1px solid #e5e7eb; border-radius:12px; margin-bottom:20px; box-shadow:0 4px 12px rgba(0,0,0,0.06);">
+  <tr>
+    <td style="padding:20px;">
+
+      <!-- HEADER -->
+      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:20px;">
+        <tr>
+          <td valign="top">
+            <div style="font-weight:700; font-size:18px; color:#111827; margin-bottom:6px;">
+              ${kpi.subtitle || kpi.title}
+            </div>
+            ${kpi.indicator_sub_title ? `<div style="font-size:13px; color:#6b7280; margin-bottom:8px;">${kpi.indicator_sub_title}</div>` : ''}
+            ${thresholds.length ? `<table border="0" cellpadding="0" cellspacing="0"><tr>${badgeHTML}</tr></table>` : ''}
+            ${kpi.unit ? `<div style="font-size:12px; color:#9ca3af; margin-top:8px;">Unit: ${kpi.unit}</div>` : ''}
+          </td>
+          <td align="right" valign="top" width="170">
+            <table border="0" cellpadding="0" cellspacing="0" align="right" style="margin-bottom:8px;">
+              <tr><td align="center" style="background:${trendBg}; border:1.5px solid ${trendColor}; border-radius:22px; padding:6px 16px;">
+                <span style="font-size:16px; color:${trendColor}; font-weight:600;">${trendIcon}</span>
+              </td></tr>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" align="right" style="margin-top:8px;">
+              <tr><td align="center" style="font-size:13px; color:#374151; background:#f3f4f6; padding:8px 16px; border-radius:20px; font-weight:500;">
+                👤 ${kpi.responsible}
+              </td></tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+
+      <!-- CHART AREA: Y‑axis + bars (aligned) + X‑axis below -->
+      <div style="margin-bottom:0;">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;">
+          <tr>
+            <td width="60" valign="top" style="padding-right:6px;">
+              ${yAxisHTML}
+            </td>
+            <td valign="bottom" style="padding-left:6px; height:${chartHeight}px; padding:0; line-height:0; vertical-align:bottom;">
+              ${barTable}
+            </td>
+          </tr>
+        </table>
+        <!-- X‑axis directly below, no margin -->
+        <div style="margin-left:66px; margin-top:0; padding-top:0; line-height:0;">
+          ${xAxisTable}
+        </div>
+      </div>
+
+      <!-- STATS FOOTER -->
+      <table border="0" cellpadding="0" cellspacing="0" width="100%"
+             style="background:#0f172a; border-radius:12px; margin-top:24px; border-collapse:collapse;">
+        <tr>
+          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
+            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">CURRENT</div>
+            <div style="font-size:20px; font-weight:700; color:#ffffff;">${formatNumber(currentValue)}</div>
+            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">Week ${weeks[weeks.length - 1]?.replace('2026-Week', '') || '5'}</div>
+          </td>
+          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
+            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">TARGET</div>
+            <div style="font-size:20px; font-weight:700; color:#22c55e;">${targetNum ? formatNumber(targetNum) : 'N/A'}</div>
+            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">Achievement</div>
+          </td>
+          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
+            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">AVERAGE</div>
+            <div style="font-size:20px; font-weight:700; color:#ffffff;">${formatNumber(averageValue)}</div>
+            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">${dataValues.length} periods</div>
+          </td>
+         
+        </tr>
+      </table>
+
+    </td>
+  </tr>
+</table>
+  `;
+};
+
+// Helper function for number formatting
+const formatNumber = (num) => {
+  if (num === null || num === undefined || isNaN(num)) return '0';
+  const number = parseFloat(num);
+
+  if (Number.isInteger(number)) {
+    return number.toString();
+  }
+
+  const formatted = number.toFixed(1);
+  return formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted;
+};
+
+// ========== UPDATED getDepartmentKPIReport FUNCTION ==========
+// This function now includes target_value, minimum_value, and maximum_value from the Kpi table
+
 const getDepartmentKPIReport = async (plantId, week) => {
   try {
     // 1. Get plant and manager info
@@ -1446,39 +3176,44 @@ const getDepartmentKPIReport = async (plantId, week) => {
       return null;
     }
 
-    // 2. Get KPIs - Use indicator_title for grouping
+    // 2. Get KPIs with target, min, max values - UPDATED QUERY
+    // In getDepartmentKPIReport function, update the kpiRes query:
+
     const kpiRes = await pool.query(
       `
-      WITH LatestKPIValues AS (
-        SELECT 
-          h.kpi_id,
-          h.responsible_id,
-          r.name AS responsible_name,
-          h.week,
-          h.new_value,
-          h.updated_at,
-          r.department_id,
-          d.name AS department_name,
-          k.indicator_title,
-          k.indicator_sub_title,
-          k.unit,
-          ROW_NUMBER() OVER (
-            PARTITION BY h.kpi_id, h.responsible_id, h.week 
-            ORDER BY h.updated_at DESC
-          ) as rn
-        FROM public.kpi_values_hist26 h
-        JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-        JOIN public."Department" d ON r.department_id = d.department_id
-        JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-        WHERE r.plant_id = $1 
-          AND h.week = $2
-          AND h.new_value IS NOT NULL
-          AND h.new_value != ''
-          AND h.new_value ~ '^[0-9.]+$'
-      )
-      SELECT * FROM LatestKPIValues WHERE rn = 1
-      ORDER BY indicator_title
-      `,
+WITH LatestKPIValues AS (
+  SELECT 
+    h.kpi_id,
+    h.responsible_id,
+    r.name AS responsible_name,
+    h.week,
+    h.new_value,
+    h.updated_at,
+    r.department_id,
+    d.name AS department_name,
+    k.indicator_title,
+    k.indicator_sub_title,
+    k.unit,
+    k.target_value,
+    k.minimum_value,
+    k.maximum_value,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.kpi_id, h.responsible_id, h.week 
+      ORDER BY h.updated_at DESC
+    ) as rn
+  FROM public.kpi_values_hist26 h
+  JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
+  JOIN public."Department" d ON r.department_id = d.department_id
+  JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+  WHERE r.plant_id = $1 
+    AND h.week = $2
+    AND h.new_value IS NOT NULL
+    AND h.new_value != ''
+    AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'  -- FIXED: Cast to text first
+)
+SELECT * FROM LatestKPIValues WHERE rn = 1
+ORDER BY indicator_title
+  `,
       [plantId, week]
     );
 
@@ -1490,32 +3225,35 @@ const getDepartmentKPIReport = async (plantId, week) => {
     // 3. Get WEEKLY TREND DATA for ALL KPIs (last 12 weeks)
     const weeklyTrendRes = await pool.query(
       `
-      WITH WeeklyKPIData AS (
-        SELECT 
-          k.kpi_id,
-          k.indicator_title,
-          k.indicator_sub_title,
-          k.unit,
-          h.week,
-          AVG(CAST(h.new_value AS NUMERIC)) as avg_value,
-          MIN(CAST(h.new_value AS NUMERIC)) as min_value,
-          MAX(CAST(h.new_value AS NUMERIC)) as max_value,
-          COUNT(*) as data_points,
-          -- Extract week number for sorting
-          CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
-        FROM public.kpi_values_hist26 h
-        JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-        JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-        WHERE r.plant_id = $1 
-          AND h.new_value IS NOT NULL
-          AND h.new_value != ''
-          AND h.new_value ~ '^[0-9.]+$'
-          AND h.week LIKE '2026-Week%'
-        GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, h.week
-      )
-      SELECT * FROM WeeklyKPIData
-      ORDER BY kpi_id, week_num DESC
-      LIMIT 500
+WITH WeeklyKPIData AS (
+  SELECT 
+    k.kpi_id,
+    k.indicator_title,
+    k.indicator_sub_title,
+    k.unit,
+    k.target_value,
+    k.minimum_value,
+    k.maximum_value,
+    h.week,
+    AVG(CAST(h.new_value AS NUMERIC)) as avg_value,
+    MIN(CAST(h.new_value AS NUMERIC)) as min_value,
+    MAX(CAST(h.new_value AS NUMERIC)) as max_value,
+    COUNT(*) as data_points,
+    CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
+  FROM public.kpi_values_hist26 h
+  JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+  JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
+  WHERE r.plant_id = $1 
+    AND h.new_value IS NOT NULL
+    AND h.new_value != ''
+    AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'  -- FIXED: Cast to text first
+    AND h.week LIKE '2026-Week%'
+  GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, 
+           k.target_value, k.minimum_value, k.maximum_value, h.week
+)
+SELECT * FROM WeeklyKPIData
+ORDER BY kpi_id, week_num DESC
+LIMIT 500
       `,
       [plantId]
     );
@@ -1523,33 +3261,25 @@ const getDepartmentKPIReport = async (plantId, week) => {
     // Helper function to extract department from indicator_title
     const extractDepartmentFromTitle = (indicatorTitle) => {
       if (!indicatorTitle) return 'Other';
-
-      // Extract text after "Actual - "
       if (indicatorTitle.includes('Actual - ')) {
         const extracted = indicatorTitle.split('Actual - ')[1];
-
-        // Further processing for specific cases
         if (extracted.includes('/')) {
-          // For "VOH / FOH expenses (excluding salaries)", take first part
           return extracted.split('/')[0].trim();
         } else if (extracted.includes('(')) {
-          // Remove parentheses content
           return extracted.split('(')[0].trim();
         }
         return extracted.trim();
       }
-
       return indicatorTitle;
     };
 
-    // 4. Organize data by department (extracted from indicator_title)
+    // 4. Organize data by department
     const kpisByDepartment = {};
     const weeklyDataByKPI = {};
 
     // First, organize weekly trend data
     weeklyTrendRes.rows.forEach(row => {
       const kpiKey = `${row.kpi_id}_${row.indicator_title}`;
-      // Extract department from indicator_title
       const derivedDept = extractDepartmentFromTitle(row.indicator_title);
 
       if (!weeklyDataByKPI[kpiKey]) {
@@ -1558,7 +3288,10 @@ const getDepartmentKPIReport = async (plantId, week) => {
           title: row.indicator_title,
           subtitle: row.indicator_sub_title || '',
           unit: row.unit || '',
-          department: derivedDept, // Use extracted department
+          target_value: row.target_value,
+          minimum_value: row.minimum_value,
+          maximum_value: row.maximum_value,
+          department: derivedDept,
           weeks: [],
           values: []
         };
@@ -1570,7 +3303,6 @@ const getDepartmentKPIReport = async (plantId, week) => {
 
     // Then, organize current week data by extracted department
     kpiRes.rows.forEach(row => {
-      // Extract department from indicator_title
       const derivedDepartment = extractDepartmentFromTitle(row.indicator_title);
       const kpiKey = `${row.kpi_id}_${row.indicator_title}`;
 
@@ -1590,8 +3322,11 @@ const getDepartmentKPIReport = async (plantId, week) => {
           title: row.indicator_title,
           subtitle: row.indicator_sub_title || '',
           unit: row.unit || '',
-          department: derivedDepartment, // Use extracted department
-          originalDepartment: row.department_name, // Keep original for reference
+          target_value: row.target_value,
+          minimum_value: row.minimum_value,
+          maximum_value: row.maximum_value,
+          department: derivedDepartment,
+          originalDepartment: row.department_name,
           currentValue: value,
           weeklyData: weeklyDataByKPI[kpiKey] || { weeks: [], values: [] },
           lastUpdated: row.updated_at,
@@ -1625,292 +3360,6 @@ const getDepartmentKPIReport = async (plantId, week) => {
     return null;
   }
 };
-
-// ========== UPDATED CHART FUNCTION WITH WEEKLY BAR CHART ==========
-// ========== UPDATED CHART FUNCTION WITH WEEKLY BAR CHART ==========
-const createIndividualKPIChart = (kpi) => {
-  const color = getDepartmentColor(kpi.department);
-  const currentValue = kpi.currentValue || 0;
-  // === SIMPLE & VISUAL TREND LOGIC (exactly what you asked) ===
-  let trendArrow = '→';
-  let trendColor = '#dfc54dff'; // orange for stable
-  let trendText = 'No change';
-
-  const values = kpi.weeklyData?.values || [];
-
-  if (values.length >= 2) {
-    const current = values[values.length - 1];
-    const previous = values[values.length - 2];
-    const change = current - previous;
-    const percentChange = previous !== 0 ? ((change / previous) * 100) : 0;
-
-    if (Math.abs(change) < 0.001) {
-      // Exactly the same or negligible change
-      trendArrow = '→';
-      trendColor = '#fd7e14'; // orange
-      trendText = 'No change';
-    } else if (change < 0) {
-      // Value INCREASED → GREEN
-      trendArrow = '↗';
-      trendColor = '#28a745';
-      trendText = `+${Math.abs(percentChange).toFixed(1)}%`;
-    } else {
-      // Value DECREASED → RED
-      trendArrow = ' ↘';
-      trendColor = '#dc3545';
-      trendText = `${percentChange.toFixed(1)}%`;
-    }
-  }
-
-  // Calculate average value
-  let averageValue = 0;
-  if (values.length > 0) {
-    const sum = values.reduce((acc, val) => acc + val, 0);
-    averageValue = sum / values.length;
-  }
-
-  // Format average value
-  let formattedAverage = averageValue.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2
-  });
-
-  // Apply unit formatting to average
-  if (kpi.unit) {
-    if (kpi.unit.includes('%')) {
-      formattedAverage = `${averageValue.toFixed(1)}%`;
-    } else if (kpi.unit.toLowerCase().includes('cur')) {
-      formattedAverage = `${(averageValue / 1000).toFixed(0)}K`;
-    }
-  }
-
-  // Prepare weekly data (last 12 weeks, reversed for chronological order)
-  const weeklyData = kpi.weeklyData || { weeks: [], values: [] };
-  const last12Weeks = weeklyData.weeks.slice(0, 12).reverse();
-  const last12Values = weeklyData.values.slice(0, 12).reverse();
-
-  // Calculate max value for chart scaling
-  const maxValue = Math.max(...last12Values, currentValue * 1.2, 100);
-
-  // Calculate Y-axis values for grid lines
-  const yAxisSteps = 5;
-  const yAxisMax = Math.ceil(maxValue / 1000) * 1000; // Round up to nearest thousand
-  const yAxisInterval = yAxisMax / yAxisSteps;
-
-  // Generate vertical bar chart with proper axes - OUTLOOK COMPATIBLE
-  const bars = last12Values.map((value, index) => {
-    const heightPercent = (value / yAxisMax) * 100;
-    const barHeightPx = Math.round((heightPercent / 100) * 160); // Convert to pixels
-    const weekLabel = last12Weeks[index].replace('2026-Week', '');
-
-    return `
-      <td align="center" valign="bottom" style="padding: 0 2px; vertical-align: bottom; height: 180px;">
-        <!-- Value label on top -->
-        <div style="font-size: 9px; font-weight: bold; color: #2c3e50; margin-bottom: 3px;">
-          ${value >= 1000 ? (value / 1000).toFixed(1) + 'K' : value.toFixed(0)}
-        </div>
-        
-        <!-- Bar -->
-        <div style="
-          width: 100%;
-          min-width: 20px;
-          max-width: 40px;
-          height: ${Math.max(barHeightPx, 3)}px;
-          background-color: ${color};
-          border-radius: 3px 3px 0 0;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        "></div>
-        
-        <!-- Week label -->
-        <div style="font-size: 10px; color: #495057; font-weight: 600; margin-top: 6px;">
-            W${weekLabel}/26
-        </div>
-      </td>
-    `;
-  }).join('');
-
-  // Generate Y-axis labels - OUTLOOK COMPATIBLE
-  const yAxisLabels = [];
-  for (let i = yAxisSteps; i >= 0; i--) {
-    const value = (yAxisInterval * i);
-    const displayValue = value >= 1000 ? `${(value / 1000).toFixed(0)}K` : value.toFixed(0);
-    yAxisLabels.push(`
-      <tr>
-        <td style="
-          font-size: 9px;
-          color: #6c757d;
-          font-weight: 500;
-          text-align: right;
-          padding-right: 8px;
-          height: ${160 / yAxisSteps}px;
-          vertical-align: top;
-        ">${displayValue}</td>
-      </tr>
-    `);
-  }
-
-  return `
-   <div style="
-  position: relative;
-  background: white;
-  border: 1px solid #e0e0e0;
-  border-radius: 10px;
-  padding: 20px;
-  height: 100%;
-  display: block;
-">
-
-  <!-- Use table for better email compatibility -->
-  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 14px;">
-<tr>
-  <td align="left" valign="top" style="
-    font-size: 11px;
-    font-weight: 700;
-    color: #2c3e50;
-    line-height: 1.3;
-    padding-right: 10px;
-    position: relative;
-    width: 100%;
-  ">
-    <!-- Main Content Container -->
-    <table width="100%" cellpadding="0" cellspacing="0" border="0">
-      <tr>
-        <!-- Left: Subtitle -->
-        <td align="left" valign="middle" style="padding-right: 8px;">
-          <span style="display: inline-block; vertical-align: middle;">
-            ${kpi.subtitle}
-          </span>
-        </td>
-        
-        <!-- Middle: Responsible with Icon -->
-        <td align="center" valign="middle" style="
-          padding: 0 8px;
-          white-space: nowrap;
-        ">
-          <div style="
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            background: #f8fafc;
-            padding: 3px 8px;
-            border-radius: 12px;
-            border: 1px solid #e2e8f0;
-          ">
-            <!-- Responsible Icon -->
-            <svg width="10" height="10" viewBox="0 0 16 16" style="
-              fill: #64748b;
-              flex-shrink: 0;
-            ">
-              <path d="M8 8c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
-            </svg>
-            <span style="
-              font-size: 10px;
-              color: #475569;
-              font-weight: 600;
-              white-space: nowrap;
-            ">
-              ${kpi.responsible}
-            </span>
-          </div>
-
-        </td>
-        
-        <!-- Right: Arrow Indicator -->
-        <td align="right" valign="middle" width="28" style="padding-left: 8px;">
-          <div style="
-            width: 26px;
-            height: 26px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            border-radius: 6px;
-            background: ${trendColor};
-            color: white;
-            font-size: 16px;
-            font-weight: 900;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-          ">
-            ${trendArrow}
-          </div>
-        </td>
-      </tr>
-      
-      <!-- Second Row: Average Value -->
-      <tr>
-      <td colspan="3" align="center" style="padding-top: 12px;">
-       <table border="0" cellpadding="0" cellspacing="0" align="center" style="
-      background: #764ba2;
-      border-radius: 20px;
-      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-       ">
-      <tr>
-        <td style="
-          font-size: 10px;
-          color: rgba(255, 255, 255, 0.85);
-          font-weight: 600;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-          padding: 8px 8px 8px 20px;
-        ">
-          Average:
-        </td>
-        <td style="
-          font-size: 18px;
-          color: white;
-          font-weight: 700;
-          letter-spacing: -0.5px;
-          padding: 8px 20px 8px 8px;
-        ">
-          ${formattedAverage}
-        </td>
-      </tr>
-      </table>
-       </td>
-       </tr>
-       </table>
-       </td>
-       </tr>
-      
-     </table>
-
-     <!-- Chart Area -->
-    <div style="
-    height: calc(100% - 50px);
-    display: flex;
-    flex-direction: column;
-    justify-content: flex-end;
-      ">
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="
-      background: #ffffff;
-      border: 1px solid #e0e0e0;
-      border-radius: 8px;
-       ">
-      <tr>
-        <td style="padding: 15px;">
-          <table border="0" cellpadding="0" cellspacing="0" width="100%">
-            <tr>
-              <td valign="top" style="width: 40px; vertical-align: top;">
-                <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height: 180px;">
-                  ${yAxisLabels.join('')}
-                </table>
-              </td>
-              <td valign="bottom" style="vertical-align: bottom; position: relative;">
-                <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height: 180px;">
-                  <tr style="vertical-align: bottom;">
-                    ${bars || '<td style="text-align: center; color: #6c757d; font-size: 11px; padding: 60px 0;">No weekly data</td>'}
-                  </tr>
-                </table>
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </div>
-</div>
-  `;
-};
-
 // ========== UPDATED HTML GENERATION ==========
 const generateManagerReportHtml = (reportData) => {
   const { plant, week, kpisByDepartment, stats } = reportData;
@@ -1992,16 +3441,18 @@ const generateManagerReportHtml = (reportData) => {
     let rows = '';
     for (let i = 0; i < kpis.length; i += 3) {
       const rowKPIs = kpis.slice(i, i + 3);
-      rows += '<tr>';
+      // Add a border-bottom to all rows except the last one
+      const borderStyle = (i + 3 < kpis.length) ? 'border-bottom: 2px solid #e9ecef;' : '';
+      rows += `<tr style="${borderStyle}">`;
 
       rowKPIs.forEach(kpi => {
-        rows += `<td width="33%" valign="top" style="padding: 10px;">${createIndividualKPIChart(kpi)}</td>`;
+        rows += `<td width="33%" valign="top" style="padding: 20px 15px;">${createIndividualKPIChart(kpi)}</td>`;
       });
 
-      // Fill empty cells if less than 3 KPIs in row
+      // Fill empty cells
       const emptyCells = 3 - rowKPIs.length;
       for (let j = 0; j < emptyCells; j++) {
-        rows += '<td width="33%" style="padding: 10px;"></td>';
+        rows += '<td width="33%" style="padding: 20px 15px;"></td>';
       }
 
       rows += '</tr>';
@@ -2200,6 +3651,8 @@ const generateManagerReportHtml = (reportData) => {
   `;
 };
 
+
+
 // Helper function for department colors (unchanged)
 const getDepartmentColor = (departmentName) => {
   // First, handle the extracted department names
@@ -2246,6 +3699,236 @@ const getPreviousWeek = (currentWeek) => {
   return `${year}-Week${weekNumber}`;
 };
 
+const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
+  try {
+    // Get responsible info
+    const resResp = await pool.query(
+      `
+      SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1
+      `,
+      [responsibleId]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible) throw new Error(`Responsible ${responsibleId} not found`);
+
+    console.log(`Generating report for ${responsible.name}, week: ${reportWeek}`);
+
+    // Generate charts data with multiple weeks
+    const chartsData = await generateWeeklyReportData(responsibleId, reportWeek);
+
+    let chartsHtml = '';
+    let hasData = false;
+    let toleranceTypes = new Set();
+    let frequencies = new Set();
+
+    if (chartsData && chartsData.length > 0) {
+      hasData = true;
+      chartsData.forEach(chart => {
+        chartsHtml += generateVerticalBarChart(chart);
+      });
+    } else {
+      // Check if there's any data at all
+      const checkRes = await pool.query(
+        `SELECT COUNT(*) FROM public.kpi_values_hist26 WHERE responsible_id = $1`,
+        [responsibleId]
+      );
+
+      if (parseInt(checkRes.rows[0].count) === 0) {
+        chartsHtml = `
+          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
+            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📊</div>
+            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">No KPI Data Available</p>
+            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
+              Start filling your KPI forms to track your performance over time.
+            </p>
+            <a href="http://localhost:5000/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
+               style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
+                      background: #28a745; color: white; text-decoration: none; 
+                      border-radius: 6px; font-weight: 600; font-size: 14px;">
+              ✏️ Start Tracking KPIs
+            </a>
+          </div>
+        `;
+      } else {
+        chartsHtml = `
+          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
+            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📈</div>
+            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">Insufficient Data</p>
+            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
+              Fill your KPI form for week ${reportWeek} to generate performance charts.
+            </p>
+            <a href="http://localhost:5000/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
+               style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
+                      background: #0078D7; color: white; text-decoration: none; 
+                      border-radius: 6px; font-weight: 600; font-size: 14px;">
+              ✏️ Fill KPI Form
+            </a>
+          </div>
+        `;
+      }
+    }
+
+
+
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KPI Codir Report</title>
+  <style>
+    @media only screen and (max-width: 600px) {
+      .header-buttons {
+        flex-direction: column;
+        gap: 10px !important;
+      }
+      .view-history-btn {
+        width: 100% !important;
+        text-align: center !important;
+      }
+    }
+  </style>
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background: #f4f6f9; line-height: 1.4;">
+  <!-- Simple container for Outlook -->
+  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background: #f4f6f9;">
+ <tr>
+  <td align="center" style="padding: 20px;">
+    <!-- Header Content -->
+    <table border="0" cellpadding="0" cellspacing="0" width="100%">
+      <tr>
+        <td style="background: #0078D7; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+          <h1 style="margin: 0; color: white; font-size: 24px; font-weight: 600;">📊 KPI Performance Report</h1>
+        </td>
+      </tr>
+  
+    </table>
+  </td>
+</tr>
+          
+          <!-- Responsible Info -->
+          <tr>
+            <td style="padding: 25px 30px; border-bottom: 1px solid #e9ecef;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td width="33%" align="center" style="padding: 10px;">
+                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Responsible</div>
+                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.name}</div>
+                  </td>
+                  <td width="34%" align="center" style="padding: 10px; border-left: 1px solid #e9ecef; border-right: 1px solid #e9ecef;">
+                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Group</div>
+                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.plant_name}</div>
+                  </td>
+                  <td width="33%" align="center" style="padding: 10px;">
+                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Department</div>
+                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.department_name}</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          
+          <!-- KPI Summary Info -->
+          ${hasData ? `
+          <tr>
+            <td style="padding: 20px 30px; background: #f8f9fa; border-bottom: 1px solid #e9ecef;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td align="center" style="color: #666; font-size: 12px;">
+                    <p style="margin: 0 0 5px 0;">
+                      <strong>${chartsData ? chartsData.length : 0} KPIs Tracked</strong> | 
+      
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          ` : ''}
+          
+          <!-- Charts Section -->
+          <tr>
+            <td style="padding: 30px;">
+              ${chartsHtml}
+            </td>
+          </tr>
+          
+          <!-- Action Section -->
+          <tr>
+            <td style="padding: 20px 30px; background: #f8f9fa; border-top: 1px solid #e9ecef;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td align="center">
+                    <p style="margin: 15px 0 0 0; color: #666; font-size: 12px; text-align: center;">
+                      Click any button above to access different views of your KPI performance
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 20px 30px; background: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td align="center" style="color: #666; font-size: 12px;">
+                    <p style="margin: 0 0 5px 0;">
+                      <strong>AVOCarbon KPI System</strong> | Automated Performance Report
+                    </p>
+                    <p style="margin: 0; font-size: 11px; color: #999;">
+                      Generated on ${new Date().toLocaleDateString('en-GB', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    })} • 
+                      Contact: <a href="mailto:administration.STS@avocarbon.com" 
+                                style="color: #0078D7; text-decoration: none;">administration.STS@avocarbon.com</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
+
+    // Send email
+    const transporter = createTransporter();
+    const mailOptions = {
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      to: responsible.email,
+      subject: `📊 KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
+      html: emailHtml
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`✅ Weekly report sent to ${responsible.email} for week ${reportWeek}`);
+
+    return info;
+
+  } catch (error) {
+    console.error(`❌ Failed to send weekly report to responsible ID ${responsibleId}:`, error.message);
+    throw error;
+  }
+};
+
 // Email sender function (unchanged)
 const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   try {
@@ -2278,9 +3961,9 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
 };
 // ---------- Update Cron Job for Department Reports ----------
 // ---------- Schedule Department Reports ----------
-// ---------- Schedule Department Reports ----------
+
 cron.schedule(
-  "00 11 * * 1", // Every day at 8:02 PM
+  "21 9 * * 1", // Every day at 8:02 PM
   async () => {
     const lockId = 'department_report_job';
     const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
@@ -2358,7 +4041,326 @@ cron.schedule(
   }
 );
 
+
+// ========== CORRECTIVE ACTION FORM PAGE ==========
+app.get("/corrective-action-form", async (req, res) => {
+  try {
+    const { responsible_id, kpi_id, week } = req.query;
+
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+      [responsible_id]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible) return res.status(404).send("Responsible not found");
+
+    const kpiResp = await pool.query(
+      `SELECT k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
+              kv.value
+       FROM public."Kpi" k
+       LEFT JOIN public.kpi_values kv ON k.kpi_id = kv.kpi_id 
+       WHERE k.kpi_id = $1 AND kv.responsible_id = $2 AND kv.week = $3`,
+      [kpi_id, responsible_id, week]
+    );
+
+    const kpi = kpiResp.rows[0];
+    if (!kpi) return res.status(404).send("KPI not found");
+
+    const existingCA = await pool.query(
+      `SELECT * FROM public.corrective_actions
+       WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3
+       ORDER BY created_date DESC LIMIT 1`,
+      [responsible_id, kpi_id, week]
+    );
+
+    const existingData = existingCA.rows[0] || {};
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Corrective Action Form</title>
+        <style>
+          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }
+          .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
+          .header { background: linear-gradient(135deg, #d32f2f 0%, #f44336 100%); color: white; padding: 25px; text-align: center; }
+          .header h1 { margin: 0; font-size: 24px; font-weight: 600; }
+          .alert-badge { background: rgba(255,255,255,0.2); display: inline-block; padding: 8px 16px; border-radius: 20px; margin-top: 10px; font-size: 13px; }
+          .form-section { padding: 30px; }
+          .info-box { background: #fff3e0; border-left: 4px solid #ff9800; padding: 20px; margin-bottom: 25px; border-radius: 4px; }
+          .info-row { display: flex; margin-bottom: 12px; font-size: 14px; }
+          .info-label { font-weight: 600; width: 140px; color: #333; }
+          .info-value { flex: 1; color: #666; }
+          .performance-box { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
+          .perf-item { text-align: center; padding: 15px; background: #f8f9fa; border-radius: 6px; }
+          .perf-label { font-size: 11px; color: #666; margin-bottom: 8px; text-transform: uppercase; }
+          .perf-value { font-size: 24px; font-weight: 700; }
+          .perf-value.current { color: #d32f2f; }
+          .perf-value.target_value { color: #4caf50; }
+          .perf-value.gap { color: #ff9800; }
+          .form-group { margin-bottom: 25px; }
+          label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; font-size: 14px; }
+          label .required { color: #d32f2f; margin-left: 4px; }
+          textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; font-family: 'Segoe UI', sans-serif; box-sizing: border-box; min-height: 100px; resize: vertical; }
+          textarea:focus { border-color: #d32f2f; outline: none; box-shadow: 0 0 0 2px rgba(211,47,47,0.1); }
+          .help-text { font-size: 12px; color: #666; margin-top: 5px; font-style: italic; }
+          .submit-btn { background: #d32f2f; color: white; border: none; padding: 14px 30px; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; }
+          .submit-btn:hover { background: #b71c1c; }
+          .status-badge { display: inline-block; padding: 6px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+          .status-open { background: #ffebee; color: #c62828; }
+          .status-completed { background: #e8f5e9; color: #2e7d32; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div style="font-size: 40px;margin-bottom:10px;">⚠️</div>
+            <h1>Corrective Action Form</h1>
+            <div class="alert-badge">Week ${week} - Performance Below target_value</div>
+          </div>
+
+          <div class="form-section">
+            <div class="info-box">
+              <div class="info-row">
+                <div class="info-label">Responsible:</div>
+                <div class="info-value">${responsible.name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Plant:</div>
+                <div class="info-value">${responsible.plant_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">Department:</div>
+                <div class="info-value">${responsible.department_name}</div>
+              </div>
+              <div class="info-row">
+                <div class="info-label">KPI:</div>
+                <div class="info-value">${kpi.indicator_title}</div>
+              </div>
+            </div>
+
+            <div class="performance-box">
+              <div class="perf-item">
+                <div class="perf-label">Current Value</div>
+                <div class="perf-value current">${kpi.value || '0'}${kpi.unit || ''}</div>
+              </div>
+              <div class="perf-item">
+                <div class="perf-label">target_value</div>
+                <div class="perf-value target_value">${kpi.target_value || 'N/A'}${kpi.unit || ''}</div>
+              </div>
+              <div class="perf-item">
+                <div class="perf-label">Gap</div>
+                <div class="perf-value gap">
+                  ${kpi.target_value ? (parseFloat(kpi.target_value) - parseFloat(kpi.value || 0)).toFixed(2) : 'N/A'}${kpi.unit || ''}
+                </div>
+              </div>
+            </div>
+
+            ${existingData.corrective_action_id ? `
+            <div style="background:#e3f2fd;padding:15px;border-radius:6px;margin-bottom:20px;">
+              <strong>Status:</strong> 
+              <span class="status-badge status-${existingData.status.toLowerCase()}">${existingData.status}</span>
+              <div style="font-size:12px;color:#666;margin-top:8px;">
+                Last updated: ${new Date(existingData.updated_date).toLocaleString()}
+              </div>
+            </div>
+            ` : ''}
+
+            <form action="/submit-corrective-action" method="POST">
+              <input type="hidden" name="responsible_id" value="${responsible_id}">
+              <input type="hidden" name="kpi_id" value="${kpi_id}">
+              <input type="hidden" name="week" value="${week}">
+              ${existingData.corrective_action_id ?
+        `<input type="hidden" name="corrective_action_id" value="${existingData.corrective_action_id}">`
+        : ''}
+
+              <div class="form-group">
+                <label>Root Cause Analysis<span class="required">*</span></label>
+                <textarea name="root_cause" required placeholder="Describe the root cause of the performance gap...">${existingData.root_cause || ''}</textarea>
+                <div class="help-text">Use the 5 Whys technique or fishbone diagram to identify the root cause</div>
+              </div>
+
+              <div class="form-group">
+                <label>Implemented Solution<span class="required">*</span></label>
+                <textarea name="implemented_solution" required placeholder="Describe the corrective actions taken...">${existingData.implemented_solution || ''}</textarea>
+                <div class="help-text">Detail the specific actions, responsibilities, and timeline</div>
+              </div>
+
+              <div class="form-group">
+                <label>Evidence of Improvement<span class="required">*</span></label>
+                <textarea name="evidence" required placeholder="Provide evidence that the solution is effective...">${existingData.evidence || ''}</textarea>
+                <div class="help-text">Include data, observations, or metrics showing improvement</div>
+              </div>
+
+              <button type="submit" class="submit-btn">
+                ${existingData.corrective_action_id ? '✓ Update' : '📝 Submit'} Corrective Action
+              </button>
+            </form>
+          </div>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error loading corrective action form:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+// ========== SUBMIT CORRECTIVE ACTION ==========
+app.post("/submit-corrective-action", async (req, res) => {
+  try {
+    const {
+      responsible_id, kpi_id, week,
+      root_cause, implemented_solution, evidence,
+      corrective_action_id
+    } = req.body;
+
+    if (corrective_action_id) {
+      await pool.query(
+        `UPDATE public.corrective_actions
+         SET root_cause = $1, implemented_solution = $2, evidence = $3,
+             status = 'Completed', updated_date = NOW()
+         WHERE corrective_action_id = $4`,
+        [root_cause, implemented_solution, evidence, corrective_action_id]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO public.corrective_actions 
+         (responsible_id, kpi_id, week, root_cause, implemented_solution, evidence, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'Completed')`,
+        [responsible_id, kpi_id, week, root_cause, implemented_solution, evidence]
+      );
+    }
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Corrective Action Submitted</title>
+        <style>
+          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+          .success-container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+          h1 { color: #4caf50; font-size: 28px; margin-bottom: 15px; }
+          p { font-size: 16px; color: #333; margin-bottom: 25px; line-height: 1.6; }
+          a { display: inline-block; padding: 12px 25px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 5px; }
+          a:hover { background: #005ea6; }
+        </style>
+      </head>
+      <body>
+        <div class="success-container">
+          <h1>✅ Corrective Action Submitted!</h1>
+          <p>Your corrective action has been successfully recorded for week ${week}.</p>
+          <a href="/dashboard?responsible_id=${responsible_id}">Go to Dashboard</a>
+          <a href="/corrective-actions-list?responsible_id=${responsible_id}">View All Actions</a>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error submitting corrective action:", err);
+    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
+  }
+});
+
+// ========== VIEW CORRECTIVE ACTIONS LIST ==========
+app.get("/corrective-actions-list", async (req, res) => {
+  try {
+    const { responsible_id } = req.query;
+
+    const actionsRes = await pool.query(
+      `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit
+      FROM public.corrective_actions ca
+      JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
+      WHERE ca.responsible_id = $1
+      ORDER BY ca.created_date DESC`,
+      [responsible_id]
+    );
+
+    const actions = actionsRes.rows;
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Corrective Actions History</title>
+        <style>
+          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }
+          .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          h1 { color: #0078D7; margin-bottom: 25px; }
+          table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+          th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
+          th { background: #0078D7; color: white; font-weight: 600; }
+          tr:nth-child(even) { background: #f8f9fa; }
+          .status-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+          .status-open { background: #ffebee; color: #c62828; }
+          .status-completed { background: #e8f5e9; color: #2e7d32; }
+          .action-link { color: #0078D7; text-decoration: none; font-weight: 600; }
+          .action-link:hover { text-decoration: underline; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>📋 Corrective Actions History</h1>
+          <table>
+            <thead>
+              <tr>
+                <th>Week</th>
+                <th>KPI</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${actions.length === 0 ?
+        '<tr><td colspan="5" style="text-align:center;padding:40px;color:#999;">No corrective actions found</td></tr>'
+        :
+        actions.map(action => `
+                  <tr>
+                    <td>${action.week}</td>
+                    <td>
+                      <strong>${action.indicator_title}</strong>
+                      ${action.indicator_sub_title ? `<br><small>${action.indicator_sub_title}</small>` : ''}
+                    </td>
+                    <td>
+                      <span class="status-badge status-${action.status.toLowerCase()}">
+                        ${action.status}
+                      </span>
+                    </td>
+                    <td>${new Date(action.created_date).toLocaleDateString()}</td>
+                    <td>
+                      <a href="/corrective-action-form?responsible_id=${responsible_id}&kpi_id=${action.kpi_id}&week=${action.week}" class="action-link">
+                        ${action.status === 'Open' ? 'Complete' : 'View'}
+                      </a>
+                    </td>
+                  </tr>`
+        ).join('')}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error loading corrective actions list:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+
+//endppoints tree kpi 
 // ========== PLANT HIERARCHY APIs ==========
+
 // 1. Get all root plants (plants without parent/owner)
 // 1. Get all root plants (plants without parent/owner) - UPDATED
 app.get('/api/plants/roots', async (req, res) => {
@@ -2472,7 +4474,7 @@ app.get('/api/plants/:plantId/indicators', async (req, res) => {
                     ))
                     FROM kpi_values kv2
                     WHERE kv2.kpi_id = k.kpi_id 
-                        AND kv2.week = COALESCE($2, '2026-Week5')
+                        AND kv2.week = COALESCE($2, '2026-Week7')
                         AND EXISTS (
                             SELECT 1 FROM "Responsible" r2 
                             WHERE r2.responsible_id = kv2.responsible_id 
@@ -2488,7 +4490,7 @@ app.get('/api/plants/:plantId/indicators', async (req, res) => {
             GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, 
                      k.good_direction, k.tolerance_percent, k.created_at
             ORDER BY k.indicator_title
-        `, [plantId, week || '2026-Week5']);
+        `, [plantId, week || '2026-Week7']);
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching indicators:', error);
@@ -3217,6 +5219,8 @@ app.get('/api/performance/by-plants', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
 
 
 // ---------- Start server ----------
