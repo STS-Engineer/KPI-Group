@@ -2359,7 +2359,6 @@ cron.schedule(
 );
 
 // ========== PLANT HIERARCHY APIs ==========
-
 // 1. Get all root plants (plants without parent/owner)
 // 1. Get all root plants (plants without parent/owner) - UPDATED
 app.get('/api/plants/roots', async (req, res) => {
@@ -2607,60 +2606,53 @@ app.get('/api/plants/:plantId/responsible', async (req, res) => {
 app.get('/api/plants/hierarchy', async (req, res) => {
   try {
     const result = await pool.query(`
-            WITH RECURSIVE plant_tree AS (
-                SELECT 
-                    plant_id,
-                    name,
-                    manager,
-                    manager_email,
-                    parent_id,
-                    created_at,
-                    0 as level,
-                    name as path_name
-                FROM "Plant"
-                WHERE parent_id IS NULL
-                
-                UNION ALL
-                
-                SELECT 
-                    p.plant_id,
-                    p.name,
-                    p.manager,
-                    p.manager_email,
-                    p.parent_id,
-                    p.created_at,
-                    pt.level + 1,
-                    pt.path_name || ' > ' || p.name
-                FROM "Plant" p
-                INNER JOIN plant_tree pt ON p.parent_id = pt.plant_id
-            )
-            SELECT 
-                pt.plant_id,
-                pt.name,
-                pt.manager,
-                pt.manager_email,
-                pt.parent_id,
-                pt.level,
-                pt.path_name,
-                (
-                    SELECT COUNT(*)
-                    FROM "Responsible" r
-                    WHERE r.plant_id = pt.plant_id
-                ) as responsible_count,
-                (
-                    SELECT COUNT(*)
-                    FROM "Plant" c
-                    WHERE c.parent_id = pt.plant_id
-                ) as child_count
-            FROM plant_tree pt
-            ORDER BY pt.path_name
-        `);
+      WITH RECURSIVE plant_tree AS (
+        SELECT
+          plant_id,
+          name::text,          -- cast to text so recursive concat matches
+          manager::text,
+          manager_email::text,
+          parent_id,
+          created_at,
+          0            AS level,
+          name::text   AS path_name
+        FROM "Plant"
+        WHERE parent_id IS NULL
+
+        UNION ALL
+
+        SELECT
+          p.plant_id,
+          p.name::text,
+          p.manager::text,
+          p.manager_email::text,
+          p.parent_id,
+          p.created_at,
+          pt.level + 1,
+          pt.path_name || ' > ' || p.name::text
+        FROM "Plant" p
+        INNER JOIN plant_tree pt ON p.parent_id = pt.plant_id
+      )
+      SELECT
+        pt.plant_id,
+        pt.name,
+        pt.manager,
+        pt.manager_email,
+        pt.parent_id,
+        pt.level,
+        pt.path_name,
+        (SELECT COUNT(*) FROM "Responsible" r WHERE r.plant_id = pt.plant_id) AS responsible_count,
+        (SELECT COUNT(*) FROM "Plant"       c WHERE c.parent_id = pt.plant_id) AS child_count
+      FROM plant_tree pt
+      ORDER BY pt.path_name
+    `);
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching plant hierarchy:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // 8. Search across plants, KPIs, and responsible persons
 app.get('/api/search', async (req, res) => {
@@ -2746,52 +2738,77 @@ app.get('/api/search', async (req, res) => {
 
 // 9. Get weekly KPI values for a plant
 app.get('/api/plants/:plantId/weekly-values', async (req, res) => {
+  const { plantId } = req.params;
+  const { week }    = req.query;
+
   try {
-    const { plantId } = req.params;
-    const { week } = req.query;
     const result = await pool.query(`
-      SELECT 
+      WITH latest_hist AS (
+        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
+               h.responsible_id,
+               h.kpi_id,
+               h.week,
+               CASE
+                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                 THEN NULLIF(trim(h.new_value), '')::numeric
+                 ELSE NULL
+               END AS new_value,
+               h.target
+        FROM   kpi_values_hist26 h
+        WHERE  ($2::varchar IS NULL OR h.week = $2)
+        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
+      )
+
+      SELECT
         k.kpi_id,
         k.indicator_title,
         k.indicator_sub_title,
         k.unit,
+        k.good_direction,
+        k.minimum_value,
+        k.maximum_value,
         r.responsible_id,
-        r.name as responsible_name,
-        d.name as department_name,
-        kv.week,
-        kv.value,
-        kv.target_snapshot as target,
-        kv.low_limit_snapshot as low_limit,
-        kv.high_limit_snapshot as high_limit,
-        kv."Date" as value_date,
-        CASE 
-          WHEN kv.value IS NULL OR kv.value = '' 
-               THEN 'No Data'
-          WHEN kv.value ~ '^-?[0-9]+(\\.[0-9]+)?$'
-               AND kv.high_limit_snapshot IS NOT NULL
-               AND kv.value::numeric >= kv.high_limit_snapshot 
-               THEN 'Above Target'
-          WHEN kv.value ~ '^-?[0-9]+(\\.[0-9]+)?$'
-               AND kv.low_limit_snapshot IS NOT NULL
-               AND kv.value::numeric <= kv.low_limit_snapshot  
-               THEN 'Below Target'
-          ELSE 'Within Target'
-        END as status
-      FROM "Responsible" r
-      INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
-      INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
-      LEFT JOIN "Department" d ON d.department_id = r.department_id
-      WHERE r.plant_id = $1
-        AND ($2::varchar IS NULL OR kv.week = $2)
-      ORDER BY k.indicator_title, r.name
+        r.name              AS responsible_name,
+        d.name              AS department_name,
+        lh.week,
+        lh.new_value        AS value,
+        lh.target,
+
+        CASE
+          WHEN lh.new_value IS NULL
+            THEN 'No Data'
+
+          WHEN k.good_direction = 'UP'
+           AND k.maximum_value IS NOT NULL
+           AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+            THEN 'Above Maximum'
+
+          WHEN k.good_direction = 'DOWN'
+           AND k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'Below Minimum'
+
+          WHEN k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'Below Minimum'
+
+          ELSE 'On Target'
+        END AS status
+
+      FROM   "Responsible"  r
+      JOIN   latest_hist    lh ON lh.responsible_id = r.responsible_id
+      JOIN   "Kpi"          k  ON k.kpi_id           = lh.kpi_id
+      LEFT   JOIN "Department" d ON d.department_id  = r.department_id
+      WHERE  r.plant_id = $1
+      ORDER  BY k.indicator_title, r.name
     `, [plantId, week || null]);
+
     res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching weekly values:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error('Error fetching weekly values:', err);
+    res.status(500).json({ error: err.message });
   }
 });
-
 
 // 10. Get plant statistics
 app.get('/api/stats', async (req, res) => {
@@ -2894,48 +2911,309 @@ app.get('/api/plants/:plantId/indicators-simple', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// 1. GET /api/plants/:plantId/performance?week=XXXX
+//    Returns aggregated RED / GREEN counts per indicator_title.
+//    Used by the frontend performanceMap to colour the KPI cards.
+// ---------------------------------------------------------------------------
 app.get('/api/plants/:plantId/performance', async (req, res) => {
   const { plantId } = req.params;
-  const { week } = req.query;
+  const { week }    = req.query;
+
   try {
     const result = await pool.query(`
+      WITH RECURSIVE plant_tree AS (
+        SELECT plant_id
+        FROM   "Plant"
+        WHERE  plant_id = $1
+
+        UNION ALL
+
+        SELECT p.plant_id
+        FROM   "Plant"    p
+        JOIN   plant_tree pt ON p.parent_id = pt.plant_id
+      ),
+
+      latest_hist AS (
+        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
+               h.responsible_id,
+               h.kpi_id,
+               CASE
+                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                 THEN NULLIF(trim(h.new_value), '')::numeric
+                 ELSE NULL
+               END AS new_value,
+               h.target
+        FROM   kpi_values_hist26 h
+        WHERE  h.week = $2
+        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
+      )
+
       SELECT
-        indicator_title,
-        good_direction,
-        performance_status,
+        k.indicator_title,
+        k.good_direction,
+        k.minimum_value,
+        k.maximum_value,
+
+        CASE
+          WHEN lh.new_value IS NULL
+            THEN 'NO_DATA'
+
+          WHEN k.good_direction = 'UP'
+           AND k.maximum_value IS NOT NULL
+           AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+            THEN 'RED'
+
+          WHEN k.good_direction = 'DOWN'
+           AND k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'RED'
+
+          WHEN k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'RED'
+
+          ELSE 'GREEN'
+        END AS performance_status,
+
         COUNT(*) AS count
-      FROM kpi_performance_view
-      WHERE plant_id = $1
-        AND week     = $2
-      GROUP BY indicator_title, good_direction, performance_status
-      ORDER BY indicator_title
+
+      FROM   plant_tree    pt
+      JOIN   "Responsible" r  ON r.plant_id        = pt.plant_id
+      JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
+      JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
+      GROUP  BY
+        k.indicator_title,
+        k.good_direction,
+        k.minimum_value,
+        k.maximum_value,
+        performance_status
+      ORDER  BY k.indicator_title
     `, [plantId, week]);
+
     res.json(result.rows);
   } catch (err) {
-    console.error('Error fetching performance:', err);
+    console.error('Error in /performance:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
+
+
 app.get('/api/plants/:plantId/indicators/:kpiId/performance', async (req, res) => {
   const { plantId, kpiId } = req.params;
-  const { week } = req.query;
+  const { week }           = req.query;
+
   try {
     const result = await pool.query(`
+      WITH latest_hist AS (
+        SELECT DISTINCT ON (h.responsible_id)
+               h.responsible_id,
+               h.kpi_id,
+               CASE
+                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                 THEN NULLIF(trim(h.new_value), '')::numeric
+                 ELSE NULL
+               END AS new_value,
+               h.target
+        FROM   kpi_values_hist26 h
+        WHERE  h.kpi_id = $2
+          AND  h.week   = $3
+        ORDER  BY h.responsible_id, h.updated_at DESC
+      )
+
       SELECT
-        kpi_id,
-        responsible_id,
-        performance_status,
-        good_direction
-      FROM kpi_performance_view
-      WHERE plant_id = $1
-        AND kpi_id   = $2
-        AND week     = $3
-      ORDER BY responsible_name
+        k.kpi_id,
+        r.responsible_id,
+        r.name           AS responsible_name,
+        lh.new_value,
+        lh.target,
+        k.minimum_value,
+        k.maximum_value,
+        k.good_direction,
+
+        CASE
+          WHEN lh.new_value IS NULL
+            THEN 'NO_DATA'
+
+          WHEN k.good_direction = 'UP'
+           AND k.maximum_value IS NOT NULL
+           AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+            THEN 'RED'
+
+          WHEN k.good_direction = 'DOWN'
+           AND k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'RED'
+
+          WHEN k.minimum_value IS NOT NULL
+           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+            THEN 'RED'
+
+          ELSE 'GREEN'
+        END AS performance_status
+
+      FROM   "Responsible" r
+      JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
+      JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
+      WHERE  r.plant_id = $1
+        AND  k.kpi_id   = $2
+      ORDER  BY r.name
     `, [plantId, kpiId, week]);
+
     res.json(result.rows);
   } catch (err) {
-    console.error('Error fetching KPI performance:', err);
+    console.error('Error in /indicators/:kpiId/performance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+//by department
+app.get('/api/performance/by-departments', async (req, res) => {
+  const { week, plantId } = req.query;
+
+  try {
+    const result = await pool.query(`
+      WITH RECURSIVE plant_scope AS (
+        -- If plantId provided, walk that subtree; otherwise all plants
+        SELECT plant_id
+        FROM   "Plant"
+        WHERE  ($2::int IS NULL OR plant_id = $2::int)
+
+        UNION ALL
+
+        SELECT p.plant_id
+        FROM   "Plant"    p
+        JOIN   plant_scope ps ON p.parent_id = ps.plant_id
+        WHERE  $2::int IS NOT NULL   -- only recurse when filtering by plant
+      ),
+
+      latest_hist AS (
+        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
+               h.responsible_id,
+               h.kpi_id,
+               CASE
+                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                 THEN NULLIF(trim(h.new_value), '')::numeric
+                 ELSE NULL
+               END AS new_value
+        FROM   kpi_values_hist26 h
+        WHERE  h.week = $1
+        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
+      ),
+
+      perf AS (
+        SELECT
+          COALESCE(d.name, 'No Department') AS department_name,
+          CASE
+            WHEN lh.new_value IS NULL
+              THEN 'NO_DATA'
+            WHEN k.good_direction = 'UP'
+             AND k.maximum_value IS NOT NULL
+             AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+              THEN 'RED'
+            WHEN k.good_direction = 'DOWN'
+             AND k.minimum_value IS NOT NULL
+             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+              THEN 'RED'
+            WHEN k.minimum_value IS NOT NULL
+             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+              THEN 'RED'
+            ELSE 'GREEN'
+          END AS performance_status
+        FROM   plant_scope   ps
+        JOIN   "Responsible" r  ON r.plant_id        = ps.plant_id
+        LEFT   JOIN "Department" d ON d.department_id = r.department_id
+        JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
+        JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
+      )
+
+      SELECT
+        department_name,
+        COUNT(*) FILTER (WHERE performance_status = 'GREEN')   AS on_target,
+        COUNT(*) FILTER (WHERE performance_status = 'RED')     AS off_target,
+        COUNT(*) FILTER (WHERE performance_status = 'NO_DATA') AS no_data,
+        COUNT(*)                                                AS total,
+        ROUND(
+          100.0 * COUNT(*) FILTER (WHERE performance_status = 'GREEN') /
+          NULLIF(COUNT(*) FILTER (WHERE performance_status IN ('GREEN','RED')), 0)
+        , 1) AS health_pct
+      FROM perf
+      GROUP BY department_name
+      ORDER BY off_target DESC, department_name
+    `, [week, plantId || null]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error in /performance/by-departments:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.get('/api/performance/by-plants', async (req, res) => {
+  const { week } = req.query;
+
+  try {
+    const result = await pool.query(`
+      WITH latest_hist AS (
+        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
+               h.responsible_id,
+               h.kpi_id,
+               CASE
+                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                 THEN NULLIF(trim(h.new_value), '')::numeric
+                 ELSE NULL
+               END AS new_value
+        FROM   kpi_values_hist26 h
+        WHERE  h.week = $1
+        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
+      ),
+
+      perf AS (
+        SELECT
+          p.plant_id,
+          p.name AS plant_name,
+          p.parent_id,
+          CASE
+            WHEN lh.new_value IS NULL
+              THEN 'NO_DATA'
+            WHEN k.good_direction = 'UP'
+             AND k.maximum_value IS NOT NULL
+             AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+              THEN 'RED'
+            WHEN k.good_direction = 'DOWN'
+             AND k.minimum_value IS NOT NULL
+             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+              THEN 'RED'
+            WHEN k.minimum_value IS NOT NULL
+             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+              THEN 'RED'
+            ELSE 'GREEN'
+          END AS performance_status
+        FROM   "Plant"       p
+        JOIN   "Responsible" r  ON r.plant_id        = p.plant_id
+        JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
+        JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
+      )
+
+      SELECT
+        plant_id,
+        plant_name,
+        parent_id,
+        COUNT(*) FILTER (WHERE performance_status = 'GREEN')   AS on_target,
+        COUNT(*) FILTER (WHERE performance_status = 'RED')     AS off_target,
+        COUNT(*) FILTER (WHERE performance_status = 'NO_DATA') AS no_data,
+        COUNT(*)                                                AS total
+      FROM perf
+      GROUP BY plant_id, plant_name, parent_id
+      ORDER BY off_target DESC, plant_name
+    `, [week]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error in /performance/by-plants:', err);
     res.status(500).json({ error: err.message });
   }
 });
