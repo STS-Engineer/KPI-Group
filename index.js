@@ -5113,14 +5113,14 @@ app.get('/api/performance/by-departments', async (req, res) => {
               THEN 'NO_DATA'
             WHEN k.good_direction = 'UP'
              AND k.maximum_value IS NOT NULL
-             AND lh.new_value > NULLIF(trim(k.maximum_value::text), '')::numeric
+             AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
               THEN 'RED'
             WHEN k.good_direction = 'DOWN'
              AND k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+             AND lh.new_value < NULLIF(REPLACE(trim(k.minimum_value::text), ',', ''), '')::numeric
               THEN 'RED'
             WHEN k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
+             AND lh.new_value < NULLIF(REPLACE(trim(k.minimum_value::text), ',', ''), '')::numeric
               THEN 'RED'
             ELSE 'GREEN'
           END AS performance_status
