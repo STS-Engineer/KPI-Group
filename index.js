@@ -690,7 +690,7 @@ const checkAndTriggerCorrectiveActions = async (
 };
 // ========== CORRECTIVE ACTION SYSTEM - END ==========
 
-// ---- AI helper: generate suggestions for one KPI ----
+// ---- AI helper: generate suggestions for one KPI ----   
 const generateCASuggestions = async (kpi) => {
   try {
     const OpenAI = require("openai");
