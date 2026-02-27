@@ -688,14 +688,14 @@ const checkAndTriggerCorrectiveActions = async (
     return { targetUpdated: false, error: error.message };
   }
 };
-// ========== CORRECTIVE ACTION SYSTEM - END ==========
+// ========== CORRECTIVE ACTION SYSTEM - END ========== 
 
 // ---- AI helper: generate suggestions for one KPI ----   
 const generateCASuggestions = async (kpi) => {
   try {
     const OpenAI = require("openai");
     const openai = new OpenAI({
-      apiKey:"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",
+      apiKey:"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",
     });
 
     const currentVal = parseFloat(kpi.value || 0);
