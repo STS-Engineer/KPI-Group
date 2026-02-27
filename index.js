@@ -695,7 +695,7 @@ const generateCASuggestions = async (kpi) => {
   try {
     const OpenAI = require("openai");
     const openai = new OpenAI({
-      apiKey:"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",
+      apiKey:process.env.SECRET_KEY,
     });
 
     const currentVal = parseFloat(kpi.value || 0);
