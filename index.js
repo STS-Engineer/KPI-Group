@@ -694,9 +694,7 @@ const checkAndTriggerCorrectiveActions = async (
 const generateCASuggestions = async (kpi) => {
   try {
     const OpenAI = require("openai");
-    const openai = new OpenAI({
-      apiKey:process.env.SECRET_KEY,
-    });
+    const openai = new OpenAI({ apiKey: process.env.SECRET_KEY });
 
     const currentVal = parseFloat(kpi.value || 0);
     const targetVal = parseFloat(kpi.target_value || 0);
@@ -707,46 +705,63 @@ const generateCASuggestions = async (kpi) => {
 
     const prompt = `You are an industrial manufacturing and continuous-improvement expert.
 
-    A KPI is BELOW its target. Give exactly 3 corrective action suggestions structured as:
-    1. Root Cause (likely reason the KPI is below target)
-    2. Immediate Action (what to do right now, within 1 week)
-    3. Evidence to collect (how to prove the action is working)
+A KPI is BELOW its target. Give exactly 2 distinct corrective action plans.
+Each plan must have:
+1. root_cause  – likely reason the KPI is below target (1-2 sentences)
+2. immediate_action – what to do right now, within 1 week (1-2 sentences)
+3. evidence – how to prove the action is working (1-2 sentences)
 
-   KPI Details:
-   - Indicator: ${kpi.indicator_title}${kpi.indicator_sub_title ? ` — ${kpi.indicator_sub_title}` : ""}
-   - Unit: ${kpi.unit || "N/A"}
-   - Current Value: ${currentVal} ${kpi.unit || ""}
-   - Target Value: ${targetVal} ${kpi.unit || ""}
-   - Gap: ${gap} ${kpi.unit || ""} (${pctGap}% below target)
+The 2 plans should represent DIFFERENT root-cause hypotheses so the responsible can pick the most relevant one.
 
-   Rules:
-  - Be specific to this KPI's context, not generic
-  - Each item: 1–2 sentences max
-  - Return ONLY valid JSON, no markdown, no extra text
+KPI Details:
+- Indicator: ${kpi.indicator_title}${kpi.indicator_sub_title ? ` — ${kpi.indicator_sub_title}` : ""}
+- Unit: ${kpi.unit || "N/A"}
+- Current Value: ${currentVal} ${kpi.unit || ""}
+- Target Value: ${targetVal} ${kpi.unit || ""}
+- Gap: ${gap} ${kpi.unit || ""} (${pctGap}% below target)
 
-  Format:
-    {
-   "root_cause": "...",
-   "immediate_action": "...",
+Rules:
+- Be specific to this KPI context, not generic
+- Return ONLY valid JSON, no markdown, no extra text
+
+Format:
+{
+  "suggestion_1": {
+    "root_cause": "...",
+    "immediate_action": "...",
     "evidence": "..."
-    }`;
+  },
+  "suggestion_2": {
+    "root_cause": "...",
+    "immediate_action": "...",
+    "evidence": "..."
+  }
+}`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.6,
-      max_tokens: 350,
+      temperature: 0.7,
+      max_tokens: 600,
     });
 
     const raw = completion.choices[0].message.content.trim()
       .replace(/```json|```/g, "").trim();
 
     const parsed = JSON.parse(raw);
-    return {
-      root_cause: parsed.root_cause || "",
-      immediate_action: parsed.immediate_action || "",
-      evidence: parsed.evidence || "",
-    };
+
+    return [
+      {
+        root_cause: parsed.suggestion_1?.root_cause || "",
+        immediate_action: parsed.suggestion_1?.immediate_action || "",
+        evidence: parsed.suggestion_1?.evidence || "",
+      },
+      {
+        root_cause: parsed.suggestion_2?.root_cause || "",
+        immediate_action: parsed.suggestion_2?.immediate_action || "",
+        evidence: parsed.suggestion_2?.evidence || "",
+      },
+    ];
   } catch (err) {
     console.error("AI suggestion error for KPI:", kpi.indicator_title, err.message);
     return null;
@@ -820,48 +835,87 @@ app.get("/corrective-actions-bulk", async (req, res) => {
         ? (((parseFloat(action.target_value) - parseFloat(action.value)) / parseFloat(action.target_value)) * 100).toFixed(1)
         : null;
 
-      const suggestionHtml = suggestions ? `
-        <div class="ai-box">
-          <div class="ai-box-header">
-            <span class="ai-icon">🤖</span>
-            <span class="ai-title">AI Suggestions</span>
-            
+      const suggestionHtml = suggestions ? (() => {
+        const renderSuggestionOption = (s, optionNum, caId) => `
+    <div class="ai-option" style="
+      border: 1.5px solid #ddd6fe;
+      border-radius: 10px;
+      padding: 14px 16px;
+      background: white;
+      margin-bottom: 10px;
+    ">
+      <div style="
+        font-size: 12px;
+        font-weight: 700;
+        color: #5b21b6;
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      ">
+        <span style="
+          background: #7c3aed;
+          color: white;
+          border-radius: 50%;
+          width: 20px; height: 20px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 11px;
+        ">${optionNum}</span>
+        Option ${optionNum}
+      </div>
+
+      <div class="ai-suggestion-row">
+        <div class="ai-suggestion-card root-cause-card"
+             onclick="applyToField('root_cause_${caId}', this)">
+          <div class="ai-card-label">
+            <span class="ai-card-icon">🔍</span>Root Cause
+            <span class="apply-hint">Click to apply ↓</span>
           </div>
+          <div class="ai-card-text">${s.root_cause}</div>
+        </div>
 
-          <div class="ai-suggestion-row">
-            <div class="ai-suggestion-card root-cause-card" onclick="applyToField('root_cause_${action.corrective_action_id}', this)">
-              <div class="ai-card-label">
-                <span class="ai-card-icon">🔍</span>
-                Root Cause
-                <span class="apply-hint">Click to apply ↓</span>
-              </div>
-              <div class="ai-card-text">${suggestions.root_cause}</div>
-            </div>
-
-            <div class="ai-suggestion-card action-card" onclick="applyToField('solution_${action.corrective_action_id}', this)">
-              <div class="ai-card-label">
-                <span class="ai-card-icon">⚡</span>
-                Immediate Action
-                <span class="apply-hint">Click to apply ↓</span>
-              </div>
-              <div class="ai-card-text">${suggestions.immediate_action}</div>
-            </div>
-
-            <div class="ai-suggestion-card evidence-card" onclick="applyToField('evidence_${action.corrective_action_id}', this)">
-              <div class="ai-card-label">
-                <span class="ai-card-icon">📊</span>
-                Evidence to Collect
-                <span class="apply-hint">Click to apply ↓</span>
-              </div>
-              <div class="ai-card-text">${suggestions.evidence}</div>
-            </div>
+        <div class="ai-suggestion-card action-card"
+             onclick="applyToField('solution_${caId}', this)">
+          <div class="ai-card-label">
+            <span class="ai-card-icon">⚡</span>Immediate Action
+            <span class="apply-hint">Click to apply ↓</span>
           </div>
+          <div class="ai-card-text">${s.immediate_action}</div>
         </div>
-      ` : `
-        <div class="ai-box ai-box-error">
-          <span>⚠️ AI suggestions unavailable for this KPI — please fill the fields manually.</span>
+
+        <div class="ai-suggestion-card evidence-card"
+             onclick="applyToField('evidence_${caId}', this)">
+          <div class="ai-card-label">
+            <span class="ai-card-icon">📊</span>Evidence
+            <span class="apply-hint">Click to apply ↓</span>
+          </div>
+          <div class="ai-card-text">${s.evidence}</div>
         </div>
-      `;
+      </div>
+
+      </div>
+    `;
+
+    return `
+    <div class="ai-box">
+      <div class="ai-box-header">
+        <span class="ai-icon">🤖</span>
+        <span class="ai-title">AI Suggestions — Pick one option</span>
+        <span class="ai-badge">2 Options</span>
+      </div>
+      <div style="padding: 14px 16px;">
+        ${renderSuggestionOption(suggestions[0], 1, action.corrective_action_id)}
+        ${renderSuggestionOption(suggestions[1], 2, action.corrective_action_id)}
+      </div>
+    </div>
+  `;
+      })() : `
+     <div class="ai-box ai-box-error">
+     <span>⚠️ AI suggestions unavailable for this KPI — please fill the fields manually.</span>
+     </div>
+   `;
 
       return `
         <div class="kpi-section">
