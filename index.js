@@ -690,172 +690,549 @@ const checkAndTriggerCorrectiveActions = async (
 };
 // ========== CORRECTIVE ACTION SYSTEM - END ==========
 
+// ---- AI helper: generate suggestions for one KPI ----
+const generateCASuggestions = async (kpi) => {
+  try {
+    const OpenAI = require("openai");
+    const openai = new OpenAI({
+      apiKey:"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",
+    });
+
+    const currentVal = parseFloat(kpi.value || 0);
+    const targetVal = parseFloat(kpi.target_value || 0);
+    const gap = targetVal > 0 ? (targetVal - currentVal).toFixed(2) : "N/A";
+    const pctGap = targetVal > 0
+      ? (((targetVal - currentVal) / targetVal) * 100).toFixed(1)
+      : "N/A";
+
+    const prompt = `You are an industrial manufacturing and continuous-improvement expert.
+
+    A KPI is BELOW its target. Give exactly 3 corrective action suggestions structured as:
+    1. Root Cause (likely reason the KPI is below target)
+    2. Immediate Action (what to do right now, within 1 week)
+    3. Evidence to collect (how to prove the action is working)
+
+   KPI Details:
+   - Indicator: ${kpi.indicator_title}${kpi.indicator_sub_title ? ` — ${kpi.indicator_sub_title}` : ""}
+   - Unit: ${kpi.unit || "N/A"}
+   - Current Value: ${currentVal} ${kpi.unit || ""}
+   - Target Value: ${targetVal} ${kpi.unit || ""}
+   - Gap: ${gap} ${kpi.unit || ""} (${pctGap}% below target)
+
+   Rules:
+  - Be specific to this KPI's context, not generic
+  - Each item: 1–2 sentences max
+  - Return ONLY valid JSON, no markdown, no extra text
+
+  Format:
+    {
+   "root_cause": "...",
+   "immediate_action": "...",
+    "evidence": "..."
+    }`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.6,
+      max_tokens: 350,
+    });
+
+    const raw = completion.choices[0].message.content.trim()
+      .replace(/```json|```/g, "").trim();
+
+    const parsed = JSON.parse(raw);
+    return {
+      root_cause: parsed.root_cause || "",
+      immediate_action: parsed.immediate_action || "",
+      evidence: parsed.evidence || "",
+    };
+  } catch (err) {
+    console.error("AI suggestion error for KPI:", kpi.indicator_title, err.message);
+    return null;
+  }
+};
+
+
 // ========== BULK CORRECTIVE ACTIONS FORM ==========
 app.get("/corrective-actions-bulk", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
 
-    // Get responsible info
+    // --- responsible ---
     const resResp = await pool.query(
       `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
+              p.name AS plant_name, d.name AS department_name
+       FROM public."Responsible" r
+       JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`,
       [responsible_id]
     );
-
     const responsible = resResp.rows[0];
     if (!responsible) return res.status(404).send("Responsible not found");
 
-    // Get all open corrective actions
+    // --- open corrective actions ---
     const actionsRes = await pool.query(
       `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
               kv.value
        FROM public.corrective_actions ca
        JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
-       LEFT JOIN public.kpi_values kv ON ca.kpi_id = kv.kpi_id 
-         AND kv.responsible_id = ca.responsible_id 
+       LEFT JOIN public.kpi_values kv
+         ON ca.kpi_id = kv.kpi_id
+         AND kv.responsible_id = ca.responsible_id
          AND kv.week = ca.week
-       WHERE ca.responsible_id = $1 
-         AND ca.week = $2 
+       WHERE ca.responsible_id = $1
+         AND ca.week = $2
          AND ca.status = 'Open'
        ORDER BY k.indicator_title`,
       [responsible_id, week]
     );
 
     const actions = actionsRes.rows;
+
     if (actions.length === 0) {
       return res.send(`
         <div style="text-align:center;padding:60px;font-family:'Segoe UI',sans-serif;">
           <h2 style="color:#4caf50;">✅ No Open Corrective Actions</h2>
           <p>All corrective actions for week ${week} have been completed.</p>
-          <a href="/dashboard?responsible_id=${responsible_id}" style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;text-decoration:none;border-radius:6px;font-weight:bold;">Go to Dashboard</a>
+          <a href="/dashboard?responsible_id=${responsible_id}"
+             style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;
+                    text-decoration:none;border-radius:6px;font-weight:bold;">
+            Go to Dashboard
+          </a>
         </div>
       `);
     }
 
+    // --- fetch AI suggestions in PARALLEL for all KPIs ---
+    console.log(`🤖 Fetching AI suggestions for ${actions.length} KPIs...`);
+    const suggestionsArray = await Promise.all(actions.map(a => generateCASuggestions(a)));
+    console.log(`✅ AI suggestions ready`);
+
+    // ---- build KPI sections ----
+    const kpiSectionsHtml = actions.map((action, index) => {
+      const suggestions = suggestionsArray[index];
+      const gap = action.target_value
+        ? (parseFloat(action.target_value) - parseFloat(action.value || 0)).toFixed(2)
+        : null;
+      const pctGap = action.target_value && action.value
+        ? (((parseFloat(action.target_value) - parseFloat(action.value)) / parseFloat(action.target_value)) * 100).toFixed(1)
+        : null;
+
+      const suggestionHtml = suggestions ? `
+        <div class="ai-box">
+          <div class="ai-box-header">
+            <span class="ai-icon">🤖</span>
+            <span class="ai-title">AI Suggestions</span>
+            
+          </div>
+
+          <div class="ai-suggestion-row">
+            <div class="ai-suggestion-card root-cause-card" onclick="applyToField('root_cause_${action.corrective_action_id}', this)">
+              <div class="ai-card-label">
+                <span class="ai-card-icon">🔍</span>
+                Root Cause
+                <span class="apply-hint">Click to apply ↓</span>
+              </div>
+              <div class="ai-card-text">${suggestions.root_cause}</div>
+            </div>
+
+            <div class="ai-suggestion-card action-card" onclick="applyToField('solution_${action.corrective_action_id}', this)">
+              <div class="ai-card-label">
+                <span class="ai-card-icon">⚡</span>
+                Immediate Action
+                <span class="apply-hint">Click to apply ↓</span>
+              </div>
+              <div class="ai-card-text">${suggestions.immediate_action}</div>
+            </div>
+
+            <div class="ai-suggestion-card evidence-card" onclick="applyToField('evidence_${action.corrective_action_id}', this)">
+              <div class="ai-card-label">
+                <span class="ai-card-icon">📊</span>
+                Evidence to Collect
+                <span class="apply-hint">Click to apply ↓</span>
+              </div>
+              <div class="ai-card-text">${suggestions.evidence}</div>
+            </div>
+          </div>
+        </div>
+      ` : `
+        <div class="ai-box ai-box-error">
+          <span>⚠️ AI suggestions unavailable for this KPI — please fill the fields manually.</span>
+        </div>
+      `;
+
+      return `
+        <div class="kpi-section">
+          <input type="hidden" name="corrective_action_ids[]" value="${action.corrective_action_id}">
+
+          <!-- KPI Header -->
+          <div class="kpi-header">
+            <div class="kpi-number">${index + 1}</div>
+            <div class="kpi-info">
+              <div class="kpi-title">${action.indicator_title}</div>
+              ${action.indicator_sub_title ? `<div class="kpi-subtitle">${action.indicator_sub_title}</div>` : ''}
+            </div>
+          </div>
+
+          <!-- Performance Stats -->
+          <div class="perf-stats">
+            <div class="stat-box stat-current">
+              <div class="stat-label">Current Value</div>
+              <div class="stat-value">${action.value || '0'} <span class="stat-unit">${action.unit || ''}</span></div>
+            </div>
+            <div class="stat-box stat-target">
+              <div class="stat-label">Target</div>
+              <div class="stat-value">${action.target_value || 'N/A'} <span class="stat-unit">${action.unit || ''}</span></div>
+            </div>
+            <div class="stat-box stat-gap">
+              <div class="stat-label">Gap</div>
+              <div class="stat-value">${gap || 'N/A'} <span class="stat-unit">${action.unit || ''}</span></div>
+              ${pctGap ? `<div class="stat-pct">${pctGap}% below target</div>` : ''}
+            </div>
+          </div>
+
+          <!-- AI Suggestions Box (auto-loaded) -->
+          ${suggestionHtml}
+
+          <!-- Form Fields -->
+          <div class="form-fields">
+            <div class="form-group">
+              <label for="root_cause_${action.corrective_action_id}">
+                🔍 Root Cause <span class="required">*</span>
+              </label>
+              <textarea
+                name="root_cause_${action.corrective_action_id}"
+                id="root_cause_${action.corrective_action_id}"
+                required
+                placeholder="Describe the root cause — or click the AI suggestion above to auto-fill"
+              >${action.root_cause || ''}</textarea>
+            </div>
+
+            <div class="form-group">
+              <label for="solution_${action.corrective_action_id}">
+                ⚡ Implemented Solution <span class="required">*</span>
+              </label>
+              <textarea
+                name="solution_${action.corrective_action_id}"
+                id="solution_${action.corrective_action_id}"
+                required
+                placeholder="Describe actions taken — or click the AI suggestion above to auto-fill"
+              >${action.implemented_solution || ''}</textarea>
+            </div>
+
+            <div class="form-group">
+              <label for="evidence_${action.corrective_action_id}">
+                📊 Evidence <span class="required">*</span>
+              </label>
+              <textarea
+                name="evidence_${action.corrective_action_id}"
+                id="evidence_${action.corrective_action_id}"
+                required
+                placeholder="What evidence shows improvement? — or click the AI suggestion above to auto-fill"
+              >${action.evidence || ''}</textarea>
+              <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    // ---- full page HTML ----
     res.send(`
       <!DOCTYPE html>
-      <html>
+      <html lang="en">
       <head>
         <meta charset="utf-8">
-        <title>Corrective Actions - Week ${week}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Corrective Actions — Week ${week}</title>
         <style>
-        body {
-          font-family: 'Segoe UI', sans-serif;
-          margin: 0;
-          padding: 20px;
-          min-height: 100vh;
-          background-image: url("https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600");
-          background-size: cover;
-          background-position: center;
-          background-repeat: no-repeat;
-          background-attachment: fixed;
-         }
+          *, *::before, *::after { box-sizing: border-box; }
 
-        .container {
-           max-width: 1000px;
-           margin: 0 auto;
-           background: rgba(255, 255, 255, 0.95);
-           backdrop-filter: blur(5px);
-           border-radius: 8px;
-           box-shadow: 0 2px 20px rgba(0,0,0,0.3);
-           overflow: hidden;
-           }
+          body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            margin: 0;
+            padding: 24px 16px;
+            min-height: 100vh;
+            background: #f0f2f5;
+            background-image: url("https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600");
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+          }
 
-          .header { background: linear-gradient(135deg, #d32f2f 0%, #f44336 100%); color: white; padding: 30px; text-align: center; }
-          .header h1 { margin: 0; font-size: 26px; font-weight: 600; }
-          .badge { background: rgba(255,255,255,0.2); display: inline-block; padding: 8px 16px; border-radius: 20px; margin-top: 10px; font-size: 14px; }
-          .form-section { padding: 30px; }
-          .info-box { background: #fff3e0; border-left: 4px solid #ff9800; padding: 20px; margin-bottom: 25px; border-radius: 4px; }
-          .kpi-section { margin-bottom: 30px; border: 2px solid #e0e0e0; border-radius: 8px; padding: 20px; background: #fafafa; }
-          .kpi-header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 15px; padding-bottom: 15px; border-bottom: 2px solid #e0e0e0; }
-          .kpi-title { font-size: 16px; font-weight: 700; color: #333; }
-          .kpi-subtitle { font-size: 13px; color: #666; margin-top: 5px; }
-          .perf-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
-          .stat-box { text-align: center; padding: 12px; background: white; border-radius: 6px; border: 1px solid #e0e0e0; }
-          .stat-label { font-size: 10px; color: #666; text-transform: uppercase; margin-bottom: 5px; }
-          .stat-value { font-size: 20px; font-weight: 700; }
-          .stat-value.current { color: #d32f2f; }
-          .stat-value.target { color: #4caf50; }
-          .stat-value.gap { color: #ff9800; }
-          .form-group { margin-bottom: 20px; }
-          label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; font-size: 13px; }
-          label .required { color: #d32f2f; }
-          textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; font-family: 'Segoe UI', sans-serif; box-sizing: border-box; min-height: 80px; resize: vertical; }
-          textarea:focus { border-color: #d32f2f; outline: none; box-shadow: 0 0 0 2px rgba(211,47,47,0.1); }
-          .help-text { font-size: 11px; color: #666; margin-top: 5px; font-style: italic; }
-          .submit-btn { background: #d32f2f; color: white; border: none; padding: 16px 40px; border-radius: 6px; font-size: 17px; font-weight: 700; cursor: pointer; width: 100%; margin-top: 20px; }
-          .submit-btn:hover { background: #b71c1c; }
+          .container {
+            max-width: 960px;
+            margin: 0 auto;
+            background: rgba(255,255,255,0.97);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+            overflow: hidden;
+          }
+
+          /* ---- Header ---- */
+          .header {
+            background: linear-gradient(135deg, #b71c1c 0%, #e53935 100%);
+            color: white;
+            padding: 32px 28px;
+            text-align: center;
+          }
+          .header-icon { font-size: 52px; margin-bottom: 12px; }
+          .header h1 { margin: 0 0 8px; font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
+          .header-badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 6px 18px;
+            border-radius: 20px;
+            font-size: 13px;
+            margin-top: 6px;
+          }
+          .responsible-bar {
+            background: rgba(0,0,0,0.15);
+            padding: 10px 20px;
+            font-size: 13px;
+            text-align: center;
+          }
+
+          /* ---- Form wrapper ---- */
+          .form-section { padding: 28px; }
+
+          /* ---- KPI Section ---- */
+          .kpi-section {
+            background: #fff;
+            border: 1.5px solid #e5e7eb;
+            border-radius: 12px;
+            margin-bottom: 32px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+          }
+
+          .kpi-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 18px 20px;
+            background: #fef2f2;
+            border-bottom: 1.5px solid #fecaca;
+          }
+          .kpi-number {
+            flex-shrink: 0;
+            width: 36px; height: 36px;
+            background: #dc2626;
+            color: white;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 15px;
+          }
+          .kpi-title { font-size: 16px; font-weight: 700; color: #111827; }
+          .kpi-subtitle { font-size: 12px; color: #6b7280; margin-top: 3px; }
+
+          /* ---- Stats ---- */
+          .perf-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0;
+            border-bottom: 1.5px solid #f3f4f6;
+          }
+          .stat-box {
+            text-align: center;
+            padding: 16px 12px;
+          }
+          .stat-box + .stat-box { border-left: 1px solid #f3f4f6; }
+          .stat-label { font-size: 10px; font-weight: 600; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.6px; margin-bottom: 6px; }
+          .stat-value { font-size: 22px; font-weight: 800; }
+          .stat-unit { font-size: 13px; font-weight: 500; }
+          .stat-pct { font-size: 11px; margin-top: 4px; font-weight: 600; }
+          .stat-current .stat-value { color: #dc2626; }
+          .stat-target .stat-value { color: #16a34a; }
+          .stat-gap .stat-value { color: #d97706; }
+          .stat-gap .stat-pct { color: #d97706; }
+
+          /* ---- AI Box ---- */
+          .ai-box {
+            margin: 20px 20px 0;
+            border: 1.5px solid #c4b5fd;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+            overflow: hidden;
+          }
+          .ai-box-error {
+            background: #fff7ed;
+            border-color: #fed7aa;
+            padding: 14px 18px;
+            font-size: 13px;
+            color: #92400e;
+          }
+          .ai-box-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 18px;
+            background: rgba(109,40,217,0.08);
+            border-bottom: 1px solid #ddd6fe;
+          }
+          .ai-icon { font-size: 18px; }
+          .ai-title { font-size: 14px; font-weight: 700; color: #5b21b6; flex: 1; }
+          .ai-badge {
+            font-size: 10px;
+            font-weight: 600;
+            background: #7c3aed;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+          }
+
+          .ai-suggestion-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            padding: 14px 16px;
+          }
+
+          .ai-suggestion-card {
+            background: white;
+            border-radius: 8px;
+            padding: 14px;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+            border: 1.5px solid transparent;
+            position: relative;
+          }
+          .ai-suggestion-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0,0,0,0.1);
+          }
+          .ai-suggestion-card.applied {
+            border-color: #4ade80 !important;
+            background: #f0fdf4;
+          }
+
+          .root-cause-card { border-top: 3px solid #ef4444; }
+          .root-cause-card:hover { border-color: #ef4444; }
+          .action-card    { border-top: 3px solid #f59e0b; }
+          .action-card:hover { border-color: #f59e0b; }
+          .evidence-card  { border-top: 3px solid #3b82f6; }
+          .evidence-card:hover { border-color: #3b82f6; }
+
+          .ai-card-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+          }
+          .root-cause-card .ai-card-label { color: #dc2626; }
+          .action-card .ai-card-label    { color: #d97706; }
+          .evidence-card .ai-card-label  { color: #2563eb; }
+
+          .apply-hint {
+            margin-left: auto;
+            font-size: 10px;
+            font-weight: 500;
+            color: #9ca3af;
+            text-transform: none;
+            letter-spacing: 0;
+          }
+          .ai-card-text { font-size: 13px; color: #374151; line-height: 1.55; }
+
+          .apply-all-btn {
+            margin: 0 16px 14px;
+            padding: 8px 20px;
+            background: #7c3aed;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+          }
+          .apply-all-btn:hover { background: #6d28d9; }
+
+          /* ---- Form fields ---- */
+          .form-fields { padding: 20px; }
+          .form-group { margin-bottom: 18px; }
+          label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 6px;
+          }
+          .required { color: #dc2626; margin-left: 3px; }
+          textarea {
+            width: 100%;
+            padding: 11px 14px;
+            border: 1.5px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 80px;
+            transition: border-color 0.2s;
+          }
+          textarea:focus { border-color: #7c3aed; outline: none; box-shadow: 0 0 0 3px rgba(124,58,237,0.1); }
+          textarea.highlight {
+            border-color: #16a34a;
+            background: #f0fdf4;
+            animation: fadeHighlight 2s forwards;
+          }
+          @keyframes fadeHighlight {
+            0%   { background: #dcfce7; border-color: #16a34a; }
+            100% { background: white;   border-color: #d1d5db; }
+          }
+          .help-text { font-size: 11px; color: #6b7280; margin-top: 5px; }
+
+          /* ---- Submit ---- */
+          .submit-btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #b71c1c, #e53935);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 17px;
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: opacity 0.15s;
+          }
+          .submit-btn:hover { opacity: 0.9; }
+
+          @media (max-width: 640px) {
+            .ai-suggestion-row { grid-template-columns: 1fr; }
+            .perf-stats { grid-template-columns: repeat(3, 1fr); }
+          }
         </style>
       </head>
       <body>
         <div class="container">
+
+          <!-- Header -->
           <div class="header">
-            <div style="font-size: 48px; margin-bottom: 15px;">⚠️</div>
+            <div class="header-icon">⚠️</div>
             <h1>Corrective Actions Required</h1>
-            <div class="badge">${actions.length} KPI${actions.length > 1 ? 's' : ''} Below Target - Week ${week}</div>
+            <div class="header-badge">
+              ${actions.length} KPI${actions.length > 1 ? 's' : ''} Below Target — Week ${week}
+            </div>
+          </div>
+          <div class="responsible-bar">
+            👤 <strong>${responsible.name}</strong> &nbsp;•&nbsp;
+            🏭 ${responsible.plant_name} &nbsp;•&nbsp;
+            🏷️ ${responsible.department_name}
           </div>
 
+          <!-- Form -->
           <div class="form-section">
-            <div class="info-box">
-              <strong>${responsible.name}</strong> • ${responsible.plant_name} • ${responsible.department_name}
-            </div>
-
             <form action="/submit-bulk-corrective-actions" method="POST">
               <input type="hidden" name="responsible_id" value="${responsible_id}">
               <input type="hidden" name="week" value="${week}">
 
-              ${actions.map((action, index) => `
-                <div class="kpi-section">
-                  <input type="hidden" name="corrective_action_ids[]" value="${action.corrective_action_id}">
-                  
-                  <div class="kpi-header">
-                    <div>
-                      <div style="display:inline-block;width:30px;height:30px;background:#d32f2f;color:white;border-radius:50%;text-align:center;line-height:30px;font-weight:700;margin-right:10px;">${index + 1}</div>
-                      <div style="display:inline-block;vertical-align:top;">
-                        <div class="kpi-title">${action.indicator_title}</div>
-                        ${action.indicator_sub_title ? `<div class="kpi-subtitle">${action.indicator_sub_title}</div>` : ''}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="perf-stats">
-                    <div class="stat-box">
-                      <div class="stat-label">Current</div>
-                      <div class="stat-value current">${action.value || '0'} ${action.unit || ''}</div>
-                    </div>
-                    <div class="stat-box">
-                      <div class="stat-label">Target</div>
-                      <div class="stat-value target">${action.target_value || 'N/A'} ${action.unit || ''}</div>
-                    </div>
-                    <div class="stat-box">
-                      <div class="stat-label">Gap</div>
-                      <div class="stat-value gap">
-                        ${action.target_value ? (parseFloat(action.target_value) - parseFloat(action.value || 0)).toFixed(2) : 'N/A'} ${action.unit || ''}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div class="form-group">
-                    <label>Root Cause<span class="required">*</span></label>
-                    <textarea name="root_cause_${action.corrective_action_id}" required placeholder="Why did this KPI fall below target?">${action.root_cause || ''}</textarea>
-                  </div>
-
-                  <div class="form-group">
-                    <label>Implemented Solution<span class="required">*</span></label>
-                    <textarea name="solution_${action.corrective_action_id}" required placeholder="What actions have been taken?">${action.implemented_solution || ''}</textarea>
-                  </div>
-
-                  <div class="form-group">
-                    <label>Evidence<span class="required">*</span></label>
-                    <textarea name="evidence_${action.corrective_action_id}" required placeholder="What evidence shows improvement?">${action.evidence || ''}</textarea>
-                    <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
-                  </div>
-                </div>
-              `).join('')}
+              ${kpiSectionsHtml}
 
               <button type="submit" class="submit-btn">
                 ✓ Submit All Corrective Actions (${actions.length})
@@ -863,6 +1240,52 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             </form>
           </div>
         </div>
+
+        <script>
+          // Apply a single suggestion card's text to its linked textarea
+          function applyToField(fieldId, card) {
+            const text = card.querySelector('.ai-card-text').textContent.trim();
+            const field = document.getElementById(fieldId);
+            if (!field) return;
+
+            field.value = text;
+            field.classList.remove('highlight');
+            void field.offsetWidth; // reflow to restart animation
+            field.classList.add('highlight');
+            field.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            // Mark card as applied
+            card.classList.add('applied');
+            const hint = card.querySelector('.apply-hint');
+            if (hint) hint.textContent = '✓ Applied';
+          }
+
+          // Apply all three suggestions at once
+          function applyAllSuggestions(rcId, solId, evId, rcText, solText, evText) {
+            const fields = [
+              { id: rcId,  text: rcText  },
+              { id: solId, text: solText },
+              { id: evId,  text: evText  },
+            ];
+            fields.forEach(({ id, text }) => {
+              const el = document.getElementById(id);
+              if (!el) return;
+              el.value = text;
+              el.classList.remove('highlight');
+              void el.offsetWidth;
+              el.classList.add('highlight');
+            });
+
+            // Mark all cards in the same kpi-section as applied
+            const btn = event.currentTarget;
+            const section = btn.closest('.kpi-section');
+            section.querySelectorAll('.ai-suggestion-card').forEach(c => {
+              c.classList.add('applied');
+              const hint = c.querySelector('.apply-hint');
+              if (hint) hint.textContent = '✓ Applied';
+            });
+          }
+        </script>
       </body>
       </html>
     `);
