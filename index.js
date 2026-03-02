@@ -2565,23 +2565,27 @@ const sendKPIEmail = async (responsibleId, week) => {
 };
 
 // ---------- Schedule weekly email ----------
-
 cron.schedule(
   "40 8 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
-    const lock = await acquireJobLock(lockId, 15); // 15 minute TTL
+    const lock = await acquireJobLock(lockId, 15);
 
-    // Exit immediately if we didn't get the lock
     if (!lock.acquired) {
       console.log(`⏭️ [KPI Form Email] Skipping - lock held by another instance`);
       return;
     }
 
     try {
-      const forcedWeek = "2026-Week9"; // or dynamically compute current week
+      // ✅ Dynamically compute current week - 1
+      const now = new Date();
+      const startOfYear = new Date(now.getFullYear(), 0, 1);
+      const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
+      const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
+      const targetWeek = currentWeek - 1;
+      const targetYear = targetWeek < 1 ? now.getFullYear() - 1 : now.getFullYear();
+      const forcedWeek = `${targetYear}-Week${targetWeek < 1 ? 52 : targetWeek}`; // e.g. "2026-Week8"
 
-      // ✅ Send only to responsibles who actually have KPI records for that week
       const resps = await pool.query(`
         SELECT DISTINCT r.responsible_id
         FROM public."Responsible" r
@@ -2604,6 +2608,8 @@ cron.schedule(
   },
   { scheduled: true, timezone: "Africa/Tunis" }
 );
+
+
 
 // ---------- Generate HTML/CSS Charts ----------
 const generateVerticalBarChart = (chartData) => {
