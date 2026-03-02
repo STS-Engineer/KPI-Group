@@ -768,13 +768,56 @@ Format:
   }
 };
 
+app.get("/generate-ca-suggestion", async (req, res) => {
+  try {
+    const { kpi_id, responsible_id, week } = req.query;
+
+    const kpiRes = await pool.query(
+      `SELECT ca.corrective_action_id, k.kpi_id, k.indicator_title, k.indicator_sub_title,
+              k.unit, k.target_value, kv.value
+       FROM public."Kpi" k
+       JOIN public.corrective_actions ca ON ca.kpi_id = k.kpi_id
+       LEFT JOIN public.kpi_values kv
+         ON kv.kpi_id = k.kpi_id
+         AND kv.responsible_id = $2
+         AND kv.week = $3
+       WHERE k.kpi_id = $1
+         AND ca.responsible_id = $2
+         AND ca.week = $3
+         AND ca.status = 'Open'
+       LIMIT 1`,
+      [kpi_id, responsible_id, week]
+    );
+
+    if (!kpiRes.rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    const kpi = kpiRes.rows[0];
+    const suggestions = await generateCASuggestions(kpi);
+
+    if (!suggestions || suggestions.length === 0) {
+      return res.status(500).json({ error: "Could not generate suggestion" });
+    }
+
+    // Return only ONE suggestion (randomly pick one to give variety on re-generate)
+    const suggestion = suggestions[Math.floor(Math.random() * suggestions.length)];
+    res.json({ suggestion });
+  } catch (err) {
+    console.error("Error generating CA suggestion:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
 
 // ========== BULK CORRECTIVE ACTIONS FORM ==========
 app.get("/corrective-actions-bulk", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
 
-    // --- responsible ---
     const resResp = await pool.query(
       `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
               p.name AS plant_name, d.name AS department_name
@@ -787,7 +830,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
     const responsible = resResp.rows[0];
     if (!responsible) return res.status(404).send("Responsible not found");
 
-    // --- open corrective actions ---
     const actionsRes = await pool.query(
       `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
               kv.value
@@ -820,102 +862,14 @@ app.get("/corrective-actions-bulk", async (req, res) => {
       `);
     }
 
-    // --- fetch AI suggestions in PARALLEL for all KPIs ---
-    console.log(`🤖 Fetching AI suggestions for ${actions.length} KPIs...`);
-    const suggestionsArray = await Promise.all(actions.map(a => generateCASuggestions(a)));
-    console.log(`✅ AI suggestions ready`);
-
-    // ---- build KPI sections ----
+    // ---- Build KPI sections WITHOUT pre-loading AI ----
     const kpiSectionsHtml = actions.map((action, index) => {
-      const suggestions = suggestionsArray[index];
       const gap = action.target_value
         ? (parseFloat(action.target_value) - parseFloat(action.value || 0)).toFixed(2)
         : null;
       const pctGap = action.target_value && action.value
         ? (((parseFloat(action.target_value) - parseFloat(action.value)) / parseFloat(action.target_value)) * 100).toFixed(1)
         : null;
-
-      const suggestionHtml = suggestions ? (() => {
-        const renderSuggestionOption = (s, optionNum, caId) => `
-    <div class="ai-option" style="
-      border: 1.5px solid #ddd6fe;
-      border-radius: 10px;
-      padding: 14px 16px;
-      background: white;
-      margin-bottom: 10px;
-    ">
-      <div style="
-        font-size: 12px;
-        font-weight: 700;
-        color: #5b21b6;
-        margin-bottom: 12px;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      ">
-        <span style="
-          background: #7c3aed;
-          color: white;
-          border-radius: 50%;
-          width: 20px; height: 20px;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 11px;
-        ">${optionNum}</span>
-        Option ${optionNum}
-      </div>
-
-      <div class="ai-suggestion-row">
-        <div class="ai-suggestion-card root-cause-card"
-             onclick="applyToField('root_cause_${caId}', this)">
-          <div class="ai-card-label">
-            <span class="ai-card-icon">🔍</span>Root Cause
-            <span class="apply-hint">Click to apply ↓</span>
-          </div>
-          <div class="ai-card-text">${s.root_cause}</div>
-        </div>
-
-        <div class="ai-suggestion-card action-card"
-             onclick="applyToField('solution_${caId}', this)">
-          <div class="ai-card-label">
-            <span class="ai-card-icon">⚡</span>Immediate Action
-            <span class="apply-hint">Click to apply ↓</span>
-          </div>
-          <div class="ai-card-text">${s.immediate_action}</div>
-        </div>
-
-        <div class="ai-suggestion-card evidence-card"
-             onclick="applyToField('evidence_${caId}', this)">
-          <div class="ai-card-label">
-            <span class="ai-card-icon">📊</span>Evidence
-            <span class="apply-hint">Click to apply ↓</span>
-          </div>
-          <div class="ai-card-text">${s.evidence}</div>
-        </div>
-      </div>
-
-      </div>
-    `;
-
-    return `
-    <div class="ai-box">
-      <div class="ai-box-header">
-        <span class="ai-icon">🤖</span>
-        <span class="ai-title">AI Suggestions — Pick one option</span>
-        <span class="ai-badge">2 Options</span>
-      </div>
-      <div style="padding: 14px 16px;">
-        ${renderSuggestionOption(suggestions[0], 1, action.corrective_action_id)}
-        ${renderSuggestionOption(suggestions[1], 2, action.corrective_action_id)}
-      </div>
-    </div>
-  `;
-      })() : `
-     <div class="ai-box ai-box-error">
-     <span>⚠️ AI suggestions unavailable for this KPI — please fill the fields manually.</span>
-     </div>
-   `;
 
       return `
         <div class="kpi-section">
@@ -947,8 +901,59 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             </div>
           </div>
 
-          <!-- AI Suggestions Box (auto-loaded) -->
-          ${suggestionHtml}
+          <!-- AI Suggestion Box (on-demand) -->
+          <div class="ai-box" id="ai-box-${action.corrective_action_id}">
+            <div class="ai-box-header">
+              <span class="ai-icon">🤖</span>
+              <span class="ai-title">AI Corrective Action Suggestion</span>
+              <button
+                type="button"
+                class="generate-btn"
+                id="gen-btn-${action.corrective_action_id}"
+                onclick="generateSuggestion('${action.corrective_action_id}', '${action.kpi_id}', '${responsible_id}', '${week}')"
+              >
+                <span class="gen-btn-icon">✨</span>
+                <span class="gen-btn-text">Generate Suggestion</span>
+              </button>
+            </div>
+
+            <!-- Suggestion content appears here -->
+            <div class="suggestion-content" id="suggestion-${action.corrective_action_id}" style="display:none;">
+              <div class="ai-suggestion-row">
+                <div class="ai-suggestion-card root-cause-card"
+                     onclick="applyToField('root_cause_${action.corrective_action_id}', this)">
+                  <div class="ai-card-label">
+                    <span class="ai-card-icon">🔍</span>Root Cause
+                    <span class="apply-hint">Click to apply ↓</span>
+                  </div>
+                  <div class="ai-card-text" id="rc-text-${action.corrective_action_id}"></div>
+                </div>
+
+                <div class="ai-suggestion-card action-card"
+                     onclick="applyToField('solution_${action.corrective_action_id}', this)">
+                  <div class="ai-card-label">
+                    <span class="ai-card-icon">⚡</span>Immediate Action
+                    <span class="apply-hint">Click to apply ↓</span>
+                  </div>
+                  <div class="ai-card-text" id="ia-text-${action.corrective_action_id}"></div>
+                </div>
+
+                <div class="ai-suggestion-card evidence-card"
+                     onclick="applyToField('evidence_${action.corrective_action_id}', this)">
+                  <div class="ai-card-label">
+                    <span class="ai-card-icon">📊</span>Evidence
+                    <span class="apply-hint">Click to apply ↓</span>
+                  </div>
+                  <div class="ai-card-text" id="ev-text-${action.corrective_action_id}"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Error state -->
+            <div class="suggestion-error" id="error-${action.corrective_action_id}" style="display:none;">
+              <span>⚠️ Could not generate suggestion. Please try again or fill manually.</span>
+            </div>
+          </div>
 
           <!-- Form Fields -->
           <div class="form-fields">
@@ -960,7 +965,7 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                 name="root_cause_${action.corrective_action_id}"
                 id="root_cause_${action.corrective_action_id}"
                 required
-                placeholder="Describe the root cause — or click the AI suggestion above to auto-fill"
+                placeholder="Click 'Generate Suggestion' above, or describe the root cause manually"
               >${action.root_cause || ''}</textarea>
             </div>
 
@@ -972,7 +977,7 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                 name="solution_${action.corrective_action_id}"
                 id="solution_${action.corrective_action_id}"
                 required
-                placeholder="Describe actions taken — or click the AI suggestion above to auto-fill"
+                placeholder="Click 'Generate Suggestion' above, or describe actions taken manually"
               >${action.implemented_solution || ''}</textarea>
             </div>
 
@@ -984,7 +989,7 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                 name="evidence_${action.corrective_action_id}"
                 id="evidence_${action.corrective_action_id}"
                 required
-                placeholder="What evidence shows improvement? — or click the AI suggestion above to auto-fill"
+                placeholder="What evidence shows improvement?"
               >${action.evidence || ''}</textarea>
               <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
             </div>
@@ -993,7 +998,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
       `;
     }).join('');
 
-    // ---- full page HTML ----
     res.send(`
       <!DOCTYPE html>
       <html lang="en">
@@ -1025,7 +1029,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             overflow: hidden;
           }
 
-          /* ---- Header ---- */
           .header {
             background: linear-gradient(135deg, #b71c1c 0%, #e53935 100%);
             color: white;
@@ -1033,7 +1036,7 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             text-align: center;
           }
           .header-icon { font-size: 52px; margin-bottom: 12px; }
-          .header h1 { margin: 0 0 8px; font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
+          .header h1 { margin: 0 0 8px; font-size: 26px; font-weight: 700; }
           .header-badge {
             display: inline-block;
             background: rgba(255,255,255,0.2);
@@ -1049,10 +1052,8 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             text-align: center;
           }
 
-          /* ---- Form wrapper ---- */
           .form-section { padding: 28px; }
 
-          /* ---- KPI Section ---- */
           .kpi-section {
             background: #fff;
             border: 1.5px solid #e5e7eb;
@@ -1082,17 +1083,12 @@ app.get("/corrective-actions-bulk", async (req, res) => {
           .kpi-title { font-size: 16px; font-weight: 700; color: #111827; }
           .kpi-subtitle { font-size: 12px; color: #6b7280; margin-top: 3px; }
 
-          /* ---- Stats ---- */
           .perf-stats {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 0;
             border-bottom: 1.5px solid #f3f4f6;
           }
-          .stat-box {
-            text-align: center;
-            padding: 16px 12px;
-          }
+          .stat-box { text-align: center; padding: 16px 12px; }
           .stat-box + .stat-box { border-left: 1px solid #f3f4f6; }
           .stat-label { font-size: 10px; font-weight: 600; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.6px; margin-bottom: 6px; }
           .stat-value { font-size: 22px; font-weight: 800; }
@@ -1111,47 +1107,73 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
             overflow: hidden;
           }
-          .ai-box-error {
-            background: #fff7ed;
-            border-color: #fed7aa;
-            padding: 14px 18px;
-            font-size: 13px;
-            color: #92400e;
-          }
           .ai-box-header {
             display: flex;
             align-items: center;
             gap: 8px;
-            padding: 12px 18px;
+            padding: 12px 16px;
             background: rgba(109,40,217,0.08);
             border-bottom: 1px solid #ddd6fe;
           }
           .ai-icon { font-size: 18px; }
           .ai-title { font-size: 14px; font-weight: 700; color: #5b21b6; flex: 1; }
-          .ai-badge {
-            font-size: 10px;
-            font-weight: 600;
-            background: #7c3aed;
+
+          /* ---- Generate Button ---- */
+          .generate-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 16px;
+            background: linear-gradient(135deg, #7c3aed, #6d28d9);
             color: white;
-            padding: 2px 8px;
-            border-radius: 10px;
+            border: none;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 2px 8px rgba(109,40,217,0.35);
+          }
+          .generate-btn:hover:not(:disabled) {
+            background: linear-gradient(135deg, #6d28d9, #5b21b6);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(109,40,217,0.45);
+          }
+          .generate-btn:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            transform: none;
+          }
+          .generate-btn.loading .gen-btn-icon { animation: spin 1s linear infinite; display: inline-block; }
+          @keyframes spin { to { transform: rotate(360deg); } }
+          @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-8px); }
+            to   { opacity: 1; transform: translateY(0); }
+          }
+
+          .suggestion-content {
+            padding: 14px 16px;
+            animation: fadeIn 0.3s ease;
+          }
+          .suggestion-error {
+            padding: 12px 16px;
+            font-size: 13px;
+            color: #92400e;
+            background: #fff7ed;
           }
 
           .ai-suggestion-row {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 12px;
-            padding: 14px 16px;
           }
-
           .ai-suggestion-card {
             background: white;
             border-radius: 8px;
             padding: 14px;
             cursor: pointer;
-            transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+            transition: transform 0.15s, box-shadow 0.15s;
             border: 1.5px solid transparent;
-            position: relative;
           }
           .ai-suggestion-card:hover {
             transform: translateY(-2px);
@@ -1161,112 +1183,60 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             border-color: #4ade80 !important;
             background: #f0fdf4;
           }
-
           .root-cause-card { border-top: 3px solid #ef4444; }
-          .root-cause-card:hover { border-color: #ef4444; }
           .action-card    { border-top: 3px solid #f59e0b; }
-          .action-card:hover { border-color: #f59e0b; }
           .evidence-card  { border-top: 3px solid #3b82f6; }
-          .evidence-card:hover { border-color: #3b82f6; }
 
           .ai-card-label {
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            font-size: 11px; font-weight: 700;
+            text-transform: uppercase; letter-spacing: 0.5px;
             margin-bottom: 8px;
-            display: flex;
-            align-items: center;
-            gap: 5px;
+            display: flex; align-items: center; gap: 5px;
           }
           .root-cause-card .ai-card-label { color: #dc2626; }
           .action-card .ai-card-label    { color: #d97706; }
           .evidence-card .ai-card-label  { color: #2563eb; }
-
-          .apply-hint {
-            margin-left: auto;
-            font-size: 10px;
-            font-weight: 500;
-            color: #9ca3af;
-            text-transform: none;
-            letter-spacing: 0;
-          }
+          .apply-hint { margin-left: auto; font-size: 10px; font-weight: 500; color: #9ca3af; text-transform: none; letter-spacing: 0; }
           .ai-card-text { font-size: 13px; color: #374151; line-height: 1.55; }
-
-          .apply-all-btn {
-            margin: 0 16px 14px;
-            padding: 8px 20px;
-            background: #7c3aed;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.15s;
-          }
-          .apply-all-btn:hover { background: #6d28d9; }
 
           /* ---- Form fields ---- */
           .form-fields { padding: 20px; }
           .form-group { margin-bottom: 18px; }
-          label {
-            display: block;
-            font-size: 13px;
-            font-weight: 600;
-            color: #374151;
-            margin-bottom: 6px;
-          }
+          label { display: block; font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 6px; }
           .required { color: #dc2626; margin-left: 3px; }
           textarea {
-            width: 100%;
-            padding: 11px 14px;
+            width: 100%; padding: 11px 14px;
             border: 1.5px solid #d1d5db;
-            border-radius: 6px;
-            font-size: 13px;
-            font-family: inherit;
-            resize: vertical;
-            min-height: 80px;
-            transition: border-color 0.2s;
+            border-radius: 6px; font-size: 13px; font-family: inherit;
+            resize: vertical; min-height: 80px; transition: border-color 0.2s;
           }
           textarea:focus { border-color: #7c3aed; outline: none; box-shadow: 0 0 0 3px rgba(124,58,237,0.1); }
           textarea.highlight {
-            border-color: #16a34a;
-            background: #f0fdf4;
-            animation: fadeHighlight 2s forwards;
+            animation: highlightFade 1.8s forwards;
           }
-          @keyframes fadeHighlight {
+          @keyframes highlightFade {
             0%   { background: #dcfce7; border-color: #16a34a; }
             100% { background: white;   border-color: #d1d5db; }
           }
           .help-text { font-size: 11px; color: #6b7280; margin-top: 5px; }
 
-          /* ---- Submit ---- */
           .submit-btn {
             width: 100%;
             padding: 16px;
             background: linear-gradient(135deg, #b71c1c, #e53935);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 17px;
-            font-weight: 700;
-            cursor: pointer;
-            margin-top: 8px;
-            transition: opacity 0.15s;
+            color: white; border: none; border-radius: 8px;
+            font-size: 17px; font-weight: 700; cursor: pointer;
+            margin-top: 8px; transition: opacity 0.15s;
           }
           .submit-btn:hover { opacity: 0.9; }
 
           @media (max-width: 640px) {
             .ai-suggestion-row { grid-template-columns: 1fr; }
-            .perf-stats { grid-template-columns: repeat(3, 1fr); }
           }
         </style>
       </head>
       <body>
         <div class="container">
-
-          <!-- Header -->
           <div class="header">
             <div class="header-icon">⚠️</div>
             <h1>Corrective Actions Required</h1>
@@ -1280,7 +1250,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             🏷️ ${responsible.department_name}
           </div>
 
-          <!-- Form -->
           <div class="form-section">
             <form action="/submit-bulk-corrective-actions" method="POST">
               <input type="hidden" name="responsible_id" value="${responsible_id}">
@@ -1296,48 +1265,76 @@ app.get("/corrective-actions-bulk", async (req, res) => {
         </div>
 
         <script>
-          // Apply a single suggestion card's text to its linked textarea
+          // Apply suggestion card text to linked textarea
           function applyToField(fieldId, card) {
             const text = card.querySelector('.ai-card-text').textContent.trim();
             const field = document.getElementById(fieldId);
-            if (!field) return;
-
+            if (!field || !text) return;
             field.value = text;
             field.classList.remove('highlight');
-            void field.offsetWidth; // reflow to restart animation
+            void field.offsetWidth;
             field.classList.add('highlight');
             field.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-            // Mark card as applied
             card.classList.add('applied');
             const hint = card.querySelector('.apply-hint');
             if (hint) hint.textContent = '✓ Applied';
           }
 
-          // Apply all three suggestions at once
-          function applyAllSuggestions(rcId, solId, evId, rcText, solText, evText) {
-            const fields = [
-              { id: rcId,  text: rcText  },
-              { id: solId, text: solText },
-              { id: evId,  text: evText  },
-            ];
-            fields.forEach(({ id, text }) => {
-              const el = document.getElementById(id);
-              if (!el) return;
-              el.value = text;
-              el.classList.remove('highlight');
-              void el.offsetWidth;
-              el.classList.add('highlight');
+          // Generate a single suggestion on demand
+          async function generateSuggestion(caId, kpiId, responsibleId, week) {
+            const btn = document.getElementById('gen-btn-' + caId);
+            const suggestionDiv = document.getElementById('suggestion-' + caId);
+            const errorDiv = document.getElementById('error-' + caId);
+
+            // Reset state
+            suggestionDiv.style.display = 'none';
+            errorDiv.style.display = 'none';
+
+            // Reset applied state on cards
+            suggestionDiv.querySelectorAll('.ai-suggestion-card').forEach(c => {
+              c.classList.remove('applied');
+              const hint = c.querySelector('.apply-hint');
+              if (hint) hint.textContent = 'Click to apply ↓';
             });
 
-            // Mark all cards in the same kpi-section as applied
-            const btn = event.currentTarget;
-            const section = btn.closest('.kpi-section');
-            section.querySelectorAll('.ai-suggestion-card').forEach(c => {
-              c.classList.add('applied');
-              const hint = c.querySelector('.apply-hint');
-              if (hint) hint.textContent = '✓ Applied';
-            });
+            // Loading state
+            btn.disabled = true;
+            btn.classList.add('loading');
+            btn.querySelector('.gen-btn-icon').textContent = '⏳';
+            btn.querySelector('.gen-btn-text').textContent = 'Generating...';
+
+            try {
+              const res = await fetch(
+                '/generate-ca-suggestion?kpi_id=' + kpiId +
+                '&responsible_id=' + responsibleId +
+                '&week=' + encodeURIComponent(week)
+              );
+
+              if (!res.ok) throw new Error('Request failed');
+              const data = await res.json();
+
+              if (data.error || !data.suggestion) throw new Error(data.error || 'No suggestion returned');
+
+              const s = data.suggestion;
+
+              // Populate card texts
+              document.getElementById('rc-text-' + caId).textContent = s.root_cause || '';
+              document.getElementById('ia-text-' + caId).textContent = s.immediate_action || '';
+              document.getElementById('ev-text-' + caId).textContent = s.evidence || '';
+
+              // Show suggestion
+              suggestionDiv.style.display = 'block';
+
+            } catch (err) {
+              console.error('Suggestion error:', err);
+              errorDiv.style.display = 'block';
+            } finally {
+              // Restore button to "Regenerate" state
+              btn.disabled = false;
+              btn.classList.remove('loading');
+              btn.querySelector('.gen-btn-icon').textContent = '🔄';
+              btn.querySelector('.gen-btn-text').textContent = 'Regenerate';
+            }
           }
         </script>
       </body>
