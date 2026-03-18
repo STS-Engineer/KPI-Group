@@ -64,30 +64,31 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
   }
 };
 
-const jobRunning = {};
-cron.schedule('10 14 * * 3', async () => {
-  if (jobRunning['kpi_week_update']) {
-    console.log('[CRON] Already running, skipping.');
-    return;
-  }
+// const jobRunning = {};
+// cron.schedule('10 14 * * 3', async () => {
+//   if (jobRunning['kpi_week_update']) {
+//     console.log('[CRON] Already running, skipping.');
+//     return;
+//   }
 
-  const lockId = 'kpi_week_update';
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
+//   const lockId = 'kpi_week_update';
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
 
-  jobRunning['kpi_week_update'] = true;
+//   jobRunning['kpi_week_update'] = true;
 
-  try {
-    await pool.query('SELECT public.update_kpi_week()');
-    console.log('[CRON] ✅ kpi_values.week updated successfully');
-  } catch (err) {
-    console.error('[CRON] ❌ Failed:', err.message);
-  } finally {
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    jobRunning['kpi_week_update'] = false;
-  }
+//   try {
+//     await pool.query('SELECT public.update_kpi_week()');
+//     console.log('[CRON] ✅ kpi_values.week updated successfully');
+//   } catch (err) {
+//     console.error('[CRON] ❌ Failed:', err.message);
+//   } finally {
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//     jobRunning['kpi_week_update'] = false;
+//   }
 
-}, { timezone: 'Africa/Tunis' });
+// }, { timezone: 'Africa/Tunis' });
+
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
