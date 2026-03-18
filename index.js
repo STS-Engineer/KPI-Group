@@ -26,18 +26,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// execute the function to update the cron function to update the week automatically each week 
-cron.schedule('10 10 * * 3', async () => {
-  console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
-  try {
-    await pool.query('SELECT public.update_kpi_week()');
-    console.log('[CRON] ✅ kpi_values.week updated successfully');
-  } catch (err) {
-    console.error('[CRON] ❌ Failed to update kpi_values.week:', err.message);
-  }
-}, {
-  timezone: 'Africa/Tunis'   // ← ensures 14:00 Tunis local time
-});
+
 
 
 
@@ -77,6 +66,33 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
     console.error(`⚠️ Could not release lock ${lockId}:`, error.message);
   }
 };
+
+
+cron.schedule('39 10 * * 3', async () => {
+  console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
+  
+  const lockId = 'kpi_week_update';
+  const lock = await acquireJobLock(lockId);
+
+  if (!lock.acquired) {
+    console.log(`[CRON] ⏭️ Another instance is already running this job. Skipping.`);
+    return;
+  }
+
+  try {
+    await pool.query('SELECT public.update_kpi_week()');
+    console.log('[CRON] ✅ kpi_values.week updated successfully');
+  } catch (err) {
+    console.error('[CRON] ❌ Failed to update kpi_values.week:', err.message);
+  } finally {
+    // Always release the lock whether it succeeded or failed
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+    console.log(`[CRON] 🔓 Lock released`);
+  }
+
+}, {
+  timezone: 'Africa/Tunis'
+});
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
