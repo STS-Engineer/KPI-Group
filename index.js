@@ -65,7 +65,7 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
 };
 
 const jobRunning = {};
-cron.schedule('37 12 * * 3', async () => {
+cron.schedule('55 13 * * 3', async () => {
   if (jobRunning['kpi_week_update']) {
     console.log('[CRON] Already running, skipping.');
     return;
