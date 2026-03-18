@@ -64,32 +64,30 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
   }
 };
 
-
-cron.schedule('36 11 * * 3', async () => {
-  console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
-  
-  const lockId = 'kpi_week_update';
-  const lock = await acquireJobLock(lockId);
-
-  if (!lock.acquired) {
-    console.log(`[CRON] ⏭️ Another instance is already running this job. Skipping.`);
+const jobRunning = {};
+cron.schedule('50 11 * * 3', async () => {
+  if (jobRunning['kpi_week_update']) {
+    console.log('[CRON] Already running, skipping.');
     return;
   }
+
+  const lockId = 'kpi_week_update';
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+
+  jobRunning['kpi_week_update'] = true;
 
   try {
     await pool.query('SELECT public.update_kpi_week()');
     console.log('[CRON] ✅ kpi_values.week updated successfully');
   } catch (err) {
-    console.error('[CRON] ❌ Failed to update kpi_values.week:', err.message);
+    console.error('[CRON] ❌ Failed:', err.message);
   } finally {
-    // Always release the lock whether it succeeded or failed
     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    console.log(`[CRON] 🔓 Lock released`);
+    jobRunning['kpi_week_update'] = false;
   }
 
-}, {
-  timezone: 'Africa/Tunis'
-});
+}, { timezone: 'Africa/Tunis' });
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
