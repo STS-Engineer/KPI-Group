@@ -27,7 +27,7 @@ const pool = new Pool({
 });
 
 // execute the function to update the cron function to update the week automatically each week 
-cron.schedule('40 08 * * 3', async () => {
+cron.schedule('46 08 * * 3', async () => {
   console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
   try {
     await pool.query('SELECT public.update_kpi_week()');
