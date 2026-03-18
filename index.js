@@ -27,9 +27,6 @@ const pool = new Pool({
 });
 
 
-
-
-
 // ---------- Job Lock Helper ----------
 // Remove the old acquireJobLock and releaseJobLock functions
 // ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
@@ -68,7 +65,7 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
 };
 
 
-cron.schedule('00 11 * * 3', async () => {
+cron.schedule('07 11 * * 3', async () => {
   console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
   
   const lockId = 'kpi_week_update';
