@@ -65,7 +65,7 @@ const releaseJobLock = async (lockId, instanceId, lockHash) => {
 };
 
 
-cron.schedule('27 11 * * 3', async () => {
+cron.schedule('32 11 * * 3', async () => {
   console.log(`[CRON] Running KPI week update — ${new Date().toISOString()}`);
   
   const lockId = 'kpi_week_update';
