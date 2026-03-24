@@ -8,7 +8,7 @@ const cron = require("node-cron");
 
 const app = express();
 const port = process.env.PORT || 5000;
-   
+
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -19,7 +19,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ---------- Postgres ----------
 const pool = new Pool({
   user: "administrationSTS",
-  host: "avo-adb-002.postgres.database.azure.com",    
+  host: "avo-adb-002.postgres.database.azure.com",
   database: "indicatordb",
   password: "St$@0987",
   port: 5432,
@@ -1634,7 +1634,6 @@ app.get("/redirect", async (req, res) => {
 
     // Arrays to collect updates
     const targetUpdates = [];
-    let hasCorrectiveActions = false;
 
     for (let item of kpiValues) {
       const oldRes = await pool.query(
@@ -1678,17 +1677,6 @@ app.get("/redirect", async (req, res) => {
             targetUpdates.push(result.updateInfo);
           }
 
-          // Check if corrective action was created
-          if (!result.targetUpdated) {
-            const caCheck = await pool.query(
-              `SELECT corrective_action_id FROM public.corrective_actions
-               WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3 AND status = 'Open'`,
-              [responsible_id, kpi_id, week]
-            );
-            if (caCheck.rows.length > 0) {
-              hasCorrectiveActions = true;
-            }
-          }
         }
       }
     }
@@ -1698,27 +1686,9 @@ app.get("/redirect", async (req, res) => {
       await sendConsolidatedTargetUpdateEmail(responsible_id, week, targetUpdates);
     }
 
-    // ===== SEND ONE CONSOLIDATED EMAIL FOR CORRECTIVE ACTIONS =====
-    if (hasCorrectiveActions) {
-      await sendConsolidatedCorrectiveActionEmail(responsible_id, week);
-    }
-
     // Determine success message based on what happened
     let successMessage = `<h1>✅ KPI Submitted Successfully!</h1>`;
-    let notifications = [];
-
-    if (targetUpdates.length > 0) {
-      notifications.push(`🎯 <strong>${targetUpdates.length} KPI target${targetUpdates.length > 1 ? 's' : ''} updated</strong> - You will receive a consolidated email`);
-    }
-
-    if (hasCorrectiveActions) {
-      notifications.push(`⚠️ <strong>Corrective actions required</strong> - You will receive a consolidated email`);
-    }
-
-    if (notifications.length === 0) {
-      notifications.push(`📊 All KPIs are within targets`);
-    }
-
+   
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -3377,7 +3347,7 @@ cron.schedule(
 
 // ========== FIXED createIndividualKPIChart FUNCTION ==========
 const createIndividualKPIChart = (kpi) => {
- 
+
   const weeklyData = kpi.weeklyData || { weeks: [], values: [] };
   const weeks = weeklyData.weeks.slice(0, 5).reverse();
   const values = weeklyData.values.slice(0, 5).reverse();
@@ -3540,13 +3510,13 @@ const createIndividualKPIChart = (kpi) => {
   // ----- X‑axis table (placed directly below the bar table, no gap) -----
   const xAxisRow = `<tr>
     ${values.map((val, idx) => {
-      const weekLabel = weeks[idx]?.replace('2026-Week', 'W') || `W${idx + 1}`;
-      const isCurrent = idx === values.length - 1;
-      return `<td align="center" style="padding:0 ${barGapPx / 2}px; border-top:2px solid #cbd5e1; font-size:10px; color:#666; font-weight:${isCurrent ? '700' : '500'}; line-height:14px; padding-top:6px;">
+    const weekLabel = weeks[idx]?.replace('2026-Week', 'W') || `W${idx + 1}`;
+    const isCurrent = idx === values.length - 1;
+    return `<td align="center" style="padding:0 ${barGapPx / 2}px; border-top:2px solid #cbd5e1; font-size:10px; color:#666; font-weight:${isCurrent ? '700' : '500'}; line-height:14px; padding-top:6px;">
                 ${weekLabel}
                 ${isCurrent ? '<div style="width:6px;height:6px;background:#0078D7;border-radius:50%;margin:2px auto 0;"></div>' : ''}
               </td>`;
-    }).join('')}
+  }).join('')}
   </tr>`;
   const xAxisTable = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">${xAxisRow}</table>`;
 
@@ -5248,7 +5218,7 @@ app.get('/api/search', async (req, res) => {
 // 9. Get weekly KPI values for a plant
 app.get('/api/plants/:plantId/weekly-values', async (req, res) => {
   const { plantId } = req.params;
-  const { week }    = req.query;
+  const { week } = req.query;
 
   try {
     const result = await pool.query(`
@@ -5427,7 +5397,7 @@ app.get('/api/plants/:plantId/indicators-simple', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/api/plants/:plantId/performance', async (req, res) => {
   const { plantId } = req.params;
-  const { week }    = req.query;
+  const { week } = req.query;
 
   try {
     const result = await pool.query(`
@@ -5511,7 +5481,7 @@ app.get('/api/plants/:plantId/performance', async (req, res) => {
 
 app.get('/api/plants/:plantId/indicators/:kpiId/performance', async (req, res) => {
   const { plantId, kpiId } = req.params;
-  const { week }           = req.query;
+  const { week } = req.query;
 
   try {
     const result = await pool.query(`
