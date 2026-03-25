@@ -20,7 +20,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const pool = new Pool({
   user: "administrationSTS",
   host: "avo-adb-002.postgres.database.azure.com",
-  database: "indicatordb",
+  database: "indicator_test",
   password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
@@ -623,7 +623,7 @@ const sendConsolidatedTargetUpdateEmail = async (responsibleId, week, targetUpda
 };
 
 
-// Modified: Enhanced function with email notifications
+// Modified: Enhanced function with email 
 // Modified: Enhanced function to COLLECT target updates for consolidated email
 const checkAndTriggerCorrectiveActions = async (
   responsibleId,
@@ -1715,28 +1715,7 @@ app.get("/redirect", async (req, res) => {
           }
           h1 { color:#28a745; font-size:28px; margin-bottom:20px; }
           p { font-size:16px; color:#333; margin-bottom:10px; }
-          .notifications {
-            background:#f8f9fa;
-            padding:20px;
-            border-radius:8px;
-            margin:20px 0;
-            text-align:left;
-          }
-          .notification-item {
-            display:flex;
-            align-items:center;
-            margin:10px 0;
-            padding:10px;
-            background:white;
-            border-radius:6px;
-          }
-          .notification-icon {
-            font-size:20px;
-            margin-right:10px;
-          }
-          .notification-text {
-            flex:1;
-          }
+         
           .btn {
             display:inline-block;
             padding:12px 25px;
@@ -1755,14 +1734,7 @@ app.get("/redirect", async (req, res) => {
           ${successMessage}
           <p>Your KPI values for ${week} have been saved.</p>
           
-          <div class="notifications">
-            <p><strong>📧 Email Notifications:</strong></p>
-            ${notifications.map(notif => `
-              <div class="notification-item">
-                <div class="notification-text">${notif}</div>
-              </div>
-            `).join('')}
-          </div>
+         
           
           <a href="/dashboard?responsible_id=${responsible_id}" class="btn">Go to Dashboard</a>
         </div>
@@ -2563,7 +2535,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "40 8 * * 1",
+  "07 12 * * *",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15);
