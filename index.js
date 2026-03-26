@@ -2535,7 +2535,7 @@ const sendKPIEmail = async (responsibleId, week) => {
 
 // ---------- Schedule weekly email ----------
 cron.schedule(
-  "07 12 * * *",
+  "07 12 * * 1",
   async () => {
     const lockId = 'kpi_form_email_job';
     const lock = await acquireJobLock(lockId, 15);
