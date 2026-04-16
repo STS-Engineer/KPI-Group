@@ -5,89 +5,4846 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 const cron = require("node-cron");
-
-const app = express();
+const { registerRecommendationRoutes } = require('./kpi-recommendations');
+const { generateKPIRecommendationsPDFBuffer, generatePlantKPIRecommendationsPDFBuffer } = require('./kpi-recommendations');
+const {
+  RESPONSIBLE_KPI_OVERRIDE_FIELDS,
+  buildResolvedKpiFieldExpression,
+  buildResolvedKpiSearchExpression
+} = require("./responsible-kpi-sql");
+// const {
+//   buildDelayKnowledgeBaseContext
+// } = require("./delay-knowledge-base");  
+const app = express();  
 const port = process.env.PORT || 5000;
-
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
-
-
 
 // ---------- Postgres ----------
 const pool = new Pool({
   user: "administrationSTS",
   host: "avo-adb-002.postgres.database.azure.com",
-  database: "indicatordb",
+  database: "indicator_test",
   password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
 });
 
+const NUMERIC_TEXT_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 
-// ---------- Job Lock Helper ----------
-// Remove the old acquireJobLock and releaseJobLock functions
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const normalizeOptionalTextInput = (value) => {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text === "" ? null : text;
+};
+
+const normalizeOptionalNumericInput = (value, { allowPercent = false } = {}) => {
+  const text = normalizeOptionalTextInput(value);
+  if (text === null) return null;
+
+  let normalized = text.replace(/\s+/g, "").replace(/,/g, ".");
+  if (allowPercent && normalized.endsWith("%")) {
+    normalized = normalized.slice(0, -1);
+  }
+
+  return NUMERIC_TEXT_PATTERN.test(normalized) ? normalized : null;
+};
+
+const toFiniteNumber = (value) => {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+};
+
+const computeDerivedKpiLimits = ({
+  target,
+  up_tolerance,
+  low_tolerance,
+  tolerance_type
+} = {}) => {
+  const normalizedTarget = normalizeOptionalNumericInput(target);
+  const normalizedUpTolerance = normalizeOptionalNumericInput(up_tolerance, { allowPercent: true });
+  const normalizedLowTolerance = normalizeOptionalNumericInput(low_tolerance, { allowPercent: true });
+  const normalizedToleranceType = normalizeOptionalTextInput(tolerance_type)?.toLowerCase() || null;
+
+  if (
+    normalizedTarget === null ||
+    normalizedUpTolerance === null ||
+    normalizedLowTolerance === null ||
+    normalizedToleranceType === null
+  ) {
+    return null;
+  }
+
+  const targetValue = toFiniteNumber(normalizedTarget);
+  const upToleranceValue = toFiniteNumber(normalizedUpTolerance);
+  const lowToleranceValue = toFiniteNumber(normalizedLowTolerance);
+
+  if (
+    targetValue === null ||
+    upToleranceValue === null ||
+    lowToleranceValue === null
+  ) {
+    return null;
+  }
+
+  let highLimitValue = null;
+  let lowLimitValue = null;
+
+  if (normalizedToleranceType === "relative") {
+    highLimitValue = targetValue * (1 + (upToleranceValue / 100));
+    lowLimitValue = targetValue * (1 + (lowToleranceValue / 100));
+  } else if (normalizedToleranceType === "absolute") {
+    highLimitValue = targetValue + upToleranceValue;
+    lowLimitValue = targetValue + lowToleranceValue;
+  } else {
+    return null;
+  }
+
+  return {
+    high_limit: Number(highLimitValue.toFixed(6)),
+    low_limit: Number(lowLimitValue.toFixed(6))
+  };
+};
+
+const prepareKpiWritePayload = (payload = {}) => {
+  const rawUpTolerance = normalizeOptionalTextInput(payload.up_tolerance);
+  const rawLowTolerance = normalizeOptionalTextInput(payload.low_tolerance);
+  const rawHighLimit = normalizeOptionalTextInput(payload.high_limit);
+  const rawLowLimit = normalizeOptionalTextInput(payload.low_limit);
+
+  const upTolerance = normalizeOptionalNumericInput(rawUpTolerance, { allowPercent: true });
+  const lowTolerance = normalizeOptionalNumericInput(rawLowTolerance, { allowPercent: true });
+  const highLimit = normalizeOptionalNumericInput(rawHighLimit);
+  const lowLimit = normalizeOptionalNumericInput(rawLowLimit);
+
+  if (rawUpTolerance !== null && upTolerance === null) {
+    throw createHttpError(400, 'Up tolerance must be numeric. Use values like "100" or "100%".');
+  }
+
+  if (rawLowTolerance !== null && lowTolerance === null) {
+    throw createHttpError(400, 'Low tolerance must be numeric. Use values like "60" or "60%".');
+  }
+
+  if (rawHighLimit !== null && highLimit === null) {
+    throw createHttpError(400, "High limit must be numeric.");
+  }
+
+  if (rawLowLimit !== null && lowLimit === null) {
+    throw createHttpError(400, "Low limit must be numeric.");
+  }
+
+  const derivedLimits = computeDerivedKpiLimits({
+    target: payload.target,
+    up_tolerance: payload.up_tolerance,
+    low_tolerance: payload.low_tolerance,
+    tolerance_type: payload.tolerance_type
+  });
+
+  return {
+    indicator_title: normalizeOptionalTextInput(payload.indicator_title),
+    indicator_sub_title: normalizeOptionalTextInput(payload.indicator_sub_title),
+    unit: normalizeOptionalTextInput(payload.unit),
+    frequency: normalizeOptionalTextInput(payload.frequency),
+    target: normalizeOptionalTextInput(payload.target),
+    target_direction: normalizeOptionalTextInput(payload.target_direction),
+    tolerance_type: normalizeOptionalTextInput(payload.tolerance_type),
+    up_tolerance: upTolerance,
+    low_tolerance: lowTolerance,
+    max: normalizeOptionalTextInput(payload.max),
+    min: normalizeOptionalTextInput(payload.min),
+    calculation_on: normalizeOptionalTextInput(payload.calculation_on),
+    target_auto_adjustment: normalizeOptionalTextInput(payload.target_auto_adjustment),
+    high_limit: derivedLimits?.high_limit ?? (highLimit === null ? null : Number(highLimit)),
+    low_limit: derivedLimits?.low_limit ?? (lowLimit === null ? null : Number(lowLimit))
+  };
+};
+
+const getKpiDisplayTitle = (kpi = {}) =>
+  normalizeOptionalTextInput(kpi.indicator_title) ||
+  normalizeOptionalTextInput(kpi.title) ||
+  normalizeOptionalTextInput(kpi.indicator_sub_title) ||
+  "Untitled KPI";
+
+const KPI_VALUE_SNAPSHOT_FIELDS = new Set(["target", "high_limit", "low_limit"]);
+
+const buildKpiValueSnapshotExpression = (field, kpiValuesAlias = "kv") =>
+  `NULLIF(BTRIM(${kpiValuesAlias}.${field}_snapshot::text), '')`;
+
+const buildResolvedResponsibleKpiSelect = (
+  kpiAlias = "k",
+  responsibleKpiAlias = "rk",
+  kpiValuesAlias = null
+) =>
+  RESPONSIBLE_KPI_OVERRIDE_FIELDS
+    .map((field) => {
+      const resolvedFieldExpression = buildResolvedKpiFieldExpression(
+        field,
+        kpiAlias,
+        responsibleKpiAlias
+      );
+      const expression = kpiValuesAlias && KPI_VALUE_SNAPSHOT_FIELDS.has(field)
+        ? `COALESCE(
+    ${buildKpiValueSnapshotExpression(field, kpiValuesAlias)},
+    ${resolvedFieldExpression}
+  )`
+        : resolvedFieldExpression;
+
+      return `${expression} AS ${field}`;
+    })
+    .join(",\n          ");
+
+const normalizeSnapshotNumber = (value) => {
+  const normalizedValue = normalizeOptionalNumericInput(value);
+  const numericValue = toFiniteNumber(normalizedValue);
+  return numericValue === null ? null : Number(numericValue.toFixed(6));
+};
+
+const buildKpiValueSnapshotPayload = (resolvedKpi = {}) => ({
+  target_snapshot: normalizeSnapshotNumber(resolvedKpi.target),
+  low_limit_snapshot: normalizeSnapshotNumber(resolvedKpi.low_limit),
+  high_limit_snapshot: normalizeSnapshotNumber(resolvedKpi.high_limit)
+});
+
+const RESPONSIBLE_KPI_RESOLVED_SELECT = buildResolvedResponsibleKpiSelect("k", "rk");
+const RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES = buildResolvedResponsibleKpiSelect("k", "rk", "kv");
+const RESPONSIBLE_KPI_SEARCH_TITLE = buildResolvedKpiSearchExpression("indicator_title", "k", "rk");
+const RESPONSIBLE_KPI_SEARCH_SUBTITLE = buildResolvedKpiSearchExpression("indicator_sub_title", "k", "rk");
+const RESPONSIBLE_KPI_SEARCH_FREQUENCY = buildResolvedKpiSearchExpression("frequency", "k", "rk");
+const RESPONSIBLE_KPI_SEARCH_TARGET = buildResolvedKpiSearchExpression("target", "k", "rk");
+
+const buildResolvedKpiValueFieldExpression = (
+  field,
+  kpiAlias = "k",
+  responsibleKpiAlias = "rk",
+  kpiValuesAlias = "kv"
+) =>
+  KPI_VALUE_SNAPSHOT_FIELDS.has(field)
+    ? `COALESCE(
+    ${buildKpiValueSnapshotExpression(field, kpiValuesAlias)},
+    ${buildResolvedKpiFieldExpression(field, kpiAlias, responsibleKpiAlias)}
+  )`
+    : buildResolvedKpiFieldExpression(field, kpiAlias, responsibleKpiAlias);
+
+const syncResponsibleKpiValueLinks = async (db, responsibleId, kpiId, responsibleKpiId) => {
+  if (!responsibleKpiId) return;
+
+  await db.query(
+    `
+    UPDATE public.kpi_values
+    SET responsible_kpi_id = $1
+    WHERE responsible_id = $2
+      AND kpi_id = $3
+      AND (responsible_kpi_id IS NULL OR responsible_kpi_id <> $1)
+    `,
+    [responsibleKpiId, responsibleId, kpiId]
+  );
+};
+
+const updateKpiValueSnapshots = async (
+  db,
+  kpiValuesId,
+  {
+    responsible_kpi_id,
+    target_snapshot,
+    low_limit_snapshot,
+    high_limit_snapshot
+  } = {}
+) => {
+  await db.query(
+    `
+    UPDATE public."kpi_values"
+    SET
+      responsible_kpi_id = $1,
+      target_snapshot = $2,
+      low_limit_snapshot = $3,
+      high_limit_snapshot = $4
+    WHERE kpi_values_id = $5
+    `,
+    [
+      responsible_kpi_id ?? null,
+      target_snapshot ?? null,
+      low_limit_snapshot ?? null,
+      high_limit_snapshot ?? null,
+      kpiValuesId
+    ]
+  );
+};
+
+const upsertResponsibleKpiAssignment = async (
+  db,
+  responsibleId,
+  kpiId,
+  payload = {},
+  { preserveMissing = false } = {}
+) => {
+  const normalizedPayload = prepareKpiWritePayload(payload);
+  const columnList = RESPONSIBLE_KPI_OVERRIDE_FIELDS.join(",\n        ");
+  const insertPlaceholders = RESPONSIBLE_KPI_OVERRIDE_FIELDS
+    .map((_, index) => `$${index + 3}`)
+    .join(", ");
+  const values = RESPONSIBLE_KPI_OVERRIDE_FIELDS.map((field) =>
+    Object.prototype.hasOwnProperty.call(payload, field)
+      ? normalizedPayload[field] ?? null
+      : null
+  );
+  const presenceFlags = RESPONSIBLE_KPI_OVERRIDE_FIELDS.map((field) =>
+    Object.prototype.hasOwnProperty.call(payload, field)
+  );
+  const updateAssignments = RESPONSIBLE_KPI_OVERRIDE_FIELDS
+    .map((field, index) => {
+      if (!preserveMissing) {
+        return `${field} = EXCLUDED.${field}`;
+      }
+
+      return `${field} = CASE
+        WHEN $${index + RESPONSIBLE_KPI_OVERRIDE_FIELDS.length + 3}
+        THEN EXCLUDED.${field}
+        ELSE public.responsible_kpis.${field}
+      END`;
+    })
+    .join(",\n        ");
+
+  const result = await db.query(
+    `
+    INSERT INTO public.responsible_kpis (
+      responsible_id,
+      kpi_id,
+      ${columnList},
+      updated_at
+    )
+    VALUES (
+      $1,
+      $2,
+      ${insertPlaceholders},
+      NOW()
+    )
+    ON CONFLICT (responsible_id, kpi_id)
+    DO UPDATE SET
+      ${updateAssignments},
+      updated_at = NOW()
+    RETURNING *
+    `,
+    preserveMissing
+      ? [responsibleId, kpiId, ...values, ...presenceFlags]
+      : [responsibleId, kpiId, ...values]
+  );
+
+  return result.rows[0];
+};
+
+const getResolvedResponsibleKpi = async (db, responsibleId, kpiId) => {
+  const result = await db.query(
+    `
+    SELECT
+      rk.responsible_kpi_id,
+      rk.responsible_id,
+      k.kpi_id,
+      ${RESPONSIBLE_KPI_RESOLVED_SELECT}
+    FROM public.responsible_kpis rk
+    JOIN public."Kpi" k
+      ON k.kpi_id = rk.kpi_id
+    WHERE rk.responsible_id = $1
+      AND rk.kpi_id = $2
+    LIMIT 1
+    `,
+    [responsibleId, kpiId]
+  );
+
+  return result.rows[0] || null;
+};
+
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// ========== KPI ADMIN API ==========
+
+// GET all KPIs
+app.get("/api/kpis", async (req, res) => {
+  try {
+    const { search = "" } = req.query;
+
+    const result = await pool.query(
+      `
+      SELECT
+        kpi_id,
+        indicator_title,
+        indicator_sub_title,
+        unit,
+        frequency,
+        target,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max,
+        min,
+        calculation_on,
+        target_auto_adjustment,
+        high_limit,
+        low_limit,
+        created_at
+      FROM public."Kpi"
+      WHERE
+        COALESCE(indicator_title, '') ILIKE $1
+        OR COALESCE(indicator_sub_title, '') ILIKE $1
+      ORDER BY kpi_id DESC
+      `,
+      [`%${search}%`]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /api/kpis error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET one KPI
+app.get("/api/kpis/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        kpi_id,
+        indicator_title,
+        indicator_sub_title,
+        unit,
+        frequency,
+        target,
+        target_direction,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max,
+        min,
+        calculation_on,
+        target_auto_adjustment,
+        high_limit,
+        low_limit,
+        created_at
+      FROM public."Kpi"
+      WHERE kpi_id = $1
+      LIMIT 1
+      `,
+      [req.params.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("GET /api/kpis/:id error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CREATE KPI
+app.post("/api/kpis", async (req, res) => {
+  try {
+    const {
+      indicator_title,
+      indicator_sub_title,
+      unit,
+      frequency,
+      target,
+      target_direction,
+      tolerance_type,
+      up_tolerance,
+      low_tolerance,
+      max,
+      min,
+      calculation_on,
+      target_auto_adjustment,
+      high_limit,
+      low_limit
+    } = prepareKpiWritePayload(req.body);
+
+    const result = await pool.query(
+      `
+      INSERT INTO public."Kpi" (
+        indicator_title,
+        indicator_sub_title,
+        unit,
+        frequency,
+        target,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max,
+        min,
+        calculation_on,
+        target_auto_adjustment,
+        high_limit,
+        low_limit
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+      )
+      RETURNING *;
+      `,
+      [
+        indicator_title,
+        indicator_sub_title,
+        unit,
+        frequency,
+        target,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max,
+        min,
+        calculation_on,
+        target_auto_adjustment,
+        high_limit,
+        low_limit
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /api/kpis error:", err.message);
+    res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to create KPI" });
+  }
+});
+
+// UPDATE KPI
+app.put("/api/kpis/:id", async (req, res) => {
+  try {
+    const {
+      indicator_title,
+      indicator_sub_title,
+      unit,
+      frequency,
+      target,
+      target_direction,
+      tolerance_type,
+      up_tolerance,
+      low_tolerance,
+      max,
+      min,
+      calculation_on,
+      target_auto_adjustment,
+      high_limit,
+      low_limit
+    } = prepareKpiWritePayload(req.body);
+
+    const result = await pool.query(
+      `
+      UPDATE public."Kpi"
+      SET
+        indicator_title = $1,
+        indicator_sub_title = $2,
+        unit = $3,
+        frequency = $4,
+        target = $5,
+        tolerance_type = $6,
+        up_tolerance = $7,
+        low_tolerance = $8,
+        max = $9,
+        min = $10,
+        calculation_on = $11,
+        target_auto_adjustment = $12,
+        high_limit = $13,
+        low_limit = $14
+      WHERE kpi_id = $15
+      RETURNING *;
+      `,
+      [
+        indicator_title,
+        indicator_sub_title,
+        unit,
+        frequency,
+        target,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max,
+        min,
+        calculation_on,
+        target_auto_adjustment,
+        high_limit,
+        low_limit,
+        req.params.id
+      ]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PUT /api/kpis/:id error:", err.message);
+    res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to update KPI" });
+  }
+});
+
+// DELETE KPI
+app.delete("/api/kpis/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM public."Kpi" WHERE kpi_id = $1 RETURNING kpi_id`,
+      [req.params.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /api/kpis/:id error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== KPI ADMIN PAGE ==========
+// ========== KPI ADMIN PAGE ==========
+app.get("/kpi-admin", async (req, res) => {
+  res.send(`
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>KPI Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --bg: #f4f7fb;
+        --bg-soft: #eef3f9;
+        --surface: rgba(255, 255, 255, 0.88);
+        --surface-strong: #ffffff;
+        --border: rgba(15, 23, 42, 0.08);
+        --border-strong: rgba(15, 23, 42, 0.12);
+        --text: #0f172a;
+        --muted: #64748b;
+        --muted-2: #94a3b8;
+        --primary: #2563eb;
+        --primary-2: #4f46e5;
+        --cyan: #06b6d4;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+        --shadow-sm: 0 6px 18px rgba(15, 23, 42, 0.05);
+        --shadow-md: 0 14px 34px rgba(15, 23, 42, 0.08);
+        --shadow-lg: 0 22px 60px rgba(15, 23, 42, 0.10);
+        --radius-xl: 28px;
+        --radius-lg: 22px;
+        --radius-md: 16px;
+        --radius-sm: 12px;
+      }
+
+      body {
+        font-family: "Inter", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(79,70,229,0.08), transparent 22%),
+          radial-gradient(circle at top right, rgba(6,182,212,0.08), transparent 22%),
+          linear-gradient(180deg, #f8fbff 0%, #f3f7fc 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .page {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 28px;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        background: linear-gradient(135deg, #ffffff 0%, #f6f9ff 100%);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow-lg);
+        padding: 32px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+        flex-wrap: wrap;
+        margin-bottom: 24px;
+      }
+
+      .hero::before {
+        content: "";
+        position: absolute;
+        width: 260px;
+        height: 260px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(37,99,235,0.10), transparent 70%);
+        top: -110px;
+        right: -60px;
+        pointer-events: none;
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        width: 200px;
+        height: 200px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(6,182,212,0.10), transparent 70%);
+        bottom: -90px;
+        left: -40px;
+        pointer-events: none;
+      }
+
+      .hero-left h1 {
+        font-size: 40px;
+        font-weight: 900;
+        letter-spacing: -1.7px;
+        color: #0b1220;
+      }
+
+      .hero-left p {
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.7;
+        max-width: 760px;
+      }
+
+      .hero-actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .btn {
+        border: none;
+        outline: none;
+        cursor: pointer;
+        transition: all 0.22s ease;
+        font-weight: 800;
+        border-radius: 14px;
+        padding: 13px 18px;
+        font-size: 14px;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+      }
+
+      .btn-primary {
+        color: #fff;
+        background: linear-gradient(135deg, var(--primary-2), var(--primary), var(--cyan));
+        box-shadow: 0 14px 28px rgba(37, 99, 235, 0.20);
+      }
+
+      .btn-soft {
+        color: var(--text);
+        background: rgba(255,255,255,0.8);
+        border: 1px solid var(--border-strong);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .btn-danger {
+        color: white;
+        background: linear-gradient(135deg, #f87171, #ef4444);
+        box-shadow: 0 12px 22px rgba(239,68,68,0.16);
+      }
+
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 18px;
+        margin-bottom: 24px;
+      }
+
+      .stat-card {
+        position: relative;
+        overflow: hidden;
+        background: rgba(255,255,255,0.84);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(255,255,255,0.7);
+        border-radius: var(--radius-lg);
+        padding: 22px;
+        box-shadow: var(--shadow-md);
+      }
+
+      .stat-card::before {
+        content: "";
+        position: absolute;
+        top: -25px;
+        right: -25px;
+        width: 110px;
+        height: 110px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, rgba(79,70,229,0.09), rgba(6,182,212,0.08));
+      }
+
+      .stat-label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+
+      .stat-value {
+        font-size: 30px;
+        font-weight: 900;
+        color: #0f172a;
+        letter-spacing: -1px;
+      }
+
+      .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+
+      .search-wrap {
+        flex: 1;
+        min-width: 280px;
+        position: relative;
+      }
+
+      .search {
+        width: 100%;
+        border: 1px solid rgba(148,163,184,0.25);
+        background: rgba(255,255,255,0.88);
+        color: var(--text);
+        border-radius: 18px;
+        padding: 16px 18px;
+        font-size: 14px;
+        outline: none;
+        box-shadow: var(--shadow-sm);
+        transition: all 0.18s ease;
+      }
+
+      .search::placeholder {
+        color: #94a3b8;
+      }
+
+      .search:focus {
+        border-color: rgba(37,99,235,0.35);
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+      }
+
+      .table-shell {
+        background: rgba(255,255,255,0.86);
+        border: 1px solid rgba(255,255,255,0.72);
+        border-radius: var(--radius-xl);
+        overflow: hidden;
+        box-shadow: var(--shadow-lg);
+        backdrop-filter: blur(18px);
+      }
+
+      .table-headbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 20px 22px;
+        border-bottom: 1px solid rgba(15,23,42,0.06);
+        background: linear-gradient(180deg, #ffffff, #fafcff);
+      }
+
+      .table-headbar h3 {
+        font-size: 18px;
+        font-weight: 800;
+        color: #0f172a;
+      }
+
+      .table-headbar span {
+        font-size: 13px;
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      .table-wrap {
+        overflow: auto;
+      }
+
+      table {
+        width: 100%;
+        min-width: 1300px;
+        border-collapse: separate;
+        border-spacing: 0;
+      }
+
+      thead th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        text-align: left;
+        padding: 18px 16px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: #64748b;
+        background: #f8fbff;
+        border-bottom: 1px solid rgba(15,23,42,0.06);
+        white-space: nowrap;
+      }
+
+      tbody tr {
+        transition: all 0.16s ease;
+      }
+
+      tbody tr:hover {
+        background: #f8fbff;
+      }
+
+      tbody tr.selected {
+        background: linear-gradient(90deg, rgba(37,99,235,0.06), rgba(6,182,212,0.05));
+      }
+
+      tbody td {
+        padding: 18px 16px;
+        border-bottom: 1px solid rgba(15,23,42,0.05);
+        vertical-align: middle;
+        font-size: 14px;
+        color: #1e293b;
+      }
+
+      .kpi-title {
+        font-weight: 800;
+        font-size: 15px;
+        color: #0f172a;
+      }
+
+      .kpi-subtitle {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 5px;
+        line-height: 1.5;
+      }
+
+      .number-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 54px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, rgba(79,70,229,0.10), rgba(37,99,235,0.10));
+        color: #1d4ed8;
+        font-weight: 800;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+        white-space: nowrap;
+        border: 1px solid transparent;
+      }
+
+      .pill-blue {
+        background: rgba(37,99,235,0.08);
+        color: #1d4ed8;
+        border-color: rgba(37,99,235,0.12);
+      }
+
+      .pill-indigo {
+        background: rgba(79,70,229,0.08);
+        color: #4338ca;
+        border-color: rgba(79,70,229,0.12);
+      }
+
+      .pill-gold {
+        background: rgba(245,158,11,0.10);
+        color: #b45309;
+        border-color: rgba(245,158,11,0.14);
+      }
+
+      .row-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .icon-btn {
+        border: none;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        transition: all 0.18s ease;
+      }
+
+      .icon-btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .edit-btn {
+        background: rgba(37,99,235,0.08);
+        color: #1d4ed8;
+        border: 1px solid rgba(37,99,235,0.10);
+      }
+
+      .delete-btn {
+        background: rgba(239,68,68,0.08);
+        color: #dc2626;
+        border: 1px solid rgba(239,68,68,0.10);
+      }
+
+      .drawer {
+        position: fixed;
+        top: 0;
+        right: -680px;
+        width: 680px;
+        max-width: 100%;
+        height: 100vh;
+        z-index: 999;
+        background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
+        border-left: 1px solid rgba(15,23,42,0.06);
+        box-shadow: -18px 0 50px rgba(15,23,42,0.10);
+        transition: right 0.30s ease;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .drawer.open {
+        right: 0;
+      }
+
+      .drawer-header {
+        padding: 24px 24px 18px;
+        border-bottom: 1px solid rgba(15,23,42,0.06);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        background: rgba(255,255,255,0.92);
+        backdrop-filter: blur(12px);
+      }
+
+      .drawer-header h2 {
+        font-size: 26px;
+        font-weight: 900;
+        color: #0f172a;
+      }
+
+      .drawer-body {
+        padding: 22px 24px 130px;
+        overflow: auto;
+      }
+
+      .section-title {
+        margin: 24px 0 12px;
+        font-size: 12px;
+        font-weight: 900;
+        color: #4f46e5;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .field.full {
+        grid-column: 1 / -1;
+      }
+
+      .field label {
+        font-size: 12px;
+        font-weight: 800;
+        color: #334155;
+      }
+
+      .field input,
+      .field textarea,
+      .field select {
+        width: 100%;
+        border: 1px solid rgba(148,163,184,0.24);
+        background: #ffffff;
+        color: #0f172a;
+        border-radius: 16px;
+        padding: 13px 14px;
+        font-size: 14px;
+        font-family: inherit;
+        outline: none;
+        transition: all 0.18s ease;
+        box-shadow: 0 2px 6px rgba(15,23,42,0.03);
+      }
+
+      .field input:focus,
+      .field textarea:focus,
+      .field select:focus {
+        border-color: rgba(37,99,235,0.34);
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+      }
+
+      .field textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+
+      .drawer-footer {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding: 18px 24px;
+        background: rgba(255,255,255,0.96);
+        border-top: 1px solid rgba(15,23,42,0.06);
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .toast {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        background: #ffffff;
+        color: #0f172a;
+        padding: 14px 18px;
+        border-radius: 14px;
+        display: none;
+        z-index: 9999;
+        border: 1px solid rgba(15,23,42,0.08);
+        box-shadow: var(--shadow-md);
+      }
+
+      .empty-state {
+        text-align: center;
+        padding: 56px 20px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+
+      ::-webkit-scrollbar-thumb {
+        background: rgba(148,163,184,0.35);
+        border-radius: 999px;
+      }
+
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      @media (max-width: 1100px) {
+        .stats-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 900px) {
+        .page {
+          padding: 16px;
+        }
+
+        .hero {
+          padding: 24px;
+        }
+
+        .hero-left h1 {
+          font-size: 30px;
+        }
+
+        .drawer {
+          width: 100%;
+          right: -100%;
+        }
+
+        .form-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .stats-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="hero">
+        <div class="hero-left">
+          <h1>KPI Management Dashboard</h1>
+          <p>
+            A clean and professional KPI workspace to create, update, manage and delete all your performance indicators with a premium enterprise design.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button class="btn btn-soft" onclick="refreshTable()">Refresh</button>
+          <button class="btn btn-primary" onclick="openNewDrawer()">+ Add KPI</button>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Total KPIs</div>
+          <div class="stat-value" id="statTotal">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Monthly KPIs</div>
+          <div class="stat-value" id="statMonthly">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">With Targets</div>
+          <div class="stat-value" id="statTargets">0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Tolerance Rules</div>
+          <div class="stat-value" id="statTolerance">0</div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="search-wrap">
+          <input id="search" class="search" placeholder="Search by title, subtitle, frequency..." />
+        </div>
+      </div>
+
+      <div class="table-shell">
+        <div class="table-headbar">
+          <h3>KPI Master List</h3>
+          <span>Total rows: <strong id="rowCount">0</strong></span>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Indicator</th>
+                <th>Unit</th>
+                <th>Frequency</th>
+                <th>Target</th>
+                <th>Low Limit</th>
+                <th>High Limit</th>
+                <th>Tolerance Type</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody">
+              <tr><td colspan="9" class="empty-state">Loading KPIs...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="drawer" class="drawer">
+      <div class="drawer-header">
+        <h2 id="drawerTitle">Edit KPI</h2>
+        <button class="btn btn-soft" onclick="closeDrawer()">Close</button>
+      </div>
+
+      <div class="drawer-body">
+        <input type="hidden" id="kpi_id" />
+
+        <div class="section-title">Identity</div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Category</label>
+            <input id="indicator_title" />
+          </div>
+          <div class="field">
+            <label>KPI</label>
+            <input id="indicator_sub_title" />
+          </div>
+          <div class="field">
+            <label>Unit</label>
+            <input id="unit" />
+          </div>
+        </div>
+
+        <div class="section-title">Performance Rules</div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Frequency</label>
+            <input id="frequency" />
+          </div>
+          <div class="field">
+            <label>Calculation On</label>
+            <input id="calculation_on" />
+          </div>
+          <div class="field">
+            <label>Target</label>
+            <input id="target" />
+          </div>
+          <div class="field">
+            <label>Target Auto Adjustment</label>
+            <input id="target_auto_adjustment" />
+          </div>
+        </div>
+
+        <div class="section-title">Limits & Tolerances</div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Tolerance Type</label>
+            <input id="tolerance_type" />
+          </div>
+          <div class="field">
+            <label>Up Tolerance</label>
+            <input id="up_tolerance" />
+          </div>
+          <div class="field">
+            <label>Low Tolerance</label>
+            <input id="low_tolerance" />
+          </div>
+          <div class="field">
+            <label>High Limit</label>
+            <input id="high_limit" type="number" step="any" />
+          </div>
+          <div class="field">
+            <label>Low Limit</label>
+            <input id="low_limit" type="number" step="any" />
+          </div>
+          <div class="field">
+            <label>Max</label>
+            <input id="max" />
+          </div>
+          <div class="field">
+            <label>Min</label>
+            <input id="min" />
+          </div>
+        </div>
+      </div>
+
+      <div class="drawer-footer">
+        <button class="btn btn-danger" onclick="deleteKpi()">Delete</button>
+        <div style="display:flex; gap:10px;">
+          <button class="btn btn-soft" onclick="closeDrawer()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script>
+      let currentRows = [];
+      let selectedKpiId = null;
+
+      function showToast(message) {
+        const toast = document.getElementById("toast");
+        toast.textContent = message;
+        toast.style.display = "block";
+        setTimeout(() => {
+          toast.style.display = "none";
+        }, 2400);
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function updateStats(rows) {
+        const total = rows.length;
+        const monthly = rows.filter(r => String(r.frequency || "").toLowerCase().includes("month")).length;
+        const withTargets = rows.filter(r => r.target !== null && r.target !== undefined && String(r.target).trim() !== "").length;
+        const tolerance = rows.filter(r => r.tolerance_type && String(r.tolerance_type).trim() !== "").length;
+
+        document.getElementById("statTotal").textContent = total;
+        document.getElementById("statMonthly").textContent = monthly;
+        document.getElementById("statTargets").textContent = withTargets;
+        document.getElementById("statTolerance").textContent = tolerance;
+        document.getElementById("rowCount").textContent = total;
+      }
+
+      function renderTable(rows) {
+        currentRows = rows || [];
+        updateStats(currentRows);
+
+        const tbody = document.getElementById("tableBody");
+
+        if (!currentRows.length) {
+          tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No KPI found.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = currentRows.map(row => \`
+          <tr class="\${String(selectedKpiId) === String(row.kpi_id) ? 'selected' : ''}">
+            <td><span class="number-badge">#\${escapeHtml(row.kpi_id)}</span></td>
+            <td>
+              <div class="kpi-title">\${escapeHtml(row.indicator_title || 'Untitled KPI')}</div>
+              <div class="kpi-subtitle">\${escapeHtml(row.indicator_sub_title || '')}</div>
+            </td>
+            <td><span class="pill pill-blue">\${escapeHtml(row.unit || '-')}</span></td>
+            <td><span class="pill pill-indigo">\${escapeHtml(row.frequency || '-')}</span></td>
+            <td>\${escapeHtml(row.target || '-')}</td>
+            <td>\${escapeHtml(row.low_limit ?? '-')}</td>
+            <td>\${escapeHtml(row.high_limit ?? '-')}</td>
+            <td><span class="pill pill-gold">\${escapeHtml(row.tolerance_type || '-')}</span></td>
+            <td>
+              <div class="row-actions">
+                <button class="icon-btn edit-btn" onclick="openEditDrawer(\${row.kpi_id})">Edit</button>
+                <button class="icon-btn delete-btn" onclick="deleteRowQuick(\${row.kpi_id})">Delete</button>
+              </div>
+            </td>
+          </tr>
+        \`).join("");
+      }
+
+      async function loadKpis(search = "") {
+        try {
+          const res = await fetch('/api/kpis?search=' + encodeURIComponent(search));
+          const data = await res.json();
+          renderTable(data);
+        } catch (err) {
+          document.getElementById("tableBody").innerHTML =
+            '<tr><td colspan="9" class="empty-state">Failed to load KPI table.</td></tr>';
+        }
+      }
+
+      async function loadKpiCharts() {
+  const chartsGrid = document.getElementById("chartsGrid");
+
+  try {
+    const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-graphs');
+    if (!res.ok) throw new Error("Failed to load chart data");
+
+    const rows = await res.json();
+
+    if (!rows.length) {
+      chartsGrid.innerHTML = '<div class="empty">No KPI graph data found for this responsible.</div>';
+      return;
+    }
+
+    chartsGrid.innerHTML = rows.map((row, index) => \`
+      <div class="chart-card">
+        <h3>\${escapeHtml(row.indicator_title || "Untitled KPI")}</h3>
+        <p>\${escapeHtml(row.indicator_sub_title || "Weekly KPI trend")}</p>
+        <div class="chart-wrap">
+          <canvas id="chart_\${index}"></canvas>
+        </div>
+      </div>
+    \`).join("");
+
+    chartInstances.forEach(chart => chart.destroy());
+    chartInstances = [];
+
+    rows.forEach((row, index) => {
+      const canvas = document.getElementById('chart_' + index);
+      const ctx = canvas.getContext('2d');
+      const axisValues = [
+        ...(Array.isArray(row.values) ? row.values : []),
+        ...(Array.isArray(row.target) ? row.target : []),
+        ...(Array.isArray(row.highLimits) ? row.highLimits : []),
+        ...(Array.isArray(row.lowLimits) ? row.lowLimits : [])
+      ]
+        .filter((value) => value !== null && value !== undefined && value !== '')
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value));
+      const axisSourceMin = axisValues.length ? Math.min(...axisValues) : 0;
+      const axisSourceMax = axisValues.length ? Math.max(...axisValues) : 100;
+      let axisMin = axisSourceMin > 0
+        ? axisSourceMin * 0.8
+        : axisSourceMin < 0
+          ? axisSourceMin * 1.2
+          : 0;
+      let axisMax = axisSourceMax > 0
+        ? axisSourceMax * 1.2
+        : axisSourceMax < 0
+          ? axisSourceMax * 0.8
+          : 0;
+      if (axisSourceMin === axisSourceMax) {
+        const pad = Math.max(Math.abs(axisSourceMax || axisSourceMin || 1) * 0.2, 1);
+        axisMin = axisSourceMin - pad;
+        axisMax = axisSourceMax + pad;
+      }
+
+    const chart = new Chart(ctx, {
+  data: {
+    labels: row.labels,
+    datasets: [
+      {
+        type: 'bar',
+        label: 'Actual Value',
+        data: row.values,
+        borderWidth: 0,
+        backgroundColor: 'rgba(34, 197, 94, 0.85)',
+        borderRadius: 6,
+        barThickness: 26
+      },
+      {
+        type: 'line',
+        label: 'Target',
+        data: row.target,
+        borderColor: 'rgba(239, 68, 68, 0.95)',
+        backgroundColor: 'rgba(239, 68, 68, 0.15)',
+        borderWidth: 2,
+        tension: 0,
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        borderDash: [6, 4]
+      },
+      {
+        type: 'line',
+        label: 'High Limit',
+        data: row.highLimits,
+        borderColor: 'rgba(245, 158, 11, 0.95)',
+        backgroundColor: 'rgba(245, 158, 11, 0.15)',
+        borderWidth: 2,
+        tension: 0,
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        borderDash: [8, 5]
+      },
+      {
+        type: 'line',
+        label: 'Low Limit',
+        data: row.lowLimits,
+        borderColor: 'rgba(59, 130, 246, 0.95)',
+        backgroundColor: 'rgba(59, 130, 246, 0.15)',
+        borderWidth: 2,
+        tension: 0,
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        borderDash: [8, 5]
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        display: true
+      },
+      tooltip: {
+        mode: 'index',
+        intersect: false
+      }
+    },
+    interaction: {
+      mode: 'nearest',
+      axis: 'x',
+      intersect: false
+    },
+    scales: {
+      x: {
+        grid: {
+          display: false
+        },
+        ticks: {
+          color: '#64748b'
+        }
+      },
+      y: {
+        beginAtZero: false,
+        min: axisMin,
+        max: axisMax,
+        ticks: {
+          color: '#64748b'
+        },
+        grid: {
+          color: 'rgba(148,163,184,0.15)'
+        }
+      }
+    }
+  }
+});
+      chartInstances.push(chart);
+      });
+    } catch (error) {
+    chartsGrid.innerHTML = '<div class="empty">Failed to load KPI charts.</div>';
+     }
+   }
+
+
+      async function refreshTable() {
+        await loadKpis(document.getElementById("search").value || "");
+        showToast("Dashboard refreshed");
+      }
+
+      function openDrawer() {
+        document.getElementById("drawer").classList.add("open");
+      }
+
+      function closeDrawer() {
+        document.getElementById("drawer").classList.remove("open");
+      }
+
+      function formatToleranceForInput(value, toleranceType) {
+        if (value === null || value === undefined || value === "") return "";
+        const text = String(value).trim();
+        if (!text) return "";
+        return String(toleranceType || "").trim().toLowerCase() === "relative"
+          ? text.replace(/%+$/g, "") + "%"
+          : text.replace(/%+$/g, "");
+      }
+
+      function resetForm() {
+        const fields = [
+          "kpi_id","indicator_title","indicator_sub_title","unit",
+          "frequency","target","tolerance_type","up_tolerance","low_tolerance",
+          "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
+        ];
+
+        fields.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = "";
+        });
+      }
+
+      function fillForm(data) {
+        const fields = [
+          "kpi_id","indicator_title","indicator_sub_title","unit",
+          "frequency","target","tolerance_type","up_tolerance","low_tolerance",
+          "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
+        ];
+
+        fields.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = data[id] ?? "";
+        });
+
+        document.getElementById("up_tolerance").value = formatToleranceForInput(data.up_tolerance, data.tolerance_type);
+        document.getElementById("low_tolerance").value = formatToleranceForInput(data.low_tolerance, data.tolerance_type);
+      }
+
+      function openNewDrawer() {
+        selectedKpiId = null;
+        resetForm();
+        document.getElementById("drawerTitle").textContent = "Create KPI";
+        openDrawer();
+      }
+
+      async function openEditDrawer(id) {
+        try {
+          const res = await fetch('/api/kpis/' + id);
+          const data = await res.json();
+          selectedKpiId = data.kpi_id;
+          fillForm(data);
+          document.getElementById("drawerTitle").textContent = "Edit KPI #" + data.kpi_id;
+          openDrawer();
+          await loadKpis(document.getElementById("search").value || "");
+        } catch (err) {
+          showToast("Unable to load KPI");
+        }
+      }
+
+      function buildPayload() {
+        return {
+          indicator_title: document.getElementById("indicator_title").value,
+          indicator_sub_title: document.getElementById("indicator_sub_title").value,
+          unit: document.getElementById("unit").value,
+          frequency: document.getElementById("frequency").value,
+          target: document.getElementById("target").value,
+          tolerance_type: document.getElementById("tolerance_type").value,
+          up_tolerance: document.getElementById("up_tolerance").value,
+          low_tolerance: document.getElementById("low_tolerance").value,
+          max: document.getElementById("max").value,
+          min: document.getElementById("min").value,
+          calculation_on: document.getElementById("calculation_on").value,
+          target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
+          high_limit: document.getElementById("high_limit").value || null,
+          low_limit: document.getElementById("low_limit").value || null
+        };
+      }
+
+      async function saveKpi() {
+        const id = document.getElementById("kpi_id").value;
+        const method = id ? "PUT" : "POST";
+        const url = id ? '/api/kpis/' + id : '/api/kpis';
+
+        try {
+          const res = await fetch(url, {
+            method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildPayload())
+          });
+
+          if (!res.ok) {
+            const errorData = await res.json().catch(() => null);
+            showToast(errorData?.error || "Save failed");
+            return;
+          }
+
+          const saved = await res.json();
+          selectedKpiId = saved.kpi_id;
+          document.getElementById("kpi_id").value = saved.kpi_id;
+          await loadKpis(document.getElementById("search").value || "");
+          showToast("KPI saved successfully");
+          closeDrawer();
+        } catch (err) {
+          showToast("Save failed");
+        }
+      }
+
+      async function deleteKpi() {
+        const id = document.getElementById("kpi_id").value;
+        if (!id) {
+          showToast("Select a KPI first");
+          return;
+        }
+
+        const ok = confirm("Delete this KPI?");
+        if (!ok) return;
+
+        try {
+          const res = await fetch('/api/kpis/' + id, { method: "DELETE" });
+          if (!res.ok) {
+            showToast("Delete failed");
+            return;
+          }
+
+          resetForm();
+          selectedKpiId = null;
+          closeDrawer();
+          await loadKpis(document.getElementById("search").value || "");
+          showToast("KPI deleted");
+        } catch (err) {
+          showToast("Delete failed");
+        }
+      }
+
+      async function deleteRowQuick(id) {
+        const ok = confirm("Delete KPI #" + id + " ?");
+        if (!ok) return;
+
+        try {
+          const res = await fetch('/api/kpis/' + id, { method: "DELETE" });
+          if (!res.ok) {
+            showToast("Delete failed");
+            return;
+          }
+
+          if (String(document.getElementById("kpi_id").value) === String(id)) {
+            resetForm();
+            closeDrawer();
+          }
+
+          await loadKpis(document.getElementById("search").value || "");
+          showToast("KPI deleted");
+        } catch (err) {
+          showToast("Delete failed");
+        }
+      }
+
+      document.getElementById("search").addEventListener("input", (e) => {
+        loadKpis(e.target.value);
+      });
+
+      loadKpis();
+    </script>
+  </body>
+  </html>
+  `);
+});
+
+
+app.get("/api/responsibles/:responsibleId/kpi-graphs", async (req, res) => {
+  const { responsibleId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+          k.kpi_id,
+          ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+          kv.week,
+          kv.value
+      FROM public.kpi_values kv
+      JOIN public."Kpi" k
+        ON k.kpi_id = kv.kpi_id
+      LEFT JOIN public.responsible_kpis rk
+        ON rk.responsible_kpi_id = kv.responsible_kpi_id
+      WHERE kv.responsible_id = $1
+        AND kv.value IS NOT NULL
+        AND kv.value <> ''
+        AND kv.week <> 'Initial'
+      ORDER BY k.kpi_id ASC, kv."Date" ASC NULLS LAST, kv.week ASC
+      `,
+      [responsibleId]
+    );
+
+    const grouped = {};
+
+    for (const row of result.rows) {
+      if (!grouped[row.kpi_id]) {
+        grouped[row.kpi_id] = {
+          kpi_id: row.kpi_id,
+          indicator_title: row.indicator_title,
+          indicator_sub_title: row.indicator_sub_title,
+          labels: [],
+          values: [],
+          targetValue: row.target !== null ? Number(row.target) : null,
+          highLimitValue: row.high_limit !== null ? Number(row.high_limit) : null,
+          lowLimitValue: row.low_limit !== null ? Number(row.low_limit) : null
+        };
+      }
+
+      grouped[row.kpi_id].labels.push(row.week);
+      grouped[row.kpi_id].values.push(Number(row.value) || 0);
+    }
+
+    res.json(Object.values(grouped));
+  } catch (error) {
+    console.error("GET KPI graphs error:", error);
+    res.status(500).json({ error: "Failed to load KPI graph data" });
+  }
+});
+
+app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
+  const { responsibleId } = req.params;
+  let client;
+
+  try {
+    const requestedKpiId = normalizeOptionalTextInput(req.body.kpi_id);
+    const existingTemplateKpiId = requestedKpiId === null ? null : Number(requestedKpiId);
+    if (requestedKpiId !== null && (!Number.isInteger(existingTemplateKpiId) || existingTemplateKpiId <= 0)) {
+      throw createHttpError(400, "kpi_id must be a positive integer.");
+    }
+
+    const {
+      indicator_title,
+      indicator_sub_title,
+      unit,
+      frequency,
+      target,
+      target_direction,
+      tolerance_type,
+      up_tolerance,
+      low_tolerance,
+      max,
+      min,
+      calculation_on,
+      target_auto_adjustment,
+      high_limit,
+      low_limit
+    } = prepareKpiWritePayload(req.body);
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    let kpiIdToAssign = existingTemplateKpiId;
+
+    if (kpiIdToAssign !== null) {
+      const existingTemplate = await client.query(
+        `SELECT kpi_id FROM public."Kpi" WHERE kpi_id = $1 LIMIT 1`,
+        [kpiIdToAssign]
+      );
+
+      if (!existingTemplate.rows.length) {
+        throw createHttpError(404, "KPI template not found.");
+      }
+    } else {
+      const insertKpi = await client.query(
+        `
+        INSERT INTO public."Kpi" (
+          indicator_sub_title,
+          unit,
+          frequency,
+          target,
+          target_direction,
+          tolerance_type,
+          up_tolerance,
+          low_tolerance,
+          max,
+          min,
+          calculation_on,
+          target_auto_adjustment,
+          indicator_title,
+          high_limit,
+          low_limit
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8,
+          $9, $10, $11, $12, $13, $14, $15
+        )
+        RETURNING *
+        `,
+        [
+          indicator_sub_title,
+          unit,
+          frequency,
+          target,
+          target_direction,
+          tolerance_type,
+          up_tolerance,
+          low_tolerance,
+          max,
+          min,
+          calculation_on,
+          target_auto_adjustment,
+          indicator_title,
+          high_limit,
+          low_limit
+        ]
+      );
+
+      kpiIdToAssign = insertKpi.rows[0].kpi_id;
+    }
+
+    const assignment = await upsertResponsibleKpiAssignment(client, responsibleId, kpiIdToAssign, req.body, {
+      preserveMissing: true
+    });
+    await syncResponsibleKpiValueLinks(client, responsibleId, kpiIdToAssign, assignment.responsible_kpi_id);
+
+    const createdKpi = await getResolvedResponsibleKpi(client, responsibleId, kpiIdToAssign);
+
+    await client.query("COMMIT");
+
+    res.status(201).json(createdKpi);
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => { });
+    }
+    console.error(error);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to create KPI" });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/kpis", async (req, res) => {
+  const { responsibleId } = req.params;
+  const search = req.query.search || "";
+  const searchTerm = `%${search}%`;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+          k.kpi_id,
+          ${RESPONSIBLE_KPI_RESOLVED_SELECT}
+      FROM public.responsible_kpis rk
+      JOIN public."Kpi" k
+        ON k.kpi_id = rk.kpi_id
+      WHERE rk.responsible_id = $1
+        AND (
+          ${RESPONSIBLE_KPI_SEARCH_TITLE} ILIKE $2
+          OR ${RESPONSIBLE_KPI_SEARCH_SUBTITLE} ILIKE $2
+          OR ${RESPONSIBLE_KPI_SEARCH_FREQUENCY} ILIKE $2
+          OR ${RESPONSIBLE_KPI_SEARCH_TARGET} ILIKE $2
+        )
+      ORDER BY k.kpi_id DESC
+      `,
+      [responsibleId, searchTerm]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("GET /api/responsibles/:responsibleId/kpis error:", error);
+    res.status(500).json({ error: "Failed to load KPIs" });
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
+  const { responsibleId, kpiId } = req.params;
+
+  try {
+    const result = await getResolvedResponsibleKpi(pool, responsibleId, kpiId);
+
+    if (!result) {
+      return res.status(404).json({ error: "KPI not found for this responsible" });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error("GET one KPI error:", error);
+    res.status(500).json({ error: "Failed to load KPI" });
+  }
+});
+
+app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
+  const { responsibleId, kpiId } = req.params;
+
+  try {
+    const existingAssignment = await pool.query(
+      `
+      SELECT responsible_kpi_id
+      FROM public.responsible_kpis
+      WHERE responsible_id = $1 AND kpi_id = $2
+      LIMIT 1
+      `,
+      [responsibleId, kpiId]
+    );
+
+    if (!existingAssignment.rows.length) {
+      return res.status(404).json({ error: "KPI not found or not allowed" });
+    }
+
+    const assignment = await upsertResponsibleKpiAssignment(pool, responsibleId, kpiId, req.body, {
+      preserveMissing: true
+    });
+    await syncResponsibleKpiValueLinks(pool, responsibleId, kpiId, assignment.responsible_kpi_id);
+    const result = await getResolvedResponsibleKpi(pool, responsibleId, kpiId);
+    res.json(result);
+  } catch (error) {
+    console.error(error);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to update KPI" });
+  }
+});
+
+app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
+  const { responsibleId, kpiId } = req.params;
+  let client;
+
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const assignmentResult = await client.query(
+      `
+      DELETE FROM public.responsible_kpis
+      WHERE responsible_id = $1
+        AND kpi_id = $2
+      RETURNING responsible_kpi_id
+      `,
+      [responsibleId, kpiId]
+    );
+
+    if (!assignmentResult.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "KPI not found or not allowed" });
+    }
+
+    await client.query(
+      `DELETE FROM public.kpi_values WHERE responsible_id = $1 AND kpi_id = $2`,
+      [responsibleId, kpiId]
+    );
+    await client.query(
+      `DELETE FROM public.kpi_values_hist26 WHERE responsible_id = $1 AND kpi_id = $2`,
+      [responsibleId, kpiId]
+    );
+    await client.query(
+      `DELETE FROM public.corrective_actions WHERE responsible_id = $1 AND kpi_id = $2`,
+      [responsibleId, kpiId]
+    );
+    await client.query(
+      `DELETE FROM public.pending_target_updates WHERE responsible_id = $1 AND kpi_id = $2`,
+      [responsibleId, kpiId]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ success: true });
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => { });
+    }
+    console.error(error);
+    res.status(500).json({ error: "Failed to delete KPI" });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+
+app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res) => {
+  const { responsibleId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      WITH ranked AS (
+        SELECT
+          h.kpi_id,
+          ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+          date_trunc('month', h.updated_at)::date AS month_start,
+          to_char(date_trunc('month', h.updated_at), 'Mon YYYY') AS month_label,
+          COALESCE(NULLIF(h.new_value, ''), '0')::numeric AS new_value_num,
+          h.updated_at,
+          ROW_NUMBER() OVER (
+            PARTITION BY h.kpi_id, date_trunc('month', h.updated_at)
+            ORDER BY h.updated_at DESC
+          ) AS rn
+        FROM public.kpi_values_hist26 h
+        JOIN public."Kpi" k
+          ON k.kpi_id = h.kpi_id
+        LEFT JOIN public.kpi_values kv
+          ON kv.kpi_values_id = h.kpi_values_id
+        LEFT JOIN public.responsible_kpis rk
+          ON rk.responsible_kpi_id = kv.responsible_kpi_id
+        WHERE h.responsible_id = $1
+      )
+      SELECT
+        kpi_id,
+        indicator_title,
+        indicator_sub_title,
+        high_limit,
+        low_limit,
+        target,
+        month_start,
+        month_label,
+        new_value_num
+      FROM ranked
+      WHERE rn = 1
+      ORDER BY kpi_id, month_start
+      `,
+      [responsibleId]
+    );
+
+    const grouped = {};
+
+    for (const row of result.rows) {
+      if (!grouped[row.kpi_id]) {
+        grouped[row.kpi_id] = {
+          kpi_id: row.kpi_id,
+          indicator_title: row.indicator_title,
+          indicator_sub_title: row.indicator_sub_title,
+          labels: [],
+          values: [],
+          targetValue: row.target !== null && row.target !== "" ? Number(row.target) : null,
+          highLimitValue: row.high_limit !== null ? Number(row.high_limit) : null,
+          lowLimitValue: row.low_limit !== null ? Number(row.low_limit) : null
+        };
+      }
+
+      grouped[row.kpi_id].labels.push(row.month_label);
+      grouped[row.kpi_id].values.push(Number(row.new_value_num) || 0);
+    }
+
+    const finalRows = Object.values(grouped).map(item => ({
+      kpi_id: item.kpi_id,
+      indicator_title: item.indicator_title,
+      indicator_sub_title: item.indicator_sub_title,
+      labels: item.labels,
+      values: item.values,
+      targetValue: item.targetValue,
+      highLimitValue: item.highLimitValue,
+      lowLimitValue: item.lowLimitValue
+    }));
+
+    res.json(finalRows);
+  } catch (error) {
+    console.error("GET monthly KPI history error:", error);
+    res.status(500).json({ error: "Failed to load monthly KPI history" });
+  }
+});
+
+app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
+  const { responsibleId } = req.params;
+
+  const responsibleResult = await pool.query(
+    `SELECT name FROM public."Responsible" WHERE responsible_id = $1`,
+    [responsibleId]
+  );
+
+  const responsibleName = responsibleResult.rows[0]?.name || "Unknown";
+
+  res.send(`
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Responsible KPI Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --bg: #f4f7fb;
+        --bg-2: #eef4ff;
+        --sidebar: #0f172a;
+        --sidebar-2: #111c33;
+        --card: rgba(255, 255, 255, 0.92);
+        --card-solid: #ffffff;
+        --line: rgba(15, 23, 42, 0.08);
+        --line-strong: rgba(15, 23, 42, 0.12);
+        --text: #0f172a;
+        --muted: #64748b;
+        --muted-2: #94a3b8;
+        --primary: #2563eb;
+        --primary-2: #4f46e5;
+        --cyan: #06b6d4;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+        --soft-blue: rgba(37,99,235,0.08);
+        --soft-red: rgba(239,68,68,0.08);
+        --soft-amber: rgba(245,158,11,0.10);
+        --soft-slate: #f8fbff;
+        --shadow-sm: 0 8px 20px rgba(15, 23, 42, 0.05);
+        --shadow-md: 0 18px 40px rgba(15, 23, 42, 0.08);
+        --shadow-lg: 0 28px 70px rgba(15, 23, 42, 0.10);
+        --radius-xl: 28px;
+        --radius-lg: 22px;
+        --radius-md: 16px;
+        --radius-sm: 12px;
+      }
+
+      body {
+        font-family: "Inter", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(79,70,229,0.08), transparent 18%),
+          radial-gradient(circle at top right, rgba(6,182,212,0.08), transparent 18%),
+          linear-gradient(180deg, #f8fbff 0%, #f3f7fc 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 280px 1fr;
+        min-height: 100vh;
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        height: 100vh;
+        background:
+          radial-gradient(circle at top right, rgba(59,130,246,0.16), transparent 28%),
+          linear-gradient(180deg, var(--sidebar) 0%, var(--sidebar-2) 100%);
+        color: white;
+        padding: 24px 18px;
+        border-right: 1px solid rgba(255,255,255,0.06);
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 12px;
+        border-radius: 18px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+      }
+
+      .brand-badge {
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, var(--primary-2), var(--cyan));
+        font-weight: 900;
+        font-size: 18px;
+        box-shadow: 0 14px 28px rgba(37,99,235,0.28);
+      }
+
+      .brand h2 {
+        font-size: 18px;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+      }
+
+      .brand p {
+        margin-top: 4px;
+        font-size: 12px;
+        color: rgba(255,255,255,0.68);
+      }
+
+      .sidebar-section-title {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: rgba(255,255,255,0.45);
+        font-weight: 800;
+        margin: 6px 12px 0;
+      }
+
+      .nav {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .nav-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: rgba(255,255,255,0.82);
+        text-decoration: none;
+        padding: 14px;
+        border-radius: 16px;
+        transition: 0.22s ease;
+        font-weight: 700;
+        border: 1px solid transparent;
+      }
+
+      .nav-item:hover,
+      .nav-item.active {
+        background: rgba(255,255,255,0.08);
+        border-color: rgba(255,255,255,0.08);
+        color: white;
+        transform: translateX(2px);
+      }
+
+      .nav-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        background: rgba(255,255,255,0.08);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+      }
+
+      .sidebar-footer {
+        margin-top: auto;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 20px;
+        padding: 18px;
+      }
+
+      .sidebar-footer h4 {
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      .sidebar-footer p {
+        margin-top: 8px;
+        font-size: 13px;
+        color: rgba(255,255,255,0.7);
+        line-height: 1.6;
+      }
+
+      .content {
+        padding: 24px;
+      }
+
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 22px;
+        flex-wrap: wrap;
+      }
+
+      .topbar-left h1 {
+        font-size: 34px;
+        font-weight: 900;
+        letter-spacing: -1.2px;
+        color: #0b1220;
+      }
+
+      .topbar-left p {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .topbar-right {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .btn {
+        border: none;
+        cursor: pointer;
+        border-radius: 14px;
+        padding: 12px 16px;
+        font-size: 14px;
+        font-weight: 800;
+        transition: all 0.22s ease;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+      }
+
+      .btn-primary {
+        color: white;
+        background: linear-gradient(135deg, var(--primary-2), var(--primary), var(--cyan));
+        box-shadow: 0 14px 28px rgba(37,99,235,0.18);
+      }
+
+      .btn-soft {
+        color: var(--text);
+        background: rgba(255,255,255,0.92);
+        border: 1px solid var(--line-strong);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .btn-danger {
+        color: white;
+        background: linear-gradient(135deg, #f87171, #ef4444);
+        box-shadow: 0 12px 22px rgba(239,68,68,0.16);
+      }
+
+      .hero-panel {
+        position: relative;
+        overflow: hidden;
+        background: linear-gradient(135deg, #ffffff 0%, #f7faff 100%);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow-lg);
+        padding: 24px;
+        margin-bottom: 22px;
+      }
+
+      .hero-panel::before {
+        content: "";
+        position: absolute;
+        width: 240px;
+        height: 240px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(37,99,235,0.08), transparent 70%);
+        top: -120px;
+        right: -80px;
+      }
+
+      .hero-panel::after {
+        content: "";
+        position: absolute;
+        width: 220px;
+        height: 220px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(6,182,212,0.08), transparent 70%);
+        bottom: -120px;
+        left: -60px;
+      }
+
+      .hero-row {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
+
+      .hero-meta h3 {
+        font-size: 22px;
+        font-weight: 900;
+      }
+
+      .hero-meta p {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .responsible-chip {
+        margin-top: 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: rgba(37,99,235,0.08);
+        color: #1d4ed8;
+        padding: 8px 14px;
+        border-radius: 999px;
+        font-weight: 800;
+        font-size: 14px;
+      }
+
+      .hero-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.90);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow-sm);
+        font-weight: 800;
+      }
+
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+        margin-bottom: 22px;
+      }
+
+      .stat-card {
+        position: relative;
+        overflow: hidden;
+        background: rgba(255,255,255,0.9);
+        border: 1px solid rgba(255,255,255,0.8);
+        border-radius: var(--radius-lg);
+        padding: 20px;
+        box-shadow: var(--shadow-md);
+      }
+
+      .stat-card::before {
+        content: "";
+        position: absolute;
+        top: -20px;
+        right: -20px;
+        width: 100px;
+        height: 100px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, rgba(79,70,229,0.10), rgba(6,182,212,0.08));
+      }
+
+      .stat-label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+
+      .stat-value {
+        font-size: 28px;
+        font-weight: 900;
+        letter-spacing: -1px;
+      }
+
+      .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+
+      .search-wrap {
+        flex: 1;
+        min-width: 280px;
+      }
+
+      .search {
+        width: 100%;
+        border: 1px solid rgba(148,163,184,0.25);
+        background: rgba(255,255,255,0.95);
+        color: var(--text);
+        border-radius: 18px;
+        padding: 15px 18px;
+        font-size: 14px;
+        outline: none;
+        box-shadow: var(--shadow-sm);
+        transition: all 0.18s ease;
+      }
+
+      .search::placeholder {
+        color: #94a3b8;
+      }
+
+      .search:focus {
+        border-color: rgba(37,99,235,0.35);
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .section-head h2 {
+        font-size: 20px;
+        font-weight: 900;
+      }
+
+      .section-head p {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 4px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0,1fr));
+        gap: 16px;
+      }
+
+      .kpi-card {
+        position: relative;
+        overflow: hidden;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid rgba(15,23,42,0.06);
+        border-radius: 22px;
+        box-shadow: var(--shadow-md);
+        padding: 18px;
+        transition: all 0.22s ease;
+      }
+
+      .kpi-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.11);
+      }
+
+      .kpi-card::before {
+        content: "";
+        position: absolute;
+        width: 110px;
+        height: 110px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(37,99,235,0.06), transparent 70%);
+        top: -20px;
+        right: -20px;
+      }
+
+      .kpi-head {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .kpi-title {
+        font-size: 17px;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+        color: #0f172a;
+      }
+
+      .kpi-subtitle {
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 7px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 900;
+        white-space: nowrap;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+
+      .pill-blue {
+        background: rgba(37,99,235,0.08);
+        color: #1d4ed8;
+      }
+
+.meta {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0,1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.meta-box {
+  position: relative;
+  background: linear-gradient(180deg, #fbfdff 0%, #f4f8fc 100%);
+  border: 1px solid #e4ecf5;
+  border-radius: 16px;
+  padding: 12px 14px;
+  min-height: 74px;
+  overflow: hidden;
+  transition: all 0.2s ease;
+}
+
+.meta-box:hover {
+  transform: translateY(-1px);
+  border-color: #d7e3f1;
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
+}
+
+.meta-box::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: transparent;
+}
+
+.meta-box.primary::before {
+  background: linear-gradient(90deg, #2563eb, #06b6d4);
+}
+
+.meta-box.success::before {
+  background: linear-gradient(90deg, #10b981, #22c55e);
+}
+
+.meta-box.warning::before {
+  background: linear-gradient(90deg, #f59e0b, #f97316);
+}
+
+.meta-box.danger::before {
+  background: linear-gradient(90deg, #ef4444, #f87171);
+}
+
+.meta-box.neutral::before {
+  background: linear-gradient(90deg, #94a3b8, #cbd5e1);
+}
+
+
+  .meta-box .label {
+  font-size: 10px;
+  color: #64748b;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 8px;
+}
+
+   .meta-box .value {
+  font-size: 17px;
+  color: #0f172a;
+  font-weight: 900;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  word-break: break-word;
+}
+
+.meta-box .subvalue {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.meta-box.compact .value {
+  font-size: 15px;
+}
+
+.meta-box.wide {
+  grid-column: 1 / -1;
+}
+
+.value-muted {
+  color: #475569;
+}
+
+.value-number {
+  font-variant-numeric: tabular-nums;
+}
+
+      .card-actions {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 14px;
+      }
+
+      .action-btn {
+        border: none;
+        border-radius: 12px;
+        padding: 10px 13px;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        transition: 0.18s ease;
+      }
+
+      .action-btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .edit-btn {
+        background: rgba(37,99,235,0.08);
+        color: #1d4ed8;
+        border: 1px solid rgba(37,99,235,0.10);
+      }
+
+      .delete-btn {
+        background: rgba(239,68,68,0.08);
+        color: #dc2626;
+        border: 1px solid rgba(239,68,68,0.10);
+      }
+
+      .empty {
+        grid-column: 1 / -1;
+        background: rgba(255,255,255,0.92);
+        border: 1px dashed #dbe5f0;
+        border-radius: 24px;
+        padding: 60px 20px;
+        text-align: center;
+        color: var(--muted);
+        box-shadow: var(--shadow-md);
+      }
+
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(15,23,42,0.34);
+        backdrop-filter: blur(8px);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        z-index: 999;
+      }
+
+      .modal-backdrop.open {
+        display: flex;
+      }
+
+      .modal {
+        width: 100%;
+        max-width: 980px;
+        max-height: 92vh;
+        overflow: hidden;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+        border-radius: 30px;
+        box-shadow: 0 32px 90px rgba(15, 23, 42, 0.20);
+        border: 1px solid rgba(255,255,255,0.9);
+        display: flex;
+        flex-direction: column;
+      }
+
+      .modal-header {
+        padding: 22px 24px 18px;
+        border-bottom: 1px solid rgba(15,23,42,0.06);
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 16px;
+        background: rgba(255,255,255,0.94);
+        backdrop-filter: blur(12px);
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+
+      .modal-title-wrap {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .modal-header h2 {
+        font-size: 28px;
+        font-weight: 900;
+        color: #0f172a;
+        letter-spacing: -0.03em;
+      }
+
+      .modal-subtitle {
+        font-size: 14px;
+        color: #64748b;
+        line-height: 1.5;
+        max-width: 700px;
+      }
+
+      .modal-body {
+        padding: 22px 24px 132px;
+        overflow: auto;
+        background:
+          radial-gradient(circle at top right, rgba(37,99,235,0.04), transparent 22%),
+          linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
+      }
+
+      .modal-overview {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .overview-card {
+        background: rgba(255,255,255,0.92);
+        border: 1px solid rgba(15,23,42,0.06);
+        border-radius: 18px;
+        padding: 13px 14px;
+        box-shadow: 0 8px 18px rgba(15,23,42,0.04);
+      }
+
+      .overview-card .label {
+        font-size: 11px;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #64748b;
+      }
+
+      .overview-card .value {
+        margin-top: 6px;
+        font-size: 14px;
+        font-weight: 800;
+        color: #0f172a;
+      }
+
+      .form-section {
+        background: rgba(255,255,255,0.90);
+        border: 1px solid rgba(15,23,42,0.06);
+        border-radius: 22px;
+        padding: 18px;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.05);
+        margin-bottom: 16px;
+      }
+
+      .section-title {
+        margin: 0 0 4px;
+        font-size: 12px;
+        font-weight: 900;
+        color: #4f46e5;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+      }
+
+      .section-subtitle {
+        margin-bottom: 16px;
+        font-size: 13px;
+        color: #64748b;
+        line-height: 1.5;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .field.col-3 { grid-column: span 3; }
+      .field.col-4 { grid-column: span 4; }
+      .field.col-6 { grid-column: span 6; }
+      .field.col-8 { grid-column: span 8; }
+      .field.col-12 { grid-column: 1 / -1; }
+
+      .field label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+        font-weight: 800;
+        color: #334155;
+      }
+
+      .field .hint {
+        font-size: 11px;
+        font-weight: 700;
+        color: #94a3b8;
+      }
+
+      .field input,
+      .field textarea,
+      .field select {
+        width: 100%;
+        border: 1px solid rgba(148,163,184,0.24);
+        background: #ffffff;
+        color: #0f172a;
+        border-radius: 16px;
+        padding: 13px 14px;
+        font-size: 14px;
+        font-family: inherit;
+        outline: none;
+        transition: all 0.18s ease;
+        box-shadow: 0 2px 6px rgba(15,23,42,0.03);
+      }
+
+      .field input::placeholder,
+      .field textarea::placeholder,
+      .field select::placeholder {
+        color: #94a3b8;
+      }
+
+      .field input:focus,
+      .field textarea:focus,
+      .field select:focus {
+        border-color: rgba(37,99,235,0.34);
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+      }
+
+      .field textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+
+      .field-help {
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.45;
+      }
+
+      .readonly-input {
+        background: #f3f6fb !important;
+        color: #475569 !important;
+        border-color: #dbe4f0 !important;
+        cursor: not-allowed;
+      }
+
+      .modal-footer {
+        position: sticky;
+        bottom: 0;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 18px 24px;
+        border-top: 1px solid rgba(15,23,42,0.06);
+        background: rgba(255,255,255,0.97);
+        backdrop-filter: blur(12px);
+      }
+
+      .footer-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .toast {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        background: #ffffff;
+        color: #0f172a;
+        padding: 14px 18px;
+        border-radius: 14px;
+        display: none;
+        z-index: 1001;
+        border: 1px solid rgba(15,23,42,0.08);
+        box-shadow: var(--shadow-md);
+      }
+
+      .chart-meta {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+
+      .chart-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+        border: 1px solid transparent;
+      }
+
+      .chart-chip-target {
+        background: rgba(239, 68, 68, 0.08);
+        color: #dc2626;
+        border-color: rgba(239, 68, 68, 0.12);
+      }
+
+      .chart-chip-high {
+        background: rgba(245, 158, 11, 0.10);
+        color: #b45309;
+        border-color: rgba(245, 158, 11, 0.14);
+      }
+
+      .chart-chip-low {
+        background: rgba(59, 130, 246, 0.08);
+        color: #2563eb;
+        border-color: rgba(59, 130, 246, 0.12);
+      }
+
+      .chart-card {
+        background: rgba(255,255,255,0.92);
+        border: 1px solid rgba(255,255,255,0.8);
+        border-radius: 24px;
+        box-shadow: var(--shadow-lg);
+        padding: 22px;
+      }
+
+      .chart-card h3 {
+        font-size: 20px;
+        font-weight: 900;
+        margin-bottom: 6px;
+        color: #0f172a;
+      }
+
+      .chart-card p {
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 16px;
+      }
+
+      .chart-wrap {
+        height: 320px;
+      }
+
+      @media (max-width: 1250px) {
+        .layout {
+          grid-template-columns: 90px 1fr;
+        }
+
+        .brand h2,
+        .brand p,
+        .nav-item span,
+        .sidebar-section-title,
+        .sidebar-footer {
+          display: none;
+        }
+
+        .brand {
+          justify-content: center;
+        }
+
+        .nav-item {
+          justify-content: center;
+          padding: 12px;
+        }
+      }
+
+      @media (max-width: 1100px) {
+        .stats-grid,
+        .grid {
+          grid-template-columns: repeat(2, minmax(0,1fr));
+        }
+
+        .modal-overview {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 820px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          position: relative;
+          height: auto;
+          padding: 16px;
+        }
+
+        .brand h2,
+        .brand p,
+        .nav-item span,
+        .sidebar-section-title,
+        .sidebar-footer {
+          display: block;
+        }
+
+        .content {
+          padding: 16px;
+        }
+
+        .stats-grid,
+        .grid,
+        .modal-overview {
+          grid-template-columns: 1fr;
+        }
+
+        .form-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .field.col-3,
+        .field.col-4,
+        .field.col-6,
+        .field.col-8,
+        .field.col-12 {
+          grid-column: auto;
+        }
+
+        .topbar-left h1 {
+          font-size: 28px;
+        }
+
+        .modal-body {
+          padding: 18px 16px 130px;
+        }
+
+        .modal-header,
+        .modal-footer {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-badge">K</div>
+          <div>
+            <h2>KPI Suite</h2>
+            <p>Performance workspace</p>
+          </div>
+        </div>
+
+        <div>
+          <div class="sidebar-section-title">Navigation</div>
+          <nav class="nav">
+            <a href="#" class="nav-item active" id="navDashboard" onclick="showDashboard(); return false;">
+              <div class="nav-icon">📊</div>
+              <span>Dashboard</span>
+            </a>
+
+            <a href="#" class="nav-item" id="navMyKpis" onclick="showMyKpis(); return false;">
+              <div class="nav-icon">🎯</div>
+              <span>My KPIs</span>
+            </a>
+
+            <a href="#" class="nav-item" onclick="openCreateModal(); return false;">
+              <div class="nav-icon">➕</div>
+              <span>Create KPI</span>
+            </a>
+          </nav>
+        </div>
+
+        <div class="sidebar-footer">
+          <h4>Responsible Workspace</h4>
+          <p>
+            Manage KPI settings, update targets and keep your performance indicators organized in one modern dashboard.
+          </p>
+        </div>
+      </aside>
+
+      <main class="content">
+        <div class="topbar">
+          <div class="topbar-left">
+            <h1>Responsible KPI Dashboard</h1>
+            <p>Modern KPI workspace for responsible management and tracking.</p>
+          </div>
+
+          <div class="topbar-right">
+            <button class="btn btn-soft" onclick="refreshKpis()">Refresh</button>
+            <button class="btn btn-primary" onclick="openCreateModal()">+ Add New KPI</button>
+          </div>
+        </div>
+
+        <section id="dashboardSection">
+          <div class="hero-panel">
+            <div class="hero-row">
+              <div class="hero-meta">
+                <h3>Executive KPI Management</h3>
+                <div class="responsible-chip">👤 ${responsibleName}</div>
+                <p>
+                  Track, maintain and optimize your KPI portfolio with a cleaner and more professional interface.
+                </p>
+              </div>
+
+              <div class="hero-badge">
+                <span>Responsible</span>
+                <strong>#${responsibleId}</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Total KPIs</div>
+              <div class="stat-value" id="statTotal">0</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-label">Monthly KPIs</div>
+              <div class="stat-value" id="statMonthly">0</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-label">With Target</div>
+              <div class="stat-value" id="statTarget">0</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-label">Tolerance Rules</div>
+              <div class="stat-value" id="statTolerance">0</div>
+            </div>
+          </div>
+
+          <div class="toolbar">
+            <div class="search-wrap">
+              <input id="search" class="search" placeholder="Search KPI by title, frequency..." />
+            </div>
+          </div>
+
+          <div class="section-head">
+            <div>
+              <h2>KPI Portfolio</h2>
+              <p>Smaller, cleaner KPI cards with full information display.</p>
+            </div>
+          </div>
+
+          <div id="grid" class="grid"></div>
+        </section>
+
+        <section id="myKpisSection" style="display:none;">
+          <div class="section-head">
+            <div>
+              <h2>My KPI Analytics</h2>
+              <p>Visual trends of KPI values by month for this responsible.</p>
+            </div>
+          </div>
+
+          <div id="chartsGrid" class="grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="modalBackdrop" class="modal-backdrop">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title-wrap">
+            <h2 id="modalTitle">Edit KPI</h2>
+            <div class="modal-subtitle" id="modalSubtitle">
+              Update KPI information, targets, calculation rules and thresholds in a cleaner professional form.
+            </div>
+          </div>
+
+          <button class="btn btn-soft" onclick="closeModal()">Close</button>
+        </div>
+
+        <div class="modal-body">
+          <input type="hidden" id="kpi_id" />
+
+          <div class="modal-overview">
+            <div class="overview-card">
+              <div class="label">Mode</div>
+              <div class="value" id="modalModeBadge">Edit KPI</div>
+            </div>
+            <div class="overview-card">
+              <div class="label">Frequency</div>
+              <div class="value" id="overviewFrequency">Not set</div>
+            </div>
+            <div class="overview-card">
+              <div class="label">Unit</div>
+              <div class="value" id="overviewUnit">Not set</div>
+            </div>
+            <div class="overview-card">
+              <div class="label">Target</div>
+              <div class="value" id="overviewTarget">Not set</div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="section-title">Identity</div>
+            <div class="section-subtitle">Basic KPI naming and structure.</div>
+
+            <div class="form-grid">
+              <div class="field col-6">
+                <label>
+                  <span>Category</span>
+                  <span class="hint">Main KPI group</span>
+                </label>
+                <input id="indicator_title" placeholder="Example: Finance / Operations / Quality" />
+              </div>
+
+              <div class="field col-6">
+                <label>
+                  <span>KPI Name</span>
+                  <span class="hint">Displayed label</span>
+                </label>
+                <input id="indicator_sub_title" placeholder="Example: Action plan milestone respected" />
+              </div>
+
+              <div class="field col-4">
+                <label>
+                  <span>Unit</span>
+                  <span class="hint">%, days, qty</span>
+                </label>
+                <input id="unit" placeholder="%" />
+              </div>
+
+              <div class="field col-4">
+                <label>
+                  <span>Frequency</span>
+                  <span class="hint">Update rhythm</span>
+                </label>
+                <input id="frequency" placeholder="Monthly" />
+              </div>
+
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="section-title">Target & Calculation</div>
+            <div class="section-subtitle">Performance objective and measurement logic.</div>
+
+            <div class="form-grid">
+              <div class="field col-4">
+                <label><span>Target</span><span class="hint">Expected result</span></label>
+                <input id="target" placeholder="145" />
+              </div>
+
+              <div class="field col-4">
+                <label><span>Calculation On</span><span class="hint">Scope or basis</span></label>
+                <input id="calculation_on" placeholder="Monthly average" />
+              </div>
+
+              <div class="field col-4">
+                <label><span>Target Auto Adjustment</span><span class="hint">Optional</span></label>
+                <input id="target_auto_adjustment" placeholder="Optional rule" />
+              </div>
+
+              <div class="field col-4">
+                <label><span>Max</span><span class="hint">Optional</span></label>
+                <input id="max" placeholder="Maximum value" />
+              </div>
+
+              <div class="field col-4">
+                <label><span>Min</span><span class="hint">Optional</span></label>
+                <input id="min" placeholder="Minimum value" />
+              </div>
+
+              <div class="field col-4">
+                <label><span>Tolerance Type</span><span class="hint">Relative / Absolute</span></label>
+                <select id="tolerance_type">
+                  <option value="">Select tolerance type</option>
+                  <option value="Relative">Relative</option>
+                  <option value="Absolute">Absolute</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="section-title">Thresholds & Tolerances</div>
+            <div class="section-subtitle">High and low limits are displayed for visibility and are read-only.</div>
+
+            <div class="form-grid">
+              <div class="field col-3">
+                <label><span>Up Tolerance</span><span class="hint">Upper variance</span></label>
+                <input id="up_tolerance" placeholder="10%" />
+              </div>
+
+              <div class="field col-3">
+                <label><span>Low Tolerance</span><span class="hint">Lower variance</span></label>
+                <input id="low_tolerance" placeholder="10%" />
+              </div>
+
+              <div class="field col-3">
+                <label><span>High Limit</span><span class="hint">Read only</span></label>
+                <input id="high_limit" class="readonly-input" type="number" step="any" placeholder="159.5" readonly />
+              </div>
+
+              <div class="field col-3">
+                <label><span>Low Limit</span><span class="hint">Read only</span></label>
+                <input id="low_limit" class="readonly-input" type="number" step="any" placeholder="130.5" readonly />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button class="btn btn-danger" id="deleteBtn" onclick="deleteCurrentKpi()">Delete KPI</button>
+
+          <div class="footer-actions">
+            <button class="btn btn-soft" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script>
+      const responsibleId = "${responsibleId}";
+      let currentRows = [];
+      let chartsLoaded = false;
+      let chartInstances = [];
+
+      function showToast(message) {
+        const toast = document.getElementById("toast");
+        toast.textContent = message;
+        toast.style.display = "block";
+        setTimeout(() => {
+          toast.style.display = "none";
+        }, 2400);
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function setActiveNav(target) {
+        document.getElementById("navDashboard").classList.remove("active");
+        document.getElementById("navMyKpis").classList.remove("active");
+        document.getElementById(target).classList.add("active");
+      }
+
+      function showDashboard() {
+        document.getElementById("dashboardSection").style.display = "block";
+        document.getElementById("myKpisSection").style.display = "none";
+        setActiveNav("navDashboard");
+      }
+
+      async function showMyKpis() {
+        document.getElementById("dashboardSection").style.display = "none";
+        document.getElementById("myKpisSection").style.display = "block";
+        setActiveNav("navMyKpis");
+
+        if (!chartsLoaded) {
+          await loadKpiCharts();
+          chartsLoaded = true;
+        }
+      }
+
+      function updateStats(rows) {
+        const total = rows.length;
+        const monthly = rows.filter(r => String(r.frequency || "").toLowerCase().includes("month")).length;
+        const withTarget = rows.filter(r => r.target !== null && r.target !== undefined && String(r.target).trim() !== "").length;
+        const tolerance = rows.filter(r => r.tolerance_type && String(r.tolerance_type).trim() !== "").length;
+
+        document.getElementById("statTotal").textContent = total;
+        document.getElementById("statMonthly").textContent = monthly;
+        document.getElementById("statTarget").textContent = withTarget;
+        document.getElementById("statTolerance").textContent = tolerance;
+      }
+
+  function renderKpis(rows) {
+  currentRows = rows || [];
+  updateStats(currentRows);
+
+  const grid = document.getElementById("grid");
+
+  if (!currentRows.length) {
+    grid.innerHTML = '<div class="empty">No KPI found for this responsible.</div>';
+    return;
+  }
+
+  grid.innerHTML = currentRows.map(row => \`
+    <div class="kpi-card">
+      <div class="kpi-head">
+        <div>
+          <div class="kpi-title">\${escapeHtml(row.indicator_title || "Untitled KPI")}</div>
+          <div class="kpi-subtitle">\${escapeHtml(row.indicator_sub_title || "")}</div>
+        </div>
+        <span class="pill pill-blue">KPI #\${escapeHtml(row.kpi_id)}</span>
+      </div>
+
+      <div class="meta">
+        <div class="meta-box neutral compact">
+          <div class="label">Unit</div>
+          <div class="value">\${escapeHtml(row.unit || "-")}</div>
+        </div>
+
+        <div class="meta-box neutral compact">
+          <div class="label">Frequency</div>
+          <div class="value">\${escapeHtml(row.frequency || "-")}</div>
+        </div>
+
+        <div class="meta-box primary">
+          <div class="label">Target</div>
+          <div class="value value-number">\${escapeHtml(row.target || "-")}</div>
+        </div>
+
+        <div class="meta-box neutral compact">
+          <div class="label">Tolerance Type</div>
+          <div class="value">\${escapeHtml(row.tolerance_type || "-")}</div>
+        </div>
+
+        <div class="meta-box success">
+          <div class="label">Up Tolerance</div>
+          <div class="value value-number">\${escapeHtml(row.up_tolerance || "-")}</div>
+        </div>
+
+        <div class="meta-box danger">
+          <div class="label">Low Tolerance</div>
+          <div class="value value-number">\${escapeHtml(row.low_tolerance || "-")}</div>
+        </div>
+
+        <div class="meta-box warning">
+          <div class="label">High Limit</div>
+          <div class="value value-number">\${escapeHtml(row.high_limit ?? "-")}</div>
+        </div>
+
+        <div class="meta-box primary">
+          <div class="label">Low Limit</div>
+          <div class="value value-number">\${escapeHtml(row.low_limit ?? "-")}</div>
+        </div>
+
+        <div class="meta-box neutral compact">
+          <div class="label">Calculation On</div>
+          <div class="value">\${escapeHtml(row.calculation_on || "-")}</div>
+        </div>
+
+        <div class="meta-box neutral compact">
+          <div class="label">Max</div>
+          <div class="value value-number">\${escapeHtml(row.max || "-")}</div>
+        </div>
+
+        <div class="meta-box neutral compact">
+          <div class="label">Min</div>
+          <div class="value value-number">\${escapeHtml(row.min || "-")}</div>
+        </div>
+
+      </div>
+
+      <div class="card-actions">
+        <button class="action-btn edit-btn" onclick="openEditModal(\${row.kpi_id})">Edit KPI</button>
+        <button class="action-btn delete-btn" onclick="deleteKpi(\${row.kpi_id})">Delete KPI</button>
+      </div>
+    </div>
+  \`).join("");
+}
+
+      async function loadKpis(search = "") {
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?search=' + encodeURIComponent(search));
+          const data = await res.json();
+          renderKpis(data);
+        } catch (error) {
+          document.getElementById("grid").innerHTML =
+            '<div class="empty">Failed to load KPIs.</div>';
+        }
+      }
+
+      async function loadKpiCharts() {
+        const chartsGrid = document.getElementById("chartsGrid");
+
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-history-monthly');
+          if (!res.ok) throw new Error("Failed to load chart data");
+
+          const rows = await res.json();
+
+          if (!rows.length) {
+            chartsGrid.innerHTML = '<div class="empty">No KPI history found for this responsible.</div>';
+            return;
+          }
+
+          chartsGrid.innerHTML = rows.map((row, index) =>
+            '<div class="chart-card">' +
+              '<h3>' + escapeHtml(row.indicator_title || "Untitled KPI") + '</h3>' +
+              '<p>' + escapeHtml(row.indicator_sub_title || "Monthly KPI history") + '</p>' +
+              '<div class="chart-meta">' +
+                '<div class="chart-chip chart-chip-target">Target: ' + escapeHtml(row.targetValue ?? "-") + '</div>' +
+                '<div class="chart-chip chart-chip-high">High Limit: ' + escapeHtml(row.highLimitValue ?? "-") + '</div>' +
+                '<div class="chart-chip chart-chip-low">Low Limit: ' + escapeHtml(row.lowLimitValue ?? "-") + '</div>' +
+              '</div>' +
+              '<div class="chart-wrap">' +
+                '<canvas id="chart_' + index + '"></canvas>' +
+              '</div>' +
+            '</div>'
+          ).join("");
+
+          chartInstances.forEach(chart => chart.destroy());
+          chartInstances = [];
+
+          rows.forEach((row, index) => {
+            const canvas = document.getElementById('chart_' + index);
+            const ctx = canvas.getContext('2d');
+
+            const targetSeries = Array.isArray(row.labels)
+              ? row.labels.map(() => row.targetValue ?? null)
+              : [];
+
+            const highLimitSeries = Array.isArray(row.labels)
+              ? row.labels.map(() => row.highLimitValue ?? null)
+              : [];
+
+            const lowLimitSeries = Array.isArray(row.labels)
+              ? row.labels.map(() => row.lowLimitValue ?? null)
+              : [];
+            const axisValues = [
+              ...(Array.isArray(row.values) ? row.values : []),
+              ...targetSeries,
+              ...highLimitSeries,
+              ...lowLimitSeries
+            ]
+              .filter((value) => value !== null && value !== undefined && value !== '')
+              .map((value) => Number(value))
+              .filter((value) => Number.isFinite(value));
+            const axisSourceMin = axisValues.length ? Math.min(...axisValues) : 0;
+            const axisSourceMax = axisValues.length ? Math.max(...axisValues) : 100;
+            let axisMin = axisSourceMin > 0
+              ? axisSourceMin * 0.8
+              : axisSourceMin < 0
+                ? axisSourceMin * 1.2
+                : 0;
+            let axisMax = axisSourceMax > 0
+              ? axisSourceMax * 1.2
+              : axisSourceMax < 0
+                ? axisSourceMax * 0.8
+                : 0;
+            if (axisSourceMin === axisSourceMax) {
+              const pad = Math.max(Math.abs(axisSourceMax || axisSourceMin || 1) * 0.2, 1);
+              axisMin = axisSourceMin - pad;
+              axisMax = axisSourceMax + pad;
+            }
+
+            const chart = new Chart(ctx, {
+              data: {
+                labels: row.labels,
+                datasets: [
+                  {
+                    type: 'bar',
+                    label: 'Actual Value',
+                    data: row.values,
+                    borderWidth: 0,
+                    backgroundColor: 'rgba(34, 197, 94, 0.85)',
+                    borderRadius: 6,
+                    barThickness: 26
+                  },
+                  {
+                    type: 'line',
+                    label: 'Target',
+                    data: targetSeries,
+                    borderColor: 'rgba(239, 68, 68, 0.95)',
+                    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                    borderWidth: 2,
+                    tension: 0,
+                    fill: false,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    borderDash: [6, 4]
+                  },
+                  {
+                    type: 'line',
+                    label: 'High Limit',
+                    data: highLimitSeries,
+                    borderColor: 'rgba(245, 158, 11, 0.95)',
+                    backgroundColor: 'rgba(245, 158, 11, 0.15)',
+                    borderWidth: 2,
+                    tension: 0,
+                    fill: false,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    borderDash: [8, 5]
+                  },
+                  {
+                    type: 'line',
+                    label: 'Low Limit',
+                    data: lowLimitSeries,
+                    borderColor: 'rgba(59, 130, 246, 0.95)',
+                    backgroundColor: 'rgba(59, 130, 246, 0.15)',
+                    borderWidth: 2,
+                    tension: 0,
+                    fill: false,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    borderDash: [8, 5]
+                  }
+                ]
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                  legend: {
+                    display: false
+                  },
+                  tooltip: {
+                    mode: 'index',
+                    intersect: false
+                  }
+                },
+                interaction: {
+                  mode: 'nearest',
+                  axis: 'x',
+                  intersect: false
+                },
+                scales: {
+                  x: {
+                    grid: {
+                      display: false
+                    },
+                    ticks: {
+                      color: '#64748b'
+                    }
+                  },
+                  y: {
+                    beginAtZero: false,
+                    min: axisMin,
+                    max: axisMax,
+                    ticks: {
+                      color: '#64748b'
+                    },
+                    grid: {
+                      color: 'rgba(148,163,184,0.15)'
+                    }
+                  }
+                }
+              }
+            });
+
+            chartInstances.push(chart);
+          });
+        } catch (error) {
+          console.error(error);
+          chartsGrid.innerHTML = '<div class="empty">Failed to load KPI charts.</div>';
+        }
+      }
+
+      async function refreshKpis() {
+        await loadKpis(document.getElementById("search").value || "");
+        showToast("Dashboard refreshed");
+      }
+
+      function openModal() {
+        document.getElementById("modalBackdrop").classList.add("open");
+      }
+
+      function closeModal() {
+        document.getElementById("modalBackdrop").classList.remove("open");
+      }
+
+      function updateModalOverview() {
+        const isEdit = !!document.getElementById("kpi_id").value;
+        document.getElementById("modalModeBadge").textContent = isEdit ? "Edit KPI" : "Create KPI";
+        document.getElementById("overviewFrequency").textContent =
+          document.getElementById("frequency").value.trim() || "Not set";
+        document.getElementById("overviewUnit").textContent =
+          document.getElementById("unit").value.trim() || "Not set";
+        document.getElementById("overviewTarget").textContent =
+          document.getElementById("target").value.trim() || "Not set";
+      }
+
+      function normalizeNumericInput(value, { allowPercent = false } = {}) {
+        const text = String(value ?? "").trim();
+        if (!text) return null;
+
+        let normalized = text.replace(/\s+/g, "").replace(/,/g, ".");
+        if (allowPercent && normalized.endsWith("%")) {
+          normalized = normalized.slice(0, -1);
+        }
+
+        return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized) ? Number(normalized) : null;
+      }
+
+      function formatDerivedLimit(value) {
+        return Number.isFinite(value) ? String(Number(value.toFixed(6))) : "";
+      }
+
+      function updateDerivedLimits({ clearWhenUnavailable = true } = {}) {
+        const target = normalizeNumericInput(document.getElementById("target").value);
+        const upTolerance = normalizeNumericInput(document.getElementById("up_tolerance").value, { allowPercent: true });
+        const lowTolerance = normalizeNumericInput(document.getElementById("low_tolerance").value, { allowPercent: true });
+        const toleranceType = String(document.getElementById("tolerance_type").value || "").trim().toLowerCase();
+
+        let highLimit = null;
+        let lowLimit = null;
+
+        if (
+          target !== null &&
+          upTolerance !== null &&
+          lowTolerance !== null &&
+          toleranceType
+        ) {
+          if (toleranceType === "relative") {
+            highLimit = target * (1 + (upTolerance / 100));
+            lowLimit = target * (1 + (lowTolerance / 100));
+          } else if (toleranceType === "absolute") {
+            highLimit = target + upTolerance;
+            lowLimit = target + lowTolerance;
+          }
+        }
+
+        if (highLimit !== null && lowLimit !== null) {
+          document.getElementById("high_limit").value = formatDerivedLimit(highLimit);
+          document.getElementById("low_limit").value = formatDerivedLimit(lowLimit);
+          return;
+        }
+
+        if (clearWhenUnavailable) {
+          document.getElementById("high_limit").value = "";
+          document.getElementById("low_limit").value = "";
+        }
+      }
+
+      function bindOverviewListeners() {
+        ["frequency", "unit", "target"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("input", updateModalOverview);
+          }
+        });
+
+        ["target", "up_tolerance", "low_tolerance"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("input", () => updateDerivedLimits());
+          }
+        });
+
+        ["up_tolerance", "low_tolerance"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("blur", () => syncToleranceInputsWithType());
+          }
+        });
+
+        const toleranceTypeField = document.getElementById("tolerance_type");
+        if (toleranceTypeField) {
+          toleranceTypeField.addEventListener("change", () => {
+            syncToleranceInputsWithType();
+            updateDerivedLimits();
+          });
+        }
+      }
+
+      function resetForm() {
+        [
+          "kpi_id",
+          "indicator_title",
+          "indicator_sub_title",
+          "unit",
+          "frequency",
+          "target",
+          "tolerance_type",
+          "up_tolerance",
+          "low_tolerance",
+          "max",
+          "min",
+          "calculation_on",
+          "target_auto_adjustment",
+          "high_limit",
+          "low_limit"
+        ].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = "";
+        });
+
+        document.getElementById("tolerance_type").value = "";
+        syncToleranceInputsWithType();
+        updateModalOverview();
+      }
+
+      function formatToleranceForInput(value, toleranceType) {
+        if (value === null || value === undefined || value === "") return "";
+        const normalizedValue = normalizeNumericInput(value, { allowPercent: true });
+        if (normalizedValue === null) {
+          const text = String(value).trim();
+          if (!text) return "";
+          return String(toleranceType || "").trim().toLowerCase() === "relative"
+            ? text.replace(/%+$/g, "") + "%"
+            : text.replace(/%+$/g, "");
+        }
+
+        const text = String(Number(normalizedValue.toFixed(6)));
+        return String(toleranceType || "").trim().toLowerCase() === "relative"
+          ? text + "%"
+          : text;
+      }
+
+      function syncToleranceInputsWithType() {
+        const toleranceType = document.getElementById("tolerance_type")?.value || "";
+        const isRelative = String(toleranceType || "").trim().toLowerCase() === "relative";
+
+        ["up_tolerance", "low_tolerance"].forEach((id) => {
+          const field = document.getElementById(id);
+          if (!field) return;
+          field.value = formatToleranceForInput(field.value, toleranceType);
+        });
+
+        const upToleranceField = document.getElementById("up_tolerance");
+        const lowToleranceField = document.getElementById("low_tolerance");
+
+        if (upToleranceField) {
+          upToleranceField.placeholder = isRelative ? "10%" : "10";
+        }
+
+        if (lowToleranceField) {
+          lowToleranceField.placeholder = isRelative ? "-10%" : "-10";
+        }
+      }
+
+      function fillForm(data) {
+        [
+          "kpi_id",
+          "indicator_title",
+          "indicator_sub_title",
+          "unit",
+          "frequency",
+          "target",
+          "max",
+          "min",
+          "calculation_on",
+          "target_auto_adjustment",
+          "high_limit",
+          "low_limit"
+        ].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = data[id] ?? "";
+        });
+
+        document.getElementById("tolerance_type").value = data.tolerance_type || "";
+        document.getElementById("up_tolerance").value = data.up_tolerance ?? "";
+        document.getElementById("low_tolerance").value = data.low_tolerance ?? "";
+
+        syncToleranceInputsWithType();
+        updateDerivedLimits({ clearWhenUnavailable: false });
+        updateModalOverview();
+      }
+
+      function openCreateModal() {
+        resetForm();
+        document.getElementById("modalTitle").textContent = "Add New KPI";
+        document.getElementById("modalSubtitle").textContent =
+          "Create a new KPI with clear identity, target logic and threshold visibility.";
+        document.getElementById("deleteBtn").style.display = "none";
+        updateModalOverview();
+        openModal();
+      }
+
+      async function openEditModal(kpiId) {
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId);
+          if (!res.ok) throw new Error("Failed to load KPI");
+
+          const data = await res.json();
+          fillForm(data);
+
+          document.getElementById("modalTitle").textContent = "Edit KPI";
+          document.getElementById("modalSubtitle").textContent =
+            "Review and update KPI details, targets, rules and displayed thresholds.";
+          document.getElementById("deleteBtn").style.display = "inline-flex";
+
+          updateModalOverview();
+          openModal();
+        } catch (error) {
+          showToast("Unable to load KPI");
+        }
+      }
+
+      function buildPayload() {
+        return {
+          indicator_title: document.getElementById("indicator_title").value,
+          indicator_sub_title: document.getElementById("indicator_sub_title").value,
+          unit: document.getElementById("unit").value,
+          frequency: document.getElementById("frequency").value,
+          target: document.getElementById("target").value,
+          tolerance_type: document.getElementById("tolerance_type").value,
+          up_tolerance: document.getElementById("up_tolerance").value,
+          low_tolerance: document.getElementById("low_tolerance").value,
+          max: document.getElementById("max").value,
+          min: document.getElementById("min").value,
+          calculation_on: document.getElementById("calculation_on").value,
+          target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
+          high_limit: document.getElementById("high_limit").value || null,
+          low_limit: document.getElementById("low_limit").value || null
+        };
+      }
+
+      async function saveKpi() {
+        const kpiId = document.getElementById("kpi_id").value;
+        const method = kpiId ? "PUT" : "POST";
+        const url = kpiId
+          ? '/api/responsibles/' + responsibleId + '/kpis/' + kpiId
+          : '/api/responsibles/' + responsibleId + '/kpis';
+
+        try {
+          const res = await fetch(url, {
+            method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildPayload())
+          });
+
+          if (!res.ok) {
+            const errorData = await res.json().catch(() => null);
+            showToast(errorData?.error || "Save failed");
+            return;
+          }
+
+          closeModal();
+          await loadKpis(document.getElementById("search").value || "");
+          showToast(kpiId ? "KPI updated successfully" : "KPI created successfully");
+        } catch (error) {
+          showToast("Save failed");
+        }
+      }
+
+      async function deleteCurrentKpi() {
+        const kpiId = document.getElementById("kpi_id").value;
+        if (!kpiId) return;
+
+        const ok = confirm("Delete this KPI?");
+        if (!ok) return;
+
+        await deleteKpi(kpiId, true);
+      }
+
+      async function deleteKpi(kpiId, fromModal = false) {
+        const ok = fromModal ? true : confirm("Delete this KPI?");
+        if (!ok) return;
+
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId, {
+            method: "DELETE"
+          });
+
+          if (!res.ok) {
+            showToast("Delete failed");
+            return;
+          }
+
+          if (fromModal) closeModal();
+          await loadKpis(document.getElementById("search").value || "");
+          showToast("KPI deleted");
+        } catch (error) {
+          showToast("Delete failed");
+        }
+      }
+
+      document.getElementById("search").addEventListener("input", (e) => {
+        loadKpis(e.target.value);
+      });
+
+      document.getElementById("modalBackdrop").addEventListener("click", (e) => {
+        if (e.target.id === "modalBackdrop") closeModal();
+      });
+
+      bindOverviewListeners();
+      loadKpis();
+    </script>
+  </body>
+  </html>
+  `);
+});
+
+app.get("/responsible/:responsibleId/kpis/:kpiId/edit", async (req, res) => {
+  const { responsibleId, kpiId } = req.params;
+
+  res.send(`
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Edit KPI</title>
+    <style>
+      body {
+        font-family: Inter, Arial, sans-serif;
+        margin: 0;
+        background: #f6f8fc;
+        padding: 24px;
+      }
+      .card {
+        max-width: 900px;
+        margin: 0 auto;
+        background: white;
+        border-radius: 22px;
+        padding: 24px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.06);
+      }
+      h1 { margin-top: 0; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0,1fr));
+        gap: 14px;
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .full { grid-column: 1 / -1; }
+      label { font-weight: 700; font-size: 13px; }
+      input, textarea {
+        width: 100%;
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid #dbe3ee;
+      }
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 20px;
+      }
+      button {
+        border: none;
+        border-radius: 12px;
+        padding: 12px 16px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .primary {
+        background: #2563eb;
+        color: white;
+      }
+      .soft {
+        background: #e2e8f0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Edit KPI</h1>
+
+      <div class="grid">
+        <div class="field">
+          <label>Category</label>
+          <input id="indicator_title" />
+        </div>
+
+        <div class="field">
+          <label>KPI</label>
+          <input id="indicator_sub_title" />
+        </div>
+
+        <div class="field">
+          <label>Unit</label>
+          <input id="unit" />
+        </div>
+
+        <div class="field">
+          <label>Frequency</label>
+          <input id="frequency" />
+        </div>
+
+        <div class="field">
+          <label>Target</label>
+          <input id="target" />
+        </div>
+
+        <div class="field">
+          <label>Tolerance Type</label>
+          <input id="tolerance_type" />
+        </div>
+
+        <div class="field">
+          <label>Up Tolerance</label>
+          <input id="up_tolerance" />
+        </div>
+
+        <div class="field">
+          <label>Low Tolerance</label>
+          <input id="low_tolerance" />
+        </div>
+
+        <div class="field">
+          <label>Max</label>
+          <input id="max" />
+        </div>
+
+        <div class="field">
+          <label>Min</label>
+          <input id="min" />
+        </div>
+
+        <div class="field">
+          <label>Calculation On</label>
+          <input id="calculation_on" />
+        </div>
+
+        <div class="field">
+          <label>Target Auto Adjustment</label>
+          <input id="target_auto_adjustment" />
+        </div>
+
+        <div class="field">
+          <label>High Limit</label>
+          <input id="high_limit" type="number" step="any" />
+        </div>
+
+        <div class="field">
+          <label>Low Limit</label>
+          <input id="low_limit" type="number" step="any" />
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="soft" onclick="goBack()">Back</button>
+        <button class="primary" onclick="saveKpi()">Save KPI</button>
+      </div>
+    </div>
+
+    <script>
+      const responsibleId = "${responsibleId}";
+      const kpiId = "${kpiId}";
+
+      function formatToleranceForInput(value, toleranceType) {
+        if (value === null || value === undefined || value === "") return "";
+        const normalizedValue = normalizeNumericInput(value, { allowPercent: true });
+        if (normalizedValue === null) {
+          const text = String(value).trim();
+          if (!text) return "";
+          return String(toleranceType || "").trim().toLowerCase() === "relative"
+            ? text.replace(/%+$/g, "") + "%"
+            : text.replace(/%+$/g, "");
+        }
+
+        const text = String(Number(normalizedValue.toFixed(6)));
+        return String(toleranceType || "").trim().toLowerCase() === "relative"
+          ? text + "%"
+          : text;
+      }
+
+      function normalizeNumericInput(value, { allowPercent = false } = {}) {
+        const text = String(value ?? "").trim();
+        if (!text) return null;
+
+        let normalized = text.replace(/\s+/g, "").replace(/,/g, ".");
+        if (allowPercent && normalized.endsWith("%")) {
+          normalized = normalized.slice(0, -1);
+        }
+
+        return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized) ? Number(normalized) : null;
+      }
+
+      function formatDerivedLimit(value) {
+        return Number.isFinite(value) ? String(Number(value.toFixed(6))) : "";
+      }
+
+      function syncToleranceInputsWithType() {
+        const toleranceType = document.getElementById("tolerance_type")?.value || "";
+        const isRelative = String(toleranceType || "").trim().toLowerCase() === "relative";
+
+        ["up_tolerance", "low_tolerance"].forEach((id) => {
+          const field = document.getElementById(id);
+          if (!field) return;
+          field.value = formatToleranceForInput(field.value, toleranceType);
+        });
+
+        const upToleranceField = document.getElementById("up_tolerance");
+        const lowToleranceField = document.getElementById("low_tolerance");
+
+        if (upToleranceField) {
+          upToleranceField.placeholder = isRelative ? "10%" : "10";
+        }
+
+        if (lowToleranceField) {
+          lowToleranceField.placeholder = isRelative ? "-10%" : "-10";
+        }
+      }
+
+      function updateDerivedLimits({ clearWhenUnavailable = true } = {}) {
+        const target = normalizeNumericInput(document.getElementById("target").value);
+        const upTolerance = normalizeNumericInput(document.getElementById("up_tolerance").value, { allowPercent: true });
+        const lowTolerance = normalizeNumericInput(document.getElementById("low_tolerance").value, { allowPercent: true });
+        const toleranceType = String(document.getElementById("tolerance_type").value || "").trim().toLowerCase();
+
+        let highLimit = null;
+        let lowLimit = null;
+
+        if (
+          target !== null &&
+          upTolerance !== null &&
+          lowTolerance !== null &&
+          toleranceType
+        ) {
+          if (toleranceType === "relative") {
+            highLimit = target * (1 + (upTolerance / 100));
+            lowLimit = target * (1 + (lowTolerance / 100));
+          } else if (toleranceType === "absolute") {
+            highLimit = target + upTolerance;
+            lowLimit = target + lowTolerance;
+          }
+        }
+
+        if (highLimit !== null && lowLimit !== null) {
+          document.getElementById("high_limit").value = formatDerivedLimit(highLimit);
+          document.getElementById("low_limit").value = formatDerivedLimit(lowLimit);
+          return;
+        }
+
+        if (clearWhenUnavailable) {
+          document.getElementById("high_limit").value = "";
+          document.getElementById("low_limit").value = "";
+        }
+      }
+
+      function bindDerivedLimitListeners() {
+        ["target", "up_tolerance", "low_tolerance"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("input", () => updateDerivedLimits());
+          }
+        });
+
+        ["up_tolerance", "low_tolerance"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.addEventListener("blur", () => syncToleranceInputsWithType());
+          }
+        });
+
+        const toleranceTypeField = document.getElementById("tolerance_type");
+        if (toleranceTypeField) {
+          toleranceTypeField.addEventListener("input", () => {
+            syncToleranceInputsWithType();
+            updateDerivedLimits();
+          });
+          toleranceTypeField.addEventListener("change", () => {
+            syncToleranceInputsWithType();
+            updateDerivedLimits();
+          });
+        }
+      }
+
+      async function loadKpi() {
+        const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId);
+        const data = await res.json();
+
+        document.getElementById("indicator_title").value = data.indicator_title || "";
+        document.getElementById("indicator_sub_title").value = data.indicator_sub_title || "";
+        document.getElementById("unit").value = data.unit || "";
+        document.getElementById("frequency").value = data.frequency || "";
+        document.getElementById("target").value = data.target || "";
+        document.getElementById("tolerance_type").value = data.tolerance_type || "";
+        document.getElementById("up_tolerance").value = data.up_tolerance ?? "";
+        document.getElementById("low_tolerance").value = data.low_tolerance ?? "";
+        document.getElementById("max").value = data.max || "";
+        document.getElementById("min").value = data.min || "";
+        document.getElementById("calculation_on").value = data.calculation_on || "";
+        document.getElementById("target_auto_adjustment").value = data.target_auto_adjustment || "";
+        document.getElementById("high_limit").value = data.high_limit || "";
+        document.getElementById("low_limit").value = data.low_limit || "";
+        syncToleranceInputsWithType();
+        updateDerivedLimits({ clearWhenUnavailable: false });
+      }
+
+      async function saveKpi() {
+        const payload = {
+          indicator_title: document.getElementById("indicator_title").value,
+          indicator_sub_title: document.getElementById("indicator_sub_title").value,
+          unit: document.getElementById("unit").value,
+          frequency: document.getElementById("frequency").value,
+          target: document.getElementById("target").value,
+          tolerance_type: document.getElementById("tolerance_type").value,
+          up_tolerance: document.getElementById("up_tolerance").value,
+          low_tolerance: document.getElementById("low_tolerance").value,
+          max: document.getElementById("max").value,
+          min: document.getElementById("min").value,
+          calculation_on: document.getElementById("calculation_on").value,
+          target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
+          high_limit: document.getElementById("high_limit").value || null,
+          low_limit: document.getElementById("low_limit").value || null
+        };
+
+        const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+          window.location.href = '/responsible/' + responsibleId + '/dashboard';
+        } else {
+          const errorData = await res.json().catch(() => null);
+          alert(errorData?.error || "Save failed");
+        }
+      }
+
+      function goBack() {
+        window.location.href = '/responsible/' + responsibleId + '/dashboard';
+      }
+
+      bindDerivedLimitListeners();
+      loadKpi();
+    </script>
+  </body>
+  </html>
+  `);
+});
+
+
+
+// ============================================================
+// KPI DIRECTION + STATUS HELPERS
+// up   = higher is better
+// down = lower is better
+// ============================================================
+const KPI_DIRECTION_OVERRIDES = Object.freeze({
+  // Add explicit overrides here if a KPI direction should not be inferred.
+  // Example: 11: "down"
+});
+
+const DOWN_DIRECTION_PATTERNS = [
+  /\bclaims?\b/i,
+  /\bbacklog\b/i,
+  /\bstock\b/i,
+  /\binventory\b/i,
+  /\bcosts?\b/i,
+  /\bfees?\b/i,
+  /\bmore than\b/i,
+  /\bdelay\b/i,
+  /\blate\b/i,
+];
+
+const isPercentageUnit = (unit) => {
+  const normalizedUnit = String(unit ?? '').trim().toLowerCase();
+  return normalizedUnit === '%' || normalizedUnit === 'percent' || normalizedUnit === 'percentage' || normalizedUnit === 'pct';
+};
+
+const parseMetricNumber = (value) => {
+  if (value === null || value === undefined || value === '' || value === 'None') {
+    return null;
+  }
+  const parsed = parseFloat(typeof value === 'string' ? value.trim().replace(',', '.') : value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeMetricNumberByUnit = (value, unit) => {
+  const parsed = parseMetricNumber(value);
+  if (parsed === null) return null;
+  if (!isPercentageUnit(unit)) return parsed;
+  return Math.abs(parsed) < 1 ? Number((parsed * 100).toFixed(4)) : parsed;
+};
+
+const normalizeKpiDirection = (value) => {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return null;
+
+  if (
+    text === 'up' ||
+    text === 'higher' ||
+    text === 'higher is better' ||
+    text === 'increase' ||
+    text === 'increasing' ||
+    text === 'maximize' ||
+    text === 'max'
+  ) {
+    return 'up';
+  }
+
+  if (
+    text === 'down' ||
+    text === 'lower' ||
+    text === 'lower is better' ||
+    text === 'decrease' ||
+    text === 'decreasing' ||
+    text === 'minimize' ||
+    text === 'min'
+  ) {
+    return 'down';
+  }
+
+  return null;
+};
+
+const getKpiBounds = (lowLimit, highLimit) => {
+  const low = parseMetricNumber(lowLimit);
+  const high = parseMetricNumber(highLimit);
+  const bounds = [low, high].filter((value) => value !== null);
+
+  if (!bounds.length) {
+    return { lowerBound: null, upperBound: null };
+  }
+
+  return {
+    lowerBound: Math.min(...bounds),
+    upperBound: Math.max(...bounds)
+  };
+};
+
+const getReadableThresholdLineValues = (lowLimit, target, highLimit) => {
+  const low = parseMetricNumber(lowLimit);
+  const targetValue = parseMetricNumber(target);
+  const high = parseMetricNumber(highLimit);
+
+  const entries = [
+    low !== null ? { key: "low", value: low, priority: 0 } : null,
+    targetValue !== null ? { key: "target", value: targetValue, priority: 1 } : null,
+    high !== null ? { key: "high", value: high, priority: 2 } : null
+  ].filter(Boolean);
+
+  if (entries.length < 2) {
+    return {
+      low,
+      target: targetValue,
+      high,
+      displayLow: low,
+      displayTarget: targetValue,
+      displayHigh: high,
+      hasTightCluster: false,
+      actualBand: 0,
+      desiredGap: 0
+    };
+  }
+
+  const sortedEntries = [...entries].sort((a, b) =>
+    a.value === b.value ? a.priority - b.priority : a.value - b.value
+  );
+
+  const actualBand =
+    sortedEntries[sortedEntries.length - 1].value - sortedEntries[0].value;
+  const magnitude = Math.max(...sortedEntries.map((entry) => Math.abs(entry.value)), 1);
+  const desiredGap = Number(
+    Math.min(Math.max(0.25, magnitude * 0.04), 6).toFixed(4)
+  );
+  const minGap = sortedEntries.slice(1).reduce((currentMin, entry, index) => {
+    const previous = sortedEntries[index];
+    return Math.min(currentMin, entry.value - previous.value);
+  }, Number.POSITIVE_INFINITY);
+
+  const hasTightCluster =
+    minGap < desiredGap ||
+    actualBand < desiredGap * (sortedEntries.length - 1);
+
+  if (!hasTightCluster) {
+    return {
+      low,
+      target: targetValue,
+      high,
+      displayLow: low,
+      displayTarget: targetValue,
+      displayHigh: high,
+      hasTightCluster: false,
+      actualBand,
+      desiredGap
+    };
+  }
+
+  let displaySorted;
+  const targetIndex = sortedEntries.findIndex((entry) => entry.key === "target");
+
+  if (targetIndex >= 0) {
+    const anchor = sortedEntries[targetIndex].value;
+    displaySorted = sortedEntries.map((entry, index) =>
+      Number((anchor + ((index - targetIndex) * desiredGap)).toFixed(4))
+    );
+  } else {
+    const center =
+      (sortedEntries[0].value + sortedEntries[sortedEntries.length - 1].value) / 2;
+    const start = center - (((sortedEntries.length - 1) * desiredGap) / 2);
+    displaySorted = sortedEntries.map((entry, index) =>
+      Number((start + (index * desiredGap)).toFixed(4))
+    );
+  }
+
+  const displayMap = {};
+  sortedEntries.forEach((entry, index) => {
+    displayMap[entry.key] = displaySorted[index];
+  });
+
+  return {
+    low,
+    target: targetValue,
+    high,
+    displayLow: displayMap.low ?? low,
+    displayTarget: displayMap.target ?? targetValue,
+    displayHigh: displayMap.high ?? high,
+    hasTightCluster: true,
+    actualBand,
+    desiredGap
+  };
+};
+
+const getAutoChartAxisRange = (
+  values = [],
+  lowLimit = null,
+  target = null,
+  highLimit = null,
+  marginRatio = 0.2
+) => {
+  const numericValues = [];
+  const pushIfNumeric = (value) => {
+    const parsed = parseMetricNumber(value);
+    if (parsed !== null) {
+      numericValues.push(parsed);
+    }
+  };
+
+  (Array.isArray(values) ? values : [values]).forEach(pushIfNumeric);
+  pushIfNumeric(lowLimit);
+  pushIfNumeric(target);
+  pushIfNumeric(highLimit);
+
+  if (!numericValues.length) {
+    return { min: 0, max: 100, sourceMin: 0, sourceMax: 100 };
+  }
+
+  const safeMargin = Number.isFinite(marginRatio) && marginRatio >= 0
+    ? marginRatio
+    : 0.2;
+  const sourceMin = Math.min(...numericValues);
+  const sourceMax = Math.max(...numericValues);
+
+  let min = sourceMin > 0
+    ? sourceMin * (1 - safeMargin)
+    : sourceMin < 0
+      ? sourceMin * (1 + safeMargin)
+      : 0;
+
+  let max = sourceMax > 0
+    ? sourceMax * (1 + safeMargin)
+    : sourceMax < 0
+      ? sourceMax * (1 - safeMargin)
+      : 0;
+
+  if (min === max) {
+    const pad = Math.max(Math.abs(sourceMax || sourceMin || 1) * safeMargin, 1);
+    min = sourceMin - pad;
+    max = sourceMax + pad;
+  }
+
+  return {
+    min: Number(min.toFixed(6)),
+    max: Number(max.toFixed(6)),
+    sourceMin,
+    sourceMax
+  };
+};
+
+const inferKpiDirection = (kpi = {}) => {
+  const explicitDirection = normalizeKpiDirection(
+    kpi.target_direction ||
+    kpi.good_direction ||
+    kpi.goodDirection ||
+    kpi.direction ||
+    kpi.performance_direction
+  );
+  if (explicitDirection) return explicitDirection;
+
+  const overrideKey = String(kpi.kpi_id ?? kpi.kpiId ?? kpi.id ?? '');
+  const overrideDirection = normalizeKpiDirection(KPI_DIRECTION_OVERRIDES[overrideKey]);
+  if (overrideDirection) return overrideDirection;
+
+  const { lowerBound, upperBound } = getKpiBounds(
+    kpi.low_limit ?? kpi.lowLimit,
+    kpi.high_limit ?? kpi.highLimit
+  );
+  const target = parseMetricNumber(kpi.target);
+
+  if (target !== null && lowerBound !== null && upperBound !== null) {
+    if (target <= lowerBound) return 'down';
+    if (target >= upperBound) return 'up';
+  }
+
+  const searchableText = [
+    kpi.indicator_title,
+    kpi.title,
+    kpi.indicator_sub_title,
+    kpi.subtitle
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  if (DOWN_DIRECTION_PATTERNS.some((pattern) => pattern.test(searchableText))) {
+    return 'down';
+  }
+
+  return 'up';
+};
+
+const getKpiGoodDirectionMeta = (direction) => {
+  const resolvedDirection = normalizeKpiDirection(direction) || 'up';
+
+  if (resolvedDirection === 'down') {
+    return {
+      value: 'down',
+      label: 'Down',
+      summary: 'Lower is better',
+      examples: 'Scrap, accidents, customer claims',
+      accent: '#dc2626',
+      background: '#fff5f5',
+      border: '#fecaca',
+      icon: '&darr;'
+    };
+  }
+
+  return {
+    value: 'up',
+    label: 'Up',
+    summary: 'Higher is better',
+    examples: 'Sales, OTD',
+    accent: '#16a34a',
+    background: '#f0fdf4',
+    border: '#bbf7d0',
+    icon: '&uarr;'
+  };
+};
+
+const getKpiStatus = (value, lowLimit, highLimit, direction = 'up') => {
+  const val = parseMetricNumber(value);
+  const resolvedDirection = normalizeKpiDirection(direction) || 'up';
+  const { lowerBound, upperBound } = getKpiBounds(lowLimit, highLimit);
+
+  if (val === null) {
+    return {
+      color: '#6c757d',
+      isGood: null,
+      direction: resolvedDirection,
+      lowerBound,
+      upperBound
+    };
+  }
+
+  if (resolvedDirection === 'down') {
+    return {
+      color: upperBound !== null && val > upperBound ? '#dc3545' : '#28a745',
+      isGood: !(upperBound !== null && val > upperBound),
+      direction: resolvedDirection,
+      lowerBound,
+      upperBound
+    };
+  }
+
+  return {
+    color: lowerBound !== null && val < lowerBound ? '#dc3545' : '#28a745',
+    isGood: !(lowerBound !== null && val < lowerBound),
+    direction: resolvedDirection,
+    lowerBound,
+    upperBound
+  };
+};
+
+const needsCorrectiveAction = (value, lowLimit, highLimit, direction = 'up') =>
+  getKpiStatus(value, lowLimit, highLimit, direction).isGood === false;
+
+const getDotColor = (value, lowLimit, highLimit, direction = 'up') =>
+  getKpiStatus(value, lowLimit, highLimit, direction).color;
+
 // ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
 const acquireJobLock = async (lockId, ttlMinutes = 9) => {
   const instanceId = process.env.WEBSITE_INSTANCE_ID || `instance_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
   try {
-    // Convert lockId string to a consistent integer hash
     const lockHash = Math.abs(lockId.split('').reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0));
-
-    // Try to acquire PostgreSQL advisory lock (non-blocking)
     const result = await pool.query('SELECT pg_try_advisory_lock($1) as acquired', [lockHash]);
-
     if (result.rows[0].acquired) {
-      console.log(`🔒 Instance ${instanceId} acquired lock ${lockId} (hash: ${lockHash})`);
+      console.log(`ðŸ”’ Instance ${instanceId} acquired lock ${lockId}`);
       return { acquired: true, instanceId, lockHash };
     } else {
-      console.log(`⏭️ Instance ${instanceId} failed to acquire lock ${lockId} - another instance is running this job`);
       return { acquired: false, instanceId, lockHash };
     }
   } catch (error) {
-    console.error(`❌ Error acquiring lock ${lockId}:`, error.message);
     return { acquired: false, instanceId, error: error.message };
   }
 };
 
-const releaseJobLock = async (lockId, instanceId, lockHash) => {
+const releaseJobLock = async (lockId, lockHash) => {
   try {
     if (lockHash) {
       await pool.query('SELECT pg_advisory_unlock($1)', [lockHash]);
-      console.log(`🔓 Instance ${instanceId} released lock ${lockId}`);
     }
   } catch (error) {
-    console.error(`⚠️ Could not release lock ${lockId}:`, error.message);
+    console.error(`âš ï¸ Could not release lock ${lockId}:`, error.message);
   }
 };
-
-// const jobRunning = {};
-// cron.schedule('10 14 * * 3', async () => {
-//   if (jobRunning['kpi_week_update']) {
-//     console.log('[CRON] Already running, skipping.');
-//     return;
-//   }
-
-//   const lockId = 'kpi_week_update';
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
-
-//   jobRunning['kpi_week_update'] = true;
-
-//   try {
-//     await pool.query('SELECT public.update_kpi_week()');
-//     console.log('[CRON] ✅ kpi_values.week updated successfully');
-//   } catch (err) {
-//     console.error('[CRON] ❌ Failed:', err.message);
-//   } finally {
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//     jobRunning['kpi_week_update'] = false;
-//   }
-
-// }, { timezone: 'Africa/Tunis' });
 
 // ---------- Nodemailer ----------
 const createTransporter = () =>
@@ -101,746 +4858,2088 @@ const createTransporter = () =>
     },
   });
 
+const formatInputDate = (dateValue) => {
+  if (!dateValue) return "";
+  const d = new Date(dateValue);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString().split("T")[0];
+};
 
+const normalizeText = (value) => {
+  const text = String(value ?? "").trim();
+  return text ? text : null;
+};
 
+const CORRECTIVE_ACTION_STATUS_OPTIONS = [
+  "Open",
+  "Waiting for validation",
+  "Completed",
+  "Closed"
+];
 
+const normalizeCorrectiveActionStatus = (value, fallback = null) => {
+  const text = normalizeText(value);
+  if (!text) return fallback;
 
-// ---------- Fetch Responsible + their KPIs ----------
-const getResponsibleWithKPIs = async (responsibleId, week) => {
-  const resResp = await pool.query(
-    `
-    SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-           p.name AS plant_name, d.name AS department_name
-    FROM public."Responsible" r
-    JOIN public."Plant" p ON r.plant_id = p.plant_id
-    JOIN public."Department" d ON r.department_id = d.department_id
-    WHERE r.responsible_id = $1
-    `,
-    [responsibleId]
+  const matchedStatus = CORRECTIVE_ACTION_STATUS_OPTIONS.find(
+    (option) => option.toLowerCase() === text.toLowerCase()
   );
 
+  return matchedStatus || fallback;
+};
+
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+const toArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return [value];
+};
+
+const getCorrectiveActionSortTime = (action = {}) => {
+  const rawValue =
+    action.updated_date ??
+    action.updatedDate ??
+    action.created_date ??
+    action.createdDate ??
+    null;
+
+  const timestamp = rawValue ? new Date(rawValue).getTime() : 0;
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const sortCorrectiveActions = (actions = []) =>
+  [...actions].sort((a, b) => {
+    const timeDiff = getCorrectiveActionSortTime(b) - getCorrectiveActionSortTime(a);
+    if (timeDiff !== 0) return timeDiff;
+
+    const parsedIdA = parseInt(a.corrective_action_id ?? a.correctiveActionId ?? a.id ?? 0, 10);
+    const parsedIdB = parseInt(b.corrective_action_id ?? b.correctiveActionId ?? b.id ?? 0, 10);
+    const idA = Number.isFinite(parsedIdA) ? parsedIdA : 0;
+    const idB = Number.isFinite(parsedIdB) ? parsedIdB : 0;
+    return idB - idA;
+  });
+
+const getLatestCorrectiveAction = (actions = []) => {
+  const sorted = sortCorrectiveActions(actions);
+  return sorted.length ? sorted[0] : null;
+};
+
+const hasMeaningfulCorrectiveActionInput = (action = {}) =>
+  Boolean(
+    normalizeText(action.rootCause ?? action.root_cause) &&
+    normalizeText(action.implementedSolution ?? action.implemented_solution) &&
+    normalizeText(action.dueDate ?? action.due_date) &&
+    normalizeText(action.responsibleName ?? action.responsible)
+  );
+
+const getCorrectiveActionStatusValue = ({
+  status
+}) => normalizeText(status) || "Open";
+
+const readSubmittedFieldList = (formData, fieldName) =>
+  toArray(formData?.[`${fieldName}[]`] ?? formData?.[fieldName]);
+
+const getSubmittedCorrectiveActions = (formData, kpiValuesId, defaultResponsibleName = null) => {
+  const actionIds = readSubmittedFieldList(formData, `ca_action_id_${kpiValuesId}`);
+  const rootCauses = readSubmittedFieldList(formData, `root_cause_${kpiValuesId}`);
+  const implementedSolutions = readSubmittedFieldList(formData, `implemented_solution_${kpiValuesId}`);
+  const dueDates = readSubmittedFieldList(formData, `due_date_${kpiValuesId}`);
+  const responsibleNames = readSubmittedFieldList(formData, `responsible_${kpiValuesId}`);
+  const statuses = readSubmittedFieldList(formData, `ca_status_${kpiValuesId}`);
+
+  const actionCount = Math.max(
+    actionIds.length,
+    rootCauses.length,
+    implementedSolutions.length,
+    dueDates.length,
+    responsibleNames.length,
+    statuses.length
+  );
+
+  return Array.from({ length: actionCount }, (_, index) => ({
+    correctiveActionId: normalizeText(actionIds[index]),
+    rootCause: normalizeText(rootCauses[index]),
+    implementedSolution: normalizeText(implementedSolutions[index]),
+    dueDate: normalizeText(dueDates[index]),
+    responsibleName:
+      normalizeText(responsibleNames[index]) ||
+      normalizeText(defaultResponsibleName),
+    status: normalizeText(statuses[index]) || "Open"
+  }));
+};
+const buildCorrectiveActionEntryHtml = ({
+  kpiValuesId,
+  actionIndex,
+  action = {},
+  defaultResponsibleName = "",
+  showRequired = false
+}) => {
+  const correctiveActionId = action.corrective_action_id ?? action.correctiveActionId ?? "";
+  const rootCause = action.root_cause ?? action.rootCause ?? "";
+  const implementedSolution = action.implemented_solution ?? action.implementedSolution ?? "";
+  const dueDate = formatInputDate(action.due_date ?? action.dueDate);
+  const responsibleName = action.responsible ?? action.responsibleName ?? defaultResponsibleName ?? "";
+  const statusText = normalizeCorrectiveActionStatus(action.status, "Open");
+  const safeStatusClass = String(statusText || "")
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+  const requiredAttr = showRequired ? "required" : "";
+  const removeButtonClass = correctiveActionId ? "ca-remove-btn is-hidden" : "ca-remove-btn";
+
+  return `
+    <div class="ca-action-card" data-existing-action="${correctiveActionId ? "1" : "0"}">
+      <input type="hidden" name="ca_action_id_${kpiValuesId}[]" value="${escapeHtml(correctiveActionId)}" />
+      <input type="hidden" name="ca_status_${kpiValuesId}[]" value="${escapeHtml(statusText)}" data-ca-field="status" />
+
+      <div class="ca-action-head">
+        <div class="ca-action-title">
+          Action <span class="ca-action-number">${actionIndex + 1}</span>
+        </div>
+
+        <div class="ca-action-tools">
+          ${statusText ? `<span class="ca-status-badge ca-status-${safeStatusClass}">${escapeHtml(statusText)}</span>` : ""}
+          <button type="button" class="${removeButtonClass}">Remove</button>
+        </div>
+      </div>
+
+      <div class="ca-dates-grid">
+        <div class="ca-field">
+          <label class="ca-label">
+            Due Date <span class="ca-required">*</span>
+          </label>
+          <input
+            type="date"
+            name="due_date_${kpiValuesId}[]"
+            class="ca-date-input ca-required-field"
+            data-ca-field="due_date"
+            value="${escapeHtml(dueDate)}"
+            ${requiredAttr}
+          />
+        </div>
+
+        <div class="ca-field">
+          <label class="ca-label">
+            Responsible <span class="ca-required">*</span>
+          </label>
+          <input
+            type="text"
+            name="responsible_${kpiValuesId}[]"
+            class="ca-text-input ca-required-field"
+            data-ca-field="responsible"
+            value="${escapeHtml(responsibleName)}"
+            ${requiredAttr}
+          />
+        </div>
+      </div>
+
+      <div class="ca-field">
+        <label class="ca-label">
+          Root Cause Analysis <span class="ca-required">*</span>
+        </label>
+        <textarea
+          name="root_cause_${kpiValuesId}[]"
+          class="ca-textarea ca-required-field"
+          data-ca-field="root_cause"
+          placeholder="Describe the root cause..."
+          ${requiredAttr}
+        >${escapeHtml(rootCause)}</textarea>
+      </div>
+
+      <div class="ca-field">
+        <label class="ca-label">
+          Implemented Solution <span class="ca-required">*</span>
+        </label>
+        <textarea
+          name="implemented_solution_${kpiValuesId}[]"
+          class="ca-textarea ca-required-field"
+          data-ca-field="implemented_solution"
+          placeholder="Describe the implemented solution..."
+          ${requiredAttr}
+        >${escapeHtml(implementedSolution)}</textarea>
+      </div>
+    </div>
+  `;
+};
+
+const buildAssistantKpiContext = (kpis = []) =>
+  kpis.slice(0, 30).map((kpi) => ({
+    kpi_id: kpi.kpi_id ?? null,
+    kpi_values_id: kpi.kpi_values_id ?? null,
+    title: normalizeText(kpi.title || kpi.indicator_title || kpi.indicator_sub_title) || "Untitled KPI",
+    subtitle: normalizeText(kpi.subtitle || kpi.indicator_sub_title),
+    unit: normalizeText(kpi.unit),
+    current_value: normalizeText(kpi.current_value ?? kpi.value),
+    target: normalizeText(kpi.target),
+    low_limit: normalizeText(kpi.low_limit),
+    high_limit: normalizeText(kpi.high_limit),
+    week: normalizeText(kpi.week),
+    comment: normalizeText(kpi.comment),
+    corrective_action_status: normalizeText(kpi.corrective_action_status || kpi.ca_status),
+    root_cause: normalizeText(kpi.root_cause),
+    implemented_solution: normalizeText(kpi.implemented_solution),
+    evidence: normalizeText(kpi.evidence),
+    good_direction: normalizeText(kpi.good_direction) || inferKpiDirection(kpi),
+    due_date: normalizeText(kpi.due_date),
+    responsible: normalizeText(kpi.responsible),
+    corrective_actions: Array.isArray(kpi.corrective_actions)
+      ? kpi.corrective_actions.slice(0, 5).map((action) => ({
+        corrective_action_id: action.corrective_action_id ?? action.correctiveActionId ?? null,
+        root_cause: normalizeText(action.root_cause ?? action.rootCause),
+        implemented_solution: normalizeText(action.implemented_solution ?? action.implementedSolution),
+        evidence: normalizeText(action.evidence),
+        due_date: normalizeText(action.due_date ?? action.dueDate),
+        responsible: normalizeText(action.responsible ?? action.responsibleName),
+        status: normalizeText(action.status)
+      }))
+      : []
+  }));
+
+const buildAssistantKpiDisplayName = (title, subtitle) => {
+  const cleanTitle = normalizeText(title);
+  const cleanSubtitle = normalizeText(subtitle);
+
+  if (cleanSubtitle && cleanTitle) {
+    return `${cleanSubtitle} (${cleanTitle})`;
+  }
+
+  return cleanSubtitle || cleanTitle || "Untitled KPI";
+};
+
+const KPI_DELAY_KB_RULES = Object.freeze([
+  {
+    id: "quote_flow",
+    patterns: [/\bquote\b/i, /\bquotation\b/i, /\bdevis\b/i, /\brfq\b/i, /\bcosting\b/i, /\bestimat/i],
+    rationale: "This KPI is directly connected to the quotation and costing process, so the delay knowledge base is directly relevant.",
+    preferredNodeIds: ["P008", "M001", "P001", "P003", "P007", "P005", "P002", "P006", "S001", "S004", "S006"],
+    kbHints: [
+      "quote released late",
+      "incomplete RFQ package at intake",
+      "late supplier quotation",
+      "detailed costing blocked",
+      "costing rework",
+      "quote OTD"
+    ],
+    ownerFocus: ["Sales", "Costing", "Purchasing", "Management"],
+    metricFocus: ["Quote OTD", "Average quote lead time", "Supplier response lead time", "% RFQ complete at intake", "Backlog days"],
+    nextChecks: [
+      "Check committed quote date versus actual release date",
+      "Review whether the RFQ package was complete before costing started",
+      "Identify blocked cost lines waiting on supplier or engineering input",
+      "Review reprioritization or backlog changes during the quote cycle"
+    ],
+    nodeRelevanceMap: {
+      P008: "This KPI is directly affected when quotes are released after the committed customer date.",
+      M001: "Quote OTD is the primary timing metric to verify whether quotation lateness is driving this KPI.",
+      P001: "Incomplete RFQ intake delays quote start and creates clarification loops before a customer-ready offer exists.",
+      P003: "Late supplier prices delay quote completion when bought parts or material costs are still open.",
+      P007: "Blocked detailed costing prevents a complete and reliable commercial release.",
+      P005: "Repeated costing rework consumes time and pushes quote release later.",
+      P002: "Insufficient costing capacity increases backlog and slows quotation throughput.",
+      P006: "Frequent reprioritization interrupts quote completion and causes missed due dates.",
+      S001: "An intake gate reduces late starts caused by unstable or missing RFQ inputs.",
+      S004: "Should-cost and supplier SLAs reduce waiting time on supplier-dependent cost lines.",
+      S006: "Priority governance protects the quote flow from constant interruption."
+    }
+  },
+  {
+    id: "commercial_outcome",
+    patterns: [/\bbusiness take\b/i, /\border intake\b/i, /\bsales\b/i, /\brevenue\b/i, /\bbookings?\b/i],
+    rationale: "Commercial performance can be reduced when quotes are late, incomplete, or blocked before customer release.",
+    preferredNodeIds: ["P008", "M001", "P001", "P003", "P002", "P006", "S001", "S004", "S006"],
+    kbHints: [
+      "quote released late",
+      "quote OTD",
+      "incomplete RFQ package at intake",
+      "late supplier quotation",
+      "insufficient costing capacity",
+      "shifting priorities and permanent urgencies"
+    ],
+    ownerFocus: ["Sales", "Purchasing", "Costing", "Management"],
+    metricFocus: ["Quote OTD", "% RFQ complete at intake", "Supplier response lead time", "Backlog days", "Priority changes per week"],
+    nextChecks: [
+      "Review the last 5 missed or delayed business opportunities",
+      "Map each one to the quotation stage where time was lost",
+      "Check whether quotes were released after the customer's expected response window",
+      "Review missing RFQ inputs, supplier delays, and internal backlog on those cases"
+    ],
+    nodeRelevanceMap: {
+      P008: "Late quote release can directly reduce business take because the customer receives the offer too late to place the order.",
+      M001: "Quote OTD is the best direct metric to test whether quotation timing is affecting business take.",
+      P001: "Incomplete RFQ intake delays the costing start and shortens the commercial response window.",
+      P003: "Supplier quotation delays keep the commercial offer open longer and can delay customer submission.",
+      P002: "Insufficient costing capacity slows opportunity handling and can reduce captured business.",
+      P006: "Shifting priorities can leave valuable opportunities unfinished or submitted too late.",
+      S001: "An RFQ intake gate helps start opportunities with complete data and fewer commercial delays.",
+      S004: "Should-cost and supplier response targets reduce wait time on bought parts before submission.",
+      S006: "Priority governance protects strategic opportunities from constant interruption."
+    }
+  },
+  {
+    id: "flow_timeliness",
+    patterns: [/\botd\b/i, /\blead time\b/i, /\bdelay\b/i, /\bbacklog\b/i, /\bcycle time\b/i, /\bdeadline\b/i],
+    rationale: "This KPI measures timeliness or flow performance, so delay, backlog, and prioritization nodes are directly relevant.",
+    preferredNodeIds: ["M001", "P008", "P002", "P006", "P005", "P003", "S003", "S006"],
+    kbHints: [
+      "quote OTD",
+      "quote released late",
+      "insufficient costing capacity",
+      "shifting priorities and permanent urgencies",
+      "costing rework"
+    ],
+    ownerFocus: ["Management", "Costing", "Sales"],
+    metricFocus: ["Quote OTD", "Average quote lead time", "Backlog days", "WIP count", "Priority changes per week"],
+    nextChecks: [
+      "Break the delay into intake, costing, supplier, validation, and release stages",
+      "Measure backlog and WIP at the same time as the KPI drop",
+      "Check how often work sequence changed before completion"
+    ],
+    nodeRelevanceMap: {
+      M001: "This KPI is itself a timing metric or is strongly linked to quote timeliness.",
+      P008: "Late release is the visible end effect when the quotation process misses its date.",
+      P002: "Capacity shortages create queue buildup and longer lead times.",
+      P006: "Frequent reprioritization creates stop-start work and delay accumulation.",
+      P005: "Rework adds avoidable cycle time before release.",
+      P003: "Supplier waits can extend the total quote timeline.",
+      S003: "Flow segmentation helps keep simple and strategic work from being delayed by one shared path.",
+      S006: "Priority governance reduces WIP churn and keeps due dates stable."
+    }
+  },
+  {
+    id: "cost_margin",
+    patterns: [/\bcost\b/i, /\bmargin\b/i, /\bprofit\b/i],
+    rationale: "Cost and margin KPIs can be affected by blocked or unstable costing inputs, supplier quotation delays, and rework.",
+    preferredNodeIds: ["P003", "P007", "P005", "P004", "S004", "S005", "P002"],
+    kbHints: [
+      "late supplier quotation",
+      "detailed costing blocked",
+      "costing rework",
+      "should-cost plus supplier SLA",
+      "simplify costing model"
+    ],
+    ownerFocus: ["Purchasing", "Costing", "Management"],
+    metricFocus: ["Supplier response lead time", "Time quote stays in draft", "Rework hours per quote", "Manual data entry time", "Throughput per analyst"],
+    nextChecks: [
+      "Identify which cost lines stayed uncertain longest",
+      "Review bought-part quotations and should-cost coverage",
+      "Measure how much time was lost to re-entry or recalculation"
+    ],
+    nodeRelevanceMap: {
+      P003: "Late supplier prices can force assumptions or delays in cost completion, affecting margin quality.",
+      P007: "Blocked detailed costing leaves key cost lines unresolved and weakens margin confidence.",
+      P005: "Rework changes assumptions repeatedly and can destabilize the final cost position.",
+      P004: "A heavy costing tool adds manual effort and slows cost-ready decision making.",
+      S004: "Should-cost and supplier SLAs provide faster backup pricing for bought parts.",
+      S005: "Simplifying the costing model reduces manual effort and repeated assumptions.",
+      P002: "Limited analyst capacity can delay detailed cost completion on margin-critical opportunities."
+    }
+  }
+]);
+
+const buildSelectedKpiSummary = (selectedKpi = null) => {
+  if (!selectedKpi) return null;
+
+  const currentValue = parseMetricNumber(selectedKpi.current_value);
+  const targetValue = parseMetricNumber(selectedKpi.target);
+  const lowLimit = parseMetricNumber(selectedKpi.low_limit);
+  const highLimit = parseMetricNumber(selectedKpi.high_limit);
+  const goodDirection = normalizeKpiDirection(selectedKpi.good_direction) || "up";
+  const status = getKpiStatus(currentValue, lowLimit, highLimit, goodDirection);
+
+  const gapToTarget =
+    currentValue !== null && targetValue !== null
+      ? Number((currentValue - targetValue).toFixed(2))
+      : null;
+
+  let targetAssessment = "Target data is not available.";
+  if (currentValue !== null && targetValue !== null) {
+    if (goodDirection === "down") {
+      if (currentValue > targetValue) {
+        targetAssessment = `${Number((currentValue - targetValue).toFixed(2))} above target, so improvement is needed.`;
+      } else if (currentValue < targetValue) {
+        targetAssessment = `${Number((targetValue - currentValue).toFixed(2))} better than target.`;
+      } else {
+        targetAssessment = "On target.";
+      }
+    } else if (currentValue < targetValue) {
+      targetAssessment = `${Number((targetValue - currentValue).toFixed(2))} below target, so improvement is needed.`;
+    } else if (currentValue > targetValue) {
+      targetAssessment = `${Number((currentValue - targetValue).toFixed(2))} above target.`;
+    } else {
+      targetAssessment = "On target.";
+    }
+  }
+
+  let thresholdAssessment = "Threshold status is not available.";
+  if (status.isGood === false) {
+    if (goodDirection === "down" && status.upperBound !== null && currentValue !== null) {
+      thresholdAssessment = `${Number((currentValue - status.upperBound).toFixed(2))} above the acceptable limit.`;
+    } else if (goodDirection === "up" && status.lowerBound !== null && currentValue !== null) {
+      thresholdAssessment = `${Number((status.lowerBound - currentValue).toFixed(2))} below the acceptable limit.`;
+    } else {
+      thresholdAssessment = "Outside the acceptable threshold.";
+    }
+  } else if (status.isGood === true) {
+    thresholdAssessment = "Inside the acceptable threshold.";
+  }
+
+  return {
+    display_name: buildAssistantKpiDisplayName(selectedKpi.title, selectedKpi.subtitle),
+    title: selectedKpi.title || "Untitled KPI",
+    subtitle: selectedKpi.subtitle || null,
+    unit: selectedKpi.unit || null,
+    week: selectedKpi.week || null,
+    good_direction: goodDirection,
+    current_value: currentValue,
+    target: targetValue,
+    low_limit: lowLimit,
+    high_limit: highLimit,
+    gap_to_target: gapToTarget,
+    target_assessment: targetAssessment,
+    threshold_assessment: thresholdAssessment,
+    corrective_action_status: selectedKpi.corrective_action_status || null,
+    comment: selectedKpi.comment || null,
+    latest_root_cause: selectedKpi.root_cause || null,
+    latest_implemented_solution: selectedKpi.implemented_solution || null,
+    due_date: selectedKpi.due_date || null,
+    responsible: selectedKpi.responsible || null
+  };
+};
+
+const buildSelectedKpiDelayFocus = (selectedKpi = null) => {
+  if (!selectedKpi) {
+    return {
+      is_direct_match: false,
+      matched_rule_id: null,
+      rationale: "No KPI is selected, so the knowledge base should be used only if the user explicitly asks about quotation or costing delay.",
+      kb_hints: [],
+      preferred_node_ids: [],
+      node_relevance_map: {},
+      owner_focus: [],
+      metric_focus: [],
+      next_checks: []
+    };
+  }
+
+  const searchableText = [
+    selectedKpi.title,
+    selectedKpi.subtitle,
+    selectedKpi.comment,
+    selectedKpi.root_cause,
+    selectedKpi.implemented_solution
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const matchedRule = KPI_DELAY_KB_RULES.find((rule) =>
+    rule.patterns.some((pattern) => pattern.test(searchableText))
+  ) || null;
+
+  if (!matchedRule) {
+    return {
+      is_direct_match: false,
+      matched_rule_id: null,
+      rationale: "This KPI does not clearly map to a delay knowledge-base category from its title alone. Use the knowledge base only if the user or KPI context points to quotation, RFQ, costing, supplier, backlog, lead time, or OTD issues.",
+      kb_hints: [],
+      preferred_node_ids: [],
+      node_relevance_map: {},
+      owner_focus: [],
+      metric_focus: [],
+      next_checks: []
+    };
+  }
+
+  return {
+    is_direct_match: true,
+    matched_rule_id: matchedRule.id,
+    rationale: matchedRule.rationale,
+    kb_hints: matchedRule.kbHints,
+    preferred_node_ids: matchedRule.preferredNodeIds || [],
+    node_relevance_map: matchedRule.nodeRelevanceMap || {},
+    owner_focus: matchedRule.ownerFocus || [],
+    metric_focus: matchedRule.metricFocus || [],
+    next_checks: matchedRule.nextChecks || []
+  };
+};
+
+const applySelectedKpiKnowledgeBaseFocus = (knowledgeBaseContext, selectedKpiDelayFocus) => {
+  if (!knowledgeBaseContext) return knowledgeBaseContext;
+
+  const preferredNodeIds = Array.isArray(selectedKpiDelayFocus?.preferred_node_ids)
+    ? selectedKpiDelayFocus.preferred_node_ids
+    : [];
+  const nodeRelevanceMap = selectedKpiDelayFocus?.node_relevance_map || {};
+  const targetMatchCount = Math.max(knowledgeBaseContext.matches?.length || 0, 4);
+  const targetRelatedCount = Math.max(knowledgeBaseContext.related?.length || 0, 4);
+
+  const byNodeId = new Map();
+  [...(knowledgeBaseContext.matches || []), ...(knowledgeBaseContext.related || [])].forEach((entry) => {
+    const key = entry?.node_id || entry?.id;
+    if (!key) return;
+    const existing = byNodeId.get(key);
+    if (!existing || Number(existing.score || 0) < Number(entry.score || 0)) {
+      byNodeId.set(key, entry);
+    }
+  });
+
+  const annotateEntry = (entry) => {
+    const preferredIndex = preferredNodeIds.indexOf(entry.node_id);
+    const preferredBoost = preferredIndex >= 0
+      ? Math.max(0, 220 - (preferredIndex * 14))
+      : 0;
+
+    return {
+      ...entry,
+      kpi_relevance_reason: nodeRelevanceMap[entry.node_id] || null,
+      preferred_for_selected_kpi: preferredIndex >= 0,
+      kpi_priority_score: Number((Number(entry.score || 0) + preferredBoost).toFixed(2))
+    };
+  };
+
+  const prioritizedEntries = [...byNodeId.values()]
+    .map(annotateEntry)
+    .sort((a, b) => Number(b.kpi_priority_score || 0) - Number(a.kpi_priority_score || 0));
+
+  return {
+    ...knowledgeBaseContext,
+    matches: prioritizedEntries.slice(0, targetMatchCount),
+    related: prioritizedEntries.slice(targetMatchCount, targetMatchCount + targetRelatedCount),
+    kpi_specific_focus: {
+      matched_rule_id: selectedKpiDelayFocus?.matched_rule_id || null,
+      preferred_node_ids: preferredNodeIds,
+      owner_focus: selectedKpiDelayFocus?.owner_focus || [],
+      metric_focus: selectedKpiDelayFocus?.metric_focus || [],
+      next_checks: selectedKpiDelayFocus?.next_checks || []
+    }
+  };
+};
+
+const MAX_ASSISTANT_HISTORY_MESSAGES = 14;
+
+const normalizeAssistantConversationHistory = (history = []) =>
+  (Array.isArray(history) ? history : [])
+    .map((entry) => {
+      const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : null;
+      const content = normalizeText(entry?.content ?? entry?.contextText ?? entry?.text ?? entry?.message);
+      if (!role || !content) return null;
+      return { role, content };
+    })
+    .filter(Boolean)
+    .slice(-MAX_ASSISTANT_HISTORY_MESSAGES);
+
+const buildKpiScopedKnowledgeBaseQuery = ({
+  message,
+  conversationHistory,
+  selectedKpi,
+  selectedKpiSummary,
+  selectedKpiDelayFocus
+}) => {
+  const queryParts = [String(message || "").trim()];
+  const recentConversationInputs = normalizeAssistantConversationHistory(conversationHistory)
+    .filter((entry) => entry.role === "user")
+    .map((entry) => entry.content)
+    .slice(-4);
+
+  if (recentConversationInputs.length) {
+    queryParts.push(`Recent conversation context: ${recentConversationInputs.join(" | ")}`);
+  }
+
+  if (selectedKpiSummary?.display_name) {
+    queryParts.push(
+      `Selected KPI: ${selectedKpiSummary.display_name}`
+    );
+  }
+
+  if (selectedKpiSummary?.target_assessment) {
+    queryParts.push(`KPI target assessment: ${selectedKpiSummary.target_assessment}`);
+  }
+
+  if (selectedKpiSummary?.threshold_assessment) {
+    queryParts.push(`KPI threshold assessment: ${selectedKpiSummary.threshold_assessment}`);
+  }
+
+  if (selectedKpi?.comment) {
+    queryParts.push(`KPI comment: ${selectedKpi.comment}`);
+  }
+
+  if (selectedKpiDelayFocus?.kb_hints?.length) {
+    queryParts.push(`Delay knowledge-base hints: ${selectedKpiDelayFocus.kb_hints.join(", ")}`);
+  }
+
+  if (selectedKpiDelayFocus?.preferred_node_ids?.length) {
+    queryParts.push(`Preferred node IDs for this KPI: ${selectedKpiDelayFocus.preferred_node_ids.join(", ")}`);
+  }
+
+  return queryParts.filter(Boolean).join("\n");
+};
+
+const buildKpiAssistantFallbackReply = ({
+  selectedKpiSummary,
+  selectedKpiDelayFocus,
+  knowledgeBaseContext
+}) => {
+  const lines = [];
+
+  if (selectedKpiSummary) {
+    lines.push(`Focused KPI: ${selectedKpiSummary.display_name}.`);
+
+    if (selectedKpiSummary.current_value !== null || selectedKpiSummary.target !== null) {
+      lines.push(
+        `Current value: ${selectedKpiSummary.current_value ?? "N/A"}${selectedKpiSummary.unit ? ` ${selectedKpiSummary.unit}` : ""}; target: ${selectedKpiSummary.target ?? "N/A"}${selectedKpiSummary.unit ? ` ${selectedKpiSummary.unit}` : ""}.`
+      );
+    }
+
+    lines.push(selectedKpiSummary.target_assessment);
+    lines.push(selectedKpiSummary.threshold_assessment);
+  }
+
+  if (selectedKpiDelayFocus?.rationale) {
+    lines.push(`Delay KB relevance: ${selectedKpiDelayFocus.rationale}`);
+  }
+
+  if (knowledgeBaseContext?.matches?.length) {
+    const topMatches = knowledgeBaseContext.matches.slice(0, 3);
+    const kbSummary = topMatches
+      .map((entry) => `${entry.node_id} - ${entry.subject}${entry.kpi_relevance_reason ? `: ${entry.kpi_relevance_reason}` : ""}`)
+      .join(" | ");
+    lines.push(`Most relevant knowledge-base nodes: ${kbSummary}.`);
+
+    const actionSummary = topMatches
+      .flatMap((entry) => entry.actions || [])
+      .filter(Boolean)
+      .slice(0, 4);
+    if (actionSummary.length) {
+      lines.push(`Recommended actions: ${actionSummary.join("; ")}.`);
+    }
+
+    const metricSummary = [
+      ...(selectedKpiDelayFocus?.metric_focus || []),
+      ...topMatches.flatMap((entry) => entry.metrics || [])
+    ].filter(Boolean);
+    if (metricSummary.length) {
+      lines.push(`Track with: ${[...new Set(metricSummary)].slice(0, 5).join("; ")}.`);
+    }
+  } else {
+    lines.push("No strong delay knowledge-base node matched this KPI and question.");
+  }
+
+  if (selectedKpiDelayFocus?.owner_focus?.length) {
+    lines.push(`Owner functions to involve: ${selectedKpiDelayFocus.owner_focus.join("; ")}.`);
+  }
+
+  if (selectedKpiDelayFocus?.next_checks?.length) {
+    lines.push(`Best next checks: ${selectedKpiDelayFocus.next_checks.slice(0, 3).join("; ")}.`);
+  }
+
+  return lines.filter(Boolean).join(" ");
+};
+
+const buildFastKpiAssistantReply = ({
+  selectedKpiSummary,
+  selectedKpiDelayFocus,
+  knowledgeBaseContext
+}) => {
+  const lines = [];
+  const topMatches = (knowledgeBaseContext?.matches || []).slice(0, 4);
+  const topActions = [...new Set(topMatches.flatMap((entry) => entry.actions || []).filter(Boolean))].slice(0, 4);
+  const topMetrics = [
+    ...(selectedKpiDelayFocus?.metric_focus || []),
+    ...topMatches.flatMap((entry) => entry.metrics || [])
+  ].filter(Boolean);
+
+  if (selectedKpiSummary) {
+    lines.push(`### KPI Status`);
+    lines.push(`- **KPI**: ${selectedKpiSummary.display_name}`);
+
+    if (selectedKpiSummary.current_value !== null) {
+      lines.push(`- **Current Value**: ${selectedKpiSummary.current_value}${selectedKpiSummary.unit ? ` ${selectedKpiSummary.unit}` : ""}`);
+    }
+
+    if (selectedKpiSummary.target !== null) {
+      lines.push(`- **Target**: ${selectedKpiSummary.target}${selectedKpiSummary.unit ? ` ${selectedKpiSummary.unit}` : ""}`);
+    }
+
+    if (selectedKpiSummary.gap_to_target !== null) {
+      const gapDirection = selectedKpiSummary.gap_to_target < 0 ? "below" : "above";
+      lines.push(`- **Gap To Target**: ${selectedKpiSummary.gap_to_target}${selectedKpiSummary.unit ? ` ${selectedKpiSummary.unit}` : ""} (${Math.abs(selectedKpiSummary.gap_to_target)} ${gapDirection} target)`);
+    }
+
+    lines.push(`- **Target Assessment**: ${selectedKpiSummary.target_assessment}`);
+    lines.push(`- **Threshold Assessment**: ${selectedKpiSummary.threshold_assessment}`);
+  }
+
+  if (selectedKpiDelayFocus?.rationale) {
+    lines.push("");
+    lines.push(`The delay knowledge base is relevant here because ${selectedKpiDelayFocus.rationale.charAt(0).toLowerCase()}${selectedKpiDelayFocus.rationale.slice(1)}`);
+  }
+
+  if (topMatches.length) {
+    lines.push("");
+    lines.push(`### Likely Delay-Related Drivers`);
+    topMatches.forEach((entry, index) => {
+      const reason = entry.kpi_relevance_reason || entry.description || "This node may influence the KPI through the quotation flow.";
+      lines.push(`${index + 1}. **${entry.node_id} - ${entry.subject}**: ${reason}`);
+    });
+  } else {
+    lines.push("");
+    lines.push(`### Likely Delay-Related Drivers`);
+    lines.push(`No strong knowledge-base match was found for this KPI and question.`);
+  }
+
+  if (topActions.length) {
+    lines.push("");
+    lines.push(`### Recommended Actions`);
+    topActions.forEach((action, index) => {
+      lines.push(`${index + 1}. ${action}`);
+    });
+  }
+
+  if (selectedKpiDelayFocus?.owner_focus?.length) {
+    lines.push("");
+    lines.push(`### Owners`);
+    selectedKpiDelayFocus.owner_focus.forEach((owner) => {
+      lines.push(`- ${owner}`);
+    });
+  }
+
+  const uniqueMetrics = [...new Set(topMetrics)].slice(0, 5);
+  if (uniqueMetrics.length) {
+    lines.push("");
+    lines.push(`### Metrics To Monitor`);
+    uniqueMetrics.forEach((metric) => {
+      lines.push(`- ${metric}`);
+    });
+  }
+
+  if (selectedKpiDelayFocus?.next_checks?.length) {
+    lines.push("");
+    lines.push(`### Next Checks`);
+    selectedKpiDelayFocus.next_checks.slice(0, 3).forEach((check) => {
+      lines.push(`- ${check}`);
+    });
+  }
+
+  return lines.join("\n");
+};
+
+const generateKpiAssistantReply = async ({
+  responsible,
+  week,
+  selectedKpiId,
+  kpis,
+  message,
+  conversationHistory
+}) => {
+  const assistantKpis = buildAssistantKpiContext(kpis);
+  const normalizedConversationHistory = normalizeAssistantConversationHistory(conversationHistory);
+  const selectedKpi = assistantKpis.find((kpi) =>
+    String(kpi.kpi_id) === String(selectedKpiId) ||
+    String(kpi.kpi_values_id) === String(selectedKpiId)
+  ) || null;
+  const selectedKpiSummary = buildSelectedKpiSummary(selectedKpi);
+  const selectedKpiDelayFocus = buildSelectedKpiDelayFocus(selectedKpi);
+  const knowledgeBaseQuery = buildKpiScopedKnowledgeBaseQuery({
+    message,
+    conversationHistory: normalizedConversationHistory,
+    selectedKpi,
+    selectedKpiSummary,
+    selectedKpiDelayFocus
+  });
+  const rawKnowledgeBaseContext = buildDelayKnowledgeBaseContext(knowledgeBaseQuery, {
+    limit: 4,
+    relatedLimit: 4,
+    preferredNodeIds: selectedKpiDelayFocus.preferred_node_ids || []
+  });
+  const knowledgeBaseContext = applySelectedKpiKnowledgeBaseFocus(
+    // rawKnowledgeBaseContext,
+    selectedKpiDelayFocus
+  );
+  const fastLocalReply = buildFastKpiAssistantReply({
+    selectedKpiSummary,
+    selectedKpiDelayFocus,
+    knowledgeBaseContext
+  });
+
+  return fastLocalReply || buildKpiAssistantFallbackReply({
+    selectedKpiSummary,
+    selectedKpiDelayFocus,
+    knowledgeBaseContext
+  });
+};
+
+// ============================================================
+// getResponsibleWithKPIs â€” now also fetches existing corrective
+// action data (root_cause, implemented_solution, evidence)
+// ============================================================
+const getResponsibleWithKPIs = async (responsibleId, week) => {
+  const resResp = await pool.query(
+    `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+             p.name AS plant_name, d.name AS department_name
+      FROM public."Responsible" r
+      JOIN public."Plant" p ON r.plant_id = p.plant_id
+      JOIN public."Department" d ON r.department_id = d.department_id
+      WHERE r.responsible_id = $1`,
+    [responsibleId]
+  );
   const responsible = resResp.rows[0];
   if (!responsible) throw new Error("Responsible not found");
 
   const kpiRes = await pool.query(
-    `
-    SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id, 
-           k.indicator_title, k.indicator_sub_title, k.unit
+    `SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id,
+           ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+           COALESCE(
+             (SELECT MAX(updated_at) FROM public.kpi_values_hist26
+              WHERE kpi_values_id = kv.kpi_values_id), NOW()
+           ) as last_updated,
+           (SELECT h.comment FROM public.kpi_values_hist26 h
+            WHERE h.kpi_values_id = kv.kpi_values_id
+              AND h.responsible_id = $1 AND h.week = $2
+            ORDER BY h.updated_at DESC LIMIT 1) as latest_comment
     FROM public.kpi_values kv
     JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
+    LEFT JOIN public.responsible_kpis rk
+      ON rk.responsible_kpi_id = kv.responsible_kpi_id
     WHERE kv.responsible_id = $1 AND kv.week = $2
-    ORDER BY k.kpi_id ASC
-    `,
+    ORDER BY k.kpi_id ASC`,
     [responsibleId, week]
   );
 
-  return { responsible, kpis: kpiRes.rows };
+  const correctiveActionsRes = await pool.query(
+    `SELECT corrective_action_id, responsible_id, kpi_id, week,
+            root_cause, implemented_solution, evidence,
+            status, created_date, updated_date, due_date, responsible
+     FROM public.corrective_actions
+     WHERE responsible_id = $1 AND week = $2
+     ORDER BY kpi_id ASC, COALESCE(updated_date, created_date) DESC, corrective_action_id DESC`,
+     [responsibleId, week]
+  );
+
+  const actionsByKpiId = {};
+  correctiveActionsRes.rows.forEach((action) => {
+    if (!actionsByKpiId[action.kpi_id]) {
+      actionsByKpiId[action.kpi_id] = [];
+    }
+    actionsByKpiId[action.kpi_id].push(action);
+  });
+
+  const kpis = kpiRes.rows.map((kpi) => {
+    const correctiveActions = sortCorrectiveActions(actionsByKpiId[kpi.kpi_id] || []);
+    const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
+
+    return {
+      ...kpi,
+      corrective_actions: correctiveActions,
+      corrective_action_count: correctiveActions.length,
+      corrective_action_id: latestCorrectiveAction?.corrective_action_id ?? null,
+      ca_root_cause: latestCorrectiveAction?.root_cause ?? "",
+      ca_implemented_solution: latestCorrectiveAction?.implemented_solution ?? "",
+      ca_evidence: latestCorrectiveAction?.evidence ?? "",
+      ca_status: latestCorrectiveAction?.status ?? "",
+      ca_due_date: latestCorrectiveAction?.due_date ?? null,
+      ca_responsible_name: latestCorrectiveAction?.responsible ?? ""
+    };
+  });
+
+  return { responsible, kpis };
 };
 
-// ---------- Generate Email HTML with Button ----------
+const getWeekLabelForDate = (date = new Date()) => {
+  const currentDate = new Date(date);
+  const year = currentDate.getFullYear();
+  const startDate = new Date(year, 0, 1);
+  const days = Math.floor((currentDate - startDate) / (24 * 60 * 60 * 1000));
+  const weekNumber = Math.ceil((days + startDate.getDay() + 1) / 7);
+  return `${year}-Week${weekNumber}`;
+};
+
+const KPI_EMAIL_CONFIG = {
+  appBaseUrl: "http://localhost:5000",
+  enableKpiSubmissionEmailCron: true,
+  kpiSubmissionEmailCron: "0 9 * * 2",
+  timezone: "Africa/Tunis",
+};
+
+const getAppBaseUrl = () =>
+  KPI_EMAIL_CONFIG.appBaseUrl.replace(/\/+$/, "");
+
+const KPI_SUBMISSION_CHART_WEEK_WINDOW = 4;
+
+const getKpiEmailRecipientsForWeek = async (week) => {
+  const resps = await pool.query(
+    `SELECT DISTINCT r.responsible_id
+     FROM public."Responsible" r
+     JOIN public.kpi_values kv
+       ON kv.responsible_id = r.responsible_id
+     WHERE kv.week = $1
+       AND r.email IS NOT NULL
+       AND TRIM(r.email) != ''
+     ORDER BY r.responsible_id ASC`,
+    [week]
+  );
+
+  return resps.rows;
+};
+
 const generateEmailHtml = ({ responsible, week }) => {
   return `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="utf-8"><title>KPI Form</title></head>
-  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;
-                border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);text-align:center;">
+  <!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI Form</title></head>
+  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;margin:0;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:30px 25px 40px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);text-align:center;">
       
-      <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0" 
-           alt="AVOCarbon Logo" style="width:80px;height:80px;object-fit:contain;margin-bottom:20px;">
+      <!-- Logo -->
+      <div style="margin-bottom:10px;">
+        <img src="https://media.licdn.com/dms/image/v2/D4E0BAQGYVmAPO2RZqQ/company-logo_200_200/company-logo_200_200/0/1689240189455/avocarbon_group_logo?e=2147483647&v=beta&t=nZNCXd3ypoMFQnQMxfAZrljyNBbp4E5HM11Y1yl9_L0"
+             alt="AVOCarbon Logo" style="width:90px;height:90px;object-fit:contain;">
+      </div>
       
-      <h2 style="color:#0078D7;font-size:22px;margin-bottom:20px;">KPI Submission - ${week}</h2>
-    
-      <h3 style="color:#0078D7;font-size:16px;margin-bottom:20px;">
-            Plant: ${responsible.plant_name}
-      </h3>
-          
-      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
-         style="display:inline-block;padding:12px 20px;background:#0078D7;color:white;
-                border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
+      <!-- KPI codir with cadre/border - directly under logo and centered -->
+      <div style="border:2px solid #0078D7;border-radius:8px;padding:6px 25px;display:inline-block;margin:0 auto 15px auto;">
+        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI codir</span>
+      </div>
+      
+      <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${week}</h2>
+      
+      <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsible.plant_name}</h3>
+      
+      <a href="${getAppBaseUrl()}/form?responsible_id=${responsible.responsible_id}&week=${week}"
+         style="display:inline-block;padding:14px 35px;background:#0078D7;color:white;
+                border-radius:50px;text-decoration:none;font-weight:600;font-size:16px;
+                margin-bottom:20px;border:none;cursor:pointer;">
         Fill KPI Form
       </a>
-
-      <p style="margin-top:20px;font-size:12px;color:#888;">
-        Click the button above to fill your KPIs for week ${week}.
-      </p>
+      
+      <p style="margin:0;font-size:13px;color:#666;">Click the button above to fill your KPIs for ${week}.</p>
     </div>
-  </body>
-  </html>
-  `;
+  </body></html>`;
 };
 
-// ========== CORRECTIVE ACTION SYSTEM - START ==========
-
-
-const generateCorrectiveActionEmailHtml = ({ responsible, kpi, week, value, target_value }) => {
-  return `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="utf-8"><title>Corrective Action Required</title></head>
-  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
-      <div style="text-align:center;margin-bottom:25px;">
-        <div style="width:80px;height:80px;margin:0 auto 15px;background:#ff9800;border-radius:50%;display:flex;align-items:center;justify-content:center;">
-          <span style="font-size:40px;">⚠️</span>
-        </div>
-        <h2 style="color:#d32f2f;font-size:22px;margin:0;">Corrective Action Required</h2>
-        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">KPI Below target_value - Week ${week}</p>
-      </div>
-      
-      <div style="background:#f8f9fa;padding:20px;border-radius:6px;margin-bottom:20px;border-left:4px solid #d32f2f;">
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
-          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
-        </div>
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
-          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
-        </div>
-        <div>
-          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
-          <span style="color:#666;font-size:13px;">${responsible.name}</span>
-        </div>
-      </div>
-      
-      <div style="background:#fff3e0;padding:20px;border-radius:6px;margin-bottom:20px;border:1px solid #ffb74d;">
-        <h3 style="color:#e65100;font-size:16px;margin:0 0 15px 0;">KPI Performance Alert</h3>
-        <div style="margin-bottom:10px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Indicator: </span>
-          <span style="color:#666;font-size:13px;">${kpi.indicator_title}</span>
-        </div>
-        <div style="margin-top:15px;display:flex;justify-content:space-around;background:white;padding:15px;border-radius:4px;">
-          <div style="text-align:center;">
-            <div style="font-size:11px;color:#666;margin-bottom:5px;">Current Value</div>
-            <div style="font-size:20px;font-weight:700;color:#d32f2f;">${value}${kpi.unit || ''}</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-size:11px;color:#666;margin-bottom:5px;">target_value</div>
-            <div style="font-size:20px;font-weight:700;color:#4caf50;">${target_value}${kpi.unit || ''}</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-size:11px;color:#666;margin-bottom:5px;">Gap</div>
-            <div style="font-size:20px;font-weight:700;color:#ff9800;">
-              ${(parseFloat(target_value) - parseFloat(value)).toFixed(2)}${kpi.unit || ''}
-            </div>
-          </div>
-        </div>
-      </div>
-      
-      <div style="text-align:center;margin:25px 0;">
-        <a href="https://kpi-form.azurewebsites.net/corrective-action-form?responsible_id=${responsible.responsible_id}&kpi_id=${kpi.kpi_id}&week=${week}"
-           style="display:inline-block;padding:14px 30px;background:#d32f2f;color:white;border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">
-          📝 Fill Corrective Action Form
-        </a>
-      </div>
-      
-      <div style="margin-top:25px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
-        <p style="font-size:11px;color:#999;margin:0;">
-          This is an automated alert from AVOCarbon KPI System<br>
-          Please complete the corrective action form within 24 hours
-        </p>
-      </div>
-    </div>
-  </body>
-  </html>
-  `;
-};
-
-// ========== ENHANCED CORRECTIVE ACTION SYSTEM WITH EMAIL NOTIFICATIONS ==========
-
-// Generate target update email HTML
-const generateTargetUpdateEmailHtml = ({ responsible, kpi, week, oldTarget, newTarget }) => {
-  return `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="utf-8"><title>KPI Target Updated</title></head>
-  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-    <div style="max-width:600px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
-      
-      <!-- Header -->
-      <div style="text-align:center;margin-bottom:30px;">
-        <div style="width:80px;height:80px;margin:0 auto 15px;background:#4caf50;border-radius:50%;display:flex;align-items:center;justify-content:center;">
-          <span style="font-size:40px;">🎯</span>
-        </div>
-        <h2 style="color:#4caf50;font-size:22px;margin:0;">KPI Target Updated</h2>
-        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Performance Exceeds Expectations</p>
-      </div>
-      
-      <!-- Responsible Info -->
-      <div style="background:#e8f5e9;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #4caf50;">
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
-          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
-        </div>
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
-          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
-        </div>
-        <div>
-          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
-          <span style="color:#666;font-size:13px;">${responsible.name}</span>
-        </div>
-      </div>
-      
-      <!-- KPI Details -->
-      <div style="background:#f5f5f5;padding:20px;border-radius:6px;margin-bottom:25px;">
-        <h3 style="color:#333;font-size:16px;margin:0 0 15px 0;">KPI Information</h3>
-        <div style="margin-bottom:10px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Indicator: </span>
-          <span style="color:#666;font-size:13px;">${kpi.indicator_title}</span>
-        </div>
-        ${kpi.indicator_sub_title ? `
-        <div style="margin-bottom:10px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Sub-title: </span>
-          <span style="color:#666;font-size:13px;">${kpi.indicator_sub_title}</span>
-        </div>
-        ` : ''}
-        ${kpi.unit ? `
-        <div>
-          <span style="font-weight:600;color:#333;font-size:13px;">Unit: </span>
-          <span style="color:#666;font-size:13px;">${kpi.unit}</span>
-        </div>
-        ` : ''}
-      </div>
-      
-      <!-- Target Update Details -->
-      <div style="background:#fff3e0;padding:20px;border-radius:6px;margin-bottom:25px;border:1px solid #ffb74d;">
-        <h3 style="color:#e65100;font-size:16px;margin:0 0 15px 0;">Target Value Updated</h3>
-        <p style="color:#666;font-size:14px;margin:0 0 15px 0;">
-          Your KPI performance exceeded the target value for week ${week}. 
-          The system has automatically updated the target to reflect this achievement.
-        </p>
-        
-        <div style="margin-top:15px;display:flex;justify-content:space-around;background:white;padding:15px;border-radius:4px;">
-          <div style="text-align:center;">
-            <div style="font-size:11px;color:#666;margin-bottom:5px;">Previous Target</div>
-            <div style="font-size:20px;font-weight:700;color:#d32f2f;">${oldTarget}${kpi.unit || ''}</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-size:24px;color:#666;margin:8px;">→</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-size:11px;color:#666;margin-bottom:5px;">New Target</div>
-            <div style="font-size:20px;font-weight:700;color:#4caf50;">${newTarget}${kpi.unit || ''}</div>
-          </div>
-        </div>
-        
-        <div style="text-align:center;margin-top:15px;padding:10px;background:#e8f5e9;border-radius:4px;">
-          <div style="font-size:20px;font-weight:700;color:#2e7d32;">
-            +${((newTarget - oldTarget) / oldTarget * 100).toFixed(1)}%
-          </div>
-          <div style="font-size:11px;color:#666;">Improvement</div>
-        </div>
-      </div>
-      
-      <!-- Message -->
-      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
-        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">🎉 Congratulations!</h3>
-        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
-          <li>Your KPI performance has exceeded expectations</li>
-          <li>The target has been updated to reflect your achievement</li>
-          <li>Continue maintaining or improving this performance</li>
-          <li><strong>Next target will be based on this new value</strong></li>
-        </ul>
-      </div>
-      
-      <!-- Footer -->
-      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
-        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
-          This is an automated notification from AVOCarbon KPI System<br>
-          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
-          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
-        </p>
-      </div>
-    </div>
-  </body>
-  </html>
-  `;
-};
-
-// Send target update email
-const sendTargetUpdateEmail = async (responsibleId, kpiId, week, oldTarget, newTarget) => {
+const checkAndTriggerCorrectiveActions = async (responsibleId, kpiId, week, newValue, histId) => {
   try {
-    // Get responsible info
-    const resResp = await pool.query(
-      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
-      [responsibleId]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible || !responsible.email) {
-      console.log(`No email found for responsible ${responsibleId}`);
-      return null;
-    }
-
-    // Get KPI details
     const kpiRes = await pool.query(
-      `SELECT kpi_id, indicator_title, indicator_sub_title, unit
-       FROM public."Kpi"
-       WHERE kpi_id = $1`,
-      [kpiId]
+      `
+      SELECT COALESCE(rk.target, k.target) AS target
+      FROM public."Kpi" k
+      LEFT JOIN public.responsible_kpis rk
+        ON rk.kpi_id = k.kpi_id
+       AND rk.responsible_id = $1
+      WHERE k.kpi_id = $2
+      `,
+      [responsibleId, kpiId]
     );
-
-    const kpi = kpiRes.rows[0];
-    if (!kpi) {
-      console.log(`KPI ${kpiId} not found`);
-      return null;
-    }
-
-    const html = generateTargetUpdateEmailHtml({
-      responsible,
-      kpi,
-      week,
-      oldTarget,
-      newTarget
-    });
-
-    const transporter = createTransporter();
-    const info = await transporter.sendMail({
-      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `🎯 Target Updated - ${kpi.indicator_title} - Week ${week}`,
-      html,
-    });
-
-    console.log(`✅ Target update email sent to ${responsible.email} for KPI ${kpiId}`);
-    return info;
-  } catch (err) {
-    console.error(`❌ Failed to send target update email:`, err.message);
-    return null;
-  }
-};
-
-// ========== CONSOLIDATED TARGET UPDATE EMAIL FUNCTIONS ==========
-
-// Generate consolidated target update email HTML
-const generateConsolidatedTargetUpdateEmailHtml = ({ responsible, week, targetUpdates }) => {
-  return `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="utf-8"><title>KPI Targets Updated</title></head>
-  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-    <div style="max-width:700px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
-      
-      <!-- Header -->
-      <div style="text-align:center;margin-bottom:30px;">
-        <div style="width:90px;height:90px;margin:0 auto 15px;background:#4caf50;border-radius:50%;display:flex;align-items:center;justify-content:center;">
-          <span style="font-size:45px;">🎯</span>
-        </div>
-        <h2 style="color:#4caf50;font-size:24px;margin:0;">KPI Targets Updated</h2>
-        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Performance Exceeds Expectations</p>
-      </div>
-      
-      <!-- Responsible Info -->
-      <div style="background:#e8f5e9;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #4caf50;">
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
-          <span style="color:#666;font-size:13px;">${responsible.name}</span>
-        </div>
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
-          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
-        </div>
-        <div>
-          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
-          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
-        </div>
-      </div>
-      
-      <!-- Summary Badge -->
-      <div style="background:#fff3e0;padding:15px;border-radius:6px;margin-bottom:25px;text-align:center;border:2px solid #ff9800;">
-        <span style="font-size:32px;font-weight:700;color:#4caf50;">${targetUpdates.length}</span>
-        <span style="font-size:14px;color:#666;display:block;margin-top:5px;">KPI Target${targetUpdates.length > 1 ? 's' : ''} Updated</span>
-      </div>
-      
-      <!-- KPIs List -->
-      <div style="margin-bottom:25px;">
-        <h3 style="color:#333;font-size:16px;margin-bottom:15px;border-bottom:2px solid #e0e0e0;padding-bottom:8px;">
-          📊 Target Updates Summary
-        </h3>
-        
-        ${targetUpdates.map((update, index) => `
-        <div style="background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:15px;margin-bottom:12px;">
-          <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;">
-            <div style="flex:1;">
-              <div style="font-weight:600;color:#333;font-size:14px;margin-bottom:5px;">
-                ${index + 1}. ${update.indicator_title}
-              </div>
-              ${update.indicator_sub_title ? `
-              <div style="color:#666;font-size:12px;margin-bottom:8px;">
-                ${update.indicator_sub_title}
-              </div>
-              ` : ''}
-            </div>
-          </div>
-          
-          <!-- Performance Summary -->
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;background:white;padding:12px;border-radius:4px;margin-bottom:10px;">
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Old Target</div>
-              <div style="font-size:16px;font-weight:700;color:#d32f2f;">${update.oldTarget} ${update.unit || ''}</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">New Target</div>
-              <div style="font-size:16px;font-weight:700;color:#4caf50;">${update.newTarget} ${update.unit || ''}</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Improvement</div>
-              <div style="font-size:16px;font-weight:700;color:#ff9800;">
-                +${update.improvement}%
-              </div>
-            </div>
-          </div>
-          
-          <!-- Progress Bar -->
-          <div style="margin-top:10px;">
-            <div style="display:flex;justify-content:space-between;font-size:11px;color:#666;margin-bottom:4px;">
-              <span>${update.oldTarget} ${update.unit || ''}</span>
-              <span>+${update.improvement}%</span>
-              <span>${update.newTarget} ${update.unit || ''}</span>
-            </div>
-            <div style="height:6px;background:#e0e0e0;border-radius:3px;overflow:hidden;">
-              <div style="height:100%;background:#4caf50;width:${Math.min(update.improvement, 100)}%;"></div>
-            </div>
-          </div>
-        </div>
-        `).join('')}
-      </div>
-      
-      <!-- Congratulations Section -->
-      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
-        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">🎉 Congratulations!</h3>
-        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
-          <li><strong>${targetUpdates.length} KPI${targetUpdates.length > 1 ? 's' : ''} exceeded their targets</strong></li>
-          <li>Target values have been updated to reflect your achievements</li>
-          <li>Continue maintaining or improving this performance</li>
-          <li>Future targets will be based on these new values</li>
-        </ul>
-      </div>
-      
-      <!-- Next Steps -->
-      <div style="background:#fff8e1;padding:20px;border-radius:6px;margin-bottom:25px;">
-        <h3 style="color:#ff8f00;font-size:15px;margin:0 0 12px 0;">📈 What This Means</h3>
-        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
-          <li>You've set a new standard for these KPIs</li>
-          <li>The system now expects at least this level of performance</li>
-          <li>Your achievement is officially recorded in the system</li>
-          <li>Keep up the excellent work!</li>
-        </ul>
-      </div>
-      
-      <!-- Footer -->
-      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
-        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
-          This is an automated notification from AVOCarbon KPI System<br>
-          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
-          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
-        </p>
-      </div>
-    </div>
-  </body>
-  </html>
-  `;
-};
-
-// Send consolidated target update email
-const sendConsolidatedTargetUpdateEmail = async (responsibleId, week, targetUpdates) => {
-  try {
-    // Get responsible info
-    const resResp = await pool.query(
-      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
-      [responsibleId]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible || !responsible.email) {
-      console.log(`No email found for responsible ${responsibleId}`);
-      return null;
-    }
-
-    if (targetUpdates.length === 0) {
-      console.log(`No target updates to send for responsible ${responsibleId}, week ${week}`);
-      return null;
-    }
-
-    // Get KPI details for each update
-    const enhancedUpdates = [];
-    for (const update of targetUpdates) {
-      const kpiRes = await pool.query(
-        `SELECT indicator_title, indicator_sub_title, unit
-         FROM public."Kpi"
-         WHERE kpi_id = $1`,
-        [update.kpiId]
-      );
-
-      if (kpiRes.rows[0]) {
-        const kpi = kpiRes.rows[0];
-        const improvement = ((update.newTarget - update.oldTarget) / update.oldTarget * 100).toFixed(1);
-
-        enhancedUpdates.push({
-          kpiId: update.kpiId,
-          indicator_title: kpi.indicator_title,
-          indicator_sub_title: kpi.indicator_sub_title,
-          unit: kpi.unit || '',
-          oldTarget: update.oldTarget,
-          newTarget: update.newTarget,
-          improvement: improvement
-        });
-      }
-    }
-
-    const html = generateConsolidatedTargetUpdateEmailHtml({
-      responsible,
-      week,
-      targetUpdates: enhancedUpdates
-    });
-
-    const transporter = createTransporter();
-    const info = await transporter.sendMail({
-      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `🎯 ${targetUpdates.length} KPI Target${targetUpdates.length > 1 ? 's' : ''} Updated - Week ${week}`,
-      html,
-    });
-
-    console.log(`✅ Consolidated target update email sent to ${responsible.email} (${targetUpdates.length} KPIs)`);
-    return info;
-  } catch (err) {
-    console.error(`❌ Failed to send consolidated target update email:`, err.message);
-    return null;
-  }
-};
-
-
-// Modified: Enhanced function with email 
-// Modified: Enhanced function to COLLECT target updates for consolidated email
-const checkAndTriggerCorrectiveActions = async (
-  responsibleId,
-  kpiId,
-  week,
-  newValue,
-  histId
-) => {
-  try {
-    // 1️⃣ Get current target value
-    const kpiRes = await pool.query(
-      `SELECT target_value FROM public."Kpi" WHERE kpi_id = $1`,
-      [kpiId]
-    );
-
     if (!kpiRes.rows.length) return { targetUpdated: false };
 
-    const currentTarget = parseFloat(kpiRes.rows[0].target_value);
+    const currentTarget = parseFloat(kpiRes.rows[0].target);
     const numValue = parseFloat(newValue);
-
     if (isNaN(numValue) || isNaN(currentTarget)) return { targetUpdated: false };
 
-    // 2️⃣ Always update history with current target
-    await pool.query(
-      `UPDATE public.kpi_values_hist26
-       SET target = $1
-       WHERE responsible_id = $2
-         AND kpi_id = $3
-         AND week = $4
-         AND (target IS NULL OR target < $1)`,
-      [numValue, responsibleId, kpiId, week]
-    );
-
-    console.log(`📝 History updated with target: ${currentTarget} for hist_id: ${histId}`);
-
-    // 3️⃣ If value exceeds target → update KPI target and RETURN update info
+    // â”€â”€ value exceeds current target â†’ queue it, touch NOTHING else â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (numValue > currentTarget) {
-      const oldTarget = currentTarget;
+      console.log(`ðŸ“Œ KPI ${kpiId}: ${numValue} > target ${currentTarget} â€” queuing pending update`);
 
-      // ✅ Update KPI target
       await pool.query(
-        `UPDATE public."Kpi"
-         SET target_value = $1
-         WHERE kpi_id = $2`,
-        [numValue, kpiId]
+        `INSERT INTO public.pending_target_updates
+           (kpi_id, responsible_id, week, new_target, applied)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (kpi_id, responsible_id, week)
+         DO UPDATE SET new_target = EXCLUDED.new_target, applied = false`,
+        [kpiId, responsibleId, week, String(numValue)]
       );
 
-      console.log(`🎯 Updated target for KPI ${kpiId}: ${oldTarget} → ${numValue}`);
+      console.log(`Pending target queued â€” KPI ${kpiId}: ${currentTarget} â†’ ${numValue}`);
 
-      // ✅ Return target update info (NO EMAIL SENT HERE)
       return {
         targetUpdated: true,
-        updateInfo: {
-          kpiId: kpiId,
-          oldTarget: oldTarget,
-          newTarget: numValue
-        }
+        updateInfo: { kpiId, oldTarget: currentTarget, newTarget: numValue }
       };
-    }
-
-    // 4️⃣ If value is BELOW target → create corrective action
-    if (numValue < currentTarget) {
-      const existingCA = await pool.query(
-        `SELECT corrective_action_id
-         FROM public.corrective_actions
-         WHERE responsible_id = $1
-           AND kpi_id = $2
-           AND week = $3
-           AND status = 'Open'`,
-        [responsibleId, kpiId, week]
-      );
-
-      if (existingCA.rows.length === 0) {
-        await pool.query(
-          `INSERT INTO public.corrective_actions
-           (responsible_id, kpi_id, week, status)
-           VALUES ($1, $2, $3, 'Open')`,
-          [responsibleId, kpiId, week]
-        );
-
-        console.log(`🔴 Corrective action created for KPI ${kpiId}, Week ${week}`);
-      }
     }
 
     return { targetUpdated: false };
 
   } catch (error) {
-    console.error(`Error checking corrective actions:`, error.message);
+    console.error('âŒ checkAndTriggerCorrectiveActions error:', error.message);
     return { targetUpdated: false, error: error.message };
   }
 };
-// ========== CORRECTIVE ACTION SYSTEM - END ========== 
 
-// ---- AI helper: generate suggestions for one KPI ----   
-const generateCASuggestions = async (kpi) => {
+// ============================================================
+// upsertCorrectiveAction â€” saves root_cause, implemented_solution,
+// evidence into corrective_actions table for a given kpi/week
+// ============================================================
+const upsertCorrectiveAction = async (
+  responsibleId,
+  kpiId,
+  week,
+  { correctiveActionId, rootCause, implementedSolution, dueDate, responsibleName, status }
+) => {
   try {
-    const OpenAI = require("openai");
-    const openai = new OpenAI({ apiKey: process.env.SECRET_KEY });
+    const normalizedPayload = {
+      rootCause: normalizeText(rootCause),
+      implementedSolution: normalizeText(implementedSolution),
+      dueDate: normalizeText(dueDate),
+      responsibleName: normalizeText(responsibleName),
+      status: normalizeCorrectiveActionStatus(status)
+    };
+    let resolvedStatus = normalizedPayload.status || "Open";
 
-    const currentVal = parseFloat(kpi.value || 0);
-    const targetVal = parseFloat(kpi.target_value || 0);
-    const gap = targetVal > 0 ? (targetVal - currentVal).toFixed(2) : "N/A";
-    const pctGap = targetVal > 0
-      ? (((targetVal - currentVal) / targetVal) * 100).toFixed(1)
-      : "N/A";
+    if (normalizeText(correctiveActionId) && !normalizedPayload.status) {
+      const existingStatusRes = await pool.query(
+        `SELECT status
+         FROM public.corrective_actions
+         WHERE corrective_action_id = $1
+         LIMIT 1`,
+        [correctiveActionId]
+      );
+      resolvedStatus = normalizeText(existingStatusRes.rows[0]?.status) || "Open";
+    }
 
-    const prompt = `You are an industrial manufacturing and continuous-improvement expert.
+    if (normalizeText(correctiveActionId)) {
+      const result = await pool.query(
+        `UPDATE public.corrective_actions
+     SET root_cause = $2::text,
+       implemented_solution = $3::text,
+       due_date = $4::date,
+       responsible = $5::text,
+       status = $6::text,
+       updated_date = NOW()
+      WHERE corrective_action_id = $1
+       RETURNING corrective_action_id`,
+        [
+          correctiveActionId,
+          normalizedPayload.rootCause,
+          normalizedPayload.implementedSolution,
+          normalizedPayload.dueDate,
+          normalizedPayload.responsibleName,
+          resolvedStatus
+        ]
+      );
 
-A KPI is BELOW its target. Give exactly 2 distinct corrective action plans.
-Each plan must have:
-1. root_cause  – likely reason the KPI is below target (1-2 sentences)
-2. immediate_action – what to do right now, within 1 week (1-2 sentences)
-3. evidence – how to prove the action is working (1-2 sentences)
+      if (result.rowCount > 0) {
+        return true;
+      }
+    }
 
-The 2 plans should represent DIFFERENT root-cause hypotheses so the responsible can pick the most relevant one.
+    await pool.query(
+      `INSERT INTO public.corrective_actions
+   (
+     responsible_id, kpi_id, week,
+     root_cause, implemented_solution,
+     due_date, responsible, status
+   )
+   VALUES (
+     $1,$2,$3,$4::text,$5::text,$6::date,$7::text,$8::text
+   )`,
+      [
+        responsibleId,
+        kpiId,
+        week,
+        normalizedPayload.rootCause,
+        normalizedPayload.implementedSolution,
+        normalizedPayload.dueDate,
+        normalizedPayload.responsibleName,
+        resolvedStatus
+      ]
+    );
 
-KPI Details:
-- Indicator: ${kpi.indicator_title}${kpi.indicator_sub_title ? ` — ${kpi.indicator_sub_title}` : ""}
-- Unit: ${kpi.unit || "N/A"}
-- Current Value: ${currentVal} ${kpi.unit || ""}
-- Target Value: ${targetVal} ${kpi.unit || ""}
-- Gap: ${gap} ${kpi.unit || ""} (${pctGap}% below target)
-
-Rules:
-- Be specific to this KPI context, not generic
-- Return ONLY valid JSON, no markdown, no extra text
-
-Format:
-{
-  "suggestion_1": {
-    "root_cause": "...",
-    "immediate_action": "...",
-    "evidence": "..."
-  },
-  "suggestion_2": {
-    "root_cause": "...",
-    "immediate_action": "...",
-    "evidence": "..."
-  }
-}`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 600,
-    });
-
-    const raw = completion.choices[0].message.content.trim()
-      .replace(/```json|```/g, "").trim();
-
-    const parsed = JSON.parse(raw);
-
-    return [
-      {
-        root_cause: parsed.suggestion_1?.root_cause || "",
-        immediate_action: parsed.suggestion_1?.immediate_action || "",
-        evidence: parsed.suggestion_1?.evidence || "",
-      },
-      {
-        root_cause: parsed.suggestion_2?.root_cause || "",
-        immediate_action: parsed.suggestion_2?.immediate_action || "",
-        evidence: parsed.suggestion_2?.evidence || "",
-      },
-    ];
+    return true;
   } catch (err) {
-    console.error("AI suggestion error for KPI:", kpi.indicator_title, err.message);
-    return null;
+    console.error("upsertCorrectiveAction error:", err.message);
+    return false;
   }
 };
+// ============================================================
+// AI SUGGESTION HELPER â€” generates 2 CA suggestions for a KPI
+// ============================================================
 
-app.get("/generate-ca-suggestion", async (req, res) => {
+app.post("/kpi-ai-assistant", async (req, res) => {
   try {
-    const { kpi_id, responsible_id, week } = req.query;
+    const {
+      responsible_id,
+      week,
+      selected_kpi_id,
+      message,
+      kpis,
+      conversation_history
+    } = req.body || {};
 
-    const kpiRes = await pool.query(
-      `SELECT ca.corrective_action_id, k.kpi_id, k.indicator_title, k.indicator_sub_title,
-              k.unit, k.target_value, kv.value
-       FROM public."Kpi" k
-       JOIN public.corrective_actions ca ON ca.kpi_id = k.kpi_id
+    const cleanMessage = String(message || "").trim();
+    if (!cleanMessage) {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    let responsible = null;
+    if (responsible_id) {
+      const responsibleRes = await pool.query(
+        `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+                p.name AS plant_name, d.name AS department_name
+         FROM public."Responsible" r
+         JOIN public."Plant" p ON r.plant_id = p.plant_id
+         JOIN public."Department" d ON r.department_id = d.department_id
+         WHERE r.responsible_id = $1`,
+        [responsible_id]
+      );
+      responsible = responsibleRes.rows[0] || null;
+    }
+
+    const reply = await generateKpiAssistantReply({
+      responsible,
+      week,
+      selectedKpiId: selected_kpi_id,
+      kpis: Array.isArray(kpis) ? kpis : [],
+      message: cleanMessage,
+      conversationHistory: Array.isArray(conversation_history) ? conversation_history : []
+    });
+
+    res.json({ reply });
+  } catch (err) {
+    console.error("KPI AI assistant error:", err.message);
+    res.status(500).json({ error: err.message || "Could not generate AI response" });
+  }
+});
+
+// ========== CORRECTIVE ACTION ROUTES ==========
+app.get("/corrective-actions-list", async (req, res) => {
+  try {
+    const { responsible_id } = req.query;
+
+    if (!responsible_id) {
+      return res.status(400).send(`<p style="color:red;">Missing responsible_id</p>`);
+    }
+
+    const responsibleRes = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email,
+              p.name AS plant_name,
+              d.name AS department_name
+       FROM public."Responsible" r
+       JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`,
+      [responsible_id]
+    );
+
+    const responsible = responsibleRes.rows[0];
+    if (!responsible) {
+      return res.status(404).send(`<p style="color:red;">Responsible not found</p>`);
+    }
+
+    const actionsRes = await pool.query(
+      `SELECT
+         ca.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY ca.kpi_id, ca.week
+           ORDER BY COALESCE(ca.updated_date, ca.created_date) ASC, ca.corrective_action_id ASC
+         ) AS action_number,
+         COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+         COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+         COALESCE(rk.unit, k.unit) AS unit,
+         kv.value,
+         ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
+         ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
+         ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit
+       FROM public.corrective_actions ca
+       JOIN public."Kpi" k
+         ON ca.kpi_id = k.kpi_id
        LEFT JOIN public.kpi_values kv
-         ON kv.kpi_id = k.kpi_id
-         AND kv.responsible_id = $2
-         AND kv.week = $3
+         ON kv.kpi_id = ca.kpi_id
+        AND kv.responsible_id = ca.responsible_id
+        AND kv.week = ca.week
+       LEFT JOIN public.responsible_kpis rk
+         ON rk.responsible_kpi_id = kv.responsible_kpi_id
+       WHERE ca.responsible_id = $1
+        ORDER BY
+          COALESCE(ca.updated_date, ca.created_date) DESC NULLS LAST,
+          ca.corrective_action_id DESC`,
+      [responsible_id]
+    );
+
+    const actions = actionsRes.rows;
+    const latestSubmittedActionId = actions[0]?.corrective_action_id ?? null;
+
+    const formatDate = (dateValue) => {
+      if (!dateValue) return "â€”";
+      const d = new Date(dateValue);
+      if (isNaN(d.getTime())) return "â€”";
+      return d.toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric"
+      });
+    };
+
+    const escapeHtml = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+
+    const cardsHtml = actions.length === 0
+      ? `
+        <div class="empty-state">
+          <div class="empty-icon">ðŸ“­</div>
+          <h3>No corrective actions found</h3>
+          <p>This responsible does not have corrective actions yet.</p>
+        </div>
+      `
+      : actions.map((a) => {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const dueDate = a.due_date ? new Date(a.due_date) : null;
+        const isOverdue =
+          dueDate &&
+          !isNaN(dueDate.getTime()) &&
+          dueDate < today &&
+          !["Closed", "Completed"].includes(a.status);
+
+        const currentVal = a.value !== null && a.value !== undefined && a.value !== ""
+          ? parseFloat(a.value)
+          : null;
+
+        const targetVal = a.target !== null && a.target !== undefined && a.target !== ""
+          ? parseFloat(a.target)
+          : null;
+
+        const gap =
+          currentVal !== null && !isNaN(currentVal) &&
+            targetVal !== null && !isNaN(targetVal)
+            ? (targetVal - currentVal).toFixed(2)
+            : "â€”";
+
+        const safeStatusClass = String(a.status || "open")
+          .toLowerCase()
+          .replace(/\s+/g, "-");
+
+        const isLatestSubmitted =
+          latestSubmittedActionId !== null &&
+          String(a.corrective_action_id) === String(latestSubmittedActionId);
+
+        return `
+            <div class="ca-card ${isOverdue ? "overdue" : ""} ${isLatestSubmitted ? "latest-submitted" : ""}">
+              <div class="ca-card-top">
+                <div>
+                  <div class="ca-kpi-title">${escapeHtml(a.indicator_title)}</div>
+                  <div class="ca-kpi-subtitle-row">
+                    <div class="ca-kpi-subtitle">Action ${escapeHtml(a.action_number || 1)}</div>
+                    ${isLatestSubmitted ? `<span class="latest-submitted-badge">Latest Submitted</span>` : ""}
+                  </div>
+                  ${a.indicator_sub_title
+            ? `<div class="ca-kpi-subtitle">${escapeHtml(a.indicator_sub_title)}</div>`
+            : ""}
+                </div>
+                <span class="status-pill status-${safeStatusClass}">
+                  ${escapeHtml(a.status || "Open")}
+                </span>
+              </div>
+
+              <div class="ca-stats">
+                <div class="stat-box">
+                  <span class="stat-label">Current</span>
+                  <strong>${a.value ?? "â€”"} ${escapeHtml(a.unit || "")}</strong>
+                </div>
+                <div class="stat-box">
+                  <span class="stat-label">Target</span>
+                  <strong>${a.target ?? "â€”"} ${escapeHtml(a.unit || "")}</strong>
+                </div>
+                <div class="stat-box">
+                  <span class="stat-label">Gap</span>
+                  <strong>${gap} ${escapeHtml(a.unit || "")}</strong>
+                </div>
+              </div>
+
+              <div class="ca-meta-grid">
+                <div class="meta-item">
+                  <span>Week</span>
+                  <strong>${escapeHtml(a.week)}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Responsible</span>
+                  <strong>${escapeHtml(a.responsible || responsible.name || "â€”")}</strong>
+                </div>
+                <div class="meta-item ${isOverdue ? "deadline-overdue" : ""}">
+                  <span>Due Date</span>
+                  <strong>${formatDate(a.due_date)}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Created</span>
+                  <strong>${formatDate(a.created_date)}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Updated</span>
+                  <strong>${formatDate(a.updated_date)}</strong>
+                </div>
+              </div>
+
+              <div class="ca-footer">
+                <div class="deadline-badge ${isOverdue ? "deadline-badge-overdue" : ""}">
+                  ${a.due_date
+            ? (isOverdue ? "â›” Overdue" : "ðŸ“… Due date set")
+            : "ðŸ•’ No due date"}
+                </div>
+
+                <a class="view-btn"
+                   href="/corrective-action-form?responsible_id=${encodeURIComponent(responsible_id)}&kpi_id=${encodeURIComponent(a.kpi_id)}&week=${encodeURIComponent(a.week)}&corrective_action_id=${encodeURIComponent(a.corrective_action_id)}">
+                  ${a.status === "Open" ? "Complete Action" : "View Corrective Action"}
+                </a>
+              </div>
+            </div>
+          `;
+      }).join("");
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <title>Corrective Actions</title>
+        <style>
+          *{box-sizing:border-box}
+          body{
+            margin:0;
+            padding:24px;
+            font-family:'Segoe UI',system-ui,sans-serif;
+            background:linear-gradient(135deg,#eef2ff 0%,#f8fafc 100%);
+            color:#1f2937;
+          }
+          .container{
+            max-width:1200px;
+            margin:0 auto;
+          }
+          .header{
+            background:linear-gradient(135deg,#0f172a,#1d4ed8);
+            color:white;
+            border-radius:18px;
+            padding:28px;
+            box-shadow:0 10px 30px rgba(0,0,0,0.12);
+            margin-bottom:24px;
+          }
+          .header h1{
+            margin:0 0 10px;
+            font-size:30px;
+          }
+          .header-sub{
+            display:flex;
+            flex-wrap:wrap;
+            gap:10px 18px;
+            opacity:.95;
+            font-size:14px;
+          }
+          .cards-grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+            gap:20px;
+          }
+          .ca-card{
+            background:white;
+            border-radius:18px;
+            padding:22px;
+            border:1px solid #e5e7eb;
+            box-shadow:0 8px 24px rgba(15,23,42,0.06);
+            transition:transform .2s ease, box-shadow .2s ease;
+          }
+          .ca-card:hover{
+            transform:translateY(-3px);
+            box-shadow:0 14px 34px rgba(15,23,42,0.10);
+          }
+          .ca-card.overdue{
+            border:1px solid #ef4444;
+            box-shadow:0 10px 28px rgba(239,68,68,0.12);
+          }
+          .ca-card.latest-submitted{
+            border:1px solid #93c5fd;
+            box-shadow:0 12px 30px rgba(37,99,235,0.14);
+            grid-column:1 / -1;
+          }
+          .ca-card-top{
+            display:flex;
+            justify-content:space-between;
+            gap:14px;
+            align-items:flex-start;
+            margin-bottom:16px;
+          }
+          .ca-kpi-title{
+            font-size:18px;
+            font-weight:800;
+            color:#111827;
+            line-height:1.3;
+          }
+          .ca-kpi-subtitle{
+            margin-top:6px;
+            font-size:13px;
+            color:#6b7280;
+          }
+          .ca-kpi-subtitle-row{
+            display:flex;
+            align-items:center;
+            gap:10px;
+            flex-wrap:wrap;
+            margin-top:6px;
+          }
+          .ca-kpi-subtitle-row .ca-kpi-subtitle{
+            margin-top:0;
+          }
+          .latest-submitted-badge{
+            display:inline-flex;
+            align-items:center;
+            padding:5px 10px;
+            border-radius:999px;
+            background:#dbeafe;
+            color:#1d4ed8;
+            font-size:11px;
+            font-weight:800;
+            letter-spacing:.3px;
+            text-transform:uppercase;
+          }
+          .status-pill{
+            display:inline-flex;
+            align-items:center;
+            padding:8px 12px;
+            border-radius:999px;
+            font-size:12px;
+            font-weight:700;
+            white-space:nowrap;
+            border:1px solid transparent;
+          }
+          .status-open{
+            background:#fef2f2;
+            color:#b91c1c;
+            border-color:#fecaca;
+          }
+          .status-waiting-for-validation{
+            background:#fff7ed;
+            color:#c2410c;
+            border-color:#fed7aa;
+          }
+          .status-completed,.status-closed{
+            background:#ecfdf5;
+            color:#047857;
+            border-color:#a7f3d0;
+          }
+          .ca-stats{
+            display:grid;
+            grid-template-columns:repeat(3,1fr);
+            gap:12px;
+            margin-bottom:16px;
+          }
+          .stat-box{
+            background:#f8fafc;
+            border:1px solid #e5e7eb;
+            border-radius:12px;
+            padding:12px;
+            text-align:center;
+          }
+          .stat-label{
+            display:block;
+            font-size:11px;
+            text-transform:uppercase;
+            letter-spacing:.6px;
+            color:#64748b;
+            margin-bottom:6px;
+            font-weight:700;
+          }
+          .stat-box strong{
+            font-size:16px;
+            color:#111827;
+          }
+          .ca-meta-grid{
+            display:grid;
+            grid-template-columns:repeat(2,1fr);
+            gap:12px;
+            margin-bottom:18px;
+          }
+          .meta-item{
+            background:#f9fafb;
+            border:1px solid #e5e7eb;
+            border-radius:12px;
+            padding:12px;
+          }
+          .meta-item span{
+            display:block;
+            font-size:11px;
+            text-transform:uppercase;
+            letter-spacing:.5px;
+            color:#6b7280;
+            margin-bottom:5px;
+            font-weight:700;
+          }
+          .meta-item strong{
+            font-size:14px;
+            color:#111827;
+          }
+          .deadline-overdue{
+            background:#fef2f2;
+            border-color:#fecaca;
+          }
+          .deadline-overdue strong{
+            color:#b91c1c;
+          }
+          .ca-footer{
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:12px;
+            flex-wrap:wrap;
+          }
+          .deadline-badge{
+            display:inline-flex;
+            align-items:center;
+            padding:8px 12px;
+            border-radius:999px;
+            background:#eff6ff;
+            color:#1d4ed8;
+            font-size:12px;
+            font-weight:700;
+          }
+          .deadline-badge-overdue{
+            background:#fef2f2;
+            color:#b91c1c;
+          }
+          .view-btn{
+            display:inline-block;
+            text-decoration:none;
+            background:linear-gradient(135deg,#2563eb,#1d4ed8);
+            color:white;
+            font-weight:700;
+            padding:11px 16px;
+            border-radius:12px;
+            box-shadow:0 8px 20px rgba(37,99,235,0.22);
+          }
+          .view-btn:hover{
+            opacity:.95;
+          }
+          .empty-state{
+            background:white;
+            border-radius:18px;
+            padding:60px 24px;
+            text-align:center;
+            border:1px dashed #cbd5e1;
+          }
+          .empty-icon{
+            font-size:48px;
+            margin-bottom:10px;
+          }
+          .back-row{
+            margin-top:22px;
+            text-align:center;
+          }
+          .back-link{
+            display:inline-block;
+            text-decoration:none;
+            color:#1d4ed8;
+            font-weight:700;
+          }
+          @media(max-width:700px){
+            body{padding:16px}
+            .ca-stats,.ca-meta-grid{grid-template-columns:1fr}
+            .ca-card-top,.ca-footer{flex-direction:column;align-items:flex-start}
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>ðŸ“‹ Corrective Actions</h1>
+            <div class="header-sub">
+              <div><strong>Responsible:</strong> ${escapeHtml(responsible.name)}</div>
+              <div><strong>Plant:</strong> ${escapeHtml(responsible.plant_name)}</div>
+              <div><strong>Department:</strong> ${escapeHtml(responsible.department_name)}</div>
+            </div>
+          </div>
+
+          <div class="cards-grid">
+            ${cardsHtml}
+          </div>
+
+          <div class="back-row">
+            <a class="back-link" href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}">
+              â† Back to Dashboard
+            </a>
+          </div>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Error loading corrective actions list:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+app.get("/corrective-action-form", async (req, res) => {
+  try {
+    const { responsible_id, kpi_id, week, corrective_action_id, new_action } = req.query;
+
+    if (!responsible_id || !kpi_id || !week) {
+      return res.status(400).send("Missing responsible_id, kpi_id, or week");
+    }
+
+    const resResp = await pool.query(
+      `SELECT r.*, p.name AS plant_name, d.name AS department_name
+       FROM public."Responsible" r
+       JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`,
+      [responsible_id]
+    );
+
+    const responsible = resResp.rows[0];
+    if (!responsible) {
+      return res.status(404).send("Responsible not found");
+    }
+
+    const kpiResp = await pool.query(
+      `SELECT
+         k.kpi_id,
+         COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+         COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+         COALESCE(rk.unit, k.unit) AS unit,
+         ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
+         ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
+         ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit,
+         kv.value
+       FROM public."Kpi" k
+       LEFT JOIN public.kpi_values kv
+         ON k.kpi_id = kv.kpi_id
+        AND kv.responsible_id = $2
+        AND kv.week = $3
+       LEFT JOIN public.responsible_kpis rk
+         ON rk.responsible_kpi_id = kv.responsible_kpi_id
        WHERE k.kpi_id = $1
-         AND ca.responsible_id = $2
-         AND ca.week = $3
-         AND ca.status = 'Open'
        LIMIT 1`,
       [kpi_id, responsible_id, week]
     );
 
-    if (!kpiRes.rows.length) {
-      return res.status(404).json({ error: "KPI not found" });
+    const kpi = kpiResp.rows[0];
+    if (!kpi) {
+      return res.status(404).send("KPI not found");
     }
 
-    const kpi = kpiRes.rows[0];
-    const suggestions = await generateCASuggestions(kpi);
-
-    if (!suggestions || suggestions.length === 0) {
-      return res.status(500).json({ error: "Could not generate suggestion" });
+    let ed = {};
+    if (corrective_action_id) {
+      const existingCARes = await pool.query(
+        `SELECT *
+         FROM public.corrective_actions
+         WHERE corrective_action_id = $1
+           AND responsible_id = $2
+           AND kpi_id = $3
+           AND week = $4
+         LIMIT 1`,
+        [corrective_action_id, responsible_id, kpi_id, week]
+      );
+      ed = existingCARes.rows[0] || {};
+    } else if (String(new_action || "") !== "1") {
+      const existingCARes = await pool.query(
+        `SELECT *
+         FROM public.corrective_actions
+         WHERE responsible_id = $1
+           AND kpi_id = $2
+           AND week = $3
+         ORDER BY COALESCE(updated_date, created_date) DESC, corrective_action_id DESC
+         LIMIT 1`,
+        [responsible_id, kpi_id, week]
+      );
+      ed = existingCARes.rows[0] || {};
     }
 
-    // Return only ONE suggestion (randomly pick one to give variety on re-generate)
-    const suggestion = suggestions[Math.floor(Math.random() * suggestions.length)];
-    res.json({ suggestion });
+    const escapeHtml = (value) =>
+      String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+
+    const defaultDueDate = (() => {
+      if (ed.due_date) return formatInputDate(ed.due_date);
+      const d = new Date();
+      d.setDate(d.getDate() + 7);
+      return d.toISOString().split("T")[0];
+    })();
+
+    const defaultResponsibleName = escapeHtml(ed.responsible || responsible.name || "");
+    const actionTitle = ed.corrective_action_id
+      ? `Corrective Action #${escapeHtml(ed.corrective_action_id)}`
+      : "New Corrective Action";
+    const submitLabel = ed.corrective_action_id
+      ? "Update Corrective Action"
+      : "Create Corrective Action";
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <title>Corrective Action</title>
+        <style>
+          *{box-sizing:border-box}
+          body{
+            margin:0;
+            padding:24px;
+            font-family:'Segoe UI',system-ui,sans-serif;
+            background:linear-gradient(135deg,#eef2ff 0%,#f8fafc 100%);
+            color:#1f2937;
+          }
+          .container{
+            max-width:900px;
+            margin:0 auto;
+            background:white;
+            border-radius:22px;
+            overflow:hidden;
+            box-shadow:0 20px 50px rgba(15,23,42,0.10);
+            border:1px solid #e5e7eb;
+          }
+          .header{
+            background:linear-gradient(135deg,#b91c1c,#ef4444);
+            color:white;
+            padding:30px;
+          }
+          .header h1{
+            margin:0 0 10px;
+            font-size:30px;
+          }
+          .header .sub{
+            display:flex;
+            flex-wrap:wrap;
+            gap:10px 18px;
+            font-size:14px;
+            opacity:.96;
+          }
+          .body{
+            padding:30px;
+          }
+          .info-grid{
+            display:grid;
+            grid-template-columns:repeat(2,1fr);
+            gap:14px;
+            margin-bottom:24px;
+          }
+          .info-box{
+            background:#f8fafc;
+            border:1px solid #e5e7eb;
+            border-radius:14px;
+            padding:14px 16px;
+          }
+          .info-box span{
+            display:block;
+            font-size:11px;
+            text-transform:uppercase;
+            letter-spacing:.6px;
+            color:#64748b;
+            font-weight:700;
+            margin-bottom:6px;
+          }
+          .info-box strong{
+            color:#111827;
+            font-size:15px;
+          }
+          .section-title{
+            margin:0 0 18px;
+            font-size:20px;
+            color:#b91c1c;
+          }
+          .form-group{
+            margin-bottom:18px;
+          }
+          label{
+            display:block;
+            font-weight:700;
+            margin-bottom:8px;
+            color:#374151;
+            font-size:14px;
+          }
+          textarea,input[type="date"],input[type="text"]{
+            width:100%;
+            padding:14px 15px;
+            border:1px solid #d1d5db;
+            border-radius:12px;
+            font-size:14px;
+            font-family:inherit;
+            background:#fff;
+            transition:border-color .2s, box-shadow .2s;
+          }
+          textarea{
+            min-height:120px;
+            resize:vertical;
+          }
+          textarea:focus,input[type="date"]:focus,input[type="text"]:focus{
+            outline:none;
+            border-color:#2563eb;
+            box-shadow:0 0 0 4px rgba(37,99,235,0.10);
+          }
+          .dates-grid{
+            display:grid;
+            grid-template-columns:repeat(2,1fr);
+            gap:14px;
+          }
+          .status-line{
+            margin-bottom:18px;
+          }
+          .status-badge{
+            display:inline-flex;
+            align-items:center;
+            padding:8px 12px;
+            border-radius:999px;
+            font-size:12px;
+            font-weight:800;
+            border:1px solid transparent;
+          }
+          .status-open{
+            background:#fef2f2;
+            color:#b91c1c;
+            border-color:#fecaca;
+          }
+          .status-waiting-for-validation{
+            background:#fff7ed;
+            color:#c2410c;
+            border-color:#fed7aa;
+          }
+          .status-completed,.status-closed{
+            background:#ecfdf5;
+            color:#047857;
+            border-color:#a7f3d0;
+          }
+          .actions{
+            display:flex;
+            gap:12px;
+            margin-top:26px;
+            flex-wrap:wrap;
+          }
+          .submit-btn{
+            background:linear-gradient(135deg,#b91c1c,#ef4444);
+            color:white;
+            border:none;
+            padding:14px 28px;
+            border-radius:12px;
+            font-size:15px;
+            font-weight:800;
+            cursor:pointer;
+            box-shadow:0 10px 24px rgba(239,68,68,0.22);
+          }
+          .back-btn{
+            display:inline-block;
+            padding:14px 22px;
+            border-radius:12px;
+            text-decoration:none;
+            font-weight:800;
+            color:#1d4ed8;
+            background:#eff6ff;
+          }
+          .hint{
+            margin-top:6px;
+            font-size:12px;
+            color:#6b7280;
+          }
+          @media(max-width:760px){
+            body{padding:16px}
+            .info-grid,.dates-grid{grid-template-columns:1fr}
+            .body{padding:20px}
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>${actionTitle}</h1>
+            <div class="sub">
+              <div><strong>Week:</strong> ${escapeHtml(week)}</div>
+              <div><strong>Responsible:</strong> ${escapeHtml(responsible.name)}</div>
+              <div><strong>Plant:</strong> ${escapeHtml(responsible.plant_name)}</div>
+              <div><strong>Department:</strong> ${escapeHtml(responsible.department_name)}</div>
+            </div>
+          </div>
+
+          <div class="body">
+            <div class="info-grid">
+              <div class="info-box">
+                <span>KPI</span>
+                <strong>${escapeHtml(kpi.indicator_title)}</strong>
+              </div>
+              <div class="info-box">
+                <span>Subtitle</span>
+                <strong>${escapeHtml(kpi.indicator_sub_title || "â€”")}</strong>
+              </div>
+              <div class="info-box">
+                <span>Current Value</span>
+                <strong>${kpi.value ?? "â€”"} ${escapeHtml(kpi.unit || "")}</strong>
+              </div>
+              <div class="info-box">
+                <span>Target</span>
+                <strong>${kpi.target ?? "â€”"} ${escapeHtml(kpi.unit || "")}</strong>
+              </div>
+              <div class="info-box">
+                <span>Low Limit</span>
+                <strong>${kpi.low_limit ?? "â€”"} ${escapeHtml(kpi.unit || "")}</strong>
+              </div>
+              <div class="info-box">
+                <span>High Limit</span>
+                <strong>${kpi.high_limit ?? "â€”"} ${escapeHtml(kpi.unit || "")}</strong>
+              </div>
+            </div>
+
+            <div class="status-line">
+              <span class="status-badge ${String(ed.status || "Open").toLowerCase().replace(/\s+/g, "-").includes("waiting-for-validation") ? "status-waiting-for-validation" : String(ed.status || "Open").toLowerCase().replace(/\s+/g, "-").includes("completed") || String(ed.status || "Open").toLowerCase().replace(/\s+/g, "-").includes("closed") ? "status-completed" : "status-open"}">
+                Status: ${escapeHtml(ed.status || "Open")}
+              </span>
+            </div>
+
+            <h2 class="section-title">Action Details</h2>
+
+            <form action="/submit-corrective-action" method="POST">
+              <input type="hidden" name="responsible_id" value="${escapeHtml(responsible_id)}">
+              <input type="hidden" name="kpi_id" value="${escapeHtml(kpi_id)}">
+              <input type="hidden" name="week" value="${escapeHtml(week)}">
+              ${ed.corrective_action_id
+        ? `<input type="hidden" name="corrective_action_id" value="${escapeHtml(ed.corrective_action_id)}">`
+        : ""}
+              <div class="dates-grid">
+                <div class="form-group">
+                  <label for="due_date">ðŸ“… Due Date *</label>
+                  <input
+                    type="date"
+                    id="due_date"
+                    name="due_date"
+                    required
+                    value="${defaultDueDate}"
+                  >
+                  <div class="hint">Set the final due date for this corrective action.</div>
+                </div>
+
+                <div class="form-group">
+                  <label for="responsible">ðŸ‘¤ Responsible *</label>
+                  <input
+                    type="text"
+                    id="responsible"
+                    name="responsible"
+                    required
+                    value="${defaultResponsibleName}"
+                  >
+                </div>
+              </div>
+
+<div class="form-group">
+  <label for="root_cause">ðŸ” Root Cause Analysis *</label>
+  <textarea id="root_cause" name="root_cause" required>${escapeHtml(ed.root_cause || "")}</textarea>
+</div>
+
+<div class="form-group">
+  <label for="implemented_solution">ðŸ”§ Implemented Solution *</label>
+  <textarea id="implemented_solution" name="implemented_solution" required>${escapeHtml(ed.implemented_solution || "")}</textarea>
+</div>
+
+
+              <div class="actions">
+                <button type="submit" class="submit-btn">${submitLabel}</button>
+                <a class="back-btn"
+                   href="/corrective-action-form?responsible_id=${encodeURIComponent(responsible_id)}&kpi_id=${encodeURIComponent(kpi_id)}&week=${encodeURIComponent(week)}&new_action=1">
+                  Add New Action
+                </a>
+                <a class="back-btn"
+                   href="/corrective-actions-list?responsible_id=${encodeURIComponent(responsible_id)}">
+                  Back to Corrective Actions
+                </a>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <script>
+          const responsibleInput = document.getElementById('responsible');
+          if (responsibleInput) {
+            responsibleInput.addEventListener('blur', () => {
+              responsibleInput.value = responsibleInput.value.trim();
+            });
+          }
+        </script>
+      </body>
+      </html>
+    `);
   } catch (err) {
-    console.error("Error generating CA suggestion:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("Error loading corrective action form:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
 
+app.post("/submit-corrective-action", async (req, res) => {
+  try {
+    const {
+      responsible_id,
+      kpi_id,
+      week,
+      corrective_action_id,
+      root_cause,
+      implemented_solution,
+      due_date,
+      responsible
+    } = req.body || {};
 
+    if (!responsible_id || !kpi_id || !week) {
+      return res.status(400).send("Missing responsible_id, kpi_id, or week");
+    }
 
+    const saved = await upsertCorrectiveAction(responsible_id, kpi_id, week, {
+      correctiveActionId: normalizeText(corrective_action_id),
+      rootCause: normalizeText(root_cause),
+      implementedSolution: normalizeText(implemented_solution),
+      dueDate: due_date || null,
+      responsibleName: normalizeText(responsible),
+      status: normalizeCorrectiveActionStatus(req.body?.status)
+    });
 
+    if (!saved) {
+      return res.status(500).send("Could not save corrective action");
+    }
 
-// ========== BULK CORRECTIVE ACTIONS FORM ==========
+    res.redirect(`/corrective-actions-list?responsible_id=${encodeURIComponent(responsible_id)}`);
+  } catch (err) {
+    console.error("Error submitting corrective action:", err);
+    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
+  }
+});
+
+app.post("/api/corrective-actions/:correctiveActionId/status", async (req, res) => {
+  try {
+    const correctiveActionId = normalizeText(req.params.correctiveActionId);
+    const nextStatus = normalizeCorrectiveActionStatus(req.body?.status);
+
+    if (!correctiveActionId) {
+      return res.status(400).json({ error: "Missing corrective action id" });
+    }
+
+    if (!nextStatus) {
+      return res.status(400).json({ error: "Invalid corrective action status" });
+    }
+
+    const result = await pool.query(
+      `UPDATE public.corrective_actions
+       SET status = $2::text,
+           updated_date = NOW()
+       WHERE corrective_action_id = $1
+       RETURNING corrective_action_id, status`,
+      [correctiveActionId, nextStatus]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Corrective action not found" });
+    }
+
+    res.json({
+      corrective_action_id: result.rows[0].corrective_action_id,
+      status: result.rows[0].status
+    });
+  } catch (err) {
+    console.error("Error updating corrective action status:", err);
+    res.status(500).json({ error: "Failed to update corrective action status" });
+  }
+});
+
 app.get("/corrective-actions-bulk", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
@@ -858,51 +6957,58 @@ app.get("/corrective-actions-bulk", async (req, res) => {
     if (!responsible) return res.status(404).send("Responsible not found");
 
     const actionsRes = await pool.query(
-      `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
+      `SELECT ca.*, k.kpi_id,
+              COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+              COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+              COALESCE(rk.unit, k.unit) AS unit,
+              ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
               kv.value
        FROM public.corrective_actions ca
        JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
        LEFT JOIN public.kpi_values kv
          ON ca.kpi_id = kv.kpi_id
-         AND kv.responsible_id = ca.responsible_id
-         AND kv.week = ca.week
-       WHERE ca.responsible_id = $1
-         AND ca.week = $2
-         AND ca.status = 'Open'
-       ORDER BY k.indicator_title`,
+        AND kv.responsible_id = ca.responsible_id
+        AND kv.week = ca.week
+       LEFT JOIN public.responsible_kpis rk
+         ON rk.responsible_kpi_id = kv.responsible_kpi_id
+       WHERE ca.responsible_id = $1 AND ca.week = $2 AND ca.status = 'Open'
+       ORDER BY COALESCE(rk.indicator_title, k.indicator_title)`,
       [responsible_id, week]
     );
-
     const actions = actionsRes.rows;
 
     if (actions.length === 0) {
       return res.send(`
         <div style="text-align:center;padding:60px;font-family:'Segoe UI',sans-serif;">
-          <h2 style="color:#4caf50;">✅ No Open Corrective Actions</h2>
+          <h2 style="color:#4caf50;">No Open Corrective Actions</h2>
           <p>All corrective actions for week ${week} have been completed.</p>
           <a href="/dashboard?responsible_id=${responsible_id}"
              style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;
                     text-decoration:none;border-radius:6px;font-weight:bold;">
             Go to Dashboard
           </a>
-        </div>
-      `);
+        </div>`);
     }
 
-    // ---- Build KPI sections WITHOUT pre-loading AI ----
     const kpiSectionsHtml = actions.map((action, index) => {
-      const gap = action.target_value
-        ? (parseFloat(action.target_value) - parseFloat(action.value || 0)).toFixed(2)
+      const gap = action.target
+        ? (parseFloat(action.target) - parseFloat(action.value || 0)).toFixed(2)
         : null;
-      const pctGap = action.target_value && action.value
-        ? (((parseFloat(action.target_value) - parseFloat(action.value)) / parseFloat(action.target_value)) * 100).toFixed(1)
+      const pctGap = action.target && action.value
+        ? (((parseFloat(action.target) - parseFloat(action.value)) / parseFloat(action.target)) * 100).toFixed(1)
         : null;
+      const defaultDueDate = formatInputDate(action.due_date);
+      const defaultResponsibleName = action.responsible || responsible.name || "";
+      const safeResponsibleName = String(defaultResponsibleName)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
 
       return `
         <div class="kpi-section">
           <input type="hidden" name="corrective_action_ids[]" value="${action.corrective_action_id}">
 
-          <!-- KPI Header -->
           <div class="kpi-header">
             <div class="kpi-number">${index + 1}</div>
             <div class="kpi-info">
@@ -911,7 +7017,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             </div>
           </div>
 
-          <!-- Performance Stats -->
           <div class="perf-stats">
             <div class="stat-box stat-current">
               <div class="stat-label">Current Value</div>
@@ -919,7 +7024,7 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             </div>
             <div class="stat-box stat-target">
               <div class="stat-label">Target</div>
-              <div class="stat-value">${action.target_value || 'N/A'} <span class="stat-unit">${action.unit || ''}</span></div>
+              <div class="stat-value">${action.target || 'N/A'} <span class="stat-unit">${action.unit || ''}</span></div>
             </div>
             <div class="stat-box stat-gap">
               <div class="stat-label">Gap</div>
@@ -928,57 +7033,50 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             </div>
           </div>
 
-          <!-- AI Suggestion Box (on-demand) -->
+          <!-- AI Box -->
           <div class="ai-box" id="ai-box-${action.corrective_action_id}">
             <div class="ai-box-header">
-              <span class="ai-icon">🤖</span>
+              <span class="ai-icon">&#129302;</span>
               <span class="ai-title">AI Corrective Action Suggestion</span>
-              <button
-                type="button"
-                class="generate-btn"
+              <button type="button" class="generate-btn"
                 id="gen-btn-${action.corrective_action_id}"
-                onclick="generateSuggestion('${action.corrective_action_id}', '${action.kpi_id}', '${responsible_id}', '${week}')"
-              >
-                <span class="gen-btn-icon">✨</span>
+                onclick="generateSuggestion('${action.corrective_action_id}','${action.kpi_id}','${responsible_id}','${week}')">
+                <span class="gen-btn-icon">&#10024;</span>
                 <span class="gen-btn-text">Generate Suggestion</span>
               </button>
             </div>
 
-            <!-- Suggestion content appears here -->
             <div class="suggestion-content" id="suggestion-${action.corrective_action_id}" style="display:none;">
               <div class="ai-suggestion-row">
                 <div class="ai-suggestion-card root-cause-card"
-                     onclick="applyToField('root_cause_${action.corrective_action_id}', this)">
+                     onclick="applyToField('root_cause_${action.corrective_action_id}',this)">
                   <div class="ai-card-label">
-                    <span class="ai-card-icon">🔍</span>Root Cause
-                    <span class="apply-hint">Click to apply ↓</span>
+                    <span class="ai-card-icon">&#128269;</span>Root Cause
+                    <span class="apply-hint">Click to apply &#8595;</span>
                   </div>
                   <div class="ai-card-text" id="rc-text-${action.corrective_action_id}"></div>
                 </div>
-
                 <div class="ai-suggestion-card action-card"
-                     onclick="applyToField('solution_${action.corrective_action_id}', this)">
+                     onclick="applyToField('solution_${action.corrective_action_id}',this)">
                   <div class="ai-card-label">
-                    <span class="ai-card-icon">⚡</span>Immediate Action
-                    <span class="apply-hint">Click to apply ↓</span>
+                    <span class="ai-card-icon">&#9889;</span>Immediate Action
+                    <span class="apply-hint">Click to apply &#8595;</span>
                   </div>
                   <div class="ai-card-text" id="ia-text-${action.corrective_action_id}"></div>
                 </div>
-
                 <div class="ai-suggestion-card evidence-card"
-                     onclick="applyToField('evidence_${action.corrective_action_id}', this)">
+                     onclick="applyToField('evidence_${action.corrective_action_id}',this)">
                   <div class="ai-card-label">
-                    <span class="ai-card-icon">📊</span>Evidence
-                    <span class="apply-hint">Click to apply ↓</span>
+                    <span class="ai-card-icon">&#128202;</span>Evidence
+                    <span class="apply-hint">Click to apply &#8595;</span>
                   </div>
                   <div class="ai-card-text" id="ev-text-${action.corrective_action_id}"></div>
                 </div>
               </div>
             </div>
 
-            <!-- Error state -->
             <div class="suggestion-error" id="error-${action.corrective_action_id}" style="display:none;">
-              <span>⚠️ Could not generate suggestion. Please try again or fill manually.</span>
+              <span>&#9888;&#65039; Could not generate suggestion. Please try again or fill manually.</span>
             </div>
           </div>
 
@@ -986,43 +7084,62 @@ app.get("/corrective-actions-bulk", async (req, res) => {
           <div class="form-fields">
             <div class="form-group">
               <label for="root_cause_${action.corrective_action_id}">
-                🔍 Root Cause <span class="required">*</span>
+                &#128269; Root Cause <span class="required">*</span>
               </label>
-              <textarea
-                name="root_cause_${action.corrective_action_id}"
-                id="root_cause_${action.corrective_action_id}"
-                required
-                placeholder="Click 'Generate Suggestion' above, or describe the root cause manually"
+              <textarea name="root_cause_${action.corrective_action_id}"
+                        id="root_cause_${action.corrective_action_id}" required
+                        placeholder="Click 'Generate Suggestion' above, or describe the root cause manually"
               >${action.root_cause || ''}</textarea>
             </div>
-
             <div class="form-group">
               <label for="solution_${action.corrective_action_id}">
-                ⚡ Implemented Solution <span class="required">*</span>
+                &#9889; Implemented Solution <span class="required">*</span>
               </label>
-              <textarea
-                name="solution_${action.corrective_action_id}"
-                id="solution_${action.corrective_action_id}"
-                required
-                placeholder="Click 'Generate Suggestion' above, or describe actions taken manually"
+              <textarea name="solution_${action.corrective_action_id}"
+                        id="solution_${action.corrective_action_id}" required
+                        placeholder="Click 'Generate Suggestion' above, or describe actions taken manually"
               >${action.implemented_solution || ''}</textarea>
             </div>
-
             <div class="form-group">
               <label for="evidence_${action.corrective_action_id}">
-                📊 Evidence <span class="required">*</span>
+                &#128202; Evidence <span class="required">*</span>
               </label>
-              <textarea
-                name="evidence_${action.corrective_action_id}"
-                id="evidence_${action.corrective_action_id}"
-                required
-                placeholder="What evidence shows improvement?"
+              <textarea name="evidence_${action.corrective_action_id}"
+                        id="evidence_${action.corrective_action_id}" required
+                        placeholder="What evidence shows improvement?"
               >${action.evidence || ''}</textarea>
               <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
             </div>
+
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="due_date_${action.corrective_action_id}">
+                  &#128197; Due Date <span class="required">*</span>
+                </label>
+                <input
+                  type="date"
+                  name="due_date_${action.corrective_action_id}"
+                  id="due_date_${action.corrective_action_id}"
+                  value="${defaultDueDate}"
+                  required
+                >
+              </div>
+
+              <div class="form-group">
+                <label for="responsible_${action.corrective_action_id}">
+                  &#128100; Responsible <span class="required">*</span>
+                </label>
+                <input
+                  type="text"
+                  name="responsible_${action.corrective_action_id}"
+                  id="responsible_${action.corrective_action_id}"
+                  value="${safeResponsibleName}"
+                  required
+                >
+              </div>
+            </div>
           </div>
-        </div>
-      `;
+        </div>`;
     }).join('');
 
     res.send(`
@@ -1030,269 +7147,132 @@ app.get("/corrective-actions-bulk", async (req, res) => {
       <html lang="en">
       <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Corrective Actions — Week ${week}</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <title>Corrective Actions â€” Week ${week}</title>
         <style>
-          *, *::before, *::after { box-sizing: border-box; }
-
-          body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            margin: 0;
-            padding: 24px 16px;
-            min-height: 100vh;
-            background: #f0f2f5;
-            background-image: url("https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600");
-            background-size: cover;
-            background-position: center;
-            background-attachment: fixed;
-          }
-
-          .container {
-            max-width: 960px;
-            margin: 0 auto;
-            background: rgba(255,255,255,0.97);
-            border-radius: 12px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.18);
-            overflow: hidden;
-          }
-
-          .header {
-            background: linear-gradient(135deg, #b71c1c 0%, #e53935 100%);
-            color: white;
-            padding: 32px 28px;
-            text-align: center;
-          }
-          .header-icon { font-size: 52px; margin-bottom: 12px; }
-          .header h1 { margin: 0 0 8px; font-size: 26px; font-weight: 700; }
-          .header-badge {
-            display: inline-block;
-            background: rgba(255,255,255,0.2);
-            padding: 6px 18px;
-            border-radius: 20px;
-            font-size: 13px;
-            margin-top: 6px;
-          }
-          .responsible-bar {
-            background: rgba(0,0,0,0.15);
-            padding: 10px 20px;
-            font-size: 13px;
-            text-align: center;
-          }
-
-          .form-section { padding: 28px; }
-
-          .kpi-section {
-            background: #fff;
-            border: 1.5px solid #e5e7eb;
-            border-radius: 12px;
-            margin-bottom: 32px;
-            overflow: hidden;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-          }
-
-          .kpi-header {
-            display: flex;
-            align-items: center;
-            gap: 14px;
-            padding: 18px 20px;
-            background: #fef2f2;
-            border-bottom: 1.5px solid #fecaca;
-          }
-          .kpi-number {
-            flex-shrink: 0;
-            width: 36px; height: 36px;
-            background: #dc2626;
-            color: white;
-            border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-weight: 700; font-size: 15px;
-          }
-          .kpi-title { font-size: 16px; font-weight: 700; color: #111827; }
-          .kpi-subtitle { font-size: 12px; color: #6b7280; margin-top: 3px; }
-
-          .perf-stats {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            border-bottom: 1.5px solid #f3f4f6;
-          }
-          .stat-box { text-align: center; padding: 16px 12px; }
-          .stat-box + .stat-box { border-left: 1px solid #f3f4f6; }
-          .stat-label { font-size: 10px; font-weight: 600; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.6px; margin-bottom: 6px; }
-          .stat-value { font-size: 22px; font-weight: 800; }
-          .stat-unit { font-size: 13px; font-weight: 500; }
-          .stat-pct { font-size: 11px; margin-top: 4px; font-weight: 600; }
-          .stat-current .stat-value { color: #dc2626; }
-          .stat-target .stat-value { color: #16a34a; }
-          .stat-gap .stat-value { color: #d97706; }
-          .stat-gap .stat-pct { color: #d97706; }
-
-          /* ---- AI Box ---- */
-          .ai-box {
-            margin: 20px 20px 0;
-            border: 1.5px solid #c4b5fd;
-            border-radius: 10px;
-            background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
-            overflow: hidden;
-          }
-          .ai-box-header {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 12px 16px;
-            background: rgba(109,40,217,0.08);
-            border-bottom: 1px solid #ddd6fe;
-          }
-          .ai-icon { font-size: 18px; }
-          .ai-title { font-size: 14px; font-weight: 700; color: #5b21b6; flex: 1; }
-
-          /* ---- Generate Button ---- */
-          .generate-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 8px 16px;
-            background: linear-gradient(135deg, #7c3aed, #6d28d9);
-            color: white;
-            border: none;
-            border-radius: 20px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            box-shadow: 0 2px 8px rgba(109,40,217,0.35);
-          }
-          .generate-btn:hover:not(:disabled) {
-            background: linear-gradient(135deg, #6d28d9, #5b21b6);
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(109,40,217,0.45);
-          }
-          .generate-btn:disabled {
-            opacity: 0.7;
-            cursor: not-allowed;
-            transform: none;
-          }
-          .generate-btn.loading .gen-btn-icon { animation: spin 1s linear infinite; display: inline-block; }
-          @keyframes spin { to { transform: rotate(360deg); } }
-          @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(-8px); }
-            to   { opacity: 1; transform: translateY(0); }
-          }
-
-          .suggestion-content {
-            padding: 14px 16px;
-            animation: fadeIn 0.3s ease;
-          }
-          .suggestion-error {
-            padding: 12px 16px;
-            font-size: 13px;
-            color: #92400e;
-            background: #fff7ed;
-          }
-
-          .ai-suggestion-row {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-          }
-          .ai-suggestion-card {
-            background: white;
-            border-radius: 8px;
-            padding: 14px;
-            cursor: pointer;
-            transition: transform 0.15s, box-shadow 0.15s;
-            border: 1.5px solid transparent;
-          }
-          .ai-suggestion-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(0,0,0,0.1);
-          }
-          .ai-suggestion-card.applied {
-            border-color: #4ade80 !important;
-            background: #f0fdf4;
-          }
-          .root-cause-card { border-top: 3px solid #ef4444; }
-          .action-card    { border-top: 3px solid #f59e0b; }
-          .evidence-card  { border-top: 3px solid #3b82f6; }
-
-          .ai-card-label {
-            font-size: 11px; font-weight: 700;
-            text-transform: uppercase; letter-spacing: 0.5px;
-            margin-bottom: 8px;
-            display: flex; align-items: center; gap: 5px;
-          }
-          .root-cause-card .ai-card-label { color: #dc2626; }
-          .action-card .ai-card-label    { color: #d97706; }
-          .evidence-card .ai-card-label  { color: #2563eb; }
-          .apply-hint { margin-left: auto; font-size: 10px; font-weight: 500; color: #9ca3af; text-transform: none; letter-spacing: 0; }
-          .ai-card-text { font-size: 13px; color: #374151; line-height: 1.55; }
-
-          /* ---- Form fields ---- */
-          .form-fields { padding: 20px; }
-          .form-group { margin-bottom: 18px; }
-          label { display: block; font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 6px; }
-          .required { color: #dc2626; margin-left: 3px; }
-          textarea {
-            width: 100%; padding: 11px 14px;
-            border: 1.5px solid #d1d5db;
-            border-radius: 6px; font-size: 13px; font-family: inherit;
-            resize: vertical; min-height: 80px; transition: border-color 0.2s;
-          }
-          textarea:focus { border-color: #7c3aed; outline: none; box-shadow: 0 0 0 3px rgba(124,58,237,0.1); }
-          textarea.highlight {
-            animation: highlightFade 1.8s forwards;
-          }
-          @keyframes highlightFade {
-            0%   { background: #dcfce7; border-color: #16a34a; }
-            100% { background: white;   border-color: #d1d5db; }
-          }
-          .help-text { font-size: 11px; color: #6b7280; margin-top: 5px; }
-
-          .submit-btn {
-            width: 100%;
-            padding: 16px;
-            background: linear-gradient(135deg, #b71c1c, #e53935);
-            color: white; border: none; border-radius: 8px;
-            font-size: 17px; font-weight: 700; cursor: pointer;
-            margin-top: 8px; transition: opacity 0.15s;
-          }
-          .submit-btn:hover { opacity: 0.9; }
-
-          @media (max-width: 640px) {
-            .ai-suggestion-row { grid-template-columns: 1fr; }
-          }
+          *,*::before,*::after{box-sizing:border-box;}
+          body{font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:24px 16px;min-height:100vh;
+            background:#f0f2f5;
+            background-image:url("https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600");
+            background-size:cover;background-position:center;background-attachment:fixed;}
+          .container{max-width:960px;margin:0 auto;background:rgba(255,255,255,0.97);border-radius:12px;
+            box-shadow:0 8px 32px rgba(0,0,0,0.18);overflow:hidden;}
+          .header{background:linear-gradient(135deg,#b71c1c 0%,#e53935 100%);color:white;
+            padding:32px 28px;text-align:center;}
+          .header-icon{font-size:52px;margin-bottom:12px;}
+          .header h1{margin:0 0 8px;font-size:26px;font-weight:700;}
+          .header-badge{display:inline-block;background:rgba(255,255,255,0.2);padding:6px 18px;
+            border-radius:20px;font-size:13px;margin-top:6px;}
+          .responsible-bar{background:rgba(0,0,0,0.15);padding:10px 20px;font-size:13px;text-align:center;}
+          .form-section{padding:28px;}
+          .kpi-section{background:#fff;border:1.5px solid #e5e7eb;border-radius:12px;
+            margin-bottom:32px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.06);}
+          .kpi-header{display:flex;align-items:center;gap:14px;padding:18px 20px;
+            background:#fef2f2;border-bottom:1.5px solid #fecaca;}
+          .kpi-number{flex-shrink:0;width:36px;height:36px;background:#dc2626;color:white;
+            border-radius:50%;display:flex;align-items:center;justify-content:center;
+            font-weight:700;font-size:15px;}
+          .kpi-title{font-size:16px;font-weight:700;color:#111827;}
+          .kpi-subtitle{font-size:12px;color:#6b7280;margin-top:3px;}
+          .perf-stats{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1.5px solid #f3f4f6;}
+          .stat-box{text-align:center;padding:16px 12px;}
+          .stat-box+.stat-box{border-left:1px solid #f3f4f6;}
+          .stat-label{font-size:10px;font-weight:600;text-transform:uppercase;color:#9ca3af;
+            letter-spacing:0.6px;margin-bottom:6px;}
+          .stat-value{font-size:22px;font-weight:800;}
+          .stat-unit{font-size:13px;font-weight:500;}
+          .stat-pct{font-size:11px;margin-top:4px;font-weight:600;}
+          .stat-current .stat-value{color:#dc2626;}
+          .stat-target .stat-value{color:#16a34a;}
+          .stat-gap .stat-value{color:#d97706;}
+          .stat-gap .stat-pct{color:#d97706;}
+          /* AI Box */
+          .ai-box{margin:20px 20px 0;border:1.5px solid #c4b5fd;border-radius:10px;
+            background:linear-gradient(135deg,#f5f3ff 0%,#ede9fe 100%);overflow:hidden;}
+          .ai-box-header{display:flex;align-items:center;gap:8px;padding:12px 16px;
+            background:rgba(109,40,217,0.08);border-bottom:1px solid #ddd6fe;}
+          .ai-icon{font-size:18px;}
+          .ai-title{font-size:14px;font-weight:700;color:#5b21b6;flex:1;}
+          .generate-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;
+            background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none;
+            border-radius:20px;font-size:13px;font-weight:600;cursor:pointer;
+            transition:all 0.2s;box-shadow:0 2px 8px rgba(109,40,217,0.35);}
+          .generate-btn:hover:not(:disabled){background:linear-gradient(135deg,#6d28d9,#5b21b6);
+            transform:translateY(-1px);box-shadow:0 4px 12px rgba(109,40,217,0.45);}
+          .generate-btn:disabled{opacity:0.7;cursor:not-allowed;transform:none;}
+          .generate-btn.loading .gen-btn-icon{animation:spin 1s linear infinite;display:inline-block;}
+          @keyframes spin{to{transform:rotate(360deg);}}
+          @keyframes fadeIn{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:translateY(0);}}
+          .suggestion-content{padding:14px 16px;animation:fadeIn 0.3s ease;}
+          .suggestion-error{padding:12px 16px;font-size:13px;color:#92400e;background:#fff7ed;}
+          .ai-suggestion-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}
+          .ai-suggestion-card{background:white;border-radius:8px;padding:14px;cursor:pointer;
+            transition:transform 0.15s,box-shadow 0.15s;border:1.5px solid transparent;}
+          .ai-suggestion-card:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,0.1);}
+          .ai-suggestion-card.applied{border-color:#4ade80!important;background:#f0fdf4;}
+          .root-cause-card{border-top:3px solid #ef4444;}
+          .action-card{border-top:3px solid #f59e0b;}
+          .evidence-card{border-top:3px solid #3b82f6;}
+          .ai-card-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;
+            margin-bottom:8px;display:flex;align-items:center;gap:5px;}
+          .root-cause-card .ai-card-label{color:#dc2626;}
+          .action-card .ai-card-label{color:#d97706;}
+          .evidence-card .ai-card-label{color:#2563eb;}
+          .apply-hint{margin-left:auto;font-size:10px;font-weight:500;color:#9ca3af;
+            text-transform:none;letter-spacing:0;}
+          .ai-card-text{font-size:13px;color:#374151;line-height:1.55;}
+          /* Form fields */
+          .form-fields{padding:20px;}
+          .form-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;}
+          .form-group{margin-bottom:18px;}
+          label{display:block;font-size:13px;font-weight:600;color:#374151;margin-bottom:6px;}
+          .required{color:#dc2626;margin-left:3px;}
+          textarea,input[type="date"],input[type="text"]{width:100%;padding:11px 14px;border:1.5px solid #d1d5db;border-radius:6px;
+            font-size:13px;font-family:inherit;resize:vertical;min-height:80px;
+            transition:border-color 0.2s;}
+          input[type="date"],input[type="text"]{min-height:auto;}
+          textarea:focus,input[type="date"]:focus,input[type="text"]:focus{border-color:#7c3aed;outline:none;
+            box-shadow:0 0 0 3px rgba(124,58,237,0.1);}
+          textarea.highlight{animation:highlightFade 1.8s forwards;}
+          @keyframes highlightFade{
+            0%{background:#dcfce7;border-color:#16a34a;}
+            100%{background:white;border-color:#d1d5db;}}
+          .help-text{font-size:11px;color:#6b7280;margin-top:5px;}
+          .submit-btn{width:100%;padding:16px;background:linear-gradient(135deg,#b71c1c,#e53935);
+            color:white;border:none;border-radius:8px;font-size:17px;font-weight:700;
+            cursor:pointer;margin-top:8px;transition:opacity 0.15s;}
+          .submit-btn:hover{opacity:0.9;}
+          @media(max-width:640px){.ai-suggestion-row,.form-grid{grid-template-columns:1fr;}}
         </style>
       </head>
       <body>
         <div class="container">
           <div class="header">
-            <div class="header-icon">⚠️</div>
+            <div class="header-icon">âš ï¸</div>
             <h1>Corrective Actions Required</h1>
             <div class="header-badge">
-              ${actions.length} KPI${actions.length > 1 ? 's' : ''} Below Target — Week ${week}
+              ${actions.length} KPI${actions.length > 1 ? 's' : ''} Below Target â€” Week ${week}
             </div>
           </div>
           <div class="responsible-bar">
-            👤 <strong>${responsible.name}</strong> &nbsp;•&nbsp;
-            🏭 ${responsible.plant_name} &nbsp;•&nbsp;
-            🏷️ ${responsible.department_name}
+            ðŸ‘¤ <strong>${responsible.name}</strong> &nbsp;â€¢&nbsp;
+            ðŸ­ ${responsible.plant_name} &nbsp;â€¢&nbsp;
+            ðŸ·ï¸ ${responsible.department_name}
           </div>
 
           <div class="form-section">
             <form action="/submit-bulk-corrective-actions" method="POST">
               <input type="hidden" name="responsible_id" value="${responsible_id}">
               <input type="hidden" name="week" value="${week}">
-
               ${kpiSectionsHtml}
-
               <button type="submit" class="submit-btn">
-                ✓ Submit All Corrective Actions (${actions.length})
+                âœ“ Submit All Corrective Actions (${actions.length})
               </button>
             </form>
           </div>
         </div>
 
         <script>
-          // Apply suggestion card text to linked textarea
           function applyToField(fieldId, card) {
             const text = card.querySelector('.ai-card-text').textContent.trim();
             const field = document.getElementById(fieldId);
@@ -1301,33 +7281,29 @@ app.get("/corrective-actions-bulk", async (req, res) => {
             field.classList.remove('highlight');
             void field.offsetWidth;
             field.classList.add('highlight');
-            field.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            field.scrollIntoView({ behavior:'smooth', block:'center' });
             card.classList.add('applied');
             const hint = card.querySelector('.apply-hint');
-            if (hint) hint.textContent = '✓ Applied';
+            if (hint) hint.textContent = 'âœ“ Applied';
           }
 
-          // Generate a single suggestion on demand
           async function generateSuggestion(caId, kpiId, responsibleId, week) {
-            const btn = document.getElementById('gen-btn-' + caId);
-            const suggestionDiv = document.getElementById('suggestion-' + caId);
-            const errorDiv = document.getElementById('error-' + caId);
+            const btn         = document.getElementById('gen-btn-' + caId);
+            const suggDiv     = document.getElementById('suggestion-' + caId);
+            const errDiv      = document.getElementById('error-' + caId);
 
-            // Reset state
-            suggestionDiv.style.display = 'none';
-            errorDiv.style.display = 'none';
+            suggDiv.style.display = 'none';
+            errDiv.style.display  = 'none';
 
-            // Reset applied state on cards
-            suggestionDiv.querySelectorAll('.ai-suggestion-card').forEach(c => {
+            suggDiv.querySelectorAll('.ai-suggestion-card').forEach(c => {
               c.classList.remove('applied');
               const hint = c.querySelector('.apply-hint');
-              if (hint) hint.textContent = 'Click to apply ↓';
+              if (hint) hint.textContent = 'Click to apply \u2193';
             });
 
-            // Loading state
             btn.disabled = true;
             btn.classList.add('loading');
-            btn.querySelector('.gen-btn-icon').textContent = '⏳';
+            btn.querySelector('.gen-btn-icon').textContent = '\u23F3';
             btn.querySelector('.gen-btn-text').textContent = 'Generating...';
 
             try {
@@ -1336,30 +7312,21 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                 '&responsible_id=' + responsibleId +
                 '&week=' + encodeURIComponent(week)
               );
-
               if (!res.ok) throw new Error('Request failed');
               const data = await res.json();
-
-              if (data.error || !data.suggestion) throw new Error(data.error || 'No suggestion returned');
+              if (data.error || !data.suggestion) throw new Error(data.error || 'No suggestion');
 
               const s = data.suggestion;
-
-              // Populate card texts
-              document.getElementById('rc-text-' + caId).textContent = s.root_cause || '';
+              document.getElementById('rc-text-' + caId).textContent = s.root_cause       || '';
               document.getElementById('ia-text-' + caId).textContent = s.immediate_action || '';
-              document.getElementById('ev-text-' + caId).textContent = s.evidence || '';
-
-              // Show suggestion
-              suggestionDiv.style.display = 'block';
-
+              document.getElementById('ev-text-' + caId).textContent = s.evidence         || '';
+              suggDiv.style.display = 'block';
             } catch (err) {
-              console.error('Suggestion error:', err);
-              errorDiv.style.display = 'block';
+              errDiv.style.display = 'block';
             } finally {
-              // Restore button to "Regenerate" state
               btn.disabled = false;
               btn.classList.remove('loading');
-              btn.querySelector('.gen-btn-icon').textContent = '🔄';
+              btn.querySelector('.gen-btn-icon').textContent = '\u{1F504}';
               btn.querySelector('.gen-btn-text').textContent = 'Regenerate';
             }
           }
@@ -1373,391 +7340,668 @@ app.get("/corrective-actions-bulk", async (req, res) => {
   }
 });
 
-// ========== SUBMIT BULK CORRECTIVE ACTIONS ==========
 app.post("/submit-bulk-corrective-actions", async (req, res) => {
   try {
     const { responsible_id, week, corrective_action_ids, ...formData } = req.body;
-
-    const ids = Array.isArray(corrective_action_ids)
-      ? corrective_action_ids
-      : [corrective_action_ids];
-
+    const ids = Array.isArray(corrective_action_ids) ? corrective_action_ids : [corrective_action_ids];
     let completedCount = 0;
-
     for (const caId of ids) {
-      const rootCause = formData[`root_cause_${caId}`];
-      const solution = formData[`solution_${caId}`];
-      const evidence = formData[`evidence_${caId}`];
-
-      if (rootCause && solution && evidence) {
+      const rootCause = normalizeText(formData[`root_cause_${caId}`]);
+      const solution = normalizeText(formData[`solution_${caId}`]);
+      const evidence = normalizeText(formData[`evidence_${caId}`]);
+      const dueDate = formData[`due_date_${caId}`] || null;
+      const responsibleName = normalizeText(formData[`responsible_${caId}`]);
+      if (rootCause || solution || evidence || dueDate || responsibleName) {
         await pool.query(
           `UPDATE public.corrective_actions
-           SET root_cause = $1, 
-               implemented_solution = $2, 
-               evidence = $3,
-               status = 'Completed',
-               updated_date = NOW()
-           WHERE corrective_action_id = $4`,
-          [rootCause, solution, evidence, caId]
+           SET root_cause=$1,
+               implemented_solution=$2,
+               evidence=$3,
+               due_date=$4::date,
+               responsible=$5::text,
+               status = CASE
+                 WHEN $1::text IS NOT NULL
+                  AND $2::text IS NOT NULL
+                  AND $3::text IS NOT NULL
+                  AND $4::date IS NOT NULL
+                  AND NULLIF(BTRIM($5::text), '') IS NOT NULL
+                 THEN 'Waiting for validation'
+                 ELSE status
+               END,
+               updated_date=NOW()
+           WHERE corrective_action_id=$6`,
+          [rootCause, solution, evidence, dueDate, responsibleName, caId]
         );
-        completedCount++;
-      }
-    }
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Corrective Actions Submitted</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-          .success-container { background: white; padding: 50px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 600px; }
-          h1 { color: #4caf50; font-size: 32px; margin-bottom: 20px; }
-          .count { font-size: 48px; font-weight: 700; color: #4caf50; margin: 20px 0; }
-          p { font-size: 16px; color: #333; margin-bottom: 30px; line-height: 1.6; }
-          a { display: inline-block; padding: 14px 30px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 5px; }
-          a:hover { background: #005ea6; }
-        </style>
-      </head>
-      <body>
-        <div class="success-container">
-          <h1>✅ All Corrective Actions Submitted!</h1>
-          <div class="count">${completedCount}</div>
-          <p>
-            You have successfully completed all corrective actions for week ${week}.<br>
-            The quality team will review your submissions.
-          </p>
-
-          <a href="/corrective-actions-list?responsible_id=${responsible_id}">View Corrective Actions</a>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("Error submitting bulk corrective actions:", err);
-    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
-  }
-});
-// Generate consolidated corrective action email with ALL KPIs below target
-const generateConsolidatedCorrectiveActionEmail = ({ responsible, week, kpisWithActions }) => {
-  return `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="utf-8"><title>Corrective Actions Required</title></head>
-  <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;">
-    <div style="max-width:700px;margin:0 auto;background:#fff;padding:25px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);">
-      
-      <!-- Header -->
-      <div style="text-align:center;margin-bottom:30px;">
-        <div style="width:90px;height:90px;margin:0 auto 15px;background:#ff9800;border-radius:50%;display:flex;align-items:center;justify-content:center;">
-          <span style="font-size:45px;">⚠️</span>
-        </div>
-        <h2 style="color:#d32f2f;font-size:24px;margin:0;">Corrective Actions Required</h2>
-        <p style="color:#666;font-size:14px;margin:10px 0 0 0;">Week ${week} - Multiple KPIs Below Target</p>
-      </div>
-      
-      <!-- Responsible Info -->
-      <div style="background:#f8f9fa;padding:20px;border-radius:6px;margin-bottom:25px;border-left:4px solid #d32f2f;">
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Responsible: </span>
-          <span style="color:#666;font-size:13px;">${responsible.name}</span>
-        </div>
-        <div style="margin-bottom:12px;">
-          <span style="font-weight:600;color:#333;font-size:13px;">Plant: </span>
-          <span style="color:#666;font-size:13px;">${responsible.plant_name}</span>
-        </div>
-        <div>
-          <span style="font-weight:600;color:#333;font-size:13px;">Department: </span>
-          <span style="color:#666;font-size:13px;">${responsible.department_name}</span>
-        </div>
-      </div>
-      
-      <!-- Summary Badge -->
-      <div style="background:#fff3e0;padding:15px;border-radius:6px;margin-bottom:25px;text-align:center;border:2px solid #ff9800;">
-        <span style="font-size:32px;font-weight:700;color:#d32f2f;">${kpisWithActions.length}</span>
-        <span style="font-size:14px;color:#666;display:block;margin-top:5px;">KPIs Requiring Corrective Action</span>
-      </div>
-      
-      <!-- KPIs List -->
-      <div style="margin-bottom:25px;">
-        <h3 style="color:#333;font-size:16px;margin-bottom:15px;border-bottom:2px solid #e0e0e0;padding-bottom:8px;">
-          📊 Performance Summary
-        </h3>
-        
-        ${kpisWithActions.map((kpi, index) => `
-        <div style="background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:15px;margin-bottom:12px;">
-          <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px;">
-            <div style="flex:1;">
-              <div style="font-weight:600;color:#333;font-size:14px;margin-bottom:5px;">
-                ${index + 1}. ${kpi.indicator_title}
-              </div>
-              ${kpi.indicator_sub_title ? `
-              <div style="color:#666;font-size:12px;margin-bottom:8px;">
-                ${kpi.indicator_sub_title}
-              </div>
-              ` : ''}
-            </div>
-          </div>
-          
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;background:white;padding:12px;border-radius:4px;">
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Current</div>
-              <div style="font-size:18px;font-weight:700;color:#d32f2f;">${kpi.value} ${kpi.unit || ''}</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Target</div>
-              <div style="font-size:18px;font-weight:700;color:#4caf50;">${kpi.target_value} ${kpi.unit || ''}</div>
-            </div>
-            <div style="text-align:center;">
-              <div style="font-size:10px;color:#666;margin-bottom:4px;text-transform:uppercase;">Gap</div>
-              <div style="font-size:18px;font-weight:700;color:#ff9800;">
-                ${(parseFloat(kpi.target_value) - parseFloat(kpi.value)).toFixed(2)} ${kpi.unit || ''}
-              </div>
-            </div>
-          </div>
-        </div>
-        `).join('')}
-      </div>
-      
-      <!-- Action Required Section -->
-      <div style="background:#e3f2fd;padding:20px;border-radius:6px;margin-bottom:25px;">
-        <h3 style="color:#1976d2;font-size:15px;margin:0 0 12px 0;">📝 What You Need To Do</h3>
-        <ul style="margin:0;padding-left:20px;color:#555;font-size:13px;line-height:1.8;">
-          <li>Click the button below to access the corrective action form</li>
-          <li>Document the root cause for each underperforming KPI</li>
-          <li>Describe the implemented solutions</li>
-          <li>Provide evidence of improvement actions</li>
-          <li><strong>Complete within 24 hours</strong></li>
-        </ul>
-      </div>
-      
-      <!-- CTA Button -->
-<div style="text-align:center;margin:30px 0;">
-  <a href="https://kpi-form.azurewebsites.net/corrective-actions-bulk?responsible_id=${responsible.responsible_id}&week=${week}"
-     style="display:inline-block;padding:16px 35px;background:#d32f2f;color:white;
-            border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;
-            box-shadow:0 4px 10px rgba(211,47,47,0.3);">
-    📝 Complete Corrective Actions (${kpisWithActions.length})
-  </a>
-</div>
-      
-      <!-- Footer -->
-      <div style="margin-top:30px;padding-top:20px;border-top:1px solid #e0e0e0;text-align:center;">
-        <p style="font-size:11px;color:#999;margin:0;line-height:1.6;">
-          This is an automated alert from AVOCarbon KPI System<br>
-          <strong>Week ${week}</strong> • Generated on ${new Date().toLocaleDateString()}<br>
-          For assistance, contact: <a href="mailto:administration.STS@avocarbon.com" style="color:#0078D7;">administration.STS@avocarbon.com</a>
-        </p>
-      </div>
-    </div>
-  </body>
-  </html>
-  `;
-};
-
-// Send consolidated corrective action email
-const sendConsolidatedCorrectiveActionEmail = async (responsibleId, week) => {
-  try {
-    // Get responsible info
-    const resResp = await pool.query(
-      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
-      [responsibleId]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible) throw new Error("Responsible not found");
-
-    // Get all open corrective actions with KPI details
-    const actionsRes = await pool.query(
-      `SELECT ca.corrective_action_id, ca.kpi_id, ca.week,
-              k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
-              kv.value
-       FROM public.corrective_actions ca
-       JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
-       LEFT JOIN public.kpi_values kv ON ca.kpi_id = kv.kpi_id 
-         AND kv.responsible_id = ca.responsible_id 
-         AND kv.week = ca.week
-       WHERE ca.responsible_id = $1 
-         AND ca.week = $2 
-         AND ca.status = 'Open'
-       ORDER BY k.indicator_title`,
-      [responsibleId, week]
-    );
-
-    if (actionsRes.rows.length === 0) {
-      console.log(`No open corrective actions for responsible ${responsibleId}, week ${week}`);
-      return null;
-    }
-
-    const kpisWithActions = actionsRes.rows;
-
-    const html = generateConsolidatedCorrectiveActionEmail({
-      responsible,
-      week,
-      kpisWithActions
-    });
-
-    const transporter = createTransporter();
-    const info = await transporter.sendMail({
-      from: '"AVOCarbon Quality System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `⚠️ ${kpisWithActions.length} Corrective Action${kpisWithActions.length > 1 ? 's' : ''} Required - Week ${week}`,
-      html,
-    });
-
-    console.log(`✅ Consolidated corrective action email sent to ${responsible.email} (${kpisWithActions.length} KPIs)`);
-    return info;
-  } catch (err) {
-    console.error(`❌ Failed to send consolidated corrective action email:`, err.message);
-    throw err;
-  }
-};
-
-
-// ---------- Redirect handler ----------
-
-app.get("/redirect", async (req, res) => {
-  try {
-    const { responsible_id, week, ...values } = req.query;
-    const kpiValues = Object.entries(values)
-      .filter(([key]) => key.startsWith("value_"))
-      .map(([key, val]) => ({
-        kpi_values_id: key.split("_")[1],
-        value: val,
-      }));
-
-    // Arrays to collect updates
-    const targetUpdates = [];
-
-    for (let item of kpiValues) {
-      const oldRes = await pool.query(
-        `SELECT value, kpi_id FROM public."kpi_values" WHERE kpi_values_id = $1`,
-        [item.kpi_values_id]
-      );
-
-      if (oldRes.rows.length) {
-        const { value: old_value, kpi_id } = oldRes.rows[0];
-
-        await pool.query(
-          `INSERT INTO public.kpi_values_hist26 
-          (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value)
-          VALUES ($1, $2, $3, $4, $5, $6)`,
-          [item.kpi_values_id, responsible_id, kpi_id, week, old_value, item.value]
-        );
-
-        await pool.query(
-          `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
-          [item.value, item.kpi_values_id]
-        );
-
-        // Get the latest hist_id
-        const histRes = await pool.query(
-          `SELECT hist_id FROM public.kpi_values_hist26 
-           WHERE kpi_values_id = $1 
-             AND responsible_id = $2 
-             AND kpi_id = $3 
-             AND week = $4
-           ORDER BY updated_at DESC LIMIT 1`,
-          [item.kpi_values_id, responsible_id, kpi_id, week]
-        );
-
-        // Check and trigger actions (collects updates but doesn't send emails)
-        if (histRes.rows.length > 0) {
-          const histId = histRes.rows[0].hist_id;
-          const result = await checkAndTriggerCorrectiveActions(responsible_id, kpi_id, week, item.value, histId);
-
-          // Collect target update if it happened
-          if (result.targetUpdated && result.updateInfo) {
-            targetUpdates.push(result.updateInfo);
-          }
-
+        if (rootCause && solution && evidence && dueDate && responsibleName) {
+          completedCount++;
         }
       }
     }
-
-    // ===== SEND ONE CONSOLIDATED EMAIL FOR TARGET UPDATES =====
-    if (targetUpdates.length > 0) {
-      await sendConsolidatedTargetUpdateEmail(responsible_id, week, targetUpdates);
-    }
-
-    // Determine success message based on what happened
-    let successMessage = `<h1>✅ KPI Submitted Successfully!</h1>`;
-   
     res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>KPI Submitted</title>
-        <style>
-          body { 
-            font-family:'Segoe UI',sans-serif; 
-            background:#f4f4f4; 
-            display:flex; 
-            justify-content:center; 
-            align-items:center; 
-            height:100vh; 
-            margin:0; 
-          }
-          .success-container {
-            background:#fff; 
-            padding:40px; 
-            border-radius:10px; 
-            box-shadow:0 4px 15px rgba(0,0,0,0.1);
-            text-align:center;
-            max-width:600px;
-          }
-          h1 { color:#28a745; font-size:28px; margin-bottom:20px; }
-          p { font-size:16px; color:#333; margin-bottom:10px; }
-         
-          .btn {
-            display:inline-block;
-            padding:12px 25px;
-            background:#0078D7;
-            color:white;
-            text-decoration:none;
-            border-radius:6px;
-            font-weight:bold;
-            margin:5px;
-          }
-          .btn:hover { background:#005ea6; }
-        </style>
-      </head>
-      <body>
-        <div class="success-container">
-          ${successMessage}
-          <p>Your KPI values for ${week} have been saved.</p>
-          
-         
-          
-          <a href="/dashboard?responsible_id=${responsible_id}" class="btn">Go to Dashboard</a>
-        </div>
-      </body>
-      </html>
-    `);
-
+      <!DOCTYPE html><html>
+      <head><meta charset="utf-8"><title>Corrective Actions Submitted</title>
+      <style>body{font-family:'Segoe UI',sans-serif;background:#f4f6f9;display:flex;
+        justify-content:center;align-items:center;height:100vh;margin:0;}
+      .sc{background:white;padding:50px;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.1);
+          text-align:center;max-width:600px;}
+      h1{color:#4caf50;font-size:32px;margin-bottom:20px;}
+      .count{font-size:48px;font-weight:700;color:#4caf50;margin:20px 0;}
+      p{font-size:16px;color:#333;margin-bottom:30px;line-height:1.6;}
+      a{display:inline-block;padding:14px 30px;background:#0078D7;color:white;
+        text-decoration:none;border-radius:6px;font-weight:bold;margin:5px;}
+      a:hover{background:#005ea6;}</style></head>
+      <body><div class="sc">
+        <h1>All Corrective Actions Submitted!</h1>
+        <div class="count">${completedCount}</div>
+        <p>You have successfully submitted all corrective actions for week ${week}.<br>
+           The quality team will review your submissions.</p>
+        <a href="/corrective-actions-list?responsible_id=${responsible_id}">View Corrective Actions</a>
+      </div></body></html>`);
   } catch (err) {
-    console.error("❌ Error in /redirect:", err.message);
-    res.status(500).send(`
-      <h2 style="color:red;">❌ Failed to submit KPI values</h2>
-      <p>${err.message}</p>
-    `);
+    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
 });
 
-// ---------- Modern Web  page ----------
-// ---------- Modern KPI Form with Loading Spinner ----------
+// ---------- Redirect handler ----------
+app.post("/redirect", async (req, res) => {
+  try {
+    const { responsible_id, week, ...values } = req.body;
+
+    // Extract KPI values
+    const kpiValues = Object.entries(values)
+      .filter(([k]) => k.startsWith("value_"))
+      .map(([k, v]) => ({ kpi_values_id: k.split("_")[1], value: v }));
+
+    // Extract comments
+    const comments = Object.entries(values)
+      .filter(([k]) => k.startsWith("comment_"))
+      .reduce((acc, [k, v]) => { acc[k.split("_")[1]] = v; return acc; }, {});
+
+    const responsibleRes = await pool.query(
+      `SELECT name FROM public."Responsible" WHERE responsible_id = $1`,
+      [responsible_id]
+    );
+    const defaultResponsibleName = responsibleRes.rows[0]?.name || null;
+
+    const targetUpdates = [];
+    let correctiveActionsCount = 0;
+
+    for (let item of kpiValues) {
+      const oldRes = await pool.query(
+        `SELECT value, kpi_id, responsible_kpi_id FROM public."kpi_values" WHERE kpi_values_id = $1`,
+        [item.kpi_values_id]
+      );
+      if (!oldRes.rows.length) continue;
+
+      const {
+        value: old_value,
+        kpi_id,
+        responsible_kpi_id: currentResponsibleKpiId
+      } = oldRes.rows[0];
+
+      // Fetch KPI limits to determine if corrective action is needed
+      const kpiInfoRes = await pool.query(
+        `
+        SELECT
+          COALESCE(rk.kpi_id, k.kpi_id) AS kpi_id,
+          rk.responsible_kpi_id,
+          COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+          COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+          COALESCE(rk.target, k.target) AS target,
+          COALESCE(rk.low_limit, k.low_limit) AS low_limit,
+          COALESCE(rk.high_limit, k.high_limit) AS high_limit
+        FROM public."Kpi" k
+        LEFT JOIN public.responsible_kpis rk
+          ON rk.responsible_kpi_id = $2
+        WHERE k.kpi_id = COALESCE(rk.kpi_id, $1)
+        `,
+        [kpi_id, currentResponsibleKpiId]
+      );
+      const kpiInfo = kpiInfoRes.rows[0] || {};
+      const effectiveKpiId = Number(kpiInfo.kpi_id || kpi_id);
+      const kpiValueSnapshots = buildKpiValueSnapshotPayload(kpiInfo);
+      const lowLimit = parseMetricNumber(kpiInfo.low_limit);
+      const highLimit = parseMetricNumber(kpiInfo.high_limit);
+      const goodDirection = inferKpiDirection(kpiInfo);
+      const numValue = parseFloat(item.value);
+      const submittedActions = getSubmittedCorrectiveActions(
+        values,
+        item.kpi_values_id,
+        defaultResponsibleName
+      );
+      await pool.query(
+        `INSERT INTO public.kpi_values_hist26
+         (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value, comment)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [item.kpi_values_id, responsible_id, effectiveKpiId, week, old_value, item.value,
+        comments[item.kpi_values_id] || null]
+      );
+
+      await pool.query(
+        `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
+        [item.value, item.kpi_values_id]
+      );
+      await updateKpiValueSnapshots(pool, item.kpi_values_id, {
+        responsible_kpi_id: kpiInfo.responsible_kpi_id ?? null,
+        ...kpiValueSnapshots
+      });
+
+      // -------------------------------------------------------
+      // Save corrective action if the KPI is outside the good-direction limit
+      // and the user filled in the corrective action fields
+      // -------------------------------------------------------
+      const meaningfulActions = submittedActions.filter(hasMeaningfulCorrectiveActionInput);
+
+      if (meaningfulActions.length) {
+        for (const action of meaningfulActions) {
+          await upsertCorrectiveAction(responsible_id, effectiveKpiId, week, action);
+          correctiveActionsCount++;
+        }
+      } else if (
+        !isNaN(numValue) &&
+        needsCorrectiveAction(numValue, lowLimit, highLimit, goodDirection)
+      ) {
+        const existing = await pool.query(
+          `SELECT corrective_action_id
+     FROM public.corrective_actions
+     WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3
+     LIMIT 1`,
+          [responsible_id, effectiveKpiId, week]
+        );
+
+        if (existing.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO public.corrective_actions
+       (responsible_id, kpi_id, week, status, due_date, responsible)
+       VALUES ($1, $2, $3, 'Open', CURRENT_DATE + 7, $4)`,
+            [responsible_id, effectiveKpiId, week, normalizeText(defaultResponsibleName)]
+          );
+        }
+      }
+
+      const histRes = await pool.query(
+        `SELECT hist_id FROM public.kpi_values_hist26
+         WHERE kpi_values_id=$1 AND responsible_id=$2 AND kpi_id=$3 AND week=$4
+         ORDER BY updated_at DESC LIMIT 1`,
+        [item.kpi_values_id, responsible_id, effectiveKpiId, week]
+      );
+      if (histRes.rows.length > 0) {
+        const result = await checkAndTriggerCorrectiveActions(
+          responsible_id, effectiveKpiId, week, item.value, histRes.rows[0].hist_id
+        );
+        if (result.targetUpdated && result.updateInfo) targetUpdates.push(result.updateInfo);
+      }
+    }
+
+    let notifications = [];
+    if (targetUpdates.length > 0)
+      notifications.push(`ðŸŽ¯ <strong>${targetUpdates.length} KPI target${targetUpdates.length > 1 ? 's' : ''} updated</strong>`);
+    if (correctiveActionsCount > 0)
+      notifications.push(`ðŸ“‹ <strong>${correctiveActionsCount} corrective action${correctiveActionsCount > 1 ? 's' : ''} recorded</strong>`);
+    if (notifications.length === 0) notifications.push(` All KPIs are within targets`);
+
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI Submitted</title>
+      <style>body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;display:flex;
+        justify-content:center;align-items:center;height:100vh;margin:0;}
+      .sc{background:#fff;padding:40px;border-radius:10px;text-align:center;max-width:600px;}
+      .ni{display:flex;align-items:center;margin:10px 0;padding:10px;background:white;border-radius:6px;}
+      .btn{display:inline-block;padding:12px 25px;background:#0078D7;color:white;
+           text-decoration:none;border-radius:6px;font-weight:bold;margin:5px;}</style></head>
+      <body><div class="sc">
+        <h1 style="color:#28a745;">KPI Submitted Successfully!</h1>
+        <p>Your KPI values for ${week} have been saved.</p>
+        <div style="background:#f8f9fa;padding:20px;border-radius:8px;margin:20px 0;">
+          ${notifications.map(n => `<div class="ni"><span style="margin-right:10px;">ðŸ“Œ</span><span>${n}</span></div>`).join('')}
+        </div>
+        <a href="/dashboard?responsible_id=${responsible_id}" class="btn">Go to Dashboard</a>
+      </div></body></html>`);
+  } catch (err) {
+    res.status(500).send(`<h2 style="color:red;">âŒ Failed: ${err.message}</h2>`);
+  }
+});
+
+
+
+app.get("/api/kpi-chart-data", async (req, res) => {
+  try {
+    const { responsible_id, kpi_id, week } = req.query;
+
+    if (!responsible_id || !kpi_id || !week) {
+      return res.status(400).json({ error: "Missing responsible_id, kpi_id, or week" });
+    }
+
+    const histRes = await pool.query(
+      `
+      SELECT DISTINCT ON (week)
+        week,
+        new_value,
+        updated_at
+      FROM public.kpi_values_hist26
+      WHERE responsible_id = $1
+        AND kpi_id = $2
+        AND new_value IS NOT NULL
+        AND new_value <> ''
+      ORDER BY week, updated_at DESC
+      `,
+      [responsible_id, kpi_id]
+    );
+
+    const currentRes = await pool.query(
+      `
+      SELECT kv.value
+      FROM public.kpi_values kv
+      WHERE kv.responsible_id = $1
+        AND kv.kpi_id = $2
+        AND kv.week = $3
+      LIMIT 1
+      `,
+      [responsible_id, kpi_id, week]
+    );
+
+    function weekLabelToDate(weekStr) {
+      const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
+      if (!m) return new Date(0);
+      const year = parseInt(m[1], 10);
+      const weekNum = parseInt(m[2], 10);
+      return new Date(year, 0, 1 + (weekNum - 1) * 7);
+    }
+
+    const weekMap = {};
+    for (const row of histRes.rows) {
+      const value = parseFloat(row.new_value);
+      if (isNaN(value)) continue;
+
+      weekMap[row.week] = value;
+    }
+
+    const currentWeekLabel = week;
+    const currentValue = parseFloat(currentRes.rows[0]?.value);
+
+    if (!isNaN(currentValue)) {
+      weekMap[currentWeekLabel] = currentValue;
+    }
+
+    const labels = Object.keys(weekMap).sort(
+      (a, b) => weekLabelToDate(a) - weekLabelToDate(b)
+    ).slice(-KPI_SUBMISSION_CHART_WEEK_WINDOW);
+
+    const values = labels.map((label) => Number(Number(weekMap[label]).toFixed(2)));
+
+    res.json({ labels, values, currentWeekLabel, currentValue: isNaN(currentValue) ? null : currentValue });
+  } catch (err) {
+    console.error("kpi-chart-data error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Form page ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
     const { responsible, kpis } = await getResponsibleWithKPIs(responsible_id, week);
-    if (!kpis.length) return res.send("<p>No KPIs found for this week.</p>");
+
+    if (!kpis.length) {
+      return res.send("<p>No KPIs found for this week.</p>");
+    }
+
+    const histRes = await pool.query(
+      `
+      SELECT DISTINCT ON (kpi_id, week)
+        kpi_id,
+        week,
+        new_value,
+        updated_at
+      FROM public.kpi_values_hist26
+      WHERE responsible_id = $1
+        AND new_value IS NOT NULL
+        AND new_value <> ''
+      ORDER BY kpi_id, week, updated_at DESC
+      `,
+      [responsible_id]
+    );
+
+    const historyByKpi = {};
+    histRes.rows.forEach((row) => {
+      if (!historyByKpi[row.kpi_id]) historyByKpi[row.kpi_id] = [];
+      historyByKpi[row.kpi_id].push({
+        week: row.week,
+        value: parseFloat(row.new_value)
+      });
+    });
+
+    function weekLabelToDate(weekStr) {
+      const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
+      if (!m) return new Date(0);
+      const year = parseInt(m[1], 10);
+      const weekNum = parseInt(m[2], 10);
+      return new Date(year, 0, 1 + (weekNum - 1) * 7);
+    }
+
+    function findPreviousWeekLabel(currentWeekLabel, labels) {
+      const currentDate = weekLabelToDate(currentWeekLabel);
+      return Array.from(new Set((labels || []).filter(Boolean)))
+        .sort((a, b) => weekLabelToDate(a) - weekLabelToDate(b))
+        .filter((label) => weekLabelToDate(label) < currentDate)
+        .pop() || null;
+    }
+
+    const encodeModalPayload = (value) =>
+      encodeURIComponent(JSON.stringify(value ?? null));
+
+    const commentsHistoryRes = await pool.query(
+      `
+      SELECT DISTINCT ON (kpi_id, week)
+        kpi_id,
+        week,
+        comment,
+        updated_at
+      FROM public.kpi_values_hist26
+      WHERE responsible_id = $1
+        AND comment IS NOT NULL
+        AND BTRIM(comment) <> ''
+      ORDER BY kpi_id, week, updated_at DESC
+      `,
+      [responsible_id]
+    );
+
+    const correctiveActionsHistoryRes = await pool.query(
+      `
+      SELECT
+        kpi_id,
+        week,
+        root_cause,
+        implemented_solution,
+        evidence,
+        status,
+        due_date,
+        responsible,
+        created_date,
+        updated_date
+      FROM public.corrective_actions
+      WHERE responsible_id = $1
+      ORDER BY kpi_id ASC, week ASC, COALESCE(updated_date, created_date) DESC
+      `,
+      [responsible_id]
+    );
+
+    const commentsByKpiWeek = {};
+    commentsHistoryRes.rows.forEach((row) => {
+      if (!commentsByKpiWeek[row.kpi_id]) commentsByKpiWeek[row.kpi_id] = {};
+      if (!commentsByKpiWeek[row.kpi_id][row.week]) commentsByKpiWeek[row.kpi_id][row.week] = [];
+      commentsByKpiWeek[row.kpi_id][row.week].push({
+        week: row.week,
+        text: row.comment,
+        updated_at: row.updated_at
+      });
+    });
+
+    const correctiveActionsByKpiWeek = {};
+    correctiveActionsHistoryRes.rows.forEach((row) => {
+      const updatedAt = row.updated_date || row.created_date || null;
+
+      if (!correctiveActionsByKpiWeek[row.kpi_id]) {
+        correctiveActionsByKpiWeek[row.kpi_id] = {};
+      }
+
+      if (!correctiveActionsByKpiWeek[row.kpi_id][row.week]) {
+        correctiveActionsByKpiWeek[row.kpi_id][row.week] = [];
+      }
+
+      correctiveActionsByKpiWeek[row.kpi_id][row.week].push({
+        week: row.week,
+        status: row.status || "",
+        root_cause: row.root_cause || "",
+        implemented_solution: row.implemented_solution || "",
+        evidence: row.evidence || "",
+        due_date: row.due_date || "",
+        responsible: row.responsible || "",
+        updated_at: updatedAt
+      });
+    });
+
+    // optional: sort newest first
+    Object.keys(correctiveActionsByKpiWeek).forEach((kpiId) => {
+      Object.keys(correctiveActionsByKpiWeek[kpiId]).forEach((weekLabel) => {
+        correctiveActionsByKpiWeek[kpiId][weekLabel].sort((a, b) => {
+          return new Date(b.updated_at || 0) - new Date(a.updated_at || 0);
+        });
+      });
+    });
+
+    let kpiCardsHtml = "";
+
+    kpis.forEach((kpi) => {
+      let lowLimit = null;
+      if (kpi.low_limit && kpi.low_limit !== "None" && kpi.low_limit !== "null" && kpi.low_limit !== "" && !isNaN(parseFloat(kpi.low_limit))) {
+        lowLimit = parseFloat(kpi.low_limit);
+      }
+      let highLimit = null;
+      if (kpi.high_limit && kpi.high_limit !== "None" && kpi.high_limit !== "null" && kpi.high_limit !== "" && !isNaN(parseFloat(kpi.high_limit))) {
+        highLimit = parseFloat(kpi.high_limit);
+      }
+      let targetValue = null;
+      if (kpi.target && kpi.target !== "None" && kpi.target !== "null" && kpi.target !== "" && !isNaN(parseFloat(kpi.target))) {
+        targetValue = parseFloat(kpi.target);
+      }
+
+      const currentValue = kpi.value && kpi.value !== "" && !isNaN(parseFloat(kpi.value))
+        ? parseFloat(kpi.value) : null;
+
+      const goodDirection = inferKpiDirection(kpi);
+      const showCA = currentValue !== null &&
+        needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
+      const correctiveActions = sortCorrectiveActions(
+        Array.isArray(kpi.corrective_actions) ? kpi.corrective_actions : []
+      );
+      const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
+      const caStatus = latestCorrectiveAction?.status || "";
+      const safeCaStatusClass = String(caStatus || "").toLowerCase().replace(/\s+/g, "-");
+      const correctiveActionsToRender = correctiveActions.length ? correctiveActions : [{
+        responsible: responsible.name || ""
+      }];
+      const correctiveActionsHtml = correctiveActionsToRender
+        .map((action, actionIndex) => buildCorrectiveActionEntryHtml({
+          kpiValuesId: kpi.kpi_values_id,
+          actionIndex,
+          action,
+          defaultResponsibleName: responsible.name || "",
+          showRequired: showCA
+        }))
+        .join("");
+
+      // â”€â”€ Corrective actions section (no footer add-btn inside) â”€â”€
+
+
+      const rawHistory = historyByKpi[kpi.kpi_id] || [];
+      const sortedHistory = rawHistory
+        .filter((h) => !isNaN(h.value))
+        .sort((a, b) => weekLabelToDate(a.week) - weekLabelToDate(b.week));
+
+      const currentWeekLabel = week;
+      const weekMap = {};
+
+      sortedHistory.forEach((item) => {
+        weekMap[item.week] = item.value;
+      });
+
+      // also force the current input value into the current week
+      if (currentValue !== null) {
+        weekMap[currentWeekLabel] = currentValue;
+      }
+
+      let historyLabels = Object.keys(weekMap).sort(
+        (a, b) => weekLabelToDate(a) - weekLabelToDate(b)
+      ).slice(-KPI_SUBMISSION_CHART_WEEK_WINDOW);
+
+      let historyValues = historyLabels.map((label) => Number(Number(weekMap[label]).toFixed(2)));
+
+      const commentWeeks = Object.keys(commentsByKpiWeek[kpi.kpi_id] || {});
+      const correctiveActionWeeks = Object.keys(correctiveActionsByKpiWeek[kpi.kpi_id] || {});
+      const previousWeekLabel = findPreviousWeekLabel(
+        currentWeekLabel,
+        historyLabels.concat(commentWeeks, correctiveActionWeeks)
+      );
+      const previousWeekActions = previousWeekLabel
+        ? correctiveActionsByKpiWeek[kpi.kpi_id]?.[previousWeekLabel] || []
+        : [];
+      const previousWeekComments = previousWeekLabel
+        ? (commentsByKpiWeek[kpi.kpi_id]?.[previousWeekLabel] || [])
+          .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        : [];
+      const hasPreviousWeekDetails = Boolean(
+        (previousWeekActions && previousWeekActions.length) ||
+        (previousWeekComments && previousWeekComments.length)
+      );
+
+      kpiCardsHtml += `
+       <div class="kpi-card"
+        data-kpi-id="${kpi.kpi_id}"
+       data-kpi-values-id="${kpi.kpi_values_id}"
+       data-low-limit="${lowLimit !== null ? lowLimit : ""}"
+       data-high-limit="${highLimit !== null ? highLimit : ""}"
+       data-good-direction="${goodDirection}"
+       data-target="${targetValue !== null ? targetValue : ""}"
+       data-history-labels='${JSON.stringify(historyLabels)}'
+       data-history-values='${JSON.stringify(historyValues)}'
+       data-current-week="${week}"
+       data-current-week-label="${currentWeekLabel}"
+       data-unit="${kpi.unit || ""}"
+      data-prev-week-label="${previousWeekLabel || ""}"
+      data-prev-week-actions="${encodeModalPayload(previousWeekActions)}"
+      data-prev-week-comments="${encodeModalPayload(previousWeekComments)}">
+
+          <div class="kpi-header">
+            <div>
+              <div class="kpi-title">${getKpiDisplayTitle(kpi)}</div>
+              ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ""}
+            </div>
+          </div>
+
+          <div class="kpi-split-layout">
+            <div class="kpi-right-panel kpi-chart-trigger"
+                 data-kpi-values-id="${kpi.kpi_values_id}"
+                 role="button"
+                 tabindex="0"
+                 title="Click to expand chart"
+                 aria-label="Expand KPI chart">
+              <button
+                type="button"
+                class="chart-expand-btn"
+                data-kpi-values-id="${kpi.kpi_values_id}"
+                aria-label="Expand KPI chart"
+                title="Expand chart">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M9 3H3v6"></path>
+                  <path d="M15 3h6v6"></path>
+                  <path d="M21 15v6h-6"></path>
+                  <path d="M9 21H3v-6"></path>
+                </svg>
+              </button>
+              <canvas id="chart_${kpi.kpi_values_id}"></canvas>
+            </div>
+
+            <div class="kpi-left-panel">
+              <div class="kpi-entry-card">
+             
+
+                <div class="kpi-input-stack">
+                  <label class="kpi-side-label" for="value_${kpi.kpi_values_id}">Current Value</label>
+                  <div class="kpi-input-shell ${kpi.unit ? "has-unit" : ""}">
+                    <input
+                      type="number"
+                      step="any"
+                      id="value_${kpi.kpi_values_id}"
+                      name="value_${kpi.kpi_values_id}"
+                      value="${kpi.value ?? ""}"
+                      placeholder="Enter value"
+                      class="kpi-input value-input"
+                      data-kpi-values-id="${kpi.kpi_values_id}"
+                      required
+                    />
+                    ${kpi.unit ? `<span class="kpi-input-unit">${kpi.unit}</span>` : ""}
+                  </div>
+                </div>
+                <div>
+                     <!-- â”€â”€ Manager Comment (moved above action bar) â”€â”€ -->
+          <div class="comment-section">
+            <div class="comment-label">
+              Manager Comment <span style="font-size:11px;color:#888;">(Optional)</span>
+            </div>
+            <textarea
+              name="comment_${kpi.kpi_values_id}"
+              class="comment-input"
+              placeholder="Add your comment..."
+            >${kpi.latest_comment || ""}</textarea>
+          </div>
+                </div>
+
+                <div class="kpi-history-panel ${hasPreviousWeekDetails ? "history-available" : "history-empty"}">
+                  <div class="kpi-history-copy">
+                 
+                  </div>
+                  <button
+                    type="button"
+                    class="view-ca-btn"
+                    data-kpi-values-id="${kpi.kpi_values_id}"
+                    onclick="openHistoryModal('${kpi.kpi_values_id}'); return false;">
+                    <span>View Corrective Action</span>
+                    <span class="view-ca-btn-icon" aria-hidden="true">&#8599;</span>
+                  </button>
+                </div>
+                    <!-- â”€â”€ Unified card action bar â”€â”€ -->
+        <div class="kpi-card-actions">
+       <div class="kpi-card-actions-left">
+       <button
+        type="button"
+        class="card-action-btn card-action-btn--ai"
+        onclick="openAssistantForKpi('${kpi.kpi_values_id}')">
+        <span class="ai-btn-glow"></span>
+        <span class="ai-btn-shine"></span>
+        <span class="ai-btn-icon" aria-hidden="true">&#129302;</span>
+        <span class="ai-btn-text">AI Support</span>
+       </button>
+  </div>
+
+  <div class="kpi-card-actions-right">
+    <button
+      type="button"
+      class="card-action-btn card-action-btn--primary open-ca-modal-btn"
+      data-kpi-values-id="${kpi.kpi_values_id}"
+      onclick="openCaTableModal('${kpi.kpi_values_id}'); return false;">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M10 4v12M4 10h12"/>
+      </svg>
+      Add Action
+    </button>
+  </div>
+</div>
+              </div>
+
+              <div class="kpi-mini-stats">
+                <div class="mini-stat-card">
+                  <div class="mini-stat-label">HIGH LIMIT</div>
+                  <div class="mini-stat-value high">${highLimit !== null ? highLimit : "â€”"}</div>
+                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                </div>
+                <div class="mini-stat-card">
+                  <div class="mini-stat-label">TARGET</div>
+                  <div class="mini-stat-value target">${targetValue !== null ? targetValue : "â€”"}</div>
+                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                </div>
+                <div class="mini-stat-card">
+                  <div class="mini-stat-label">LOW LIMIT</div>
+                  <div class="mini-stat-value low">${lowLimit !== null ? lowLimit : "â€”"}</div>
+                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+         <div class="ca-actions-stack" data-kpi-values-id="${kpi.kpi_values_id}" style="display:none;">
+         ${correctiveActionsHtml}
+           </div>
+        </div>
+      `;
+    });
 
     res.send(`
       <!DOCTYPE html>
@@ -1766,1452 +8010,4239 @@ app.get("/form", async (req, res) => {
         <meta charset="utf-8">
         <title>KPI Form - Week ${week}</title>
         <style>
-          body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: #f4f6f9; 
-            padding: 20px;
-            margin: 0;
+          body{
+            font-family:'Segoe UI',sans-serif;
+            background:#f4f6f9;
+            background-image:url('https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?w=1600');
+            background-size:cover;
+            background-position:center;
+            background-attachment:fixed;
+            padding:20px;
+            margin:0;
+            min-height:100vh;
           }
-          .container { 
-            max-width: 800px; 
-            margin: 0 auto; 
-            background: #fff; 
-            border-radius: 8px; 
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
+          .container{
+            max-width:1500px;
+            width:96%;
+            margin:0 auto;
+            background:rgba(255,255,255,0.95);
+            border-radius:8px;
+            box-shadow:0 4px 20px rgba(0,0,0,0.2);
+            overflow:hidden;
           }
-          .header { 
-            background: #0078D7; 
-            color: white; 
-            padding: 20px; 
-            text-align: center;
+          .header{
+            background:#0078D7;
+            color:white;
+            padding:20px;
           }
-          .header h1 { 
-            margin: 0; 
-            font-size: 24px;
-            font-weight: 600;
+          .header-inner{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:16px;
           }
-          .form-section { 
-            padding: 30px;
+          .header-title{
+            width:100%;
+            text-align:center;
+            font-size:22px;
+            font-weight:700;
+            margin:0;
           }
-          .info-section {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 6px;
-            margin-bottom: 25px;
-            border-left: 4px solid #0078D7;
+          .form-section{padding:30px;}
+          .info-section{
+            display:grid;
+            grid-template-columns:repeat(4,minmax(0,1fr));
+            gap:16px;
+            background:linear-gradient(135deg,#f8fbff 0%,#eef6ff 100%);
+            padding:20px;
+            border-radius:18px;
+            margin-bottom:25px;
+            border:1px solid #cfe3fb;
+            box-shadow:inset 0 1px 0 rgba(255,255,255,0.85);
           }
-          .info-row {
-            display: flex;
-            margin-bottom: 15px;
-            align-items: center;
+          .info-row{
+            display:flex;
+            flex-direction:column;
+            gap:8px;
+            align-items:stretch;
+            min-width:0;
+            margin-bottom:0;
           }
-          .info-label {
-            font-weight: 600;
-            color: #333;
-            width: 120px;
-            font-size: 14px;
+          .info-label{
+            font-weight:800;
+            color:#1d4ed8;
+            font-size:12px;
+            letter-spacing:.8px;
+            text-transform:uppercase;
           }
-          .info-value {
-            flex: 1;
-            padding: 8px 12px;
-            background: white;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
+          .info-value{
+            min-width:0;
+            padding:12px 14px;
+            background:white;
+            border:1px solid #d8e3f0;
+            border-radius:12px;
+            box-shadow:0 4px 12px rgba(15,23,42,0.04);
+            font-size:15px;
+            font-weight:700;
+            color:#0f172a;
           }
-          .kpi-section {
-            margin-top: 30px;
+
+          /* â”€â”€ KPI Card â”€â”€ */
+          .kpi-card{
+            background:#fff;
+            border:1px solid #e1e5e9;
+            border-radius:6px;
+            padding:20px;
+            margin-bottom:20px;
           }
-          .kpi-section h3 {
-            color: #0078D7;
-            margin-bottom: 20px;
-            font-size: 18px;
-            border-bottom: 2px solid #0078D7;
-            padding-bottom: 8px;
+          .kpi-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;}
+          .kpi-title{font-weight:600;color:#333;font-size:15px;}
+          .kpi-subtitle{color:#666;font-size:13px;margin-bottom:10px;}
+
+          .kpi-split-layout{
+            display:grid;
+            grid-template-columns:minmax(0,1fr) 380px;
+            gap:20px;
+            align-items:stretch;
+            margin-top:16px;
+            position:relative;
+            isolation:isolate;
           }
-          .kpi-card {
-            background: #fff;
-            border: 1px solid #e1e5e9;
-            border-radius: 6px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+          .kpi-left-panel,.kpi-right-panel{
+            background:#fafafa;
+            border:1px solid #e5e7eb;
+            border-radius:20px;
+            padding:18px;
+            min-width:0;
+            position:relative;
           }
-          .kpi-title {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 5px;
-            font-size: 15px;
+          .kpi-left-panel{
+            min-height:480px;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            position:relative;
+            overflow:hidden;
+            z-index:30;
+            isolation:isolate;
+            background:
+              radial-gradient(circle at top right,rgba(37,99,235,0.14),transparent 34%),
+              linear-gradient(180deg,#ffffff 0%,#f7fbff 52%,#f2f7fc 100%);
           }
-          .kpi-subtitle {
-            color: #666;
-            font-size: 13px;
-            margin-bottom: 10px;
+          .kpi-left-panel::before{
+            content:"";
+            position:absolute;
+            width:220px;height:220px;right:-90px;top:-90px;
+            border-radius:50%;
+            background:radial-gradient(circle,rgba(56,189,248,0.18) 0%,rgba(56,189,248,0) 72%);
+            pointer-events:none;
           }
-          .kpi-input {
-            width: 100%;
-            padding: 10px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-            transition: border-color 0.2s;
+
+        .kpi-entry-card{
+        padding:24px;
+        border-radius:24px;
+        background:rgba(255,255,255,0.96);
+        border:1px solid #d8e3ee;
+        box-shadow:0 20px 40px rgba(15,23,42,0.10);
+        display:flex;
+        flex-direction:column;
+        gap:18px;
+        position:relative;
+        z-index:31;
+
+        /* ðŸ‘‡ ADD THIS */
+        padding-bottom:28px;
+        }
+          .kpi-entry-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;}
+          .kpi-entry-eyebrow{font-size:11px;font-weight:800;letter-spacing:1.1px;text-transform:uppercase;color:#64748b;}
+          .kpi-entry-title{margin-top:6px;color:#0f172a;font-size:18px;font-weight:800;line-height:1.25;}
+          .kpi-entry-unit{
+            flex-shrink:0;padding:8px 12px;border-radius:999px;
+            background:#eff6ff;color:#1d4ed8;font-size:12px;font-weight:800;
+            border:1px solid #bfdbfe;white-space:nowrap;
           }
-          .kpi-input:focus {
-            border-color: #0078D7;
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(0,120,215,0.1);
+          .kpi-input-stack{display:flex;flex-direction:column;gap:8px;}
+          .kpi-side-label{font-size:12px;font-weight:800;letter-spacing:0.9px;text-transform:uppercase;color:#475569;}
+          .kpi-input-shell{position:relative;}
+          .kpi-input{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:4px;font-size:14px;box-sizing:border-box;}
+          .kpi-input:focus{border-color:#0078D7;outline:none;}
+          .kpi-left-panel .kpi-input{
+            width:100%;margin:0;min-height:58px;padding:16px 18px;
+            border:1.5px solid #d6dee8;border-radius:16px;background:#ffffff;
+            color:#0f172a;font-size:24px;font-weight:800;
+            box-shadow:inset 0 1px 0 rgba(255,255,255,0.9);
           }
-          
-          /* Submit Button Styles */
-          .submit-btn {
-            background: #0078D7;
-            color: white;
-            border: none;
-            padding: 12px 30px;
-            border-radius: 4px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 100%;
-            margin-top: 20px;
-            min-height: 48px;
-            gap: 10px;
+          .kpi-left-panel .kpi-input::placeholder{color:#94a3b8;font-size:16px;font-weight:600;}
+          .kpi-input-shell.has-unit .kpi-input{padding-right:76px;}
+          .kpi-input-unit{
+            position:absolute;top:50%;right:14px;transform:translateY(-50%);
+            padding:6px 10px;border-radius:999px;background:#f8fafc;
+            border:1px solid #e2e8f0;color:#64748b;font-size:12px;font-weight:800;pointer-events:none;
           }
-          .submit-btn:hover:not(:disabled) {
-            background: #005ea6;
+          .kpi-left-panel .kpi-input:focus{
+            border-color:#3b82f6;outline:none;
+            box-shadow:0 0 0 4px rgba(59,130,246,0.12),0 14px 30px rgba(59,130,246,0.10);
           }
-          .submit-btn:disabled {
-            background: #6c757d;
-            cursor: not-allowed;
-            opacity: 0.8;
+        
+          .kpi-history-panel{
+           width:calc(100% - 12px);
+           margin:0 0 0 auto;
+           padding:14px 0 0;   /* â¬…ï¸ remove side padding */
+           border:none;        /* â¬…ï¸ remove border */
+           background:transparent; /* â¬…ï¸ remove background */
+           display:flex;
+           flex-direction:column;
+           gap:14px;
+           position:relative;
+           z-index:32;
+           box-sizing:border-box;
+            }
+          .kpi-history-panel.history-empty{border-color:#e2e8f0;background:linear-gradient(180deg,#fbfdff 0%,#f8fafc 100%);}
+          .kpi-history-copy{display:flex;flex-direction:column;gap:6px;}
+          .kpi-history-kicker{font-size:11px;font-weight:800;letter-spacing:1px;text-transform:uppercase;color:#64748b;}
+          .kpi-history-title{font-size:18px;font-weight:800;line-height:1.2;color:#0f172a;}
+          .view-ca-btn{
+          width:100%;
+          border:none;
+          border-radius:14px;
+          padding:14px 16px;
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:12px;
+
+          background:linear-gradient(135deg,#0f6cbd 0%,#2894ff 100%);
+          color:white;
+          font-size:14px;
+          font-weight:800;
+          cursor:pointer;
+          position:relative;
+          z-index:40;
+          pointer-events:auto;
+         box-shadow:0 8px 18px rgba(15,108,189,0.18); /* â¬…ï¸ softer */
           }
-          
-          /* Loading Spinner */
-          .spinner {
-            display: none;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 1s ease-in-out infinite;
+          .view-ca-btn:hover{transform:translateY(-2px);box-shadow:0 18px 34px rgba(15,108,189,0.26);}
+          .view-ca-btn-icon{
+            width:32px;height:32px;border-radius:999px;
+            display:inline-flex;align-items:center;justify-content:center;
+            background:rgba(255,255,255,0.18);font-size:16px;
           }
-          
-          .submit-text {
-            display: block;
+          .view-ca-note{font-size:13px;color:#526277;line-height:1.6;}
+          .kpi-mini-stats{display:none;}
+          .kpi-right-panel{
+            min-height:280px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;z-index:1;
           }
-          
-          .submitting .spinner {
-            display: block;
+          .kpi-chart-trigger{
+            cursor:zoom-in;transition:border-color 0.2s ease,box-shadow 0.2s ease;pointer-events:none;
           }
-          
-          .submitting .submit-text {
-            display: none;
+          .kpi-chart-trigger:hover{border-color:#bfdbfe;box-shadow:0 12px 28px rgba(37,99,235,0.10);}
+          .chart-expand-btn{
+            position:absolute;top:14px;right:14px;width:42px;height:42px;
+            border:none;border-radius:14px;
+            display:inline-flex;align-items:center;justify-content:center;
+            background:rgba(255,255,255,0.92);color:#1d4ed8;
+            box-shadow:0 12px 24px rgba(15,23,42,0.12);
+            cursor:pointer;z-index:3;pointer-events:auto;
+            transition:transform 0.18s ease,box-shadow 0.18s ease;
           }
-          
-          @keyframes spin {
-            to { transform: rotate(360deg); }
+          .chart-expand-btn:hover{transform:translateY(-1px);background:#eff6ff;}
+          .chart-expand-btn svg{width:18px;height:18px;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round;}
+          .kpi-right-panel canvas{width:100% !important;height:380px !important;max-width:100%;display:block;pointer-events:none;}
+
+          .history-table-wrap {
+  overflow-x: auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.history-table thead tr {
+  background: #f8fafc;
+}
+
+.history-table th {
+  padding: 12px 14px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #334155;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+}
+
+.history-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: top;
+  color: #334155;
+  line-height: 1.5;
+}
+
+.history-table tr:last-child td {
+  border-bottom: none;
+}
+
+.history-table td pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+
+          /* â”€â”€ CA Section â”€â”€ */
+          .ca-container{
+            margin-top:16px;
+            background:linear-gradient(135deg,#fff5f5,#fff8f0);
+            border:2px solid #f28b82;
+            border-radius:10px;
+            display:none;overflow:hidden;
           }
-          
-          .unit-label {
-            color: #888;
-            font-size: 12px;
-            margin-top: 5px;
+          .ca-container.visible{display:block;}
+          .ca-header{
+            font-weight:700;color:#c62828;font-size:14px;
+            padding:14px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+            background:rgba(211,47,47,0.05);
           }
-          
-          /* Overlay for preventing interaction */
-          .form-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(255, 255, 255, 0.95);
-            display: none;
-            justify-content: center;
-            align-items: center;
-            z-index: 1000;
-            backdrop-filter: blur(3px);
+          .ca-header-copy{flex:1 1 280px;}
+          .ca-header-meta{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;}
+          .ca-count-badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:999px;background:#fff;border:1px solid #fecaca;color:#b91c1c;}
+          .ca-status-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;}
+          .ca-status-open{background:#ffebee;color:#c62828;border:1px solid #ef9a9a;}
+          .ca-status-waiting-for-validation{background:#fff3e0;color:#e65100;border:1px solid #ffcc02;}
+          .ca-actions-note{padding:14px 14px 0;font-size:12px;color:#7f1d1d;}
+          .ca-ai-box{margin:14px 14px 0;border:none;border-radius:10px;background:linear-gradient(135deg,#f5f3ff,#ede9fe);overflow:hidden;}
+          .ca-suggestion-content{padding:12px 14px;}
+          .ca-ai-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+          .ca-ai-card{background:white;border-radius:8px;padding:12px;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s;border:1.5px solid transparent;}
+          .ca-ai-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.1);}
+          .ca-ai-card.applied{border-color:#4ade80 !important;background:#f0fdf4;}
+          .ca-rc-card{border-top:3px solid #ef4444;}
+          .ca-sol-card{border-top:3px solid #f59e0b;}
+          .ca-ev-card{border-top:3px solid #3b82f6;}
+          .ca-ai-card-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:7px;display:flex;align-items:center;gap:5px;}
+          .ca-rc-card .ca-ai-card-label{color:#dc2626;}
+          .ca-sol-card .ca-ai-card-label{color:#d97706;}
+          .ca-ev-card .ca-ai-card-label{color:#2563eb;}
+          .ca-apply-hint{margin-left:auto;font-size:9px;font-weight:500;color:#9ca3af;text-transform:none;letter-spacing:0;}
+          .ca-ai-card-text{font-size:12px;color:#374151;line-height:1.5;}
+          .ca-sugg-error{padding:10px 14px;font-size:12px;color:#92400e;background:#fff7ed;}
+          .ca-actions-stack{padding:14px;display:grid;gap:14px;}
+          .ca-action-card{
+            background:rgba(255,255,255,0.85);border:1px solid #f8b4b4;
+            border-radius:14px;padding:14px 0 2px;
+            box-shadow:0 8px 20px rgba(239,68,68,0.06);
           }
-          
-          .overlay-spinner {
-            width: 60px;
-            height: 60px;
-            border: 5px solid #f3f3f3;
-            border-radius: 50%;
-            border-top-color: #0078D7;
-            animation: spin 1s linear infinite;
+          .ca-action-head{
+            display:flex;justify-content:space-between;align-items:center;gap:12px;
+            padding:0 14px 12px;margin-bottom:12px;
+            border-bottom:1px solid #fee2e2;flex-wrap:wrap;
           }
-          
-          .overlay-message {
-            margin-top: 20px;
-            color: #0078D7;
-            font-weight: 600;
-            font-size: 18px;
+          .ca-action-title{font-size:14px;font-weight:900;color:#991b1b;}
+          .ca-action-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+          .ca-remove-btn{border:none;border-radius:999px;padding:8px 12px;background:#fee2e2;color:#b91c1c;font-size:11px;font-weight:800;cursor:pointer;}
+          .ca-remove-btn.is-hidden{display:none;}
+          .ca-dates-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:0 14px 14px;align-items:start;}
+          .ca-dates-grid .ca-field{margin-top:0 !important;margin-bottom:0;padding:0;}
+          .ca-date-input,.ca-text-input{width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:6px;font-size:13px;font-family:inherit;background:#fff;box-sizing:border-box;}
+          .ca-date-input:focus,.ca-text-input:focus{border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.12);}
+          .ca-field{margin-bottom:14px;padding:0 14px;}
+          .ca-label{display:block;font-weight:600;font-size:13px;color:#555;margin-bottom:6px;}
+          .ca-required{color:#dc3545;}
+          .ca-textarea{
+            width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:6px;
+            min-height:80px;resize:vertical;font-family:inherit;font-size:13px;
+            background:#fff;box-sizing:border-box;transition:border-color 0.2s;
           }
-          
-          .overlay-submessage {
-            margin-top: 10px;
-            color: #666;
-            font-size: 14px;
-            max-width: 300px;
-            text-align: center;
+          .ca-textarea:focus{border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.12);}
+          .ca-textarea.error,.ca-date-input.error,.ca-text-input.error{border-color:#dc3545;background:#fff5f5;}
+          .ca-textarea.highlight{animation:caHighlight 1.8s forwards;}
+          @keyframes caHighlight{0%{background:#dcfce7;border-color:#16a34a;}100%{background:#fff;border-color:#f28b82;}}
+
+          /* â”€â”€ Comment Section â”€â”€ */
+          .comment-section{margin-top:16px;}
+          .comment-section{position:relative;z-index:32;}
+          .comment-label{font-weight:600;color:#555;margin-bottom:8px;font-size:13px;}
+          .comment-input{
+            width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;
+            min-height:70px;resize:vertical;font-family:inherit;box-sizing:border-box;
+          }
+
+          /* â”€â”€ Unified Card Action Bar â”€â”€ */
+          .kpi-card-actions {
+           display: flex;
+           align-items: center;
+           justify-content: flex-start; /* â¬…ï¸ instead of space-between */
+           gap: 10px; /* â¬…ï¸ space between buttons */
+           margin-top: 16px;
+           padding-top: 14px;
+           border-top: 1px solid #e5e7eb;
+           flex-wrap: nowrap; /* â¬…ï¸ keep them on same row */
+           position:relative;
+           z-index:35;
+           }
+          .kpi-card-actions-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+          .kpi-card-actions-right{display:flex;align-items:center;gap:10px;}
+
+          .card-action-btn{
+            display:inline-flex;align-items:center;gap:7px;
+            border:none;border-radius:10px;
+            padding:9px 16px;
+            font-size:13px;font-weight:700;cursor:pointer;
+            position:relative;
+            z-index:40;
+            pointer-events:auto;
+            transition:transform 0.15s,box-shadow 0.15s,background 0.15s;
+          }
+          .card-action-btn svg{width:15px;height:15px;flex-shrink:0;}
+          .card-action-btn:hover{transform:translateY(-1px);}
+
+          .card-action-btn--ghost{
+            background:#f8fafc;color:#475569;
+            border:1px solid #d1d5db;
+          }
+          .card-action-btn--ghost:hover{background:#f1f5f9;box-shadow:0 4px 10px rgba(0,0,0,0.07);}
+
+          .card-action-btn--primary{
+            background:linear-gradient(135deg,#ef4444,#dc2626);
+            color:white;
+            box-shadow:0 6px 16px rgba(220,38,38,0.22);
+          }
+          .card-action-btn--primary:hover{box-shadow:0 8px 20px rgba(220,38,38,0.30);}
+
+       .card-action-btn--ai{
+  position:relative;
+  overflow:hidden;
+  background:linear-gradient(135deg,#2f87d6,#ff944d);
+  color:white;
+  box-shadow:0 6px 16px rgba(47,135,214,0.24);
+  padding:9px 18px;
+  isolation:isolate;
+}
+
+.card-action-btn--ai:hover{
+  box-shadow:0 10px 22px rgba(47,135,214,0.34);
+  transform:translateY(-1px) scale(1.02);
+}
+
+.ai-btn-glow{
+  position:absolute;
+  inset:0;
+  background:radial-gradient(circle at 30% 50%,rgba(255,255,255,0.18),transparent 60%);
+  pointer-events:none;
+  animation:aiPulseGlow 2.8s ease-in-out infinite;
+  z-index:0;
+}
+
+.ai-btn-shine{
+  position:absolute;
+  top:-20%;
+  left:-35%;
+  width:38%;
+  height:140%;
+  transform:rotate(18deg);
+  background:linear-gradient(
+    90deg,
+    rgba(255,255,255,0) 0%,
+    rgba(255,255,255,0.18) 50%,
+    rgba(255,255,255,0) 100%
+  );
+  animation:aiShineSweep 3.2s linear infinite;
+  pointer-events:none;
+  z-index:0;
+}
+
+.ai-btn-icon,
+.ai-btn-text{
+  position:relative;
+  z-index:1;
+}
+
+.ai-btn-icon{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  animation:aiRobotFloat 2.2s ease-in-out infinite;
+}
+
+@keyframes aiPulseGlow{
+  0%,100%{opacity:0.65;}
+  50%{opacity:1;}
+}
+
+@keyframes aiShineSweep{
+  0%{left:-35%;}
+  100%{left:120%;}
+}
+
+@keyframes aiRobotFloat{
+  0%,100%{transform:translateY(0);}
+  50%{transform:translateY(-2px);}
+}
+
+          /* â”€â”€ CA Table Modal â”€â”€ */
+        .ca-modal-overlay {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(15, 23, 42, 0.55);
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        z-index: 9999;
+        transition: opacity 0.25s ease, visibility 0.25s ease;
+       }
+          .ca-modal-overlay.active{opacity:1;pointer-events:auto;}
+          .ca-modal-box{
+            width:min(98vw,980px);
+            max-height:min(90vh,820px);
+            background:#fff;border-radius:22px;
+            box-shadow:0 30px 80px rgba(15,23,42,0.30);
+            display:flex;flex-direction:column;overflow:hidden;
+            transform:translateY(18px) scale(0.98);
+            transition:transform 0.22s ease;
+          }
+          .ca-modal-overlay.active {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+          }
+          .ca-modal-overlay.active .ca-modal-box{transform:translateY(0) scale(1);}
+          .ca-modal-panel {
+           width: min(1100px, 92vw);
+           max-height: 90vh;
+           overflow: auto;
+           background: #fff;
+           border-radius: 18px;
+           transform: translateY(12px);
+           transition: transform 0.25s ease;
+           }
+
+          .ca-modal-overlay.active .ca-modal-panel {
+           transform: translateY(0);
+           }
+          .ca-modal-header{
+            display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+            padding:22px 26px 18px;
+            border-bottom:1px solid #fee2e2;
+            background:linear-gradient(180deg,#fff5f5,#fff8f5);
+          }
+          .ca-modal-header-text{}
+          .ca-modal-title{margin:0;font-size:20px;font-weight:900;color:#991b1b;}
+          .ca-modal-subtitle{margin:5px 0 0;font-size:13px;color:#64748b;}
+          .ca-modal-close{
+            width:40px;height:40px;border:none;border-radius:999px;
+            background:#fee2e2;color:#b91c1c;font-size:22px;line-height:1;
+            cursor:pointer;flex-shrink:0;transition:background 0.2s;
+          }
+          .ca-modal-close:hover{background:#fecaca;}
+          .ca-modal-body{flex:1;min-height:0;overflow:auto;padding:22px 26px;}
+
+          /* Table */
+          .ca-table-wrap{overflow-x:auto;border-radius:14px;border:1px solid #fee2e2;}
+          .ca-table{
+            width:100%;border-collapse:collapse;font-size:13px;
+          }
+          .ca-table thead tr{background:#fff5f5;}
+          .ca-table th{
+            padding:12px 14px;text-align:left;font-size:11px;font-weight:800;
+            text-transform:uppercase;letter-spacing:0.6px;color:#991b1b;
+            border-bottom:2px solid #fecaca;white-space:nowrap;
+          }
+          .ca-table td{
+            padding:12px 14px;border-bottom:1px solid #fef2f2;
+            vertical-align:top;color:#374151;line-height:1.5;
+          }
+          .ca-col-actions{
+            width: 130px;
+            text-align: right;
+            white-space: nowrap;
+          }
+
+          .ca-table td.ca-col-actions{
+            text-align: right;
+            white-space: nowrap;
+          }
+
+
+.ca-table-edit-btn,
+.ca-table-delete-btn{
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  height: 34px;
+  min-width: 34px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.18s ease,
+    color 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.ca-table-edit-btn{
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+  box-shadow: 0 2px 6px rgba(29, 78, 216, 0.08);
+}
+
+.ca-table-edit-btn:hover{
+  background: #eff6ff;
+  border-color: #93c5fd;
+  box-shadow: 0 6px 14px rgba(29, 78, 216, 0.14);
+  transform: translateY(-1px);
+}
+  .ca-table-edit-btn:active{
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(29, 78, 216, 0.08);
+}
+
+.ca-table-delete-btn{
+  background: linear-gradient(180deg, #ffffff 0%, #fff7f7 100%);
+  color: #dc2626;
+  border-color: #fecaca;
+  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.08);
+  padding: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ca-table-delete-btn:hover{
+  background: #fef2f2;
+  border-color: #fca5a5;
+  box-shadow: 0 6px 14px rgba(220, 38, 38, 0.14);
+  transform: translateY(-1px);
+}
+
+.ca-table-delete-btn:active{
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.08);
+}
+
+.ca-table-edit-btn:focus-visible,
+.ca-table-delete-btn:focus-visible{
+  outline: none;
+  box-shadow:
+    0 0 0 3px rgba(59, 130, 246, 0.18),
+    0 4px 12px rgba(15, 23, 42, 0.10);
+}
+
+.ca-table-delete-btn:focus-visible{
+  box-shadow:
+    0 0 0 3px rgba(239, 68, 68, 0.18),
+    0 4px 12px rgba(15, 23, 42, 0.10);
+}
+
+          .ca-table tr:last-child td{border-bottom:none;}
+          .ca-table tr:hover td{background:#fff5f5;}
+          .ca-table .ca-col-num{width:36px;font-weight:800;color:#b91c1c;}
+          .ca-table .ca-col-actions{width:100px;text-align:right;white-space:nowrap;}
+          .ca-table-empty{
+            text-align:center;padding:40px 20px;color:#94a3b8;font-size:14px;
+          }
+          .ca-table-status{
+            display:inline-block;padding:3px 10px;border-radius:999px;
+            font-size:11px;font-weight:700;
+            background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;
+          }
+          .ca-table-status.open{background:#fef2f2;color:#b91c1c;border-color:#fecaca;}
+          .ca-table-status.closed,.ca-table-status.completed{background:#ecfdf5;color:#047857;border-color:#a7f3d0;}
+          .ca-table-status.waiting-for-validation{background:#fff7ed;color:#c2410c;border-color:#fed7aa;}
+
+          .ca-tbl-btn{
+            border:none;border-radius:7px;padding:5px 11px;font-size:11px;font-weight:700;cursor:pointer;
+          }
+          .ca-tbl-edit{background:#eff6ff;color:#1d4ed8;}
+          .ca-tbl-edit:hover{background:#dbeafe;}
+          .ca-tbl-delete{background:#fef2f2;color:#dc2626;margin-left:5px;}
+          .ca-tbl-delete:hover{background:#fee2e2;}
+
+          /* Modal form */
+          .ca-modal-form-section{
+            margin-top:22px;
+            border:1.5px solid #fecaca;
+            border-radius:16px;
+            overflow:hidden;
+          }
+          .ca-modal-form-header{
+            display:flex;align-items:center;justify-content:space-between;
+            padding:14px 18px;background:#fff5f5;
+            border-bottom:1px solid #fecaca;
+          }
+          .ca-modal-form-title{font-size:14px;font-weight:800;color:#991b1b;}
+          .ca-modal-form-body{padding:18px;display:grid;gap:14px;}
+          .ca-modal-form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+          .ca-modal-field label{display:block;font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;}
+          .ca-modal-input,.ca-modal-textarea,.ca-modal-select{
+            width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:8px;
+            font-size:13px;font-family:inherit;background:#fff;box-sizing:border-box;
+          }
+          .ca-modal-textarea{min-height:72px;resize:vertical;}
+          .ca-modal-input:focus,.ca-modal-textarea:focus,.ca-modal-select:focus{
+            border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.10);
+          }
+          .ca-modal-form-footer{
+            display:flex;justify-content:flex-end;gap:10px;
+            padding:14px 18px;
+            border-top:1px solid #fecaca;background:#fff5f5;
+          }
+          .ca-modal-cancel-btn{
+            padding:9px 20px;border:1px solid #d1d5db;border-radius:8px;
+            background:#fff;color:#374151;font-size:13px;font-weight:700;cursor:pointer;
+          }
+          .ca-modal-save-btn{
+            padding:9px 24px;border:none;border-radius:8px;
+            background:linear-gradient(135deg,#ef4444,#dc2626);
+            color:white;font-size:13px;font-weight:700;cursor:pointer;
+            box-shadow:0 4px 12px rgba(220,38,38,0.22);
+          }
+          .ca-modal-add-row-btn{
+            display:inline-flex;align-items:center;gap:8px;
+            margin-top:16px;
+            padding:10px 18px;border:1.5px dashed #fca5a5;border-radius:10px;
+            background:transparent;color:#b91c1c;font-size:13px;font-weight:700;cursor:pointer;
+            transition:background 0.15s;width:100%;justify-content:center;
+          }
+          .ca-modal-add-row-btn:hover{background:#fff5f5;}
+
+          /* â”€â”€ Modals (chart + history) â”€â”€ */
+          body.chart-modal-open{overflow:hidden;}
+          .chart-modal-overlay{
+            position:fixed;inset:0;padding:24px;background:rgba(15,23,42,0.58);
+            display:flex;align-items:center;justify-content:center;z-index:10003;
+            opacity:0;pointer-events:none;transition:opacity 0.22s ease;
+          }
+          .chart-modal-overlay.active{opacity:1;pointer-events:auto;}
+          .chart-modal-box{
+            width:min(96vw,1700px);height:min(92vh,980px);
+            background:#fff;border-radius:20px;
+            box-shadow:0 28px 80px rgba(15,23,42,0.28);
+            display:flex;flex-direction:column;overflow:hidden;
+            transform:translateY(18px) scale(0.98);transition:transform 0.22s ease;
+          }
+          .chart-modal-overlay.active .chart-modal-box{transform:translateY(0) scale(1);}
+          .chart-modal-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:24px 28px 18px;border-bottom:1px solid #e5e7eb;}
+          .chart-modal-header h3{margin:0;color:#0f172a;font-size:32px;line-height:1.15;}
+          .chart-modal-header p{margin:8px 0 0;color:#64748b;font-size:15px;}
+          .chart-modal-close{width:44px;height:44px;border:none;border-radius:999px;background:#f8fafc;color:#334155;font-size:28px;line-height:1;cursor:pointer;flex-shrink:0;}
+          .chart-modal-close:hover{background:#e2e8f0;color:#0f172a;}
+          .chart-modal-body{flex:1;min-height:0;padding:20px 24px 24px;background:linear-gradient(180deg,#ffffff 0%,#f8fafc 100%);}
+          .chart-modal-stage{height:100%;min-height:0;background:#fff;border:1px solid #dbe4f0;border-radius:16px;padding:20px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.8);}
+          .chart-modal-stage canvas{width:100% !important;height:100% !important;display:block;}
+
+        .history-modal-overlay{
+           position:fixed;
+           inset:0;
+           padding:12px;
+           background:rgba(15,23,42,0.58);
+           display:flex;
+           align-items:center;
+           justify-content:center;
+           z-index:10004;
+           opacity:0;
+           pointer-events:none;
+          transition:opacity 0.22s ease;
+          }
+          .history-modal-overlay.active{opacity:1;pointer-events:auto;}
+         .history-modal-box{
+          width:min(98vw,1400px);
+          height:min(94vh,1000px);
+          max-height:min(94vh,1000px);
+          background:#fff;
+         border-radius:22px;
+         overflow:hidden;
+         box-shadow:0 28px 80px rgba(15,23,42,0.28);
+         transform:translateY(18px) scale(0.98);
+         transition:transform 0.22s ease;
+         display:flex;
+         flex-direction:column;
+         }
+          .history-modal-overlay.active .history-modal-box{transform:translateY(0) scale(1);}
+          .history-modal-header{
+           display:flex;
+           align-items:flex-start;
+           justify-content:space-between;
+           gap:16px;
+           padding:24px 28px 18px;
+           border-bottom:1px solid #e5e7eb;
+           background:linear-gradient(180deg,#ffffff,#f8fbff);
+           flex-shrink:0;
+             }
+          .history-modal-title{margin:0;color:#0f172a;font-size:24px;line-height:1.2;}
+          .history-modal-subtitle{margin:8px 0 0;color:#64748b;font-size:14px;}
+          .history-modal-close{width:42px;height:42px;border:none;border-radius:999px;background:#f8fafc;color:#334155;font-size:26px;line-height:1;cursor:pointer;flex-shrink:0;}
+          .history-modal-content{
+           flex:1;
+           min-height:0;
+           padding:24px 28px 28px;
+           overflow:auto;
+           background:linear-gradient(180deg,#ffffff,#f8fafc 100%);
+          }
+          .history-meta-row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px;}
+          .history-chip{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border-radius:999px;font-size:12px;font-weight:800;background:#eff6ff;color:#1d4ed8;}
+          .history-chip.status-open{background:#fef2f2;color:#b91c1c;}
+          .history-chip.status-waiting-for-validation{background:#fff7ed;color:#c2410c;}
+          .history-chip.status-completed,.history-chip.status-closed{background:#ecfdf5;color:#047857;}
+          .history-status-select{
+            min-width:170px;
+            padding:9px 36px 9px 12px;
+            border-radius:999px;
+            border:1px solid #cbd5e1;
+            font-size:12px;
+            font-weight:800;
+            font-family:inherit;
+            background-color:#ffffff;
+            background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%2364758b' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 8 5 5 5-5'/%3E%3C/svg%3E");
+            background-position:right 12px center;
+            background-repeat:no-repeat;
+            background-size:14px;
+            appearance:none;
+            cursor:pointer;
+            transition:border-color .2s ease, box-shadow .2s ease, background-color .2s ease;
+          }
+          .history-status-select:focus{
+            outline:none;
+            border-color:#93c5fd;
+            box-shadow:0 0 0 4px rgba(59,130,246,0.12);
+          }
+          .history-status-select:disabled{opacity:0.72;cursor:wait;}
+          .history-status-select.status-open{background-color:#fef2f2;color:#b91c1c;border-color:#fecaca;}
+          .history-status-select.status-waiting-for-validation{background-color:#fff7ed;color:#c2410c;border-color:#fed7aa;}
+          .history-status-select.status-completed,.history-status-select.status-closed{background-color:#ecfdf5;color:#047857;border-color:#a7f3d0;}
+          .history-section{background:white;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 8px 22px rgba(15,23,42,0.05);}
+          .history-section+.history-section{margin-top:16px;}
+          .history-section-title{margin:0 0 14px;font-size:14px;font-weight:900;color:#111827;display:flex;align-items:center;gap:8px;}
+          .history-detail-card{background:linear-gradient(135deg,#fff8f8,#fffaf5);border:1px solid #fee2e2;border-radius:16px;padding:16px;}
+          .history-detail-row+.history-detail-row{margin-top:14px;padding-top:14px;border-top:1px solid rgba(226,232,240,0.8);}
+          .history-detail-label{font-size:12px;font-weight:900;margin-bottom:6px;}
+          .history-detail-label.root{color:#dc2626;}
+          .history-detail-label.solution{color:#d97706;}
+          .history-detail-label.evidence{color:#2563eb;}
+          .history-detail-text{font-size:14px;line-height:1.6;color:#334155;white-space:pre-wrap;}
+          .history-comments-list{display:grid;gap:12px;}
+          .history-comment-card{border-radius:16px;padding:16px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border-left:4px solid #0f6cbd;}
+          .history-comment-label{font-size:12px;font-weight:900;color:#2563eb;margin-bottom:8px;}
+          .history-comment-text{font-size:14px;color:#1e293b;line-height:1.6;white-space:pre-wrap;}
+          .history-empty{text-align:center;padding:34px 20px;background:white;border:1px dashed #cbd5e1;border-radius:18px;color:#64748b;font-size:14px;line-height:1.6;}
+
+          /* â”€â”€ Global Loading / Submit Modal â”€â”€ */
+          .loading-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:20px;}
+          .loading-overlay.active{display:flex;}
+          .spinner{width:56px;height:56px;border:6px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 0.9s linear infinite;}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          .loading-text{color:#fff;font-size:18px;font-weight:600;}
+          .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:10000;opacity:0;pointer-events:none;transition:all 0.25s ease;}
+          .modal-overlay.active{opacity:1;pointer-events:all;}
+          .modal-box{background:white;border-radius:12px;padding:30px 25px;width:90%;max-width:420px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,0.25);transform:translateY(20px);transition:transform 0.25s ease;}
+          .modal-overlay.active .modal-box{transform:translateY(0);}
+          .modal-icon{font-size:42px;margin-bottom:10px;}
+          .modal-box h3{margin:10px 0;font-size:20px;color:#333;}
+          .modal-box p{color:#666;font-size:14px;margin-bottom:25px;}
+          .modal-actions{display:flex;gap:12px;justify-content:center;}
+          .btn-cancel{padding:10px 20px;border:1px solid #ccc;background:white;border-radius:6px;cursor:pointer;font-weight:600;}
+          .btn-confirm{padding:10px 20px;border:none;background:linear-gradient(135deg,#0078D7,#005ea6);color:white;border-radius:6px;cursor:pointer;font-weight:600;}
+          .submit-btn{background:#0078D7;color:white;border:none;padding:12px 30px;border-radius:4px;font-size:16px;font-weight:600;cursor:pointer;display:block;width:100%;margin-top:20px;}
+
+          /* â”€â”€ AI Assistant â”€â”€ */
+          .assistant-shell{
+           position:fixed;
+           right:90px;
+           bottom:24px;
+           z-index:10001;
+           width:0;
+           height:0;
+           pointer-events:none;
+          }
+          .assistant-shell.open{pointer-events:auto;}
+          .assistant-launcher{
+           width:64px;
+           height:64px;
+           border:none;
+           border-radius:999px;
+           background:linear-gradient(135deg,#2f87d6,#ff944d);
+           color:white;
+           box-shadow:0 18px 35px rgba(15,23,42,0.26);
+           font-size:30px;
+           cursor:pointer;
+           animation:assistantLauncherPulse 2.4s ease-in-out infinite;
+           transition:transform 0.18s ease, box-shadow 0.18s ease;
+          }
+          .assistant-launcher:hover{
+           transform:translateY(-6px) scale(1.04);
+           box-shadow:0 22px 42px rgba(15,23,42,0.32);
+          }
+
+          @keyframes assistantLauncherPulse{
+          0%,100%{
+           box-shadow:0 18px 35px rgba(15,23,42,0.26), 0 0 0 0 rgba(47,135,214,0.28);
+            }
+          50%{
+            box-shadow:0 18px 35px rgba(15,23,42,0.26), 0 0 0 10px rgba(47,135,214,0);
+           }
+          }
+
+         .assistant-cursor{
+           display:inline-block;
+            margin-left:2px;
+            color:#0f6cbd;
+            animation:assistantBlink 0.8s step-end infinite;
+           }
+
+           @keyframes assistantBlink{
+           50%{opacity:0;}
+          }
+          .assistant-panel{
+           position:absolute;
+           right:0;
+           bottom:0;
+           width:min(92vw,460px);
+           height:min(72vh,620px);
+           background:rgba(255,255,255,0.98);
+           border:1px solid #dbe7f4;
+           border-radius:26px;
+           box-shadow:0 30px 60px rgba(15,23,42,0.22);
+           overflow:hidden;
+           display:flex;
+           flex-direction:column;
+           margin-bottom:18px;
+           backdrop-filter:blur(12px);
+           opacity:0;
+           transform:translateY(18px) scale(0.96);
+           pointer-events:none;
+           visibility:hidden;
+           transition:
+           opacity 0.28s ease,
+           transform 0.28s ease,
+           visibility 0.28s ease;
+         }
+
+          .assistant-shell.open .assistant-panel{
+            opacity:1;
+            transform:translateY(0) scale(1);
+            pointer-events:auto;
+            visibility:visible;
+              }
+          .assistant-header{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid #e5edf6;background:linear-gradient(180deg,#ffffff,#f6fbff);}
+          .assistant-title-wrap{display:flex;align-items:center;gap:12px;}
+          .assistant-avatar{width:42px;height:42px;border-radius:999px;display:flex;align-items:center;justify-content:center;background:#eef6ff;color:#0f6cbd;font-size:22px;border:1px solid #c6def5;}
+          .assistant-title{font-size:16px;font-weight:800;color:#0f6cbd;}
+          .assistant-focus{margin-top:4px;font-size:12px;color:#5b6b7b;}
+          .assistant-header-actions{display:flex;align-items:center;gap:8px;}
+          .assistant-reset{border:1px solid #d7e2ee;background:white;color:#5b6b7b;border-radius:999px;padding:8px 12px;font-size:12px;font-weight:700;cursor:pointer;line-height:1;}
+          .assistant-reset:hover{background:#f8fbff;color:#0f6cbd;}
+          .assistant-close{border:none;background:transparent;color:#5b6b7b;font-size:24px;cursor:pointer;line-height:1;}
+          .assistant-messages{flex:1;padding:18px;overflow:auto;background:linear-gradient(180deg,#ffffff,#f8fbff 55%,#ffffff);display:flex;flex-direction:column;gap:14px;}
+          .assistant-message{max-width:85%;padding:14px 16px;border-radius:20px;line-height:1.55;font-size:14px;white-space:pre-wrap;}
+          .assistant-message.assistant{align-self:flex-start;background:#eef4fb;color:#1f2a37;border:1px solid #d7e2ee;}
+          .assistant-message.user{align-self:flex-end;background:#0f6cbd;color:white;}
+          /* â”€â”€ Responsive â”€â”€ */
+          @media(max-width:900px){
+            .info-section{grid-template-columns:repeat(2,minmax(0,1fr));}
+            .kpi-split-layout{grid-template-columns:1fr;}
+            .chart-modal-overlay{padding:14px;}
+            .chart-modal-box{width:100%;height:min(90vh,900px);}
+            .chart-modal-header{padding:18px 18px 14px;}
+            .chart-modal-header h3{font-size:24px;}
+            .chart-modal-body{padding:14px;}
+            .history-modal-overlay{padding:8px;}
+            .history-modal-box{
+              width:100%;
+              height:94vh;
+              max-height:94vh;
+              border-radius:16px;
+             }
+            .ca-modal-box{max-height:min(94vh,820px);}
+          }
+          @media(max-width:700px){
+            .ca-dates-grid{grid-template-columns:1fr;}
+            .ca-modal-form-row{grid-template-columns:1fr;}
+            .kpi-history-panel{width:calc(100% - 8px);}
+            .kpi-card-actions{flex-direction:column;align-items:stretch;}
+            .kpi-card-actions-right{justify-content:flex-end;}
+          }
+          @media(max-width:600px){
+            .info-section{grid-template-columns:1fr;}
+            .ca-ai-row{grid-template-columns:1fr;}
+            .assistant-shell{right:16px;bottom:16px;}
+            .assistant-panel{height:min(76vh,620px);}
+            .header-inner{flex-direction:column;align-items:stretch;}
+            .header-title{text-align:center;}
           }
         </style>
       </head>
       <body>
-        <!-- Loading Overlay -->
-        <div class="form-overlay" id="loadingOverlay">
-          <div style="text-align: center;">
-            <div class="overlay-spinner"></div>
-            <div class="overlay-message" id="overlayMessage">Submitting KPI Values...</div>
-            <div class="overlay-submessage" id="overlaySubmessage">Please wait while we process your submission</div>
+        <!-- Loading overlay -->
+        <div class="loading-overlay" id="loadingOverlay">
+          <div class="spinner"></div>
+          <div class="loading-text">Submitting KPI Values...</div>
+        </div>
+
+        <!-- Submit confirm modal -->
+        <div id="confirmModal" class="modal-overlay">
+          <div class="modal-box">
+            <div class="modal-icon" aria-hidden="true">&#9888;&#65039;</div>
+            <h3>Confirm Submission</h3>
+            <p>Are you sure you want to submit your KPI values?</p>
+            <div class="modal-actions">
+              <button id="cancelBtn" type="button" class="btn-cancel">Cancel</button>
+              <button id="confirmBtn" type="button" class="btn-confirm">Yes, Submit</button>
+            </div>
           </div>
         </div>
-        
+
+        <!-- Chart expand modal -->
+        <div id="chartModal" class="chart-modal-overlay" aria-hidden="true">
+          <div class="chart-modal-box" role="dialog" aria-modal="true" aria-labelledby="chartModalTitle">
+            <div class="chart-modal-header">
+              <div>
+                <h3 id="chartModalTitle">KPI Trend</h3>
+                <p id="chartModalSubtitle">Weekly KPI performance overview</p>
+              </div>
+              <button id="chartModalClose" type="button" class="chart-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <div class="chart-modal-body">
+              <div class="chart-modal-stage">
+                <canvas id="chartModalCanvas"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- History modal -->
+        <div id="historyModal" class="history-modal-overlay" aria-hidden="true">
+          <div class="history-modal-box" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle">
+            <div class="history-modal-header">
+              <div>
+                <h3 id="historyModalTitle" class="history-modal-title">Corrective Action History</h3>
+                <p id="historyModalSubtitle" class="history-modal-subtitle">Previous month details for this KPI</p>
+              </div>
+              <button id="historyModalClose" type="button" class="history-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <div id="historyModalContent" class="history-modal-content"></div>
+          </div>
+        </div>
+
+        <!-- â”€â”€ CA Table Modal â”€â”€ -->
+        <div id="caTableModal" class="ca-modal-overlay" aria-hidden="true">
+          <div class="ca-modal-box" role="dialog" aria-modal="true" aria-labelledby="caModalTitle">
+            <div class="ca-modal-header">
+              <div class="ca-modal-header-text">
+                <h3 id="caModalTitle" class="ca-modal-title">Corrective Actions</h3>
+                <p id="caModalSubtitle" class="ca-modal-subtitle">Manage corrective action entries for this KPI</p>
+              </div>
+              <button id="caModalClose" type="button" class="ca-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <div class="ca-modal-body">
+              <!-- Table of existing actions -->
+              <div class="ca-table-wrap">
+                <table class="ca-table" id="caModalTable">
+                  <thead>
+                    <tr>
+                      <th class="ca-col-num">#</th>
+                      <th>Root Cause</th>
+                      <th>Immediate Action</th>
+                      <th>Evidence</th>
+                      <th>Due Date</th>
+                      <th>Responsible</th>
+                      <th>Status</th>
+                      <th class="ca-col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="caModalTableBody">
+                    <tr><td colspan="8" class="ca-table-empty">No corrective actions yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- Add new / Edit form -->
+              <button type="button" class="ca-modal-add-row-btn" id="caModalAddRowBtn">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M7 1v12M1 7h12"/></svg>
+                Add New Corrective Action
+              </button>
+
+              <div class="ca-modal-form-section" id="caModalFormSection" style="display:none;">
+                <div class="ca-modal-form-header">
+                  <span class="ca-modal-form-title" id="caModalFormTitle">New Corrective Action</span>
+                  <button type="button" class="ca-tbl-btn ca-tbl-delete" id="caModalFormCollapse">&times; Cancel</button>
+                </div>
+                <div class="ca-modal-form-body">
+                  <input type="hidden" id="caModalEditIndex" value="">
+                  <div class="ca-modal-form-row">
+                    <div class="ca-modal-field">
+                      <label>Due Date <span class="ca-required">*</span></label>
+                      <input type="date" id="caModalDueDate" class="ca-modal-input">
+                    </div>
+                    <div class="ca-modal-field">
+                      <label>Responsible <span class="ca-required">*</span></label>
+                      <input type="text" id="caModalResponsible" class="ca-modal-input" placeholder="Name">
+                    </div>
+                  </div>
+                  <div class="ca-modal-field">
+                    <label>Root Cause <span class="ca-required">*</span></label>
+                    <textarea id="caModalRootCause" class="ca-modal-textarea" placeholder="Describe the root cause..."></textarea>
+                  </div>
+                  <div class="ca-modal-field">
+                    <label>Immediate Action / Solution <span class="ca-required">*</span></label>
+                    <textarea id="caModalSolution" class="ca-modal-textarea" placeholder="Describe the implemented solution..."></textarea>
+                  </div>
+                </div>
+                <div class="ca-modal-form-footer">
+                  <button type="button" class="ca-modal-cancel-btn" id="caModalCancelForm">Cancel</button>
+                  <button type="button" class="ca-modal-save-btn" id="caModalSaveForm">Save Action</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main container -->
         <div class="container">
           <div class="header">
-            <h2 style="color:#0078D7;font-size:22px;margin-bottom:5px;">
-              KPI Submission - ${week}
-            </h2>
+            <div class="header-inner">
+              <h2 class="header-title">KPI Submission - ${week}</h2>
+            </div>
           </div>
-          
+
           <div class="form-section">
             <div class="info-section">
-              <div class="info-row">
-                <div class="info-label">Responsible Name</div>
-                <div class="info-value">${responsible.name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Plant</div>
-                <div class="info-value">${responsible.plant_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Department</div>
-                <div class="info-value">${responsible.department_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Week</div>
-                <div class="info-value">${week}</div>
-              </div>
+              <div class="info-row"><div class="info-label">Name</div><div class="info-value">${responsible.name}</div></div>
+              <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsible.plant_name}</div></div>
+              <div class="info-row"><div class="info-label">Department</div><div class="info-value">${responsible.department_name}</div></div>
+              <div class="info-row"><div class="info-label">Week</div><div class="info-value">${week}</div></div>
             </div>
 
             <div class="kpi-section">
-              <h3>KPI Values</h3>
-              <form id="kpiForm" action="/redirect" method="GET">
+              <h3 style="color:#0078D7;margin-bottom:20px;border-bottom:2px solid #0078D7;padding-bottom:8px;">KPI Values</h3>
+              <form action="/redirect" method="POST" id="kpiForm" novalidate>
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
                 <input type="hidden" name="week" value="${week}" />
-                ${kpis.map(kpi => `
-                  <div class="kpi-card">
-                    <div class="kpi-title">${kpi.indicator_title}</div>
-                    ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ''}
-                    <input 
-                      type="text" 
-                      name="value_${kpi.kpi_values_id}" 
-                      value="${kpi.value || ''}" 
-                      placeholder="Enter value" 
-                      class="kpi-input"
-                      required
-                    />
-                    ${kpi.unit ? `<div class="unit-label">Unit: ${kpi.unit}</div>` : ''}
-                  </div>
-                `).join('')}
-                <button type="submit" id="submitBtn" class="submit-btn">
-                  <span class="spinner" id="buttonSpinner"></span>
-                  <span class="submit-text" id="submitText">Submit KPI Values</span>
-                </button>
+                ${kpiCardsHtml}
+                <button type="submit" class="submit-btn">Submit KPI Values</button>
               </form>
             </div>
           </div>
         </div>
-        
+
+        <!-- AI Assistant -->
+        <div class="assistant-shell" id="assistantShell">
+          <div class="assistant-panel" id="assistantPanel">
+            <div class="assistant-header">
+              <div class="assistant-title-wrap">
+                <div class="assistant-avatar" aria-hidden="true">&#129302;</div>
+                <div>
+                  <div class="assistant-title">AI Assistant</div>
+                  <div class="assistant-focus" id="assistantFocus">All KPIs on this form</div>
+                </div>
+              </div>
+              <div class="assistant-header-actions">
+                <button type="button" class="assistant-reset" id="assistantReset">Reset</button>
+                <button type="button" class="assistant-close" id="assistantClose" aria-label="Close">&times;</button>
+              </div>
+            </div>
+            <div class="assistant-messages" id="assistantMessages"></div>
+          </div>
+      
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <script>
-          document.addEventListener('DOMContentLoaded', function() {
-            const form = document.getElementById('kpiForm');
-            const submitBtn = document.getElementById('submitBtn');
-            const buttonSpinner = document.getElementById('buttonSpinner');
-            const submitText = document.getElementById('submitText');
-            const loadingOverlay = document.getElementById('loadingOverlay');
-            const overlayMessage = document.getElementById('overlayMessage');
-            const overlaySubmessage = document.getElementById('overlaySubmessage');
-            let isSubmitting = false;
-            
-            // Validate all inputs are filled before submission
-            function validateForm() {
-              const inputs = form.querySelectorAll('.kpi-input');
-              let allValid = true;
-              
-              inputs.forEach(input => {
-                const value = input.value.trim();
-                if (!value || isNaN(parseFloat(value))) {
-                  allValid = false;
-                  input.style.borderColor = '#dc3545';
-                  input.style.boxShadow = '0 0 0 2px rgba(220, 53, 69, 0.1)';
-                } else {
-                  input.style.borderColor = '#ddd';
-                  input.style.boxShadow = '';
-                }
-              });
-              
-              return allValid;
+          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+             CA TABLE MODAL
+          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+          let caModalKvId = null;
+          // In-memory store: kvId â†’ array of action objects
+          const caModalStore = {};
+
+function getCaModalActions(kvId) {
+  if (!caModalStore[kvId]) {
+    caModalStore[kvId] = [];
+
+    getCorrectiveActionCards(kvId).forEach((card) => {
+      const rootCause = getTrimmedValue(getCorrectiveActionField(card, "root_cause"));
+      const implSolution = getTrimmedValue(getCorrectiveActionField(card, "implemented_solution"));
+      const dueDate = getInputValue(getCorrectiveActionField(card, "due_date"));
+      const responsible = getTrimmedValue(getCorrectiveActionField(card, "responsible"));
+      const actionId = getTrimmedValue(
+        card.querySelector('input[name="ca_action_id_' + kvId + '[]"]')
+      );
+      const status = getTrimmedValue(
+        card.querySelector('input[name="ca_status_' + kvId + '[]"]')
+      );
+
+      if (rootCause || implSolution || dueDate || responsible || actionId) {
+        caModalStore[kvId].push({
+        id: actionId,
+        root_cause: rootCause,
+       implemented_solution: implSolution, //FIXED
+       due_date: dueDate,
+       responsible: responsible,
+       status: getCanonicalCorrectiveActionStatus(status)
+      });
+      }
+    });
+  }
+
+  return caModalStore[kvId];
+}
+
+          function escapeHtml(v) {
+            return String(v || "")
+              .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          }
+
+          function statusClass(s) {
+            return String(s || "").trim().toLowerCase().replace(/\s+/g, "-");
+          }
+
+          const HISTORY_STATUS_OPTIONS = ["Open", "Waiting for validation", "Completed", "Closed"];
+
+          function getCanonicalCorrectiveActionStatus(status) {
+            const normalized = String(status || "").trim().toLowerCase();
+            const matched = HISTORY_STATUS_OPTIONS.find(option => option.toLowerCase() === normalized);
+            return matched || "Open";
+          }
+
+          function setCorrectiveActionBadgeState(badge, status) {
+            if (!badge) return;
+            const canonicalStatus = getCanonicalCorrectiveActionStatus(status);
+            badge.textContent = canonicalStatus;
+            badge.className = "ca-status-badge ca-status-" + statusClass(canonicalStatus);
+          }
+
+          function updateCorrectiveActionStatusInStore(kvId, actionIndex, status) {
+            const actions = getCaModalActions(kvId);
+            if (!actions[actionIndex]) return null;
+
+            const canonicalStatus = getCanonicalCorrectiveActionStatus(status);
+            actions[actionIndex].status = canonicalStatus;
+            syncDomFromStore(kvId);
+
+            if (caModalKvId === kvId) {
+              renderCaModalTable(kvId);
             }
-            
-            // Show loading state
-            function showLoading() {
-              isSubmitting = true;
-              submitBtn.disabled = true;
-              submitBtn.classList.add('submitting');
-              loadingOverlay.style.display = 'flex';
+
+            return canonicalStatus;
+          }
+
+          function truncate(str, n) {
+            const s = String(str || "");
+            return s.length > n ? s.slice(0, n) + "â€¦" : s;
+          }
+
+        function renderCaModalTable(kvId) {
+       const tbody = document.getElementById("caModalTableBody");
+       if (!tbody) return;
+       const actions = getCaModalActions(kvId);
+       if (!actions.length) {
+       tbody.innerHTML = '<tr><td colspan="8" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
+       return;
+       }
+
+       tbody.innerHTML = actions.map((a, i) => {
+      const sc = statusClass(a.status);
+      return \`<tr>
+      <td class="ca-col-num">\${i + 1}</td>
+      <td title="\${escapeHtml(a.root_cause)}">\${escapeHtml(truncate(a.root_cause, 60))}</td>
+      <td title="\${escapeHtml(a.implemented_solution)}">\${escapeHtml(truncate(a.implemented_solution, 60))}</td>
+      <td title="\${escapeHtml(a.evidence || "")}">\${escapeHtml(truncate(a.evidence || "", 40))}</td>
+      <td>\${escapeHtml(a.due_date)}</td>
+      <td>\${escapeHtml(a.responsible)}</td>
+      <td>\${a.status ? \`<span class="ca-table-status \${sc}">\${escapeHtml(a.status)}</span>\` : "&mdash;"}</td>
+      <td class="ca-col-actions">
+        <button type="button" class="ca-table-edit-btn" onclick="caModalOpenForm(\${i})">Edit</button>
+        <button type="button" class="ca-table-delete-btn" onclick="caModalDeleteAction(\${i})">&times;</button>
+      </td>
+       </tr>\`;
+        }).join("");
+      }
+
+    function caModalOpenForm(editIndex) {
+     const section = document.getElementById("caModalFormSection");
+     const formTitle = document.getElementById("caModalFormTitle");
+     const editIdx = document.getElementById("caModalEditIndex");
+     if (!section) return;
+
+     section.style.display = "";
+     if (editIndex !== null && editIndex !== undefined && editIndex >= 0) {
+     const actions = getCaModalActions(caModalKvId);
+     const a = actions[editIndex];
+     if (!a) return;
+    if (formTitle) formTitle.textContent = "Edit Action #" + (editIndex + 1);
+    if (editIdx) editIdx.value = String(editIndex);
+    document.getElementById("caModalDueDate").value = a.due_date || "";
+    document.getElementById("caModalResponsible").value = a.responsible || "";
+    document.getElementById("caModalRootCause").value = a.root_cause || "";
+    document.getElementById("caModalSolution").value = a.implemented_solution || "";
+  } else {
+    if (formTitle) formTitle.textContent = "New Corrective Action";
+    if (editIdx) editIdx.value = "";
+    ["caModalDueDate","caModalResponsible","caModalRootCause","caModalSolution"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = "";
+    });
+  }
+
+  section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+          function caModalOpenEdit(index) {
+            caModalOpenForm(index);
+          }
+
+          function caModalCollapseForm() {
+            const section = document.getElementById("caModalFormSection");
+            if (section) section.style.display = "none";
+          }
+
+function caModalSaveForm() {
+  if (!caModalKvId) return;
+
+  const rootCauseEl = document.getElementById("caModalRootCause");
+  const solutionEl = document.getElementById("caModalSolution");
+  const dueDateEl = document.getElementById("caModalDueDate");
+  const responsibleEl = document.getElementById("caModalResponsible");
+  const editIndexEl = document.getElementById("caModalEditIndex");
+
+  const rootCause = rootCauseEl ? rootCauseEl.value.trim() : "";
+  const solution = solutionEl ? solutionEl.value.trim() : "";
+  const dueDate = dueDateEl ? dueDateEl.value : "";
+  const responsible = responsibleEl ? responsibleEl.value.trim() : "";
+  const editIndex = editIndexEl ? editIndexEl.value : "";
+
+  if (!rootCause || !solution || !dueDate || !responsible) {
+    alert("Please fill in Root Cause, Corrective Action, Due Date, and Responsible.");
+    return;
+  }
+
+  const actions = getCaModalActions(caModalKvId);
+  const existingAction =
+    editIndex !== "" && !isNaN(parseInt(editIndex, 10))
+      ? actions[parseInt(editIndex, 10)] || null
+      : null;
+
+  const entry = {
+   id: "",
+   root_cause: rootCause,
+    implemented_solution: solution, // FIXED
+    due_date: dueDate,
+    responsible: responsible,
+    status: getCanonicalCorrectiveActionStatus(existingAction && existingAction.status)
+  };
+
+  if (editIndex !== "" && !isNaN(parseInt(editIndex, 10))) {
+    const idx = parseInt(editIndex, 10);
+    if (actions[idx] && actions[idx].id) {
+      entry.id = actions[idx].id;
+    }
+    actions.splice(idx, 1);
+    actions.unshift(entry);
+  } else {
+    actions.unshift(entry);
+  }
+
+  renderCaModalTable(caModalKvId);
+  syncDomFromStore(caModalKvId);
+  caModalCollapseForm();
+}
+
+function caModalDeleteAction(index) {
+  if (!caModalKvId) return;
+
+  const actions = getCaModalActions(caModalKvId);
+  actions.splice(index, 1);
+
+  renderCaModalTable(caModalKvId);
+  syncDomFromStore(caModalKvId);
+}
+
+
+function syncDomFromStore(kvId) {
+  const stack = getCorrectiveActionStack(kvId);
+  if (!stack) return;
+
+  const actions = getCaModalActions(kvId);
+
+  const existingCards = Array.from(stack.querySelectorAll(".ca-action-card"));
+  const template = existingCards[0];
+  if (!template) return;
+
+  stack.innerHTML = "";
+
+  actions.forEach((action, idx) => {
+    const newCard = template.cloneNode(true);
+
+    const idInput = newCard.querySelector('input[name="ca_action_id_' + kvId + '[]"]');
+    if (idInput) idInput.value = action.id || "";
+
+    const statusInput = newCard.querySelector('input[name="ca_status_' + kvId + '[]"]');
+    if (statusInput) statusInput.value = getCanonicalCorrectiveActionStatus(action.status);
+
+    const dueDateField = getCorrectiveActionField(newCard, "due_date");
+    const responsibleField = getCorrectiveActionField(newCard, "responsible");
+    const rootCauseField = getCorrectiveActionField(newCard, "root_cause");
+    const implSolutionField = getCorrectiveActionField(newCard, "implemented_solution");
+
+    if (dueDateField) dueDateField.value = action.due_date || "";
+    if (responsibleField) responsibleField.value = action.responsible || "";
+    if (rootCauseField) rootCauseField.value = action.root_cause || "";
+    if (implSolutionField) implSolutionField.value = action.implemented_solution || "";
+
+    const badge = newCard.querySelector(".ca-status-badge");
+    if (badge) {
+      setCorrectiveActionBadgeState(badge, action.status);
+    }
+
+    const removeBtn = newCard.querySelector(".ca-remove-btn");
+    if (removeBtn) {
+      removeBtn.classList.toggle("is-hidden", actions.length === 1);
+    }
+
+    stack.appendChild(newCard);
+    bindCorrectiveActionCard(newCard, kvId);
+  });
+
+  renumberCorrectiveActionCards(kvId);
+
+  const countBadge = document.getElementById("ca-count-badge-" + kvId);
+  if (countBadge) {
+    countBadge.textContent = actions.length + " Action" + (actions.length === 1 ? "" : "s");
+  }
+}
+
+          function openCaTableModal(kvId) {
+            caModalKvId = kvId;
+            const overlay = document.getElementById("caTableModal");
+            if (!overlay) return;
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            const title = card ? (card.querySelector(".kpi-title") || {}).textContent || "KPI" : "KPI";
+
+            const modalTitle = document.getElementById("caModalTitle");
+            const modalSubtitle = document.getElementById("caModalSubtitle");
+            if (modalTitle) modalTitle.textContent = "Corrective Actions â€” " + title.trim();
+            if (modalSubtitle) modalSubtitle.textContent = "Add, edit, or remove corrective action entries";
+
+            caModalCollapseForm();
+            renderCaModalTable(kvId);
+
+            overlay.classList.add("active");
+            overlay.setAttribute("aria-hidden", "false");
+            document.body.classList.add("chart-modal-open");
+          }
+
+          function closeCaTableModal() {
+            const overlay = document.getElementById("caTableModal");
+            if (!overlay) return;
+            overlay.classList.remove("active");
+            overlay.setAttribute("aria-hidden", "true");
+            if (!document.querySelector(".chart-modal-overlay.active") &&
+                !document.querySelector(".history-modal-overlay.active")) {
+              document.body.classList.remove("chart-modal-open");
             }
-            
-            // Hide loading state
-            function hideLoading() {
-              isSubmitting = false;
-              submitBtn.disabled = false;
-              submitBtn.classList.remove('submitting');
-              loadingOverlay.style.display = 'none';
-              overlayMessage.textContent = 'Submitting KPI Values...';
-              overlayMessage.style.color = '#0078D7';
-              overlaySubmessage.textContent = 'Please wait while we process your submission';
-            }
-            
-            // Show error state
-            function showError(message) {
-              overlayMessage.textContent = 'Submission Failed';
-              overlayMessage.style.color = '#dc3545';
-              overlaySubmessage.textContent = message;
-              
-              // Change button to retry state
-              submitBtn.innerHTML = '<span class="submit-text">Retry Submission</span>';
-              submitBtn.style.background = '#dc3545';
-              submitBtn.disabled = false;
-              submitBtn.classList.remove('submitting');
-              
-              // Re-enable inputs
-              const inputs = form.querySelectorAll('input');
-              inputs.forEach(input => {
-                input.disabled = false;
-              });
-              
-              // Auto-hide overlay after 5 seconds
-              setTimeout(() => {
-                hideLoading();
-                submitBtn.innerHTML = '<span class="spinner" id="buttonSpinner"></span><span class="submit-text" id="submitText">Submit KPI Values</span>';
-                submitBtn.style.background = '#0078D7';
-                // Re-attach event listeners
-                buttonSpinner = document.getElementById('buttonSpinner');
-                submitText = document.getElementById('submitText');
-              }, 5000);
-            }
-            
-            form.addEventListener('submit', function(e) {
-              e.preventDefault();
-              
-              if (isSubmitting) {
-                console.log('Already submitting, ignoring click');
-                return false;
-              }
-              
-              // Validate form
-              if (!validateForm()) {
-                // Show error in overlay instead of alert
-                loadingOverlay.style.display = 'flex';
-                overlayMessage.textContent = 'Validation Error';
-                overlayMessage.style.color = '#dc3545';
-                overlaySubmessage.textContent = 'Please fill in all KPI values with valid numbers';
-                
-                // Hide overlay after 3 seconds
-                setTimeout(() => {
-                  loadingOverlay.style.display = 'none';
-                }, 3000);
-                return false;
-              }
-              
-              // Show loading state IMMEDIATELY
-              showLoading();
-              
-              // Get form data
-              const formData = new FormData(form);
-              const params = new URLSearchParams();
-              
-              // Add all form data to params
-              for (const [key, value] of formData.entries()) {
-                params.append(key, value);
-              }
-              
-              // Store submission time in localStorage to prevent back-button resubmission
-              const submissionId = 'kpi_submission_' + Date.now();
-              localStorage.setItem('last_kpi_submission', submissionId);
-              
-              // Disable all inputs
-              const inputs = form.querySelectorAll('input');
-              inputs.forEach(input => {
-                input.disabled = true;
-              });
-              
-              // Show processing message
-              overlayMessage.textContent = 'Processing submission...';
-              overlaySubmessage.textContent = 'Saving your KPI values to the database';
-              
-              // Submit the form programmatically
-              fetch(form.action + '?' + params.toString(), {
-                method: 'GET',
-                headers: {
-                  'Accept': 'text/html'
-                }
-              })
-              .then(response => {
-                if (response.ok) {
-                  return response.text();
-                }
-                throw new Error('Network response was not ok. Status: ' + response.status);
-              })
-              .then(html => {
-                // Replace entire page with response
-                document.open();
-                document.write(html);
-                document.close();
-              })
-              .catch(error => {
-                console.error('Error:', error);
-                showError(error.message || 'Network error. Please check your connection and try again.');
-              });
-              
-              return false;
+            caModalKvId = null;
+          }
+
+          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+             UTILITY HELPERS
+          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+          function getTextContent(node) { return node && typeof node.textContent === "string" ? node.textContent : ""; }
+          function getTrimmedText(node) { return getTextContent(node).trim(); }
+          function getInputValue(node) { return node && typeof node.value === "string" ? node.value : ""; }
+          function getTrimmedValue(node) { return getInputValue(node).trim(); }
+
+          function getCorrectiveActionStack(kvId) {
+            return document.querySelector('.ca-actions-stack[data-kpi-values-id="' + kvId + '"]');
+          }
+          function getCorrectiveActionCards(kvId) {
+            const stack = getCorrectiveActionStack(kvId);
+            return stack ? Array.from(stack.querySelectorAll(".ca-action-card")) : [];
+          }
+          function getLatestCorrectiveActionCard(kvId) {
+            const cards = getCorrectiveActionCards(kvId);
+            return cards.length ? cards[0] : null;
+          }
+          function getCorrectiveActionField(actionCard, fieldName) {
+            return actionCard ? actionCard.querySelector('[data-ca-field="' + fieldName + '"]') : null;
+          }
+          function renumberCorrectiveActionCards(kvId) {
+            getCorrectiveActionCards(kvId).forEach((card, index) => {
+              const num = card.querySelector(".ca-action-number");
+              if (num) num.textContent = String(index + 1);
             });
-            
-            // Clear validation on input
-            const inputs = form.querySelectorAll('.kpi-input');
-            inputs.forEach(input => {
-              input.addEventListener('input', function() {
-                this.style.borderColor = '#ddd';
-                this.style.boxShadow = '';
-              });
-              
-              // Allow only numbers and decimals
-              input.addEventListener('keypress', function(e) {
-                const charCode = e.which ? e.which : e.keyCode;
-                if (charCode === 46) {
-                  // Allow decimal point if not already present
-                  if (this.value.indexOf('.') > -1) {
-                    e.preventDefault();
-                  }
-                  return;
-                }
-                if (charCode < 48 || charCode > 57) {
-                  e.preventDefault();
-                }
-              });
-              
-              // Also allow paste and validate
-              input.addEventListener('paste', function(e) {
-                setTimeout(() => {
-                  const value = this.value;
-                  // Remove any non-numeric characters except decimal point
-                  this.value = value.replace(/[^0-9.]/g, '');
-                  // Ensure only one decimal point
-                  const parts = this.value.split('.');
-                  if (parts.length > 2) {
-                    this.value = parts[0] + '.' + parts.slice(1).join('');
-                  }
-                }, 0);
-              });
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            const badge = card ? card.querySelector(".ca-count-badge") : null;
+            const count = getCorrectiveActionCards(kvId).length;
+            if (badge) badge.textContent = count + " Action" + (count === 1 ? "" : "s");
+          }
+          function bindCorrectiveActionCard(actionCard, kvId) {
+            if (!actionCard) return;
+            const removeButton = actionCard.querySelector(".ca-remove-btn");
+            if (removeButton) {
+              removeButton.onclick = () => {
+                if (getCorrectiveActionCards(kvId).length <= 1) return;
+                actionCard.remove();
+                renumberCorrectiveActionCards(kvId);
+              };
+            }
+          }
+
+          function formApplyField(kvId, fieldName, card) {
+            const text = getTrimmedText(card.querySelector(".ca-ai-card-text"));
+            const actionCard = getLatestCorrectiveActionCard(kvId);
+            const field = getCorrectiveActionField(actionCard, fieldName);
+            if (!field || !text) return;
+            field.value = text;
+            field.classList.remove("highlight");
+            void field.offsetWidth;
+            field.classList.add("highlight");
+            field.scrollIntoView({ behavior: "smooth", block: "center" });
+            card.classList.add("applied");
+            const hint = card.querySelector(".ca-apply-hint");
+            if (hint) hint.textContent = "Applied";
+          }
+          window.formApplyField = formApplyField;
+
+          function checkLowLimit(input) {
+            const card = input.closest(".kpi-card");
+            if (!card) return;
+            const rawLow = parseFloat(card.dataset.lowLimit);
+            const rawHigh = parseFloat(card.dataset.highLimit);
+            const hasLow = !isNaN(rawLow), hasHigh = !isNaN(rawHigh);
+            const lowerBound = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : hasHigh ? rawHigh : null;
+            const upperBound = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : hasLow ? rawLow : null;
+            const goodDirection = String(card.dataset.goodDirection || "up").toLowerCase() === "down" ? "down" : "up";
+            const val = parseFloat(input.value);
+            const kvId = input.dataset.kpiValuesId;
+            const caPanel = document.getElementById("ca_container_" + kvId);
+            const isOutside = !isNaN(val) && (
+              goodDirection === "down"
+                ? upperBound !== null && val > upperBound
+                : lowerBound !== null && val < lowerBound
+            );
+            if (!caPanel) return;
+            caPanel.classList.toggle("visible", isOutside);
+            caPanel.querySelectorAll(".ca-required-field").forEach(f => { f.required = isOutside; });
+          }
+
+          function collectAssistantKpis() {
+            return Array.from(document.querySelectorAll(".kpi-card")).map(card => {
+              const kvId = card.dataset.kpiValuesId;
+              const valueInput = card.querySelector(".value-input");
+              const comment = getTrimmedValue(card.querySelector('textarea[name^="comment_"]'));
+              const statusBadge = card.querySelector(".ca-status-badge");
+              const actionCards = getCorrectiveActionCards(kvId);
+              const correctiveActions = actionCards.map(ac => ({
+                corrective_action_id: getTrimmedValue(ac.querySelector('input[name="ca_action_id_' + kvId + '[]"]')),
+                root_cause: getTrimmedValue(getCorrectiveActionField(ac, "root_cause")),
+                implemented_solution: getTrimmedValue(getCorrectiveActionField(ac, "implemented_solution")),
+                evidence: getTrimmedValue(getCorrectiveActionField(ac, "evidence")),
+                due_date: getInputValue(getCorrectiveActionField(ac, "due_date")),
+                responsible: getTrimmedValue(getCorrectiveActionField(ac, "responsible"))
+              }));
+              const latestAction = correctiveActions.length ? correctiveActions[0] : {};
+              return {
+                kpi_id: card.dataset.kpiId,
+                kpi_values_id: kvId,
+                title: getTrimmedText(card.querySelector(".kpi-title")),
+                subtitle: getTrimmedText(card.querySelector(".kpi-subtitle")),
+                good_direction: card.dataset.goodDirection || "",
+                current_value: getInputValue(valueInput),
+                target: card.dataset.target || "",
+                low_limit: card.dataset.lowLimit || "",
+                high_limit: card.dataset.highLimit || "",
+                unit: card.dataset.unit || "",
+                week: card.dataset.currentWeek || "",
+                comment,
+                root_cause: latestAction.root_cause || "",
+                implemented_solution: latestAction.implemented_solution || "",
+                evidence: latestAction.evidence || "",
+                due_date: latestAction.due_date || "",
+                responsible: latestAction.responsible || "",
+                corrective_action_status: getTrimmedText(statusBadge),
+                corrective_actions: correctiveActions
+              };
             });
-            
-            // Prevent form resubmission on page refresh/back
-            if (localStorage.getItem('last_kpi_submission')) {
-              const lastSubmission = localStorage.getItem('last_kpi_submission');
-              const submissionTime = parseInt(lastSubmission.split('_')[2]);
-              const now = Date.now();
-              
-              // If submission was less than 30 seconds ago, disable form
-              if (now - submissionTime < 30000) {
-                submitBtn.disabled = true;
-                submitBtn.innerHTML = '<span class="submit-text">Already Submitted (Please wait 30 seconds)</span>';
-                submitBtn.style.background = '#6c757d';
-                
-                setTimeout(() => {
-                  localStorage.removeItem('last_kpi_submission');
-                  submitBtn.disabled = false;
-                  submitBtn.innerHTML = '<span class="spinner" id="buttonSpinner"></span><span class="submit-text" id="submitText">Submit KPI Values</span>';
-                  submitBtn.style.background = '#0078D7';
-                }, 30000);
+          }
+
+          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+             AI ASSISTANT
+          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+          const assistantShell = document.getElementById("assistantShell");
+          const assistantLauncher = document.getElementById("assistantLauncher");
+          const assistantClose = document.getElementById("assistantClose");
+          const assistantMessages = document.getElementById("assistantMessages");
+          const assistantFocus = document.getElementById("assistantFocus");
+          const assistantStatus = document.getElementById("assistantStatus");
+          const assistantForm = document.getElementById("assistantForm");
+          const assistantInput = document.getElementById("assistantInput");
+          const assistantSend = document.getElementById("assistantSend");
+          const assistantReset = document.getElementById("assistantReset");
+          const assistantStorageKey = "kpi-assistant:${responsible_id}:${week}";
+          const assistantState = {
+            selectedKpiId: null,
+            pending: false,
+            threads: loadAssistantThreads()
+          };
+
+          function normalizeAssistantThreadMessage(entry) {
+            const role = entry && (entry.role === "assistant" || entry.role === "user") ? entry.role : null;
+            const text = String(entry?.text ?? "").trim();
+            const contextText = String(entry?.contextText ?? entry?.content ?? text).trim();
+            if (!role || !text || !contextText) return null;
+            return {
+              role,
+              text,
+              contextText,
+              ts: Number(entry?.ts) || Date.now()
+            };
+          }
+
+          function loadAssistantThreads() {
+            try {
+              const raw = window.localStorage ? window.localStorage.getItem(assistantStorageKey) : null;
+              if (!raw) return {};
+              const parsed = JSON.parse(raw);
+              const normalized = {};
+              Object.keys(parsed || {}).forEach((key) => {
+                const threadMessages = Array.isArray(parsed[key]?.messages)
+                  ? parsed[key].messages.map(normalizeAssistantThreadMessage).filter(Boolean).slice(-18)
+                  : [];
+                normalized[key] = { messages: threadMessages };
+              });
+              return normalized;
+            } catch (err) {
+              return {};
+            }
+          }
+
+          function persistAssistantThreads() {
+            try {
+              if (!window.localStorage) return;
+              window.localStorage.setItem(assistantStorageKey, JSON.stringify(assistantState.threads));
+            } catch (err) {
+              // Ignore storage errors so the assistant remains usable.
+            }
+          }
+
+          function clearAssistantThreads() {
+            assistantState.threads = {};
+            try {
+              if (window.localStorage) {
+                window.localStorage.removeItem(assistantStorageKey);
+              }
+            } catch (err) {
+              // Ignore storage errors so reset still clears in-memory state.
+            }
+          }
+
+          function getAssistantThreadKey(kvId) {
+            const resolvedKpiId = kvId === undefined ? assistantState.selectedKpiId : kvId;
+            return resolvedKpiId === null || resolvedKpiId === undefined || resolvedKpiId === ""
+              ? "all"
+              : "kpi:" + String(resolvedKpiId);
+          }
+
+          function ensureAssistantThread(threadKey) {
+            const key = threadKey || getAssistantThreadKey();
+            if (!assistantState.threads[key] || !Array.isArray(assistantState.threads[key].messages)) {
+              assistantState.threads[key] = { messages: [] };
+            }
+            return assistantState.threads[key];
+          }
+
+          function getCurrentAssistantThread() {
+            return ensureAssistantThread();
+          }
+
+          function pushAssistantThreadMessage(role, text, contextText) {
+            const cleanText = String(text || "").trim();
+            const cleanContextText = String(contextText || text || "").trim();
+            if (!cleanText || !cleanContextText) return;
+            const thread = getCurrentAssistantThread();
+            thread.messages.push({
+              role,
+              text: cleanText,
+              contextText: cleanContextText,
+              ts: Date.now()
+            });
+            if (thread.messages.length > 18) {
+              thread.messages = thread.messages.slice(-18);
+            }
+            persistAssistantThreads();
+          }
+
+          function getAssistantRequestHistory(latestContextText) {
+            const thread = getCurrentAssistantThread();
+            const history = thread.messages.map((entry) => ({
+              role: entry.role,
+              content: entry.contextText || entry.text
+            }));
+            const last = history[history.length - 1];
+            if (
+              latestContextText &&
+              last &&
+              last.role === "user" &&
+              String(last.content || "").trim() === String(latestContextText || "").trim()
+            ) {
+              history.pop();
+            }
+            return history.slice(-14);
+          }
+
+          function appendAssistantMessageInstant(role, text) {
+            if (!assistantMessages) return;
+            const msg = document.createElement("div");
+            msg.className = "assistant-message " + role;
+            msg.innerHTML = String(text || "")
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .split("\\n")
+              .join("<br>");
+            assistantMessages.appendChild(msg);
+            assistantMessages.scrollTop = assistantMessages.scrollHeight;
+          }
+
+          function addAssistantMessage(role, text) {
+          return new Promise((resolve) => {
+        if (!assistantMessages) {
+         resolve();
+         return;
+         }
+
+    const msg = document.createElement("div");
+    msg.className = "assistant-message " + role;
+    assistantMessages.appendChild(msg);
+    assistantMessages.scrollTop = assistantMessages.scrollHeight;
+
+    const safeText = String(text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    if (role !== "assistant" || safeText.length > 400) {
+      msg.innerHTML = safeText.split("\\n").join("<br>");
+      assistantMessages.scrollTop = assistantMessages.scrollHeight;
+      resolve();
+      return;
+    }
+
+    let i = 0;
+    const typingSpeed = 5;
+
+    function typeNext() {
+      const partial = safeText.slice(0, i).split("\\n").join("<br>");
+      msg.innerHTML = partial + '<span class="assistant-cursor">|</span>';
+      assistantMessages.scrollTop = assistantMessages.scrollHeight;
+
+      if (i < safeText.length) {
+        i++;
+        setTimeout(typeNext, typingSpeed);
+      } else {
+        msg.innerHTML = safeText.split("\\n").join("<br>");
+        assistantMessages.scrollTop = assistantMessages.scrollHeight;
+        resolve();
+      }
+    }
+
+    typeNext();
+  });
+}
+          function setAssistantStatus(text) { if (assistantStatus) assistantStatus.textContent = text; }
+          function getKpiCardById(kvId) { return document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]'); }
+          function getAssistantKpiDisplayName(card) {
+            if (!card) return "Selected KPI";
+            const title = getTrimmedText(card.querySelector(".kpi-title"));
+            const subtitle = getTrimmedText(card.querySelector(".kpi-subtitle"));
+            return subtitle && title ? (subtitle + " (" + title + ")") : (subtitle || title || "Selected KPI");
+          }
+
+          function buildAssistantGreeting() {
+           return "AI Support will be ready soon.";
+          } 
+
+          function ensureAssistantGreeting() {
+            const thread = getCurrentAssistantThread();
+            if (!thread.messages.length) {
+              const greeting = buildAssistantGreeting();
+              pushAssistantThreadMessage("assistant", greeting, greeting);
+            }
+          }
+
+          function renderAssistantConversation() {
+            if (!assistantMessages) return;
+            assistantMessages.innerHTML = "";
+            appendAssistantMessageInstant("assistant", buildAssistantGreeting());
+          }
+
+          function extractGuidedQuestionOptions(text) {
+            const lines = String(text || "")
+              .replaceAll("\\r", "")
+              .split("\\n")
+              .map((line) => line.trim())
+              .filter(Boolean);
+            const options = {};
+
+            lines.forEach((line) => {
+              const separatorIndex = line.indexOf(". ");
+              if (separatorIndex <= 0) return;
+              const optionNumber = line.slice(0, separatorIndex).trim();
+              const optionText = line.slice(separatorIndex + 2).trim();
+              if (optionNumber.length === 1 && optionNumber >= "1" && optionNumber <= "9" && optionText) {
+                options[optionNumber] = optionText;
+              }
+            });
+
+            if (!Object.keys(options).length) return null;
+
+            const questionLine = lines.find((line) => {
+              const separatorIndex = line.indexOf(". ");
+              if (separatorIndex <= 0) return true;
+              const optionNumber = line.slice(0, separatorIndex).trim();
+              return !(optionNumber.length === 1 && optionNumber >= "1" && optionNumber <= "9");
+            }) || "Previous guided question";
+            return {
+              question: questionLine.endsWith(":")
+                ? questionLine.slice(0, -1).trim()
+                : questionLine,
+              options
+            };
+          }
+
+          function resolveAssistantUserMessage(rawMessage) {
+            const text = String(rawMessage || "").trim();
+            if (!text) return "";
+
+            const lastAssistantMessage = [...getCurrentAssistantThread().messages]
+              .reverse()
+              .find((entry) => entry.role === "assistant");
+            const guidedQuestion = extractGuidedQuestionOptions(lastAssistantMessage?.text || "");
+            if (!guidedQuestion) return text;
+
+            const tokens = text.split(" ").filter(Boolean);
+            if (!tokens.length) return text;
+
+            const startsWithOptionWord = tokens[0].toLowerCase() === "option";
+            const rawOptionToken = startsWithOptionWord ? tokens[1] : tokens[0];
+            if (!rawOptionToken) return text;
+
+            let optionNumber = rawOptionToken.trim();
+            if (optionNumber.endsWith(".") || optionNumber.endsWith(")")) {
+              optionNumber = optionNumber.slice(0, -1);
+            }
+            if (!(optionNumber.length === 1 && optionNumber >= "1" && optionNumber <= "9")) {
+              return text;
+            }
+
+            const optionLabel = guidedQuestion.options[optionNumber];
+            if (!optionLabel) return text;
+
+            const additionalDetail = (startsWithOptionWord ? tokens.slice(2) : tokens.slice(1)).join(" ").trim();
+            return additionalDetail
+              ? 'Answer to the previous question "' + guidedQuestion.question + '": ' + optionNumber + '. ' + optionLabel + '. Additional detail: ' + additionalDetail
+              : 'Answer to the previous question "' + guidedQuestion.question + '": ' + optionNumber + '. ' + optionLabel;
+          }
+
+          function syncAssistantInputPlaceholder() {
+            if (!assistantInput) return;
+            if (!assistantState.selectedKpiId) {
+              assistantInput.placeholder = "Ask about KPIs or quote delays";
+              return;
+            }
+            const card = getKpiCardById(assistantState.selectedKpiId);
+            const kpiName = getAssistantKpiDisplayName(card);
+            assistantInput.placeholder = "Ask about " + kpiName;
+          }
+
+          function openAssistant() {
+            if (!assistantShell) return;
+            assistantShell.classList.add("open");
+            if (assistantLauncher) assistantLauncher.innerHTML = "&times;";
+            if (assistantFocus) {
+              if (!assistantState.selectedKpiId) {
+                assistantFocus.textContent = "All KPIs on this form";
+                setAssistantStatus("AI support will be ready soon.");
               } else {
-                localStorage.removeItem('last_kpi_submission');
+                const card = getKpiCardById(assistantState.selectedKpiId);
+                assistantFocus.textContent = "Focused on: " + getAssistantKpiDisplayName(card);
+                setAssistantStatus("Focused on " + getAssistantKpiDisplayName(card) + ". AI support will be ready soon.");
               }
+            }
+            syncAssistantInputPlaceholder();
+            renderAssistantConversation();
+            if (assistantInput) assistantInput.focus();
+          }
+          function closeAssistant() {
+            if (!assistantShell) return;
+            assistantShell.classList.remove("open");
+            if (assistantLauncher) assistantLauncher.innerHTML = "&#129302;";
+          }
+
+          function resetAssistantForTesting() {
+            clearAssistantThreads();
+            renderAssistantConversation();
+            setAssistantStatus("AI support will be ready soon.");
+            if (assistantInput) assistantInput.focus();
+          }
+          window.resetAssistantForTesting = resetAssistantForTesting;
+
+          function openAssistantForKpi(kvId) {
+            assistantState.selectedKpiId = kvId;
+            openAssistant();
+            const card = getKpiCardById(kvId);
+            const kpiName = getAssistantKpiDisplayName(card);
+            setAssistantStatus("Focused on " + kpiName + ". AI support will be ready soon.");
+          }
+          window.openAssistantForKpi = openAssistantForKpi;
+          
+
+async function sendAssistantPrompt(message) {
+  const cleanMessage = String(message || "").trim();
+  if (!cleanMessage || assistantState.pending) return;
+
+  const resolvedMessage = resolveAssistantUserMessage(cleanMessage);
+
+  assistantState.pending = true;
+  if (assistantSend) assistantSend.disabled = true;
+
+  pushAssistantThreadMessage("user", cleanMessage, resolvedMessage);
+  await addAssistantMessage("user", cleanMessage);
+  setAssistantStatus("Thinking...");
+
+  try {
+    const res = await fetch("/kpi-ai-assistant", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        responsible_id: "${responsible_id}",
+        week: "${week}",
+        selected_kpi_id: assistantState.selectedKpiId,
+        kpis: collectAssistantKpis(),
+        message: resolvedMessage,
+        conversation_history: getAssistantRequestHistory(resolvedMessage)
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Request failed");
+
+    const assistantReply = data.reply || "I could not generate a response.";
+    pushAssistantThreadMessage("assistant", assistantReply, assistantReply);
+
+    await addAssistantMessage(
+      "assistant",
+      assistantReply
+    );
+
+    setAssistantStatus("AI assistant is ready.");
+  } catch (err) {
+    const fallbackReply = "I could not answer right now. Please try again.";
+    pushAssistantThreadMessage("assistant", fallbackReply, fallbackReply);
+    await addAssistantMessage(
+      "assistant",
+      fallbackReply
+    );
+    setAssistantStatus("AI assistant is unavailable.");
+  } finally {
+    assistantState.pending = false;
+    if (assistantSend) assistantSend.disabled = false;
+  }
+}
+
+          if (assistantLauncher) assistantLauncher.addEventListener("click", () => {
+            if (assistantShell.classList.contains("open")) {
+              closeAssistant();
+              return;
+            }
+            assistantState.selectedKpiId = null;
+            openAssistant();
+          });
+          if (assistantClose) assistantClose.addEventListener("click", closeAssistant);
+          if (assistantReset) assistantReset.addEventListener("click", resetAssistantForTesting);
+          if (assistantInput) {
+            assistantInput.addEventListener("input", () => {
+              assistantInput.style.height = "auto";
+              assistantInput.style.height = Math.min(assistantInput.scrollHeight, 140) + "px";
+            });
+            assistantInput.addEventListener("keydown", e => {
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); assistantForm && assistantForm.requestSubmit(); }
+            });
+          }
+          if (assistantForm) assistantForm.addEventListener("submit", async e => {
+            e.preventDefault();
+            const prompt = getInputValue(assistantInput);
+            if (assistantInput) { assistantInput.value = ""; assistantInput.style.height = "auto"; }
+            await sendAssistantPrompt(prompt);
+          });
+
+          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+             CHARTS
+          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+          const kpiCharts = {};
+          let expandedChart = null;
+          let expandedChartKpiValuesId = null;
+
+          async function refreshKpiChartFromServer(kvId) {
+  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+  if (!card) return;
+
+  const responsibleId = new URLSearchParams(window.location.search).get("responsible_id");
+  const week = card.dataset.currentWeek;
+  const kpiId = card.dataset.kpiId;
+
+  if (!responsibleId || !week || !kpiId) return;
+
+  const url =
+    "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
+    "&kpi_id=" + encodeURIComponent(kpiId) +
+    "&week=" + encodeURIComponent(week);
+
+  const res = await fetch(url);
+  if (!res.ok) return;
+
+  const data = await res.json();
+  if (!Array.isArray(data.labels) || !Array.isArray(data.values)) return;
+
+  card.dataset.historyLabels = JSON.stringify(data.labels);
+  card.dataset.historyValues = JSON.stringify(data.values);
+  if (data.currentWeekLabel) {
+    card.dataset.currentWeekLabel = data.currentWeekLabel;
+  }
+
+  const input = document.getElementById("value_" + kvId);
+  if (input && data.currentValue !== null) {
+    input.value = data.currentValue;
+  }
+
+  const chart = kpiCharts[kvId];
+  if (!chart) {
+    buildKpiChart(kvId);
+    return;
+  }
+
+  chart.data.labels = data.labels;
+  chart.data.datasets[0].data = data.values;
+  updateKpiChart(kvId);
+}
+
+
+         function startRealtimeCharts() {
+  document.querySelectorAll(".kpi-card").forEach(card => {
+    const kvId = card.dataset.kpiValuesId;
+    if (!kvId) return;
+
+    refreshKpiChartFromServer(kvId);
+
+    setInterval(() => {
+      refreshKpiChartFromServer(kvId);
+    }, 30000);
+  });
+}
+          function formatChartValue(value) {
+            const n = Number(value);
+            if (!isFinite(n)) return "";
+            return n.toLocaleString("en-US", { minimumFractionDigits: Math.abs(n % 1) > 0.001 ? 2 : 0, maximumFractionDigits: 2 });
+          }
+          const expandedChartValueLabelsPlugin = {
+            id: "expandedChartValueLabels",
+            afterDatasetsDraw(chart) {
+              const idx = chart.data.datasets.findIndex(d => (d.type || chart.config.type) !== "line");
+              if (idx === -1) return;
+              const dataset = chart.data.datasets[idx];
+              const meta = chart.getDatasetMeta(idx);
+              const ctx = chart.ctx;
+              ctx.save();
+              ctx.fillStyle = "#334155"; ctx.font = "600 13px Segoe UI"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+              meta.data.forEach((bar, i) => {
+                const val = typeof dataset.data[i] === "number" ? dataset.data[i] : parseFloat(dataset.data[i]);
+                if (isNaN(val)) return;
+                const pt = bar.tooltipPosition();
+                ctx.fillText(formatChartValue(val), pt.x, pt.y - 8);
+              });
+              ctx.restore();
+            }
+          };
+
+          function hexToRgba(hex, alpha) {
+            const n = String(hex || "").replace("#", "");
+            if (n.length !== 6) return "rgba(148,163,184," + alpha + ")";
+            return "rgba(" + parseInt(n.slice(0,2),16) + "," + parseInt(n.slice(2,4),16) + "," + parseInt(n.slice(4,6),16) + "," + alpha + ")";
+          }
+
+          function getSeparatedLines(lines, top, bottom, minSpc) {
+            if (!lines.length) return [];
+            const positioned = lines
+              .map(l => ({ ...l, displayY: Math.min(Math.max(l.actualY, top + minSpc/2), bottom - minSpc/2) }))
+              .sort((a,b) => a.displayY - b.displayY);
+            const anchor = Math.max(0, positioned.findIndex(l => l.key === "target"));
+            positioned[anchor].displayY = Math.min(Math.max(positioned[anchor].actualY - 2, top + minSpc/2), bottom - minSpc/2);
+            for (let i = anchor - 1; i >= 0; i--) { positioned[i].displayY = Math.min(positioned[i].actualY, positioned[i+1].displayY - minSpc); }
+            for (let i = anchor + 1; i < positioned.length; i++) { positioned[i].displayY = Math.max(positioned[i].actualY, positioned[i-1].displayY + minSpc); }
+            const overflow = positioned[positioned.length-1].displayY - (bottom - minSpc/2);
+            if (overflow > 0) positioned.forEach(l => l.displayY -= overflow);
+            for (let i = positioned.length - 2; i >= 0; i--) { if (positioned[i].displayY > positioned[i+1].displayY - minSpc) positioned[i].displayY = positioned[i+1].displayY - minSpc; }
+            const underflow = (top + minSpc/2) - positioned[0].displayY;
+            if (underflow > 0) positioned.forEach(l => l.displayY += underflow);
+            return positioned;
+          }
+
+          const kpiThresholdLinesPlugin = {
+            id: "kpiThresholdLines",
+            afterDatasetsDraw(chart, args, opts) {
+              const { left, right, top, bottom } = chart.chartArea;
+              const yScale = chart.scales.y;
+              const lines = (opts && opts.lines) || [];
+              if (!lines.length) return;
+              const ctx = chart.ctx;
+              const visibleLines = lines.map(l => {
+                const v = Number(l.value);
+                if (!isFinite(v)) return null;
+                const ay = yScale.getPixelForValue(v);
+                if (!isFinite(ay) || ay < top || ay > bottom) return null;
+                return { ...l, value: v, actualY: ay };
+              }).filter(Boolean);
+              const rendered = getSeparatedLines(visibleLines, top, bottom, 18);
+              ctx.save();
+              rendered.forEach(l => {
+                const y = l.displayY;
+                if (!isFinite(y) || y < top || y > bottom) return;
+                if (Math.abs(l.displayY - l.actualY) > 1) {
+                  ctx.beginPath(); ctx.setLineDash([2,3]); ctx.lineWidth = 1;
+                  ctx.strokeStyle = hexToRgba(l.borderColor, 0.45);
+                  ctx.moveTo(right - 20, l.actualY); ctx.lineTo(right - 3, l.displayY); ctx.stroke();
+                }
+                ctx.beginPath(); ctx.setLineDash(l.borderDash || [6,4]);
+                ctx.lineWidth = l.borderWidth || 2; ctx.strokeStyle = l.borderColor;
+                ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+              });
+              ctx.restore();
+            }
+          };
+
+          function getThresholdLines(lowLimit, target, highLimit) {
+            const lines = [];
+            if (!isNaN(highLimit)) lines.push({ key:"high_limit", label:"High", value:highLimit, borderColor:"#f59e0b", borderDash:[10,4], borderWidth:2 });
+            if (!isNaN(target)) lines.push({ key:"target", label:"Target", value:target, borderColor:"#22c55e", borderDash:[], borderWidth:2.5 });
+            if (!isNaN(lowLimit)) lines.push({ key:"low_limit", label:"Low", value:lowLimit, borderColor:"#ef4444", borderDash:[4,4], borderWidth:2 });
+            return lines;
+          }
+
+          function getPointColor(value, lowLimit, highLimit, direction) {
+            const val = parseFloat(value);
+            const rawLow = parseFloat(lowLimit), rawHigh = parseFloat(highLimit);
+            const hasLow = !isNaN(rawLow), hasHigh = !isNaN(rawHigh);
+            const lower = hasLow && hasHigh ? Math.min(rawLow,rawHigh) : hasLow ? rawLow : hasHigh ? rawHigh : null;
+            const upper = hasLow && hasHigh ? Math.max(rawLow,rawHigh) : hasHigh ? rawHigh : hasLow ? rawLow : null;
+            const dir = String(direction||"up").toLowerCase() === "down" ? "down" : "up";
+            if (isNaN(val)) return "#6b7280";
+            if (dir === "down") return (upper !== null && val > upper) ? "#ef4444" : "#22c55e";
+            return (lower !== null && val < lower) ? "#ef4444" : "#22c55e";
+          }
+
+          function computeBounds(values, lowLimit, target, highLimit) {
+            const all = (Array.isArray(values) ? values : [])
+              .filter(v => v !== null && v !== undefined && v !== "")
+              .map(v => Number(v))
+              .filter(v => Number.isFinite(v));
+            if (!isNaN(lowLimit)) all.push(lowLimit);
+            if (!isNaN(target)) all.push(target);
+            if (!isNaN(highLimit)) all.push(highLimit);
+            if (!all.length) return { min: 0, max: 100 };
+
+            const sourceMin = Math.min(...all);
+            const sourceMax = Math.max(...all);
+            let min = sourceMin > 0
+              ? sourceMin * 0.8
+              : sourceMin < 0
+                ? sourceMin * 1.2
+                : 0;
+            let max = sourceMax > 0
+              ? sourceMax * 1.2
+              : sourceMax < 0
+                ? sourceMax * 0.8
+                : 0;
+
+            if (min === max) {
+              const pad = Math.max(Math.abs(sourceMax || sourceMin || 1) * 0.2, 1);
+              min = sourceMin - pad;
+              max = sourceMax + pad;
+            }
+
+            return { min, max };
+          }
+
+          function buildKpiChart(kvId) {
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            if (!card) return;
+            const canvas = document.getElementById("chart_" + kvId);
+            if (!canvas) return;
+            const lowLimit = parseFloat(card.dataset.lowLimit);
+            const highLimit = parseFloat(card.dataset.highLimit);
+            const target = parseFloat(card.dataset.target);
+            const dir = card.dataset.goodDirection || "up";
+            let labels = [], values = [];
+            try { labels = JSON.parse(card.dataset.historyLabels || "[]"); values = JSON.parse(card.dataset.historyValues || "[]"); } catch(e){}
+            const colors = values.map(v => getPointColor(v, lowLimit, highLimit, dir));
+            const bounds = computeBounds(values, lowLimit, target, highLimit);
+            kpiCharts[kvId] = new Chart(canvas.getContext("2d"), {
+              type:"bar",
+              data:{ labels, datasets:[{ label:"Value", data:values, backgroundColor:colors, borderRadius:6, borderSkipped:false, barThickness:30 }] },
+              options:{
+                responsive:true, maintainAspectRatio:false, animation:false,
+                layout:{ padding:{ right:12 } },
+                plugins:{ legend:{ display:false }, kpiThresholdLines:{ lines: getThresholdLines(lowLimit,target,highLimit) } },
+                scales:{ x:{ grid:{ display:false }, ticks:{ callback:function(value){ const rawLabel = this.getLabelForValue(value); return formatWeekLabelClient(rawLabel); } } }, y:{ min:bounds.min, max:bounds.max } }
+              },
+              plugins:[kpiThresholdLinesPlugin]
+            });
+          }
+
+          function updateKpiChart(kvId) {
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            if (!card) return;
+            const chart = kpiCharts[kvId]; if (!chart) return;
+            const lowLimit = parseFloat(card.dataset.lowLimit), highLimit = parseFloat(card.dataset.highLimit), target = parseFloat(card.dataset.target);
+            const dir = card.dataset.goodDirection || "up";
+            const data = chart.data.datasets[0].data;
+            const colors = data.map(v => getPointColor(v, lowLimit, highLimit, dir));
+            chart.data.datasets[0].backgroundColor = colors;
+            const bounds = computeBounds(data, lowLimit, target, highLimit);
+            chart.options.scales.y.min = bounds.min; chart.options.scales.y.max = bounds.max;
+            chart.options.plugins.kpiThresholdLines.lines = getThresholdLines(lowLimit, target, highLimit);
+            chart.update();
+            if (expandedChartKpiValuesId === kvId && expandedChart) syncExpandedChart(chart);
+          }
+
+         function weekLabelToDateClient(weekStr) {
+  const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
+  if (!m) return null;
+
+  const year = parseInt(m[1], 10);
+  const weekNum = parseInt(m[2], 10);
+  return new Date(year, 0, 1 + (weekNum - 1) * 7);
+}
+
+function getFallbackCurrentWeekLabel(card, labels) {
+  const storedWeekLabel = String(card?.dataset?.currentWeekLabel || "").trim();
+  if (storedWeekLabel) return storedWeekLabel;
+
+  const weekFromCard = String(card?.dataset?.currentWeek || "").trim();
+  if (weekFromCard) return weekFromCard;
+
+  const pageWeek = new URLSearchParams(window.location.search).get("week") || "";
+  if (pageWeek) return pageWeek;
+
+  if (Array.isArray(labels) && labels.length) {
+    return labels[labels.length - 1];
+  }
+
+  return "";
+}
+
+function formatWeekLabelClient(weekStr) {
+  const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
+  return m ? "Week " + parseInt(m[2], 10) : String(weekStr || "");
+}
+
+
+          function updateCurrentWeekBarFromInput(kvId, rawValue) {
+  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+  const chart = kpiCharts[kvId];
+  if (!card || !chart) return;
+
+  const value = parseFloat(rawValue);
+
+  let labels = [];
+  let values = [];
+
+  try {
+    labels = JSON.parse(card.dataset.historyLabels || "[]");
+    values = JSON.parse(card.dataset.historyValues || "[]");
+  } catch (e) {
+    labels = [];
+    values = [];
+  }
+
+  const currentWeekLabel = getFallbackCurrentWeekLabel(card, labels);
+  if (!currentWeekLabel) return;
+
+  const existingIndex = labels.indexOf(currentWeekLabel);
+
+  if (isNaN(value)) {
+    if (existingIndex >= 0) {
+      values[existingIndex] = null;
+    }
+  } else {
+    if (existingIndex >= 0) {
+      values[existingIndex] = value;
+    } else {
+      labels.push(currentWeekLabel);
+      values.push(value);
+    }
+  }
+
+  const normalized = labels.map(function(label, index) {
+    return { label: label, value: values[index] };
+  }).sort(function(a, b) {
+    return weekLabelToDateClient(a.label) - weekLabelToDateClient(b.label);
+  }).slice(-${KPI_SUBMISSION_CHART_WEEK_WINDOW});
+
+  labels = normalized.map(function(item) { return item.label; });
+  values = normalized.map(function(item) { return item.value; });
+
+  card.dataset.historyLabels = JSON.stringify(labels);
+  card.dataset.historyValues = JSON.stringify(values);
+
+  chart.data.labels = labels.slice();
+  chart.data.datasets[0].data = values.slice();
+
+  updateKpiChart(kvId);
+}
+
+          function syncExpandedChart(src) {
+            if (!expandedChart || !src) return;
+            expandedChart.data.labels = src.data.labels.slice();
+            expandedChart.data.datasets = src.data.datasets.map((d,i) => {
+              const c = Object.assign({}, d);
+              c.data = d.data.slice(); c.backgroundColor = Array.isArray(d.backgroundColor) ? d.backgroundColor.slice() : d.backgroundColor;
+              if (i===0){ c.barThickness=56; c.maxBarThickness=72; c.borderRadius=10; }
+              return c;
+            });
+            expandedChart.options.scales.y.min = src.options.scales.y.min;
+            expandedChart.options.scales.y.max = src.options.scales.y.max;
+            expandedChart.options.plugins.kpiThresholdLines.lines = (src.options.plugins.kpiThresholdLines.lines||[]).map(l=>({...l,borderDash:(l.borderDash||[]).slice()}));
+            expandedChart.update();
+          }
+
+          function closeChartModal() {
+            if (expandedChart) { expandedChart.destroy(); expandedChart = null; }
+            expandedChartKpiValuesId = null;
+            const chartModal = document.getElementById("chartModal");
+            if (chartModal) { chartModal.classList.remove("active"); chartModal.setAttribute("aria-hidden","true"); }
+            if (!document.querySelector(".history-modal-overlay.active") && !document.querySelector(".ca-modal-overlay.active")) {
+              document.body.classList.remove("chart-modal-open");
+            }
+          }
+
+          function openChartModal(kvId) {
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            const chartModal = document.getElementById("chartModal");
+            const chartModalCanvas = document.getElementById("chartModalCanvas");
+            const chartModalTitle = document.getElementById("chartModalTitle");
+            const chartModalSubtitle = document.getElementById("chartModalSubtitle");
+            if (!card || !chartModal || !chartModalCanvas) return;
+            if (!kpiCharts[kvId]) buildKpiChart(kvId);
+            const src = kpiCharts[kvId]; if (!src) return;
+            if (chartModalTitle) chartModalTitle.textContent = getTrimmedText(card.querySelector(".kpi-title")) || "KPI Trend";
+            if (chartModalSubtitle) chartModalSubtitle.textContent = getTrimmedText(card.querySelector(".kpi-subtitle")) || "Weekly KPI performance overview";
+            if (expandedChart) { expandedChart.destroy(); expandedChart = null; }
+            expandedChartKpiValuesId = kvId;
+            chartModal.classList.add("active"); chartModal.setAttribute("aria-hidden","false");
+            document.body.classList.add("chart-modal-open");
+            requestAnimationFrame(() => {
+              if (!chartModal.classList.contains("active")) return;
+              expandedChart = new Chart(chartModalCanvas.getContext("2d"), {
+                type:"bar",
+                data:{
+                  labels: src.data.labels.slice(),
+                  datasets: src.data.datasets.map((d,i) => {
+                    const c = Object.assign({},d); c.data = d.data.slice(); c.backgroundColor = Array.isArray(d.backgroundColor)?d.backgroundColor.slice():d.backgroundColor;
+                    if(i===0){c.barThickness=56;c.maxBarThickness=72;c.borderRadius=10;} return c;
+                  })
+                },
+                options:{
+                  responsive:true, maintainAspectRatio:false, animation:false,
+                  interaction:{ mode:"index", intersect:false }, layout:{ padding:{right:12} },
+                  plugins:{ legend:{display:false}, kpiThresholdLines:{ lines:(src.options.plugins.kpiThresholdLines.lines||[]).map(l=>({...l,borderDash:(l.borderDash||[]).slice()})) } },
+                  scales:{ x:{grid:{display:false},ticks:{color:"#475569",font:{size:14,weight:"600"},callback:function(value){ const rawLabel = this.getLabelForValue(value); return formatWeekLabelClient(rawLabel); }}}, y:{min:src.options.scales.y.min,max:src.options.scales.y.max,ticks:{color:"#64748b",font:{size:13}},grid:{color:"#e2e8f0"}} }
+                },
+                plugins:[expandedChartValueLabelsPlugin, kpiThresholdLinesPlugin]
+              });
+            });
+          }
+
+          /* â”€â”€ History modal helpers â”€â”€ */
+          function escapeHistoryHtml(v) { return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+          function formatHistoryText(v) { return escapeHistoryHtml(v).split("\\n").join("<br>"); }
+          function decodeModalPayload(v, fb) { try { const d=decodeURIComponent(v||""); if(!d) return fb; const p=JSON.parse(d); return (p===null||p===undefined)?fb:p; } catch(e){ return fb; } }
+          function formatHistoryWeek(w) { return escapeHistoryHtml(formatWeekLabelClient(w)); }
+          function getHistoryStatusClass(s) { return "status-"+String(s||"Open").trim().toLowerCase().replace(/\s+/g,"-"); }
+
+          function renderHistoryStatusContent(action, options) {
+            const canonicalStatus = getCanonicalCorrectiveActionStatus(action.status);
+
+            if (!options || !options.editableStatus) {
+              return canonicalStatus
+                ? '<span class="history-chip ' + getHistoryStatusClass(canonicalStatus) + '">' + escapeHistoryHtml(canonicalStatus) + '</span>'
+                : '&mdash;';
+            }
+
+            const actionIndex = Number.isInteger(action._storeIndex) ? String(action._storeIndex) : "";
+            const actionId = String(action.id || action.corrective_action_id || "").trim();
+
+            return '' +
+              '<select class="history-status-select ' + getHistoryStatusClass(canonicalStatus) + '"' +
+                ' data-kpi-values-id="' + escapeHistoryHtml(options.kvId || "") + '"' +
+                ' data-action-index="' + escapeHistoryHtml(actionIndex) + '"' +
+                ' data-action-id="' + escapeHistoryHtml(actionId) + '"' +
+                ' data-previous-status="' + escapeHistoryHtml(canonicalStatus) + '"' +
+              '>' +
+                HISTORY_STATUS_OPTIONS.map(function(option) {
+                  return '<option value="' + escapeHistoryHtml(option) + '"' +
+                    (option === canonicalStatus ? ' selected' : '') +
+                    '>' + escapeHistoryHtml(option) + '</option>';
+                }).join("") +
+              '</select>';
+          }
+
+          function applyHistoryStatusSelectState(selectEl, status) {
+            if (!selectEl) return;
+            const canonicalStatus = getCanonicalCorrectiveActionStatus(status);
+            selectEl.value = canonicalStatus;
+            selectEl.className = "history-status-select " + getHistoryStatusClass(canonicalStatus);
+          }
+
+          async function handleHistoryStatusChange(selectEl) {
+            if (!selectEl) return;
+
+            const kvId = String(selectEl.dataset.kpiValuesId || "").trim();
+            const actionIndex = parseInt(selectEl.dataset.actionIndex || "", 10);
+
+            if (!kvId || Number.isNaN(actionIndex)) {
+              applyHistoryStatusSelectState(selectEl, selectEl.dataset.previousStatus || "Open");
+              return;
+            }
+
+            const previousStatus = getCanonicalCorrectiveActionStatus(selectEl.dataset.previousStatus || "Open");
+            const nextStatus = getCanonicalCorrectiveActionStatus(selectEl.value);
+
+            applyHistoryStatusSelectState(selectEl, nextStatus);
+            updateCorrectiveActionStatusInStore(kvId, actionIndex, nextStatus);
+
+            const actionId = String(selectEl.dataset.actionId || "").trim();
+            if (!actionId) {
+              selectEl.dataset.previousStatus = nextStatus;
+              return;
+            }
+
+            selectEl.disabled = true;
+
+            try {
+              const response = await fetch('/api/corrective-actions/' + encodeURIComponent(actionId) + '/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: nextStatus })
+              });
+
+              const payload = await response.json().catch(function() { return {}; });
+              if (!response.ok) {
+                throw new Error(payload.error || 'Could not update corrective action status.');
+              }
+
+              const savedStatus = getCanonicalCorrectiveActionStatus(payload.status || nextStatus);
+              updateCorrectiveActionStatusInStore(kvId, actionIndex, savedStatus);
+              applyHistoryStatusSelectState(selectEl, savedStatus);
+              selectEl.dataset.previousStatus = savedStatus;
+            } catch (error) {
+              updateCorrectiveActionStatusInStore(kvId, actionIndex, previousStatus);
+              applyHistoryStatusSelectState(selectEl, previousStatus);
+              alert(error.message || 'Could not update corrective action status.');
+            } finally {
+              selectEl.disabled = false;
+            }
+          }
+
+          function bindHistoryStatusControls() {
+            document.querySelectorAll(".history-status-select").forEach(function(selectEl) {
+              applyHistoryStatusSelectState(selectEl, selectEl.value);
+              selectEl.onchange = function() {
+                handleHistoryStatusChange(this);
+              };
+            });
+          }
+
+          function closeHistoryModal() {
+            const historyModal = document.getElementById("historyModal");
+            if (!historyModal) return;
+            historyModal.classList.remove("active"); historyModal.setAttribute("aria-hidden","true");
+            if (!document.querySelector(".chart-modal-overlay.active") && !document.querySelector(".ca-modal-overlay.active")) {
+              document.body.classList.remove("chart-modal-open");
+            }
+          }
+
+          function hasCorrectiveActionContent(action) {
+            if (!action) return false;
+            return Boolean(
+              String(action.root_cause || "").trim() ||
+              String(action.implemented_solution || "").trim() ||
+              String(action.due_date || "").trim() ||
+              String(action.responsible || "").trim() ||
+              String(action.id || action.corrective_action_id || "").trim()
+            );
+          }
+
+          function renderHistoryActionsTable(actions, emptyMessage, options) {
+            if (!actions.length) {
+              return '<div class="history-empty">' + escapeHistoryHtml(emptyMessage) + '</div>';
+            }
+
+            return '' +
+              '<div class="history-table-wrap">' +
+                '<table class="history-table">' +
+                  '<thead>' +
+                    '<tr>' +
+                      '<th>#</th>' +
+                      '<th>Week</th>' +
+                      '<th>Root Cause</th>' +
+                      '<th>Implemented Solution</th>' +
+                      '<th>Due Date</th>' +
+                      '<th>Responsible</th>' +
+                      '<th>Status</th>' +
+                    '</tr>' +
+                  '</thead>' +
+                  '<tbody>' +
+                    actions.map(function(action, index) {
+                      return '' +
+                        '<tr>' +
+                          '<td>' + (index + 1) + '</td>' +
+                          '<td>' + formatHistoryWeek(action.week || action.month_label || "Current") + '</td>' +
+                          '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
+                          '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
+                          '<td>' + escapeHistoryHtml(action.due_date || "") + '</td>' +
+                          '<td>' + escapeHistoryHtml(action.responsible || "") + '</td>' +
+                          '<td>' + renderHistoryStatusContent(action, options) + '</td>' +
+                        '</tr>';
+                    }).join("") +
+                  '</tbody>' +
+                '</table>' +
+              '</div>';
+          }
+
+        function openHistoryModal(kvId) {
+  const historyModal = document.getElementById("historyModal");
+  const historyModalTitle = document.getElementById("historyModalTitle");
+  const historyModalSubtitle = document.getElementById("historyModalSubtitle");
+  const historyModalContent = document.getElementById("historyModalContent");
+  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+
+  if (!card || !historyModal || !historyModalContent) return;
+
+  const titleText = getTrimmedText(card.querySelector(".kpi-title")) || "Corrective Actions";
+  const subtitleText = getTrimmedText(card.querySelector(".kpi-subtitle"));
+  const currentWeekLabel = card.dataset.currentWeekLabel || card.dataset.currentWeek || "Current week";
+  const prevLabel = card.dataset.prevWeekLabel || "";
+  const liveActions = getCaModalActions(kvId)
+    .map(function(action, actionIndex) {
+      return Object.assign({ week: currentWeekLabel, status: action.status || "Open", _storeIndex: actionIndex }, action);
+    })
+    .filter(hasCorrectiveActionContent);
+  const prevActions = decodeModalPayload(card.dataset.prevWeekActions, []);
+  const prevComments = decodeModalPayload(card.dataset.prevWeekComments, []);
+  const comments = Array.isArray(prevComments) ? prevComments : [];
+  const previousActions = (Array.isArray(prevActions) ? prevActions : []).filter(hasCorrectiveActionContent);
+  const sections = [];
+
+  if (historyModalTitle) historyModalTitle.textContent = titleText;
+  if (historyModalSubtitle) {
+    const displayCurrentWeekLabel = formatWeekLabelClient(currentWeekLabel);
+    historyModalSubtitle.textContent = subtitleText
+      ? displayCurrentWeekLabel + ' • ' + subtitleText
+      : displayCurrentWeekLabel;
+  }
+
+  sections.push(
+    '<div class="history-section">' +
+      '<h4 class="history-section-title">Current Corrective Actions</h4>' +
+      renderHistoryActionsTable(
+        liveActions,
+        'No corrective actions saved yet for this KPI in the current week.',
+        { editableStatus: true, kvId: kvId }
+      ) +
+    '</div>'
+  );
+
+  if (previousActions.length) {
+    sections.push(
+      '<div class="history-section">' +
+        '<h4 class="history-section-title">Previous Week Corrective Actions</h4>' +
+        renderHistoryActionsTable(previousActions, 'No previous-week corrective actions were found.') +
+      '</div>'
+    );
+  }
+
+  if (comments.length) {
+    const commentsHtml = '<div class="history-comments-list">' + comments.map(c =>
+      '<div class="history-comment-card">' +
+        '<div class="history-comment-label">' +
+          formatHistoryWeek(c.week || prevLabel || "") +
+        '</div>' +
+        '<div class="history-comment-text">' + formatHistoryText(c.text || "") + '</div>' +
+      '</div>'
+    ).join("") + '</div>';
+
+    sections.push(
+      '<div class="history-section">' +
+        '<h4 class="history-section-title">Previous Week Comments</h4>' +
+        commentsHtml +
+      '</div>'
+    );
+  }
+
+  historyModalContent.innerHTML = sections.join('');
+  bindHistoryStatusControls();
+  historyModal.classList.add("active");
+  historyModal.setAttribute("aria-hidden", "false");
+  document.body.classList.add("chart-modal-open");
+}
+
+          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+             DOM READY
+          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+        document.addEventListener("DOMContentLoaded", () => {
+  // Value inputs
+  document.querySelectorAll(".value-input").forEach(input => {
+    const kvId = input.dataset.kpiValuesId;
+    checkLowLimit(input);
+    buildKpiChart(kvId);
+
+    input.addEventListener("input", function() {
+      checkLowLimit(this);
+      updateCurrentWeekBarFromInput(kvId, this.value);
+    });
+  });
+
+  startRealtimeCharts();
+            // Chart expand
+            document.querySelectorAll(".kpi-chart-trigger").forEach(panel => {
+              const kvId = panel.dataset.kpiValuesId;
+              if (!kvId) return;
+              panel.addEventListener("click", () => openChartModal(kvId));
+              panel.addEventListener("keydown", e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); openChartModal(kvId); } });
+            });
+            document.querySelectorAll(".chart-expand-btn").forEach(btn => {
+              const kvId = btn.dataset.kpiValuesId; if (!kvId) return;
+              btn.addEventListener("click", e => { e.stopPropagation(); openChartModal(kvId); });
+            });
+
+            // History modal (view previous CA inside card panel)
+            document.querySelectorAll(".view-ca-btn").forEach(btn => {
+              const kvId = btn.dataset.kpiValuesId; if (!kvId) return;
+              btn.addEventListener("click", () => openHistoryModal(kvId));
+            });
+
+            // Card action bar â€” View Previous Actions
+            document.querySelectorAll(".view-prev-ca-btn").forEach(btn => {
+              const kvId = btn.dataset.kpiValuesId; if (!kvId) return;
+              btn.addEventListener("click", () => openHistoryModal(kvId));
+            });
+
+            // Card action bar â€” Open CA Table Modal
+            document.querySelectorAll(".open-ca-modal-btn").forEach(btn => {
+              const kvId = btn.dataset.kpiValuesId; if (!kvId) return;
+              btn.addEventListener("click", () => openCaTableModal(kvId));
+            });
+
+            // Bind existing CA action cards
+            document.querySelectorAll(".ca-actions-stack").forEach(stack => {
+              const kvId = stack.dataset.kpiValuesId; if (!kvId) return;
+              getCorrectiveActionCards(kvId).forEach(card => bindCorrectiveActionCard(card, kvId));
+              renumberCorrectiveActionCards(kvId);
+            });
+
+            // Chart modal close
+            const chartModal = document.getElementById("chartModal");
+            const chartModalClose = document.getElementById("chartModalClose");
+            if (chartModal && chartModalClose) {
+              chartModalClose.addEventListener("click", closeChartModal);
+              chartModal.addEventListener("click", e => { if (e.target===chartModal) closeChartModal(); });
+            }
+
+            // History modal close
+            const historyModal = document.getElementById("historyModal");
+            const historyModalClose = document.getElementById("historyModalClose");
+            if (historyModal && historyModalClose) {
+              historyModalClose.addEventListener("click", closeHistoryModal);
+              historyModal.addEventListener("click", e => { if (e.target===historyModal) closeHistoryModal(); });
+            }
+
+            // CA Table Modal close
+            const caModalClose = document.getElementById("caModalClose");
+            const caTableModal = document.getElementById("caTableModal");
+            if (caModalClose) caModalClose.addEventListener("click", closeCaTableModal);
+            if (caTableModal) caTableModal.addEventListener("click", e => { if (e.target===caTableModal) closeCaTableModal(); });
+
+            // CA modal form controls
+            const caModalAddRowBtn = document.getElementById("caModalAddRowBtn");
+            if (caModalAddRowBtn) caModalAddRowBtn.addEventListener("click", () => caModalOpenForm(null));
+            const caModalFormCollapse = document.getElementById("caModalFormCollapse");
+            if (caModalFormCollapse) caModalFormCollapse.addEventListener("click", caModalCollapseForm);
+            const caModalCancelForm = document.getElementById("caModalCancelForm");
+            if (caModalCancelForm) caModalCancelForm.addEventListener("click", caModalCollapseForm);
+            const caModalSaveFormBtn = document.getElementById("caModalSaveForm");
+            if (caModalSaveFormBtn) caModalSaveFormBtn.addEventListener("click", caModalSaveForm);
+
+            // Escape key
+            document.addEventListener("keydown", e => {
+              if (e.key === "Escape") {
+                if (document.getElementById("caTableModal").classList.contains("active")) { closeCaTableModal(); return; }
+                if (document.getElementById("chartModal").classList.contains("active")) { closeChartModal(); return; }
+                if (document.getElementById("historyModal").classList.contains("active")) { closeHistoryModal(); return; }
+              }
+            });
+
+            // Submit form
+            const form = document.getElementById("kpiForm");
+            const confirmModal = document.getElementById("confirmModal");
+            const confirmBtn = document.getElementById("confirmBtn");
+            const cancelBtn = document.getElementById("cancelBtn");
+            const loadingOverlay = document.getElementById("loadingOverlay");
+            let formToSubmit = null;
+
+            if (form && confirmModal && confirmBtn && cancelBtn) {
+              form.addEventListener("submit", function(e) {
+                e.preventDefault();
+                let hasError = false;
+                this.querySelectorAll("input.value-input[required]").forEach(input => {
+                  if (!input.value.trim() || isNaN(input.value.trim())) { hasError = true; input.style.borderColor = "#dc3545"; }
+                  else input.style.borderColor = "#ddd";
+                });
+                document.querySelectorAll(".ca-container.visible").forEach(panel => {
+                  panel.querySelectorAll(".ca-textarea, .ca-date-input, .ca-text-input").forEach(field => {
+                    if (!field.value.trim()) { hasError = true; field.classList.add("error"); }
+                    else field.classList.remove("error");
+                  });
+                });
+                if (hasError) return;
+                formToSubmit = this;
+                confirmModal.classList.add("active");
+              });
+              confirmBtn.addEventListener("click", () => {
+                confirmModal.classList.remove("active");
+                if (loadingOverlay) loadingOverlay.classList.add("active");
+                if (formToSubmit) formToSubmit.submit();
+              });
+              cancelBtn.addEventListener("click", () => confirmModal.classList.remove("active"));
             }
           });
+
+          window.caModalOpenEdit = caModalOpenEdit;
+          window.caModalDeleteAction = caModalDeleteAction;
+          window.openHistoryModal = openHistoryModal;
+          window.openCaTableModal = openCaTableModal;
         </script>
       </body>
       </html>
     `);
   } catch (err) {
+    console.error("Error loading form:", err);
     res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
-// ---------- Modern Dashboard by Week ----------
+
+
+// ---------- Dashboard ----------
 app.get("/dashboard", async (req, res) => {
   try {
     const { responsible_id } = req.query;
 
-    // 1️⃣ Fetch responsible info
     const resResp = await pool.query(
-      `
-      SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1
-      `,
+      `SELECT r.*, p.name AS plant_name, d.name AS department_name
+       FROM public."Responsible" r
+       JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`,
       [responsible_id]
     );
 
     const responsible = resResp.rows[0];
     if (!responsible) throw new Error("Responsible not found");
 
-    // 2️⃣ Fetch ALL historical KPI submissions for this responsible, ALL weeks
     const kpiRes = await pool.query(
-      `
-      SELECT DISTINCT ON (h.week, h.kpi_id)
-             h.hist_id, h.kpi_values_id, h.new_value as value, h.week, 
-             h.kpi_id, h.updated_at,
-             k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.kpi_values_hist26 h
-      JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-      WHERE h.responsible_id = $1
-      ORDER BY h.week DESC, h.kpi_id ASC, h.updated_at DESC
-      `,
+      `SELECT DISTINCT ON (h.week, h.kpi_id)
+              h.hist_id,
+              h.kpi_values_id,
+              h.new_value as value,
+              h.week,
+              h.kpi_id,
+              h.updated_at,
+              ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES}
+       FROM public.kpi_values_hist26 h
+       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+       LEFT JOIN public.kpi_values kv
+         ON kv.kpi_values_id = h.kpi_values_id
+       LEFT JOIN public.responsible_kpis rk
+         ON rk.responsible_kpi_id = kv.responsible_kpi_id
+       WHERE h.responsible_id = $1
+       ORDER BY h.week DESC, h.kpi_id ASC, h.updated_at DESC`,
       [responsible_id]
     );
 
-    // 3️⃣ Group KPIs by week - FIX: Use Map to preserve order and handle duplicates properly
-    const weekMap = new Map();
-    kpiRes.rows.forEach(kpi => {
-      if (!weekMap.has(kpi.week)) {
-        weekMap.set(kpi.week, []);
-      }
-      weekMap.get(kpi.week).push(kpi);
+    const monthMap = new Map();
+
+    kpiRes.rows.forEach((kpi) => {
+      if (!kpi.updated_at) return;
+
+      const date = new Date(kpi.updated_at);
+      const monthKey = `${date.getFullYear()}-${date.getMonth()}`;
+
+      if (!monthMap.has(monthKey)) monthMap.set(monthKey, []);
+      monthMap.get(monthKey).push(kpi);
     });
 
-    // 4️⃣ Build Dashboard HTML
-    let html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>KPI Dashboard - ${responsible.name}</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin:0; }
-          .container { max-width: 900px; margin: 0 auto; }
-          .header { background:#0078D7; color:white; padding:20px; text-align:center; border-radius:8px 8px 0 0; }
-          .header h1 { margin:0; font-size:24px; }
-          .content { background:#fff; padding:30px; border-radius:0 0 8px 8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
+    const sortedMonthEntries = Array.from(monthMap.entries()).sort((a, b) => {
+      const [yearA, monthA] = a[0].split("-").map(Number);
+      const [yearB, monthB] = b[0].split("-").map(Number);
+      return new Date(yearB, monthB) - new Date(yearA, monthA);
+    });
 
-          .info-section { background:#f8f9fa; padding:20px; border-radius:6px; margin-bottom:25px; border-left:4px solid #0078D7; }
-          .info-row { display:flex; margin-bottom:10px; }
-          .info-label { width:120px; font-weight:600; color:#333; }
-          .info-value { flex:1; background:white; padding:8px 12px; border:1px solid #ddd; border-radius:4px; }
+    const formatDashboardMetricValue = (value, unit = "") => {
+      const numericValue = normalizeMetricNumberByUnit(value, unit);
+      if (numericValue === null) return "Not filled";
+      const formatted = numericValue.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: isPercentageUnit(unit) ? 1 : 2
+      });
+      return unit ? `${formatted} ${unit}` : formatted;
+    };
 
-          .week-section { margin-bottom:30px; border:1px solid #e1e5e9; border-radius:8px; padding:20px; background:#fafbfc; }
-          .week-title { color:#0078D7; font-size:20px; margin-bottom:15px; font-weight:600; border-bottom:2px solid #0078D7; padding-bottom:8px; }
+    const formatDashboardTimestamp = (value) => {
+      if (!value) return "No updates recorded";
+      const parsed = new Date(value);
+      if (isNaN(parsed.getTime())) return "No updates recorded";
+      return parsed.toLocaleString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+    };
 
-          .kpi-card { background:#fff; border:1px solid #e1e5e9; border-radius:6px; padding:15px; margin-bottom:15px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
-          .kpi-title { font-weight:600; color:#333; margin-bottom:5px; }
-          .kpi-subtitle { color:#666; font-size:13px; margin-bottom:10px; }
-          .kpi-value { font-size:16px; font-weight:bold; color:#0078D7; }
-          .kpi-unit { color:#888; font-size:12px; margin-top:5px; }
-          .kpi-date { color:#999; font-size:11px; margin-top:3px; font-style:italic; }
-          .no-data { color:#999; font-style:italic; }
-          
-          .summary { 
-            background:#e7f3ff; 
-            padding:15px; 
-            border-radius:6px; 
-            margin-bottom:25px;
-            border-left:4px solid #0078D7;
+    const monthSummaries = sortedMonthEntries.map(([monthKey, items], index) => {
+      const [year, month] = monthKey.split("-").map(Number);
+      const monthDate = new Date(year, month);
+      let alertCount = 0;
+      let onTrackCount = 0;
+      let missingCount = 0;
+      let latestUpdatedAt = null;
+
+      items.forEach((kpi) => {
+        const currentValue = normalizeMetricNumberByUnit(kpi.value, kpi.unit);
+        const lowLimit = normalizeMetricNumberByUnit(kpi.low_limit, kpi.unit);
+        const highLimit = normalizeMetricNumberByUnit(kpi.high_limit, kpi.unit);
+        const statusInfo = getKpiStatus(currentValue, lowLimit, highLimit, inferKpiDirection(kpi));
+
+        if (currentValue === null) missingCount += 1;
+        else if (statusInfo.isGood === false) alertCount += 1;
+        else onTrackCount += 1;
+
+        if (kpi.updated_at) {
+          const updatedAt = new Date(kpi.updated_at);
+          if (!isNaN(updatedAt.getTime()) && (!latestUpdatedAt || updatedAt > latestUpdatedAt)) {
+            latestUpdatedAt = updatedAt;
           }
-          .summary-text {
-            margin:0;
-            color:#333;
-            font-size:14px;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <h1>KPI Dashboard - ${responsible.name}</h1>
-          </div>
-          <div class="content">
-            <div class="info-section">
-              <div class="info-row"><div class="info-label">Responsible</div><div class="info-value">${responsible.name}</div></div>
-              <div class="info-row"><div class="info-label">Plant</div><div class="info-value">${responsible.plant_name}</div></div>
-              <div class="info-row"><div class="info-label">Department</div><div class="info-value">${responsible.department_name}</div></div>
-            </div>
-    `;
+        }
+      });
 
-    // 5️⃣ Loop through WEEKS using Map
-    if (weekMap.size === 0) {
-      html += `<div class="no-data">No KPI data available yet.</div>`;
+      return {
+        monthKey,
+        monthLabel: monthDate.toLocaleString("en-US", { month: "long", year: "numeric" }),
+        monthShort: monthDate.toLocaleString("en-US", { month: "short" }).toUpperCase(),
+        isLatest: index === 0,
+        kpiCount: items.length,
+        alertCount,
+        onTrackCount,
+        missingCount,
+        lastUpdated: formatDashboardTimestamp(latestUpdatedAt)
+      };
+    });
+
+    const monthSummaryByKey = new Map(monthSummaries.map((summary) => [summary.monthKey, summary]));
+    const selectedMonthSummary = monthSummaries[0] || null;
+    const selectedMonthKey = selectedMonthSummary?.monthKey || "";
+    const monthOptionsHtml = monthSummaries
+      .map((summary) =>
+        `<option value="${escapeHtml(summary.monthKey)}"${summary.monthKey === selectedMonthKey ? " selected" : ""}>${escapeHtml(summary.monthLabel)}${summary.isLatest ? " - Latest" : ""}</option>`
+      )
+      .join("");
+    const monthSummaryMapJson = JSON.stringify(
+      monthSummaries.reduce((acc, summary) => {
+        acc[summary.monthKey] = summary;
+        return acc;
+      }, {})
+    ).replace(/</g, "\\u003c");
+
+    let html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>KPI Dashboard</title>
+  <style>
+    :root{
+      --bg:#eef4f9;
+      --panel:#ffffff;
+      --panel-soft:#f8fbff;
+      --text:#0f172a;
+      --muted:#64748b;
+      --border:rgba(148,163,184,0.22);
+      --brand:#0f6cbd;
+      --brand-strong:#005a9c;
+      --good:#16a34a;
+      --warn:#f59e0b;
+      --bad:#dc2626;
+      --shadow:0 24px 60px rgba(15,23,42,0.14);
+    }
+    *{box-sizing:border-box;}
+    body{
+      font-family:'Segoe UI',sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(15,108,189,0.18), transparent 28%),
+        linear-gradient(180deg, #eef4f9 0%, #f8fbfd 100%);
+      padding:30px 20px 40px;
+      margin:0;
+      color:var(--text);
+    }
+    .container{max-width:1120px;margin:0 auto;}
+    .header{
+      position:relative;
+      overflow:hidden;
+      background:linear-gradient(135deg, var(--brand) 0%, #2894ff 100%);
+      color:white;
+      padding:34px 36px 28px;
+      border-radius:28px 28px 0 0;
+    }
+    .header::after{
+      content:"";
+      position:absolute;
+      inset:auto -120px -120px auto;
+      width:320px;
+      height:320px;
+      background:radial-gradient(circle, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 70%);
+      pointer-events:none;
+    }
+    .header-eyebrow{
+      display:inline-flex;
+      align-items:center;
+      padding:8px 12px;
+      border-radius:999px;
+      font-size:12px;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      background:rgba(255,255,255,0.14);
+      border:1px solid rgba(255,255,255,0.18);
+      margin-bottom:16px;
+    }
+    .header h1{
+      margin:0;
+      font-size:38px;
+      line-height:1.1;
+      font-weight:700;
+      letter-spacing:-0.03em;
+    }
+    .header p{
+      margin:12px 0 0;
+      max-width:680px;
+      font-size:15px;
+      line-height:1.6;
+      color:rgba(255,255,255,0.88);
+    }
+    .content{
+      background:rgba(255,255,255,0.96);
+      backdrop-filter:blur(10px);
+      padding:28px;
+      border-radius:0 0 28px 28px;
+      box-shadow:var(--shadow);
+    }
+    .identity-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:14px;
+      margin-bottom:20px;
+    }
+    .identity-card{
+      padding:18px 18px 16px;
+      border-radius:20px;
+      background:linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+      border:1px solid var(--border);
+      box-shadow:0 10px 26px rgba(148,163,184,0.10);
+    }
+    .identity-label{
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:var(--muted);
+      margin-bottom:8px;
+    }
+    .identity-value{
+      font-size:20px;
+      font-weight:700;
+      color:var(--text);
+      line-height:1.3;
+    }
+    .toolbar{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-end;
+      gap:18px;
+      padding:20px 22px;
+      border-radius:22px;
+      background:linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+      border:1px solid var(--border);
+      margin-bottom:20px;
+    }
+    .toolbar-copy{max-width:560px;}
+    .toolbar-label{
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:var(--brand);
+      margin-bottom:6px;
+    }
+    .toolbar-title{
+      font-size:24px;
+      font-weight:700;
+      letter-spacing:-0.02em;
+      color:var(--text);
+      margin-bottom:6px;
+    }
+    .toolbar-text{
+      margin:0;
+      color:var(--muted);
+      line-height:1.6;
+      font-size:14px;
+    }
+    .month-filter{
+      min-width:260px;
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .month-filter span{
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:var(--muted);
+    }
+    .month-filter select{
+      width:100%;
+      padding:14px 16px;
+      border-radius:16px;
+      border:1px solid rgba(15,108,189,0.18);
+      background:#fff;
+      color:var(--text);
+      font-size:15px;
+      font-weight:600;
+      outline:none;
+      box-shadow:0 8px 20px rgba(15,108,189,0.08);
+    }
+    .active-month-card{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:20px;
+      padding:24px 26px;
+      border-radius:24px;
+      background:
+        linear-gradient(135deg, rgba(15,108,189,0.08) 0%, rgba(40,148,255,0.05) 100%),
+        #ffffff;
+      border:1px solid rgba(15,108,189,0.16);
+      margin-bottom:22px;
+      box-shadow:0 16px 34px rgba(15,108,189,0.08);
+    }
+    .active-month-badge{
+      display:inline-flex;
+      align-items:center;
+      padding:8px 12px;
+      border-radius:999px;
+      background:rgba(15,108,189,0.10);
+      color:var(--brand-strong);
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.06em;
+      text-transform:uppercase;
+      margin-bottom:12px;
+    }
+    .active-month-title{
+      margin:0;
+      font-size:34px;
+      line-height:1.08;
+      letter-spacing:-0.03em;
+      color:var(--text);
+    }
+    .active-month-description{
+      margin:10px 0 0;
+      max-width:560px;
+      color:var(--muted);
+      font-size:15px;
+      line-height:1.6;
+    }
+    .active-month-stats{
+      display:grid;
+      grid-template-columns:repeat(2,minmax(150px,1fr));
+      gap:12px;
+      min-width:340px;
+    }
+    .active-stat{
+      padding:14px 16px;
+      border-radius:18px;
+      background:rgba(255,255,255,0.9);
+      border:1px solid rgba(148,163,184,0.18);
+    }
+    .active-stat-label{
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.07em;
+      text-transform:uppercase;
+      color:var(--muted);
+      margin-bottom:8px;
+    }
+    .active-stat strong{
+      display:block;
+      font-size:28px;
+      line-height:1;
+      color:var(--text);
+    }
+    .active-stat small{
+      display:block;
+      margin-top:8px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+    }
+    .month-section{
+      margin-bottom:24px;
+      padding:22px;
+      border-radius:24px;
+      background:var(--panel-soft);
+      border:1px solid var(--border);
+    }
+    .month-section[hidden]{display:none !important;}
+    .month-section-header{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:18px;
+      margin-bottom:18px;
+    }
+    .month-heading{
+      display:flex;
+      align-items:center;
+      gap:14px;
+    }
+    .month-calendar{
+      width:58px;
+      height:58px;
+      border-radius:18px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background:linear-gradient(135deg, var(--brand) 0%, #3fa7ff 100%);
+      color:#fff;
+      font-size:14px;
+      font-weight:800;
+      letter-spacing:0.08em;
+      box-shadow:0 14px 24px rgba(15,108,189,0.18);
+    }
+    .month-title{
+      margin:0;
+      font-size:28px;
+      line-height:1.1;
+      letter-spacing:-0.03em;
+      color:var(--text);
+    }
+    .month-subtitle{
+      margin:6px 0 0;
+      color:var(--muted);
+      font-size:14px;
+    }
+    .month-badges{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+    }
+    .month-badge{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:10px 14px;
+      border-radius:999px;
+      background:#fff;
+      border:1px solid var(--border);
+      color:var(--muted);
+      font-size:13px;
+      font-weight:600;
+    }
+    .month-badge strong{color:var(--text);}
+    .kpi-list{
+      display:grid;
+      gap:14px;
+    }
+    .kpi-card{
+      background:#fff;
+      border:1px solid rgba(148,163,184,0.18);
+      border-radius:20px;
+      padding:18px 20px;
+      box-shadow:0 12px 26px rgba(148,163,184,0.08);
+    }
+    .kpi-title{
+      font-weight:700;
+      color:var(--text);
+      margin:0 0 6px;
+      font-size:18px;
+    }
+    .kpi-top{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:18px;
+    }
+    .kpi-subtitle{
+      color:var(--muted);
+      font-size:14px;
+      line-height:1.55;
+      margin:0;
+      font-style:italic;
+    }
+    .status-chip{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:9px 12px;
+      border-radius:999px;
+      font-size:12px;
+      font-weight:700;
+      letter-spacing:0.06em;
+      text-transform:uppercase;
+      white-space:nowrap;
+      border:1px solid transparent;
+    }
+    .status-chip.good{
+      background:rgba(22,163,74,0.10);
+      color:var(--good);
+      border-color:rgba(22,163,74,0.16);
+    }
+    .status-chip.bad{
+      background:rgba(220,38,38,0.10);
+      color:var(--bad);
+      border-color:rgba(220,38,38,0.16);
+    }
+    .status-chip.neutral{
+      background:rgba(100,116,139,0.10);
+      color:var(--muted);
+      border-color:rgba(100,116,139,0.16);
+    }
+    .status-dot{
+      width:8px;
+      height:8px;
+      border-radius:50%;
+      background:currentColor;
+    }
+    .metric-grid{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+      gap:12px;
+      margin-top:16px;
+    }
+    .metric-card{
+      padding:14px 15px;
+      border-radius:16px;
+      background:linear-gradient(180deg,#ffffff 0%,#f9fbfd 100%);
+      border:1px solid rgba(148,163,184,0.18);
+    }
+    .metric-label{
+      font-size:11px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:var(--muted);
+      margin-bottom:8px;
+    }
+    .metric-value{
+      font-size:24px;
+      font-weight:700;
+      line-height:1.1;
+      color:var(--text);
+      letter-spacing:-0.02em;
+    }
+    .metric-value.good{color:var(--good);}
+    .metric-value.bad{color:var(--bad);}
+    .metric-value.warn{color:var(--warn);}
+    .kpi-footer{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin-top:16px;
+      padding-top:14px;
+      border-top:1px solid rgba(148,163,184,0.16);
+      color:var(--muted);
+      font-size:12px;
+    }
+    .empty-state{
+      padding:34px 24px;
+      border-radius:24px;
+      text-align:center;
+      background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);
+      border:1px solid var(--border);
+      color:var(--muted);
+      font-size:15px;
+    }
+    @media (max-width: 900px){
+      .identity-grid,
+      .active-month-stats{
+        grid-template-columns:1fr;
+      }
+      .toolbar,
+      .active-month-card,
+      .month-section-header,
+      .kpi-top,
+      .kpi-footer{
+        flex-direction:column;
+        align-items:flex-start;
+      }
+      .month-filter{
+        width:100%;
+        min-width:0;
+      }
+    }
+    @media (max-width: 640px){
+      body{padding:18px 12px 24px;}
+      .header,
+      .content{padding:22px 18px;}
+      .header h1{font-size:30px;}
+      .active-month-title,
+      .month-title{font-size:24px;}
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-eyebrow">KPI Performance Center</div>
+      <h1>${escapeHtml(responsible.name)} Dashboard</h1>
+      <p>Review KPI snapshots by month, focus on the latest performance picture, and switch between archived views without leaving the page.</p>
+    </div>
+
+    <div class="content">
+      <div class="identity-grid">
+        <div class="identity-card">
+          <div class="identity-label">Responsible</div>
+          <div class="identity-value">${escapeHtml(responsible.name || "-")}</div>
+        </div>
+        <div class="identity-card">
+          <div class="identity-label">Group</div>
+          <div class="identity-value">${escapeHtml(responsible.plant_name || "-")}</div>
+        </div>
+        <div class="identity-card">
+          <div class="identity-label">Department</div>
+          <div class="identity-value">${escapeHtml(responsible.department_name || "-")}</div>
+        </div>
+      </div>`;
+
+    if (sortedMonthEntries.length === 0) {
+      html += `<div class="empty-state">No KPI data available yet.</div>`;
     } else {
-      for (const [week, items] of weekMap) {
-        html += `
-          <div class="week-section">
-            <div class="week-title">📅 Week ${week}</div>
-        `;
+      html += `
+      <div class="toolbar">
+        <div class="toolbar-copy">
+          <div class="toolbar-label">Monthly View</div>
+          <div class="toolbar-title">Filter KPI snapshots by month</div>
+          <p class="toolbar-text">Use the selector to focus on one reporting month at a time. The dashboard summary below updates instantly to match your selection.</p>
+        </div>
+        <label class="month-filter" for="monthFilter">
+          <span>Select month</span>
+          <select id="monthFilter">${monthOptionsHtml}</select>
+        </label>
+      </div>
 
-        items.forEach(kpi => {
-          const hasValue = kpi.value !== null && kpi.value !== undefined && kpi.value !== '';
-          const submittedDate = kpi.updated_at ? new Date(kpi.updated_at).toLocaleString('en-GB', {
-            day: '2-digit',
-            month: 'short',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit'
-          }) : '';
+      <section class="active-month-card" id="activeMonthCard">
+        <div>
+          <div class="active-month-badge">Current Selection</div>
+          <h2 class="active-month-title" id="activeMonthLabel">${escapeHtml(selectedMonthSummary?.monthLabel || "Latest month")}</h2>
+          <p class="active-month-description" id="activeMonthDescription">Showing the KPI snapshot recorded for ${escapeHtml(selectedMonthSummary?.monthLabel || "the latest available month")}.</p>
+        </div>
+        <div class="active-month-stats">
+          <div class="active-stat">
+            <div class="active-stat-label">KPI Cards</div>
+            <strong id="activeMonthKpiCount">${selectedMonthSummary?.kpiCount ?? 0}</strong>
+            <small>Total KPI snapshots in this month</small>
+          </div>
+          <div class="active-stat">
+            <div class="active-stat-label">Needs Attention</div>
+            <strong id="activeMonthAlertCount">${selectedMonthSummary?.alertCount ?? 0}</strong>
+            <small>KPIs currently outside their expected direction</small>
+          </div>
+          <div class="active-stat">
+            <div class="active-stat-label">On Track</div>
+            <strong id="activeMonthHealthyCount">${selectedMonthSummary?.onTrackCount ?? 0}</strong>
+            <small>KPIs aligned with their expected direction</small>
+          </div>
+          <div class="active-stat">
+            <div class="active-stat-label">Last Update</div>
+            <strong id="activeMonthLastUpdated">${escapeHtml(selectedMonthSummary?.lastUpdated || "No updates recorded")}</strong>
+            <small>Most recent KPI update stored for this month</small>
+          </div>
+        </div>
+      </section>`;
+
+      for (const [monthKey, items] of sortedMonthEntries) {
+        const [year, month] = monthKey.split("-").map(Number);
+        const date = new Date(year, month);
+        const monthLabel = date.toLocaleString("en-US", { month: "long", year: "numeric" });
+        const summary = monthSummaryByKey.get(monthKey);
+
+        html += `
+        <section class="month-section" data-month-key="${escapeHtml(monthKey)}"${monthKey === selectedMonthKey ? "" : " hidden"}>
+          <div class="month-section-header">
+            <div class="month-heading">
+              <div class="month-calendar">${escapeHtml(summary?.monthShort || date.toLocaleString("en-US", { month: "short" }).toUpperCase())}</div>
+              <div>
+                <h2 class="month-title">${escapeHtml(monthLabel)}</h2>
+                <p class="month-subtitle">${items.length} KPI snapshot${items.length !== 1 ? "s" : ""} recorded for this view</p>
+              </div>
+            </div>
+            <div class="month-badges">
+              <div class="month-badge"><strong>${summary?.alertCount ?? 0}</strong> need attention</div>
+              <div class="month-badge"><strong>${summary?.onTrackCount ?? 0}</strong> on track</div>
+              <div class="month-badge"><strong>${escapeHtml(summary?.lastUpdated || "No updates")}</strong></div>
+            </div>
+          </div>
+          <div class="kpi-list">`;
+
+        items.forEach((kpi) => {
+          const currentValue = normalizeMetricNumberByUnit(kpi.value, kpi.unit);
+          const targetValue = normalizeMetricNumberByUnit(kpi.target, kpi.unit);
+          const lowLimit = normalizeMetricNumberByUnit(kpi.low_limit, kpi.unit);
+          const highLimit = normalizeMetricNumberByUnit(kpi.high_limit, kpi.unit);
+          const statusInfo = getKpiStatus(currentValue, lowLimit, highLimit, inferKpiDirection(kpi));
+          const hasValue = currentValue !== null;
+          const statusLabel = !hasValue
+            ? "Pending update"
+            : statusInfo.isGood === false
+              ? "Needs attention"
+              : "On track";
+          const statusClass = !hasValue
+            ? "neutral"
+            : statusInfo.isGood === false
+              ? "bad"
+              : "good";
+          const actualValueClass = !hasValue
+            ? ""
+            : statusInfo.isGood === false
+              ? "bad"
+              : "good";
 
           html += `
             <div class="kpi-card">
-              <div class="kpi-title">${kpi.indicator_title}</div>
-              ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ""}
-              <div class="kpi-value ${!hasValue ? 'no-data' : ''}">${hasValue ? kpi.value : "Not filled yet"}</div>
-              ${kpi.unit ? `<div class="kpi-unit">Unit: ${kpi.unit}</div>` : ""}
-              ${submittedDate ? `<div class="kpi-date">Last updated: ${submittedDate}</div>` : ""}
-            </div>
-          `;
+              <div class="kpi-top">
+                <div>
+                  <h3 class="kpi-title">${escapeHtml(getKpiDisplayTitle(kpi))}</h3>
+                  <p class="kpi-subtitle">${escapeHtml(kpi.indicator_sub_title || "No KPI subtitle provided.")}</p>
+                </div>
+                <div class="status-chip ${statusClass}">
+                  <span class="status-dot"></span>
+                  <span>${statusLabel}</span>
+                </div>
+              </div>
+              <div class="metric-grid">
+                <div class="metric-card">
+                  <div class="metric-label">Actual</div>
+                  <div class="metric-value ${actualValueClass}">${escapeHtml(formatDashboardMetricValue(currentValue, kpi.unit))}</div>
+                </div>
+                ${targetValue !== null
+              ? `<div class="metric-card">
+                      <div class="metric-label">Target</div>
+                      <div class="metric-value good">${escapeHtml(formatDashboardMetricValue(targetValue, kpi.unit))}</div>
+                    </div>`
+              : ""}
+                ${highLimit !== null
+              ? `<div class="metric-card">
+                      <div class="metric-label">High Limit</div>
+                      <div class="metric-value warn">${escapeHtml(formatDashboardMetricValue(highLimit, kpi.unit))}</div>
+                    </div>`
+              : ""}
+                ${lowLimit !== null
+              ? `<div class="metric-card">
+                      <div class="metric-label">Low Limit</div>
+                      <div class="metric-value bad">${escapeHtml(formatDashboardMetricValue(lowLimit, kpi.unit))}</div>
+                    </div>`
+              : ""}
+              </div>
+              <div class="kpi-footer">
+                <div>Last updated: ${escapeHtml(formatDashboardTimestamp(kpi.updated_at))}</div>
+                <div>${escapeHtml(responsible.department_name || "")}</div>
+              </div>
+            </div>`;
         });
 
-        html += `</div>`;
+        html += `</div></section>`;
       }
     }
 
     html += `
-          </div>
-        </div>
-      </body>
-      </html>
-    `;
+    <script>
+      (function () {
+        const monthFilter = document.getElementById("monthFilter");
+        const monthSections = Array.from(document.querySelectorAll(".month-section"));
+        const monthSummaryMap = ${monthSummaryMapJson};
+        const activeMonthLabel = document.getElementById("activeMonthLabel");
+        const activeMonthDescription = document.getElementById("activeMonthDescription");
+        const activeMonthKpiCount = document.getElementById("activeMonthKpiCount");
+        const activeMonthAlertCount = document.getElementById("activeMonthAlertCount");
+        const activeMonthHealthyCount = document.getElementById("activeMonthHealthyCount");
+        const activeMonthLastUpdated = document.getElementById("activeMonthLastUpdated");
+        const defaultMonthKey = ${JSON.stringify(selectedMonthKey)};
+
+        function applyMonthFilter(monthKey) {
+          const resolvedKey = monthSummaryMap[monthKey] ? monthKey : defaultMonthKey;
+          monthSections.forEach((section) => {
+            section.hidden = section.dataset.monthKey !== resolvedKey;
+          });
+
+          const summary = monthSummaryMap[resolvedKey];
+          if (!summary) return;
+
+          if (monthFilter && monthFilter.value !== resolvedKey) {
+            monthFilter.value = resolvedKey;
+          }
+
+          if (activeMonthLabel) activeMonthLabel.textContent = summary.monthLabel;
+          if (activeMonthDescription) {
+            activeMonthDescription.textContent = "Showing the KPI snapshot recorded for " + summary.monthLabel + ".";
+          }
+          if (activeMonthKpiCount) activeMonthKpiCount.textContent = summary.kpiCount;
+          if (activeMonthAlertCount) activeMonthAlertCount.textContent = summary.alertCount;
+          if (activeMonthHealthyCount) activeMonthHealthyCount.textContent = summary.onTrackCount;
+          if (activeMonthLastUpdated) activeMonthLastUpdated.textContent = summary.lastUpdated;
+        }
+
+        if (monthFilter) {
+          monthFilter.addEventListener("change", function () {
+            applyMonthFilter(this.value);
+          });
+          applyMonthFilter(monthFilter.value || defaultMonthKey);
+        }
+      })();
+    </script>
+    </div>
+  </div>
+</body>
+</html>`;
 
     res.send(html);
-
   } catch (err) {
-    console.error("Dashboard error:", err);
     res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
 });
 
-
-
 app.get("/dashboard-history", async (req, res) => {
   try {
-    const { responsible_id, week } = req.query;
-
+    const { responsible_id } = req.query;
     const histRes = await pool.query(
-      `
-      SELECT h.hist_id, h.kpi_id, h.week, h.old_value, h.new_value, h.updated_at,
-             k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.kpi_values_hist26 h
-      JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-      WHERE h.responsible_id = $1
-      ORDER BY h.updated_at DESC
-      `,
-      [responsible_id]
-    );
-
+      `SELECT h.hist_id, h.kpi_id, h.week, h.old_value, h.new_value, h.updated_at,
+              COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+              COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+              COALESCE(rk.unit, k.unit) AS unit
+       FROM public.kpi_values_hist26 h
+       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+       LEFT JOIN public.kpi_values kv
+         ON kv.kpi_values_id = h.kpi_values_id
+       LEFT JOIN public.responsible_kpis rk
+         ON rk.responsible_kpi_id = kv.responsible_kpi_id
+       WHERE h.responsible_id = $1 ORDER BY h.updated_at DESC`, [responsible_id]);
     const rows = histRes.rows;
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>KPI History Dashboard</title>
-        <style>
-          body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f4f6f9;
-            padding: 20px;
-            margin: 0;
-          }
-          .container {
-            max-width: 1000px;
-            margin: 0 auto;
-            background: #fff;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-          }
-          h1 {
-            text-align: center;
-            color: #0078D7;
-            margin-bottom: 30px;
-          }
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-          }
-          th, td {
-            padding: 10px 12px;
-            border: 1px solid #ddd;
-            text-align: center;
-          }
-          th {
-            background: #0078D7;
-            color: white;
-            font-weight: 600;
-          }
-          tr:nth-child(even) {
-            background: #f8f9fa;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>KPI Value History</h1>
-          <table>
-            <thead>
-              <tr>
-                <th>Indicator</th>
-                <th>Sub Title</th>
-                <th>Week</th>
-                <th>Old Value</th>
-                <th>New Value</th>
-                <th>Unit</th>
-                <th>Updated At</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows
-        .map(
-          (r) => `
-                  <tr>
-                    <td>${r.indicator_title}</td>
-                    <td>${r.indicator_sub_title || "-"}</td>
-                    <td>${r.week}</td>
-                    <td>${r.old_value ?? "—"}</td>
-                    <td>${r.new_value ?? "—"}</td>
-                    <td>${r.unit || ""}</td>
-                    <td>${new Date(r.updated_at).toLocaleString()}</td>
-                  </tr>`
-        )
-        .join("")}
-            </tbody>
-          </table>
-        </div>
-      </body>
-      </html>
-    `);
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI History</title>
+      <style>body{font-family:'Segoe UI',sans-serif;background:#f4f6f9;padding:20px}
+      .container{max-width:1000px;margin:0 auto;background:#fff;padding:30px;border-radius:8px}
+      h1{color:#0078D7}table{width:100%;border-collapse:collapse;margin-top:20px}
+      th,td{padding:10px 12px;border:1px solid #ddd;text-align:center}
+      th{background:#0078D7;color:white}tr:nth-child(even){background:#f8f9fa}</style></head><body>
+      <div class="container"><h1>KPI Value History</h1>
+      <table><thead><tr><th>Indicator</th><th>Sub Title</th><th>Week</th>
+        <th>Old Value</th><th>New Value</th><th>Unit</th><th>Updated At</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td>${r.indicator_title || '-'}</td><td>${r.indicator_sub_title || '-'}</td><td>${r.week}</td>
+        <td>${r.old_value ?? 'â€”'}</td><td>${r.new_value ?? 'â€”'}</td>
+        <td>${r.unit || ''}</td><td>${new Date(r.updated_at).toLocaleString()}</td>
+      </tr>`).join('')}</tbody></table></div></body></html>`);
   } catch (err) {
-    console.error("❌ Error loading dashboard-history:", err.message);
     res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
 
-
-// ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week) => {
   try {
     const { responsible } = await getResponsibleWithKPIs(responsibleId, week);
     const html = generateEmailHtml({ responsible, week });
     const transporter = createTransporter();
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: '"Administration STS" <administration.STS@avocarbon.com>',
       to: responsible.email,
       subject: `KPI Form for ${responsible.name} - ${week}`,
       html,
     });
-    console.log(`✅ Email sent to ${responsible.email}: ${info.messageId}`);
+    console.log(`Email sent to ${responsible.email}`);
   } catch (err) {
-    console.error(`❌ Failed to send email to responsible ID ${responsibleId}:`, err.message);
+    console.error(`âŒ Failed to send email to responsible ID ${responsibleId}:`, err.message);
   }
 };
 
-// ---------- Schedule weekly email ----------
-cron.schedule(
-  "40 08 * * 1",
-  async () => {
-    const lockId = 'kpi_form_email_job';
-    const lock = await acquireJobLock(lockId, 15);
+const formatNumber = (num) => {
+  const n = parseFloat(num);
+  if (Number.isInteger(n)) return n.toString();
+  if (Math.abs(n - Math.round(n)) < 0.0001) return Math.round(n).toString();
+  return n.toFixed(1);
+};
 
-    if (!lock.acquired) {
-      console.log(`⏭️ [KPI Form Email] Skipping - lock held by another instance`);
-      return;
-    }
-
-    try {
-      // ✅ Dynamically compute current week - 1
-      const now = new Date();
-      const startOfYear = new Date(now.getFullYear(), 0, 1);
-      const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-      const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
-      const targetWeek = currentWeek - 1;
-      const targetYear = targetWeek < 1 ? now.getFullYear() - 1 : now.getFullYear();
-      const forcedWeek = `${targetYear}-Week${targetWeek < 1 ? 52 : targetWeek}`; // e.g. "2026-Week8"
-
-      const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id
-        FROM public."Responsible" r
-        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id
-        WHERE kv.week = $1
-      `, [forcedWeek]);
-
-      console.log(`📧 [KPI Form Email] Sending to ${resps.rows.length} responsibles for week ${forcedWeek}...`);
-
-      for (let r of resps.rows) {
-        await sendKPIEmail(r.responsible_id, forcedWeek);
-      }
-
-      console.log(`✅ [KPI Form Email] Successfully sent ${resps.rows.length} emails`);
-    } catch (err) {
-      console.error("❌ [KPI Form Email] Error:", err.message);
-    } finally {
-      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    }
-  },
-  { scheduled: true, timezone: "Africa/Tunis" }
-);
-
-
-
-// ---------- Generate HTML/CSS Charts ----------
+// ============================================================
+// generateVerticalBarChart â€” DOTS + HIGH/LOW LIMIT LINES
+// ============================================================
 const generateVerticalBarChart = (chartData) => {
   const {
-    title,
-    subtitle,
-    unit,
-    data,
-    weekLabels,
-    currentWeek,
-    stats,
-    target,
-    min,
-    max
+    title, subtitle, unit, data, weekLabels, currentWeek,
+    stats, target, low_limit, high_limit,
+    direction,
+    tolerance_type, up_tolerance, low_tolerance,
+    frequency, comments = [],
+    correctiveActions = []
   } = chartData;
 
-  // ✅ Clean values - handle "None" strings from database
-  const cleantarget = target !== null && target !== undefined && target !== 'None' && !isNaN(parseFloat(target)) ? parseFloat(target) : null;
-  const cleanMin = min !== null && min !== undefined && min !== 'None' && !isNaN(parseFloat(min)) ? parseFloat(min) : null;
-  const cleanMax = max !== null && max !== undefined && max !== 'None' && !isNaN(parseFloat(max)) ? parseFloat(max) : null;
+  const cleanHigh = (high_limit && high_limit !== 'None' && high_limit !== '' && !isNaN(parseFloat(high_limit)))
+    ? parseFloat(high_limit) : null;
+  const cleanLow = (low_limit && low_limit !== 'None' && low_limit !== '' && !isNaN(parseFloat(low_limit)))
+    ? parseFloat(low_limit) : null;
+  const cleanTarget = (target && target !== 'None' && target !== '' && !isNaN(parseFloat(target)))
+    ? parseFloat(target) : null;
+  const thresholdLineValues = getReadableThresholdLineValues(cleanLow, cleanTarget, cleanHigh);
+  const displayHigh = thresholdLineValues.displayHigh;
+  const displayLow = thresholdLineValues.displayLow;
+  const displayTarget = thresholdLineValues.displayTarget;
 
-  // ✅ FIX: Check if data is valid and has actual values
-  const validData = data ? data.filter(val => val !== null && val !== undefined && !isNaN(parseFloat(val)) && parseFloat(val) > 0) : [];
-
-  if (!data || data.length === 0 || validData.length === 0) {
-    return `
-      <table border="0" cellpadding="20" cellspacing="0" width="100%" style="margin: 20px 0; background: white; border-radius: 8px; border: 1px solid #e0e0e0;">
-        <tr><td>
-          <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
-          ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
-          <p style="margin: 15px 0; color: #999; font-size: 14px;">No data available</p>
-        </td></tr>
-      </table>
-    `;
+  if (!data || data.length === 0 || data.every(v => v <= 0)) {
+    return `<table border="0" cellpadding="20" cellspacing="0" width="100%"
+              style="margin:20px 0;background:white;border-radius:8px;border:1px solid #e0e0e0;">
+      <tr><td>
+        <h3 style="margin:0;color:#333;font-size:16px;">${title}</h3>
+        ${subtitle ? `<p style="margin:5px 0 0;color:#666;font-size:14px;">${subtitle}</p>` : ''}
+        <p style="margin:15px 0;color:#999;font-size:14px;">No data available</p>
+      </td></tr></table>`;
   }
 
-  // ✅ FIX: Safely get current value
-  const currentValue = validData.length > 0 ? validData[validData.length - 1] : 0;
-  const valueVstargetRatio = cleantarget && cleantarget > 0 ? currentValue / cleantarget : 0;
-  const isValueExtremelySmall = valueVstargetRatio < 0.01;
+  const validData = data.filter(v => v > 0 && !isNaN(v));
+  const values = data.slice(0, 12);
+  const axisRange = getAutoChartAxisRange(values, displayLow, displayTarget, displayHigh);
 
-  // ✅ HELPER: Format large numbers for display
-  const formatLargeNumber = (num) => {
-    if (num === null || num === undefined || isNaN(num)) return 'N/A';
-    if (num >= 1000000) {
-      return (num / 1000000).toFixed(num % 1000000 === 0 ? 0 : 1) + 'M';
-    }
-    if (num >= 1000) {
-      return (num / 1000).toFixed(num % 1000 === 0 ? 0 : 1) + 'k';
-    }
+  const labels =
+    (weekLabels || data.map((_, i) => `W${i + 1}`))
+      .slice(0, 12);
+
+  const fmt = (num) => {
+    if (num === null || num === undefined || isNaN(num)) return '0';
+    const w = Math.abs(num - Math.round(num)) < 0.0001;
+    if (num >= 1e6) return (num / 1e6).toFixed(w ? 0 : 1) + 'M';
+    if (num >= 1e3) return (num / 1e3).toFixed(w ? 0 : 1) + 'k';
+    if (w) return Math.round(num).toString();
     if (num < 1) return num.toFixed(2);
-    if (num < 10) return num.toFixed(1);
-    return num.toFixed(num % 1 === 0 ? 0 : 1);
+    return num.toFixed(1);
   };
 
-  //  UPDATED: Calculate Y-axis scaling with null checks
-  const calculateYAxisScaling = () => {
-    // Get all values that need to be displayed
-    const allValues = [...validData];
-    if (cleantarget !== null && cleantarget > 0) allValues.push(cleantarget);
-    if (cleanMin !== null && cleanMin > 0) allValues.push(cleanMin);
-    if (cleanMax !== null && cleanMax > 0) allValues.push(cleanMax);
+  const resolvedDirection = normalizeKpiDirection(direction) || 'up';
+  const directionMeta = getKpiGoodDirectionMeta(resolvedDirection);
+  const pointColors = values.map(v => getDotColor(v, cleanLow, cleanHigh, resolvedDirection));
 
-    if (allValues.length === 0) {
-      return {
-        maxValue: 10,
-        interval: 2,
-        numSteps: 5,
-        useDualScale: false
-      };
-    }
+  const allVals = [...validData];
+  if (displayHigh !== null) allVals.push(displayHigh);
+  if (displayLow !== null) allVals.push(displayLow);
+  if (displayTarget !== null) allVals.push(displayTarget);
 
-    const dataMax = Math.max(...allValues);
-    const dataMin = Math.min(...allValues.filter(v => v > 0));
+  const thresholdValues = [cleanLow, cleanTarget, cleanHigh]
+    .filter((value) => value !== null)
+    .sort((a, b) => a - b);
+  const tightThresholdCluster = thresholdLineValues.hasTightCluster;
+  const chartHeightPx = tightThresholdCluster ? 320 : 260;
 
-    // ✅ CRITICAL FIX: If value is extremely small compared to target
-    if (isValueExtremelySmall && cleantarget && cleantarget > 0) {
-      const valueBasedMax = Math.max(dataMax * 2, 10);
-      return {
-        maxValue: valueBasedMax,
-        interval: valueBasedMax / 4,
-        numSteps: 4,
-        useDualScale: true,
-        targetValue: cleantarget
-      };
-    }
+  const dataMax = Math.max(...allVals, 1);
+  const rawInt = dataMax / 10;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawInt || 1)));
+  const norm = rawInt / mag;
+  let interval;
+  if (norm <= 1) interval = 1 * mag;
+  else if (norm <= 2) interval = 2 * mag;
+  else if (norm <= 2.5) interval = 2.5 * mag;
+  else if (norm <= 5) interval = 5 * mag;
+  else interval = 10 * mag;
 
-    // Normal scaling for regular cases
-    if (!cleantarget || cleantarget <= 0) {
-      const numSteps = 5;
-      const interval = Math.max(1, Math.ceil(dataMax / numSteps));
-      const maxValue = interval * numSteps;
-      return { maxValue, interval, numSteps, useDualScale: false };
-    }
-
-    const targetNum = cleantarget;
-
-    // Determine scaling based on target value
-    if (targetNum <= 10) {
-      return {
-        maxValue: Math.max(dataMax, Math.ceil(targetNum * 1.2)),
-        interval: Math.ceil(targetNum / 3),
-        numSteps: 3,
-        useDualScale: false
-      };
-    }
-
-    if (targetNum <= 50) {
-      const rounded = Math.max(dataMax, Math.ceil(targetNum / 5) * 5);
-      return {
-        maxValue: rounded,
-        interval: rounded / 4,
-        numSteps: 4,
-        useDualScale: false
-      };
-    }
-
-    if (targetNum <= 200) {
-      const rounded = Math.max(dataMax, Math.ceil(targetNum / 20) * 20);
-      return {
-        maxValue: rounded,
-        interval: rounded / 4,
-        numSteps: 4,
-        useDualScale: false
-      };
-    }
-
-    if (targetNum <= 1000) {
-      const rounded = Math.max(dataMax, Math.ceil(targetNum / 100) * 100);
-      return {
-        maxValue: rounded,
-        interval: rounded / 4,
-        numSteps: 4,
-        useDualScale: false
-      };
-    }
-
-    // For very large targets
-    const rounded = Math.max(dataMax, Math.ceil(targetNum / 500) * 500);
-    return {
-      maxValue: rounded,
-      interval: rounded / 3,
-      numSteps: 3,
-      useDualScale: false
-    };
-  };
-
-  // Calculate scaling
-  const scaling = calculateYAxisScaling();
-  const { maxValue, interval, numSteps, useDualScale } = scaling;
+  const maxValue = Math.ceil(dataMax / interval) * interval + interval;
+  const numSteps = Math.round(maxValue / interval);
   const chartHeight = 180;
   const segmentHeight = chartHeight / numSteps;
 
-  // ✅ IMPROVED: Generate Y-axis with special handling for small values
-  const generateYAxis = () => {
-    let yAxis = '';
-
+  const yAxis = () => {
+    let h = '';
     for (let i = numSteps; i >= 0; i--) {
-      const value = i * interval;
-      let displayValue = formatLargeNumber(value);
-
-      // Special indicator for extremely small values
-      if (useDualScale && i === numSteps && cleantarget) {
-        displayValue += ` (target: ${formatLargeNumber(cleantarget)})`;
-      }
-
-      const tolerance = interval / 2;
-      let indicators = '';
-
-      if (cleantarget && Math.abs(value - cleantarget) < tolerance) indicators += ' ';
-      if (cleanMax && Math.abs(value - cleanMax) < tolerance) indicators += ' 📈';
-      if (cleanMin && Math.abs(value - cleanMin) < tolerance) indicators += ' 📉';
-
-      yAxis += `
-        <tr>
-          <td height="${segmentHeight}" valign="top" align="right" 
-              style="font-size: 10px; color: #666; padding-right: 8px;">
-            ${displayValue}${indicators}
-          </td>
-        </tr>
-      `;
+      const val = i * interval;
+      let ind = '';
+      if (cleanHigh !== null && Math.abs(val - cleanHigh) < interval / 2) ind += ' H';
+      if (cleanLow !== null && Math.abs(val - cleanLow) < interval / 2) ind += ' L';
+      h += `<tr><td height="${segmentHeight}" valign="top" align="right"
+              style="font-size:10px;color:#666;padding-right:8px;white-space:nowrap;">
+              ${fmt(val)}${ind}</td></tr>`;
     }
-
-    // Add a note for extremely small values
-    if (useDualScale) {
-      yAxis += `
-        <tr>
-          <td height="20" valign="top" align="right" 
-              style="font-size: 8px; color: #ff9800; padding-right: 8px; font-style: italic;">
-            * Value scale ≠ target scale
-          </td>
-        </tr>
-      `;
-    }
-
-    return yAxis;
+    return h;
   };
 
-  // ✅ IMPROVED: Calculate segment positions with minimum bar height
-  const getSegmentForValue = (value) => {
-    if (!value || value <= 0 || isNaN(value)) return -1;
-    return Math.round((parseFloat(value) / maxValue) * numSteps);
-  };
-
-  const targetSegment = getSegmentForValue(cleantarget);
-  const maxSegment = cleanMax !== null ? getSegmentForValue(cleanMax) : -1;
-  const minSegment = getSegmentForValue(cleanMin);
-
-  // ✅ CRITICAL FIX: Calculate bar heights with MINIMUM VISIBLE HEIGHT
-  const barSegmentHeights = data.map(value => {
-    if (!value || value <= 0 || isNaN(value)) return 0;
-
-    let segmentHeightRatio = (value / maxValue) * numSteps;
-
-    // ENSURE MINIMUM VISIBLE HEIGHT: At least 2 segments for any non-zero value
-    if (segmentHeightRatio < 0.5 && value > 0) {
-      segmentHeightRatio = 0.5;
-    }
-
-    return Math.max(1, Math.round(segmentHeightRatio));
-  });
-
-  // ✅ UPDATED: Determine bar colors
-  const getBarColor = (value) => {
-    return '#0078D7';  // Sky blue (you can replace with any hex)
-  };
-  //  UPDATED: Generate chart with visible bars
-  const generateChart = () => {
-    let chart = '';
-
-    // Start from one segment above max to show values, go down to 0 (X-axis)
-    for (let seg = numSteps + 1; seg >= 0; seg--) {
-      const hastarget = seg === targetSegment;
-      const hasMax = cleanMax !== null && seg === maxSegment && cleanMax !== cleantarget;
-      const hasMin = seg === minSegment;
-      const hasLine = hastarget || hasMax || hasMin;
-
-      // 🎯 Set dashed line color based on threshold type
-      let lineColor = '';
-      let lineStyle = '';
-      if (hasLine) {
-        lineStyle = '2px dashed';
-        if (hastarget) lineColor = '#28a745';      // Green for target
-        else if (hasMax) lineColor = '#ff9800';    // Orange for Max
-        else if (hasMin) lineColor = '#dc3545';    // Red for Min
-      }
-
-      chart += '<tr>';
-
-      data.forEach((value, idx) => {
-        const barHeight = barSegmentHeights[idx];
-        const barColor = getBarColor(value);
-        const isExtremelySmall = value > 0 && value < (maxValue * 0.01);
-
-        let cellContent = '';
-        let cellBorder = '';
-
-        if (hasLine) {
-          cellBorder = `border-top: ${lineStyle} ${lineColor};`;
-        }
-
-        // Top area: value label
-        if (seg === barHeight + 1 && barHeight > 0) {
-          const displayVal = formatLargeNumber(value);
-          cellContent = `
-          <table border="0" cellpadding="2" cellspacing="0" width="100%">
-            <tr><td align="center" style="font-size: 10px; font-weight: bold; color: #333;">
-              ${displayVal}
-            </td></tr>
-          </table>
-        `;
-        }
-        else if (seg > 0 && seg <= barHeight) {
-          const actualBarHeight = Math.max(segmentHeight, 4);
-          cellContent = `
-          <table border="0" cellpadding="0" cellspacing="0" width="60" align="center">
-            <tr>
-              <td height="${actualBarHeight}" 
-                  style="background-color: ${barColor}; 
-                         border: none; 
-                         padding: 0; 
-                         margin: 0; 
-                         font-size: 1px; 
-                         line-height: ${actualBarHeight}px;
-                         ${isExtremelySmall ? 'border: 1px solid #ff9800;' : ''}">
-                &nbsp;
-              </td>
-            </tr>
-          </table>
-        `;
-          if (isExtremelySmall && seg === 1) {
-            cellContent += `
-            <div style="position: relative; top: -2px; text-align: center;">
-              <div style="display: inline-block; width: 6px; height: 6px; background: #ff9800; border-radius: 50%;"></div>
-            </div>
-          `;
-          }
-        }
-        else if (seg === 0) {
-          const w = weekLabels[idx] || `W${idx + 1}`;
-          cellContent = `
-          <table border="0" cellpadding="2" cellspacing="0" width="100%">
-            <tr><td align="center" style="font-size: 10px; color: #666; padding-top: 6px;">
-              ${w}
-            </td></tr>
-          </table>
-        `;
-        }
-
-        chart += `
-        <td align="center" width="${100 / data.length}%" 
-            style="padding: 0 4px; vertical-align: middle; ${cellBorder} 
-                   height: ${seg >= 0 ? segmentHeight : 'auto'}px; 
-                   line-height: 0; font-size: 0;
-                   position: relative;">
-          ${cellContent}
+  const currentValue = data[data.length - 1] || 0;
+  const directionGuideHtml = `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="margin:0 0 18px;background:${directionMeta.background};
+                  border:1px solid ${directionMeta.border};border-radius:12px;">
+      <tr>
+        <td style="padding:14px 16px;">
+          <div style="font-size:11px;font-weight:700;color:${directionMeta.accent};
+                      text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">
+            Good Direction
+          </div>
+          <div style="font-size:15px;font-weight:700;color:#1f2937;margin-bottom:4px;">
+            <span style="color:${directionMeta.accent};margin-right:6px;">${directionMeta.icon}</span>
+            ${directionMeta.label} = ${directionMeta.summary}
+          </div>
+          <div style="font-size:12px;color:#475569;line-height:1.5;">
+            Examples: ${directionMeta.examples}. This direction is used for colors, alerts, and target management.
+          </div>
         </td>
-      `;
-      });
-
-      chart += '</tr>';
-    }
-
-    return chart;
-  };
-
-  // Add warning for extremely small values
-  let smallValueWarning = '';
-  if (isValueExtremelySmall && cleantarget) {
-    smallValueWarning = `
-      <div style="margin: 10px 0; padding: 10px; background: #fff3cd; border-radius: 6px; border-left: 4px solid #ffc107;">
-        <div style="font-size: 12px; color: #856404; font-weight: 600; margin-bottom: 5px;">
-          ⚠️ Note: Current value (${formatLargeNumber(currentValue)}) is very small compared to target (${formatLargeNumber(cleantarget)})
-        </div>
-      </div>
-    `;
-  }
-
-  // ✅ FIX: Safely format stats values
-  const safeStats = {
-    current: stats && stats.current ? formatNumber(stats.current) : 'N/A',
-    average: stats && stats.average ? formatNumber(stats.average) : 'N/A',
-    trend: stats && stats.trend ? stats.trend : '0.0%',
-    dataPoints: stats && stats.dataPoints ? stats.dataPoints : data.length
-  };
-
-  // ✅ Return HTML with visible bars
-  return `
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin: 20px 0; background: white; border-radius: 8px; border: 1px solid #e0e0e0; font-family: Arial, sans-serif;">
-      <tr><td style="padding: 20px;">
-        
-        <!-- Header -->
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
-          <tr><td>
-            <h3 style="margin: 0; color: #333; font-size: 16px; font-weight: 600;">${title}</h3>
-            ${subtitle ? `<p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">${subtitle}</p>` : ''}
-            ${unit ? `<p style="margin: 5px 0 0 0; color: #888; font-size: 12px;">Unit: ${unit}</p>` : ''}
-          
-          </td></tr>
-        </table>
-
-     <!-- Target / Max / Min summary line - CENTERED -->
-     <table border="0" cellpadding="0" cellspacing="0" align="center" style="margin-bottom: 15px;">
-     <tr>
-      ${cleantarget !== null ? `
-      <td style="font-size: 12px; padding: 0 10px;">
-      <span style="font-weight: 600; color: #28a745;">Target:</span> ${formatLargeNumber(cleantarget)}
-      </td>` : ''}
-      ${cleanMax !== null ? `
-      <td style="font-size: 12px; padding: 0 10px;">
-       <span style="font-weight: 600; color: #ff9800;">Max:</span> ${formatLargeNumber(cleanMax)}
-       </td>` : ''}
-      ${cleanMin !== null ? `
-       <td style="font-size: 12px; padding: 0 10px;">
-       <span style="font-weight: 600; color: #dc3545;">Min:</span> ${formatLargeNumber(cleanMin)}
-       </td>` : ''}
-        </tr>
-        </table>
-        
-        <!-- Chart -->
-        <table border="0" cellpadding="0" cellspacing="0" width="100%">
-          <tr>
-            <td width="50" valign="top" style="border-right: 2px solid #ccc; padding-right: 10px;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height: ${chartHeight}px;">
-                ${generateYAxis()}
-              </table>
-            </td>
-            <td valign="top" style="padding-left: 10px; border-bottom: 2px solid #ccc;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                ${generateChart()}
-              </table>
-            </td>
-          </tr>
-        </table>
-        
-        <!-- Stats -->
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background: #FFFFFF; border-radius: 6px; margin-top: 20px;">
-          <tr>
-            <td width="20%" align="center" style="border-right: 1px solid #e0e0e0; padding: 10px;">
-              <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">CURRENT</div>
-              <div style="font-size: 20px; font-weight: 700; color: #4CAF50;">${safeStats.current}</div>
-              <div style="font-size: 10px; color: #999;">${currentWeek ? currentWeek.replace('2026-Week', 'Week ') : 'Current'}</div>
-            </td>
-            <td width="20%" align="center" style="padding: 10px; border-radius: 12px;">
-              <div style="font-size: 11px; color: #8971df; text-transform: uppercase; margin-bottom: 5px; font-weight: 600;">TARGET</div>
-              <div style="font-size: 20px; font-weight: 700; color: ${cleantarget !== null ? '#4CAF50' : '#999'};">
-                ${cleantarget !== null ? formatLargeNumber(cleantarget) : 'N/A'}
-              </div>
-              <div style="font-size: 10px; color: rgba(255,255,255,0.7);">Achievement</div>
-            </td>
-            <td width="20%" align="center" style="border-left: 1px solid #e0e0e0; padding: 10px;">
-              <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">AVERAGE</div>
-              <div style="font-size: 20px; font-weight: 700; color: #8971df;">${safeStats.average}</div>
-              <div style="font-size: 10px; color: #999;">${safeStats.dataPoints} periods</div>
-            </td>
-          
-          </tr>
-        </table>
-        
-        <!-- Legend -->
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #f0f0f0;">
-          <tr><td align="center">
-            <table border="0" cellpadding="8" cellspacing="0">
-              <tr>
-                ${cleantarget !== null ? `
-                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
-                    <td width="20" height="12" style="border-top: 2px dashed #28a745;"></td>
-                    <td style="font-size: 11px; color: #666;">target</td>
-                  </tr></table></td>
-                ` : ''}
-         
-                ${cleanMax !== null ? `
-                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
-                    <td width="20" height="12" style="border-top: 2px dashed #ff9800;"></td>
-                    <td style="font-size: 11px; color: #666;">Max</td>
-                  </tr></table></td>
-                ` : ''}
-                ${cleanMin !== null ? `
-                  <td><table border="0" cellpadding="0" cellspacing="5"><tr>
-                    <td width="20" height="12" style="border-top: 2px dashed #dc3545;"></td>
-                    <td style="font-size: 11px; color: #666;">Min</td>
-                  </tr></table></td>
-                ` : ''}
-                ${isValueExtremelySmall ? `
-                <td><table border="0" cellpadding="0" cellspacing="5"><tr>
-                  <td width="12" height="12" style="background-color: #ff9800; border: 1px solid #ff9800;"></td>
-                  <td style="font-size: 11px; color: #666;">Exaggerated for visibility</td>
-                </tr></table></td>
-                ` : ''}
-              </tr>
-            </table>
-          </td></tr>
-        </table>
-        
-      </td></tr>
+      </tr>
     </table>
   `;
-};
 
+  // STATS BOX - 3 columns (CURRENT, AVERAGE, TREND)
+  // Replace the statsBox const with this:
+  const currentStatus = getKpiStatus(currentValue, cleanLow, cleanHigh, resolvedDirection);
+  const trendIcon = currentStatus.isGood === false
+    ? {
+      icon: resolvedDirection === 'down' ? '&uarr;' : '&darr;',
+      color: '#dc2626'
+    }
+    : {
+      icon: resolvedDirection === 'down' ? '&darr;' : '&uarr;',
+      color: '#28a745'
+    };
+
+  const statsBox = `
+  <table border="0" cellpadding="0" cellspacing="0" width="100%"
+         style="background:white;border-radius:12px;border:1px solid #e0e0e0;margin-bottom:20px;">
+    <tr>
+      <td style="padding:20px;">
+        <table border="0" cellpadding="0" cellspacing="0" align="center"
+               style="margin:0 auto;text-align:center;">
+          <tr>
+
+            <!-- CURRENT -->
+            <td valign="middle" style="padding-right:30px;text-align:center;">
+              <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">CURRENT</div>
+              <div style="font-size:32px;font-weight:700;color:${getDotColor(currentValue, cleanLow, cleanHigh, resolvedDirection)};line-height:36px;">
+                ${stats.current}
+              </div>
+              ${currentWeek ? `
+                <div style="font-size:11px;color:#999;margin-top:2px;">
+                  ${String(currentWeek).replace('2026-Week', 'Week ')}
+                </div>` : ''}
+            </td>
+
+            <!-- TREND ICON â€” same row, between CURRENT and AVERAGE -->
+            <td valign="middle" style="padding:0 30px;text-align:center;">
+             <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">Direction</div>
+              <div style="font-size:40px;font-weight:900;color:${trendIcon.color};line-height:1;">
+                ${trendIcon.icon}
+              </div>
+           
+            </td>
+
+            <!-- AVERAGE -->
+            <td valign="middle" style="padding-left:30px;text-align:center;">
+              <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">AVERAGE</div>
+              <div style="font-size:32px;font-weight:700;color:#0078D7;line-height:36px;">
+                ${stats.average}
+              </div>
+              <div style="font-size:11px;color:#999;margin-top:2px;">
+                ${stats.dataPoints || data.length} periods
+              </div>
+            </td>
+
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+`;
+  // QuickChart datasets
+  const datasets = [
+    {
+      label: subtitle || title,
+      data: values,
+      borderColor: '#94a3b8',
+      borderWidth: 2,
+      lineTension: 0,
+      fill: false,
+      pointBackgroundColor: pointColors,
+      pointBorderColor: '#ffffff',
+      pointBorderWidth: 2,
+      pointRadius: 6
+    }
+  ];
+
+  if (cleanHigh !== null) {
+    datasets.push({
+      label: `High Limit (${fmt(cleanHigh)})`,
+      data: new Array(values.length).fill(displayHigh),
+      borderColor: '#ff9800',
+      borderWidth: 3,
+      borderDash: [12, 5],
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  if (cleanLow !== null) {
+    datasets.push({
+      label: `Low Limit (${fmt(cleanLow)})`,
+      data: new Array(values.length).fill(displayLow),
+      borderColor: '#dc3545',
+      borderWidth: 3,
+      borderDash: [2, 6],
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  if (cleanTarget !== null) {
+    datasets.push({
+      label: `Target (${fmt(cleanTarget)})`,
+      data: new Array(values.length).fill(displayTarget),
+      borderColor: '#16a34a',
+      borderWidth: 3.5,
+      borderDash: [],
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  const chartConfig = {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      legend: { display: false },
+      layout: {
+        padding: {
+          top: tightThresholdCluster ? 12 : 6,
+          right: 12,
+          bottom: 4,
+          left: 4
+        }
+      },
+      scales: {
+        xAxes: [{
+          ticks: { fontSize: 10 },
+          gridLines: { color: 'rgba(0,0,0,0.05)' }
+        }],
+        yAxes: [{
+          ticks: {
+            fontSize: 10,
+            beginAtZero: false,
+            min: axisRange.min,
+            max: axisRange.max
+          },
+          gridLines: { color: 'rgba(0,0,0,0.05)' }
+        }]
+      }
+    }
+  };
+
+  const chartUrl =
+    `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}` +
+    `&w=500&h=${chartHeightPx}&bkg=white`;
+
+  const commentsHtml = comments.length > 0 ? `
+    <div style="margin-bottom:20px;">
+      <h4 style="margin:0 0 15px;color:#333;font-size:16px;">Comments</h4>
+      ${comments.map(c => `
+        <div style="margin-bottom:12px;padding:12px;background:#e3f2fd;border-radius:8px;border-left:4px solid #0078D7;">
+          <div style="font-size:11px;font-weight:600;color:#0078D7;margin-bottom:6px;">
+           ${weekToMonthLabel(c.week || '') || (c.week || '').replace('2026-Week', 'Week ')}
+          </div>
+          <div style="font-size:13px;color:#2c3e50;">${c.text}</div>
+        </div>
+      `).join('')}
+    </div>` : '';
+
+  const correctiveActionsHtml = correctiveActions.length > 0 ? `
+    <div style="margin-bottom:20px;">
+      <h4 style="margin:0 0 15px;color:#333;font-size:16px;">Corrective Actions</h4>
+      ${correctiveActions.map(ca => `
+        <div style="margin-bottom:15px;padding:15px;background:#fff3f3;border-radius:8px;border-left:4px solid #dc3545;">
+       <div style="font-size:12px;font-weight:600;color:#495057;margin-bottom:8px;">
+         ${ca.week ? weekToMonthLabel(ca.week) : 'N/A'}
+         ${ca.status ? `<span style="margin-left:10px;font-size:11px;color:#dc3545;">${ca.status}</span>` : ''}
+          </div>
+          ${ca.root_cause ? `
+            <div style="margin-bottom:8px;">
+              <div style="font-size:11px;font-weight:700;color:#dc3545;">Root Cause</div>
+              <div style="font-size:12px;color:#374151;">${ca.root_cause}</div>
+            </div>
+          ` : ''}
+          ${ca.implemented_solution ? `
+            <div style="margin-bottom:8px;">
+              <div style="font-size:11px;font-weight:700;color:#d97706;">Implemented Solution</div>
+              <div style="font-size:12px;color:#374151;">${ca.implemented_solution}</div>
+            </div>
+          ` : ''}
+          ${ca.evidence ? `
+            <div>
+              <div style="font-size:11px;font-weight:700;color:#2563eb;">Evidence</div>
+              <div style="font-size:12px;color:#374151;">${ca.evidence}</div>
+            </div>
+          ` : ''}
+        </div>
+      `).join('')}
+    </div>
+  ` : '';
+
+  // EMAIL-SAFE LIMITS (High + Low side-by-side using table)
+  const limitsRowHtml = (() => {
+    const highBox = cleanHigh !== null ? `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="background:white;border-radius:12px;border:1px solid #e0e0e0;text-align:center;">
+      <tr><td style="padding:15px;">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">HIGH LIMIT</div>
+        <div style="font-size:28px;font-weight:700;color:#ff9800;">${fmt(cleanHigh)}</div>
+        <div style="font-size:11px;color:#999;">${unit || ''}</div>
+      </td></tr>
+    </table>
+  ` : '';
+
+    const targetBox = cleanTarget !== null ? `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="background:white;border-radius:12px;border:1px solid #e0e0e0;text-align:center;">
+      <tr><td style="padding:15px;">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">TARGET</div>
+        <div style="font-size:28px;font-weight:700;color:#16a34a;">${fmt(cleanTarget)}</div>
+        <div style="font-size:11px;color:#999;">${unit || ''}</div>
+      </td></tr>
+    </table>
+  ` : '';
+
+    const lowBox = cleanLow !== null ? `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="background:white;border-radius:12px;border:1px solid #e0e0e0;text-align:center;">
+      <tr><td style="padding:15px;">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;margin-bottom:5px;">LOW LIMIT</div>
+        <div style="font-size:28px;font-weight:700;color:#dc3545;">${fmt(cleanLow)}</div>
+        <div style="font-size:11px;color:#999;">${unit || ''}</div>
+      </td></tr>
+    </table>
+  ` : '';
+
+    const boxes = [];
+    if (highBox) boxes.push(highBox);
+    if (targetBox) boxes.push(targetBox);
+    if (lowBox) boxes.push(lowBox);
+
+    if (boxes.length === 0) {
+      return `
+      <div style="margin-top:20px;background:#f8f9fa;border-radius:12px;padding:30px;
+                  text-align:center;border:1px dashed #e0e0e0;">
+        <p style="margin:0;color:#999;font-size:13px;">No limits defined</p>
+      </div>
+    `;
+    }
+
+    const colWidth = Math.floor(100 / boxes.length);
+
+    return `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top:20px;">
+      <tr>
+        ${boxes.map((box, i) => `
+          <td width="${colWidth}%" valign="top"
+              style="${i !== boxes.length - 1 ? 'padding-right:8px;' : ''}">
+            ${box}
+          </td>
+        `).join('')}
+      </tr>
+    </table>
+  `;
+  })();
+
+  const thresholdFocusHtml = tightThresholdCluster ? `
+    <div style="margin:0 0 16px;padding:12px 14px;background:#f8fbff;border:1px solid #dbeafe;
+                border-radius:12px;">
+      <div style="font-size:11px;font-weight:700;color:#0f6cbd;text-transform:uppercase;
+                  letter-spacing:0.08em;margin-bottom:6px;">Threshold Focus</div>
+      <div style="font-size:13px;color:#475569;line-height:1.5;">
+        High limit, target, and low limit are tightly grouped between
+        <strong>${fmt(thresholdValues[0])}</strong> and
+        <strong>${fmt(thresholdValues[thresholdValues.length - 1])}</strong>${unit ? ` ${unit}` : ''}.
+        The chart lines are slightly spaced for readability, and the exact values are shown below.
+      </div>
+    </div>
+  ` : '';
+
+  const preChartLimitsHtml = tightThresholdCluster ? limitsRowHtml : '';
+  const postChartLimitsHtml = tightThresholdCluster ? '' : limitsRowHtml;
+
+  return `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="margin:20px 0;background:white;border-radius:12px;
+                  border:1px solid #e0e0e0;font-family:Arial,sans-serif;">
+      <tr><td style="padding:20px;">
+        <div style="margin-bottom:20px;">
+          <h3 style="margin:0;color:#333;font-size:18px;font-weight:600;">${title}</h3>
+          ${subtitle ? `<p style="margin:5px 0 0;color:#666;font-size:14px;">${subtitle}</p>` : ''}
+          ${unit ? `<p style="margin:5px 0 0;color:#888;font-size:12px;">Unit: ${unit} | Frequency: ${frequency || 'Monthly'}</p>` : ''}
+        </div>
+
+        ${directionGuideHtml}
+        ${statsBox}
+        ${thresholdFocusHtml}
+
+        <table border="0" cellpadding="0" cellspacing="0" width="100%">
+          <tr>
+            <td width="60%" valign="top" style="padding-right:20px;">
+              ${preChartLimitsHtml}
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+  
+                  <td valign="top" style="padding-left:5px;">
+                    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="text-align:center;">
+                      <tr>
+                        <td align="center">
+                          <img src="${chartUrl}"
+                               width="500"
+                               height="${chartHeightPx}"
+                               alt="KPI Trend Chart"
+                               style="max-width:100%;
+                                      border-radius:8px;
+                                      border:1px solid #f0f0f0;
+                                      display:block;
+                                      margin:auto;" />
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+
+              <!--High/Low limits beside each other -->
+              ${postChartLimitsHtml}
+            </td>
+
+            <td width="40%" valign="top" style="padding-left:20px;border-left:2px solid #f0f0f0;">
+              ${correctiveActionsHtml}
+              ${commentsHtml}
+
+              ${comments.length === 0 && correctiveActions.length === 0 ? `
+                <div style="background:#f8f9fa;border-radius:12px;padding:30px;
+                            text-align:center;border:1px dashed #e0e0e0;">
+                  <p style="margin:0;color:#999;font-size:13px;">No additional data</p>
+                </div>` : ''}
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>`;
+};
+// ============================================================
+// generateWeeklyReportData
+// ============================================================
+// ============================================================
+// generateWeeklyReportData (updated to include corrective actions)
+// ============================================================
 const generateWeeklyReportData = async (responsibleId, reportWeek) => {
   try {
-    // Get historical data from kpi_values_hist26 table WITH threshold values
     const histRes = await pool.query(
-      `
-      WITH KpiHistory AS (
-        SELECT 
-          h.kpi_id,
-          h.week,
-          h.new_value,
-          h.updated_at,
-          k.indicator_title,
-          k.indicator_sub_title,
-          k.unit,
-          k.target_value,
-          k.minimum_value,
-          k.maximum_value,
-          ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
+      `WITH KpiHistory AS (
+        SELECT h.kpi_id, h.week, h.new_value, h.updated_at, h.comment,
+               ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+               ca.corrective_action_id,
+               ca.root_cause,
+               ca.implemented_solution,
+               ca.evidence,
+               ca.status as ca_status,
+               ca.created_date as ca_created_date,
+               ca.updated_date as ca_updated_date,
+               ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
         FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+        LEFT JOIN public.kpi_values kv
+          ON kv.kpi_values_id = h.kpi_values_id
+        LEFT JOIN public.responsible_kpis rk
+          ON rk.responsible_kpi_id = kv.responsible_kpi_id
+        LEFT JOIN LATERAL (
+          SELECT corrective_action_id, root_cause, implemented_solution,
+                 evidence, status, created_date, updated_date
+          FROM public.corrective_actions
+          WHERE kpi_id = h.kpi_id
+            AND responsible_id = h.responsible_id
+            AND week = h.week
+          ORDER BY COALESCE(updated_date, created_date) DESC, corrective_action_id DESC
+          LIMIT 1
+        ) ca ON TRUE
         WHERE h.responsible_id = $1
-          AND h.new_value IS NOT NULL
-          AND h.new_value != ''
-          AND h.new_value != '0'
+          AND h.new_value IS NOT NULL AND h.new_value != '' AND h.new_value != '0'
       )
-      SELECT * FROM KpiHistory 
-      WHERE rn = 1
-      ORDER BY kpi_id, week ASC
-      `,
+      SELECT * FROM KpiHistory WHERE rn = 1
+      ORDER BY kpi_id, week ASC`,
       [responsibleId]
     );
 
-    if (!histRes.rows.length) {
-      console.log(`No historical data found for responsible ${responsibleId}`);
-      return null;
-    }
+    if (!histRes.rows.length) return null;
 
-    // Group by KPI
     const kpisData = {};
-    const weekLabelsSet = new Set();
 
+    // â”€â”€ Pass 1: build kpisData entries and accumulate into monthly maps â”€â”€â”€â”€â”€â”€
     histRes.rows.forEach(row => {
       const kpiId = row.kpi_id;
-
       if (!kpisData[kpiId]) {
         kpisData[kpiId] = {
-          title: row.indicator_title,
+          title: row.indicator_title || row.indicator_sub_title || 'Untitled KPI',
           subtitle: row.indicator_sub_title || '',
           unit: row.unit || '',
-          target: row.target_value,
-          min: row.minimum_value,
-          max: row.maximum_value,
-          weeklyData: new Map()
+          target: row.target,
+          target_direction: row.target_direction,
+          direction: inferKpiDirection(row),
+          min: row.min,
+          max: row.max,
+          low_limit: row.low_limit,
+          high_limit: row.high_limit,
+          tolerance_type: row.tolerance_type,
+          up_tolerance: row.up_tolerance,
+          low_tolerance: row.low_tolerance,
+          frequency: row.frequency,
+          _monthlyMap: {},   // { "Feb 2026": { sum, count } }
+          comments: [],
+          correctiveActions: []
         };
       }
 
-      // Parse value safely
       const value = parseFloat(row.new_value);
       if (!isNaN(value) && value > 0) {
-        kpisData[kpiId].weeklyData.set(row.week, value);
-        weekLabelsSet.add(row.week);
+        const month = weekToMonthLabel(row.week); // e.g. "Feb 2026"
+        const mm = kpisData[kpiId]._monthlyMap;
+        if (!mm[month]) mm[month] = { sum: 0, count: 0 };
+        mm[month].sum += value;
+        mm[month].count += 1;
       }
-    });
 
-    // Convert week labels set to sorted array
-    const weekLabels = Array.from(weekLabelsSet).sort((a, b) => {
-      const [yearA, weekA] = a.includes('Week')
-        ? [parseInt(a.split('-Week')[0]), parseInt(a.split('-Week')[1])]
-        : [0, parseInt(a.replace('Week', ''))];
+      if (row.comment && row.comment.trim())
+        kpisData[kpiId].comments.push({ week: row.week, text: row.comment, date: row.updated_at });
 
-      const [yearB, weekB] = b.includes('Week')
-        ? [parseInt(b.split('-Week')[0]), parseInt(b.split('-Week')[1])]
-        : [0, parseInt(b.replace('Week', ''))];
-
-      if (yearA !== yearB) return yearA - yearB;
-      return weekA - weekB;
-    });
-
-    if (weekLabels.length === 0) {
-      console.log(`No valid week data found for responsible ${responsibleId}`);
-      return null;
-    }
-
-    const charts = [];
-
-    // Process each KPI
-    for (const [kpiId, kpiData] of Object.entries(kpisData)) {
-      // Prepare data array for all weeks
-      const dataPoints = [];
-
-      weekLabels.forEach(week => {
-        if (kpiData.weeklyData.has(week)) {
-          dataPoints.push(kpiData.weeklyData.get(week));
-        } else {
-          dataPoints.push(0);
+      if (row.root_cause || row.implemented_solution || row.evidence) {
+        const existingCA = kpisData[kpiId].correctiveActions.find(ca => ca.week === row.week);
+        if (!existingCA) {
+          kpisData[kpiId].correctiveActions.push({
+            week: row.week,
+            root_cause: row.root_cause,
+            implemented_solution: row.implemented_solution,
+            evidence: row.evidence,
+            status: row.ca_status || 'Open',
+            created_date: row.ca_created_date,
+            updated_date: row.ca_updated_date
+          });
         }
-      });
-
-      // Skip if all values are zero
-      const validDataPoints = dataPoints.filter(val => val > 0 && !isNaN(val));
-      if (validDataPoints.length === 0) {
-        continue;
       }
+    });
 
-      // Find current week (latest with data)
-      let currentWeek = null;
-      let currentValue = 0;
-      let previousValue = 0;
+    // â”€â”€ Pass 2: convert monthly maps â†’ sorted month labels + averaged values â”€
+    const monthLabelsSet = new Set();
+    Object.values(kpisData).forEach(kpi => {
+      const mm = kpi._monthlyMap;
+      const sortedMonths = Object.keys(mm).sort((a, b) => new Date(a) - new Date(b));
+      kpi.weeklyData = new Map();
+      sortedMonths.forEach(m => {
+        kpi.weeklyData.set(m, mm[m].sum / mm[m].count);
+        monthLabelsSet.add(m);
+      });
+      delete kpi._monthlyMap;
+    });
 
-      // Go backwards to find the latest non-zero value
+    // â”€â”€ Sorted month labels for all KPIs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const weekLabels = Array.from(monthLabelsSet).sort((a, b) => new Date(a) - new Date(b));
+    if (weekLabels.length === 0) return null;
+
+    // â”€â”€ Build chart objects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const charts = [];
+    for (const [kpiId, kpiData] of Object.entries(kpisData)) {
+      const dataPoints = weekLabels.map(w => kpiData.weeklyData.get(w) || 0);
+      if (!dataPoints.some(v => v > 0)) continue;
+
+      let currentWeek = null, currentValue = 0, previousValue = 0;
       for (let i = weekLabels.length - 1; i >= 0; i--) {
         if (dataPoints[i] > 0) {
-          currentWeek = weekLabels[i];
-          currentValue = dataPoints[i];
-
-          // Find previous non-zero value for trend calculation
-          for (let j = i - 1; j >= 0; j--) {
-            if (dataPoints[j] > 0) {
-              previousValue = dataPoints[j];
-              break;
-            }
-          }
+          currentWeek = weekLabels[i]; currentValue = dataPoints[i];
+          for (let j = i - 1; j >= 0; j--) { if (dataPoints[j] > 0) { previousValue = dataPoints[j]; break; } }
           break;
         }
       }
+      if (!currentWeek) continue;
 
-      if (!currentWeek) {
-        continue;
-      }
-
-      // Calculate statistics
-      const nonZeroData = validDataPoints;
-
-      const avg = nonZeroData.reduce((sum, val) => sum + val, 0) / nonZeroData.length;
-      const maxValue = Math.max(...nonZeroData);
-      const minValue = Math.min(...nonZeroData);
-
-      // Calculate trend (week-over-week change) safely
+      const nonZero = dataPoints.filter(v => v > 0);
+      const avg = nonZero.reduce((s, v) => s + v, 0) / nonZero.length;
       let trend = '0.0%';
       if (previousValue > 0 && currentValue > 0) {
-        const trendValue = ((currentValue - previousValue) / previousValue) * 100;
-        trend = (trendValue >= 0 ? '+' : '') + trendValue.toFixed(1) + '%';
+        const tv = ((currentValue - previousValue) / previousValue) * 100;
+        trend = (tv >= 0 ? '+' : '') + tv.toFixed(1) + '%';
       }
 
-      // Format week labels for display
-      const displayWeekLabels = weekLabels.map(week => {
-        if (week.includes('2026-Week')) {
-          return `W${week.split('-Week')[1]}`;
-        } else if (week.includes('Week')) {
-          return `W${week.replace('Week', '')}`;
-        }
-        return week;
-      });
+      // Labels are already "Jan 2026", "Feb 2026" etc â€” pass through as-is
+      const displayWeekLabels = weekLabels;
 
       charts.push({
-        kpiId: kpiId,
+        kpiId,
         title: kpiData.title,
         subtitle: kpiData.subtitle,
         unit: kpiData.unit,
+        target: kpiData.target,
+        direction: kpiData.direction,
+        min: kpiData.min,
+        max: kpiData.max,
+        low_limit: kpiData.low_limit,
+        high_limit: kpiData.high_limit,
+        tolerance_type: kpiData.tolerance_type,
+        up_tolerance: kpiData.up_tolerance,
+        low_tolerance: kpiData.low_tolerance,
+        frequency: kpiData.frequency,
         data: dataPoints,
         weekLabels: displayWeekLabels,
         fullWeeks: weekLabels,
-        currentWeek: currentWeek,
-        target: kpiData.target,
-        min: kpiData.min,
-        max: kpiData.max,
+        currentWeek,
+        comments: kpiData.comments.sort((a, b) => new Date(b.date) - new Date(a.date)),
+        correctiveActions: kpiData.correctiveActions.sort((a, b) =>
+          new Date(b.updated_date || b.created_date) - new Date(a.updated_date || a.created_date)
+        ),
         stats: {
-          current: currentValue,
-          previous: previousValue > 0 ? previousValue : null,
-          average: avg,
-          max: maxValue,
-          min: minValue > 0 ? minValue : null,
-          trend: trend,
-          dataPoints: nonZeroData.length,
+          current: currentValue.toFixed(kpiData.unit === '%' ? 1 : 2),
+          previous: previousValue > 0 ? previousValue.toFixed(kpiData.unit === '%' ? 1 : 2) : 'N/A',
+          average: avg.toFixed(kpiData.unit === '%' ? 1 : 2),
+          trend,
+          dataPoints: nonZero.length,
           totalWeeks: weekLabels.length
         }
       });
@@ -3219,588 +12250,1314 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
 
     console.log(`Generated ${charts.length} KPI charts for responsible ${responsibleId}`);
     return charts;
-
   } catch (error) {
     console.error('Error generating weekly report data:', error);
     return null;
   }
 };
 
-// ---------- Schedule Weekly Reports  to send it for each responsible  ----------
-// ---------- Schedule Weekly Reports ----------
-// ---------- Schedule Weekly Reports ----------
-cron.schedule(
-  "00 10 * * 1", // Every Friday at 8:16 PM
-  async () => {
-    const lockId = 'weekly_report_job';
-    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL (longer job)
+function getCurrentWeek() {
+  return getWeekLabelForDate(new Date());
+}
 
-    // Exit immediately if we didn't get the lock
-    if (!lock.acquired) {
-      console.log(`⏭️ [Weekly Report] Skipping - lock held by another instance`);
-      return;
+const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
+  try {
+    const resResp = await pool.query(
+      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
+              p.name AS plant_name, d.name AS department_name
+       FROM public."Responsible" r
+       JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`, [responsibleId]
+    );
+    const responsible = resResp.rows[0];
+    if (!responsible) throw new Error(`Responsible ${responsibleId} not found`);
+
+    // â”€â”€ Build charts using CURRENT (old) target from Kpi table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const chartsData = await generateWeeklyReportData(responsibleId, reportWeek);
+    let chartsHtml = '';
+
+    if (chartsData && chartsData.length > 0) {
+      chartsData.forEach(chart => { chartsHtml += generateVerticalBarChart(chart); });
+    } else {
+      chartsHtml = `
+        <div style="text-align:center;padding:60px;background:#f8f9fa;border-radius:12px;">
+          <p style="color:#495057;margin:0;font-size:18px;">No KPI Data Available</p>
+        </div>`;
     }
 
-    try {
-      // Calculate current week
-      const now = new Date();
-      const year = now.getFullYear();
+    const emailHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f6f9;">
+      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#f4f6f9;">
+        <tr><td align="center" style="padding:20px;">
+          <table border="0" cellpadding="0" cellspacing="0" width="100%">
+            <tr><td style="background:#0078D7;padding:30px;text-align:center;border-radius:8px 8px 0 0;">
+              <h1 style="margin:0;color:white;font-size:24px;">KPI Performance Report</h1>
+              <p style="margin:10px 0 20px;color:rgba(255,255,255,0.9);">
+                ${reportWeek.replace('2026-Week', 'Week ')} | ${responsible.name} | ${responsible.plant_name}
+              </p>
+              <table border="0" cellpadding="0" cellspacing="0" align="center"><tr>
+                <td style="padding:0 8px;">
+                  <a href="http://localhost:5000/kpi-trends?responsible_id=${responsible.responsible_id}"
+                     style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
+                            text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
+                    View KPI Graphics</a>
+                </td>
+                <td style="padding:0 8px;">
+                  <a href="http://localhost:5000/dashboard?responsible_id=${responsible.responsible_id}"
+                     style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
+                            text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
+                    View Dashboard</a>
+                </td>
+              </tr></table>
+            </td></tr>
 
-      // Get week number function
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
-
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `${year}-Week${weekNumber}`;
-      const previousWeek = `${year}-Week${weekNumber - 1}`;
-
-      console.log(`📊 [Weekly Report] Current week: ${currentWeek}, Reporting on: ${previousWeek}`);
-
-      // Get all responsibles who have ANY KPI history data
-      const resps = await pool.query(`
-        SELECT DISTINCT r.responsible_id, r.email, r.name
-        FROM public."Responsible" r
-        JOIN public.kpi_values_hist26 h ON r.responsible_id = h.responsible_id
-        WHERE r.email IS NOT NULL
-          AND r.email != ''
-        GROUP BY r.responsible_id, r.email, r.name
-        HAVING COUNT(h.hist_id) > 0
-        ORDER BY r.responsible_id
-      `);
-
-      console.log(`📊 [Weekly Report] Sending to ${resps.rows.length} responsibles for week ${previousWeek}...`);
-
-      const results = [];
-      for (const [index, resp] of resps.rows.entries()) {
-        try {
-          await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
-          console.log(`  ✅ [${index + 1}/${resps.rows.length}] Sent to ${resp.name} (${resp.email})`);
-          results.push({
-            responsible_id: resp.responsible_id,
-            name: resp.name,
-            status: 'success'
-          });
-
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  ❌ [${index + 1}/${resps.rows.length}] Failed for ${resp.name}:`, err.message);
-          results.push({
-            responsible_id: resp.responsible_id,
-            name: resp.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
-
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ [Weekly Report] Completed. Sent: ${succeeded}/${results.length}`);
-
-    } catch (error) {
-      console.error("❌ [Weekly Report] Error:", error.message);
-    } finally {
-      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
-
-
-
-// ========== FIXED createIndividualKPIChart FUNCTION ==========
-const createIndividualKPIChart = (kpi) => {
-
-  const weeklyData = kpi.weeklyData || { weeks: [], values: [] };
-  const weeks = weeklyData.weeks.slice(0, 5).reverse();
-  const values = weeklyData.values.slice(0, 5).reverse();
-
-  // ----- No data / invalid data -----
-  if (!values.length || values.every(v => v <= 0)) {
-    return `<table ...>... no data ...</table>`;  // keep your fallback
-  }
-  const dataValues = values.filter(v => v > 0 && !isNaN(v)).map(v => parseFloat(v));
-  if (dataValues.length === 0) return `<table ...>... invalid data ...</table>`;
-
-  // ----- thresholds -----
-  const targetNum = kpi.target_value && kpi.target_value !== 'None' ? parseFloat(kpi.target_value) : null;
-  const minNum = kpi.minimum_value && kpi.minimum_value !== 'None' ? parseFloat(kpi.minimum_value) : null;
-  const maxNum = kpi.maximum_value && kpi.maximum_value !== 'None' ? parseFloat(kpi.maximum_value) : null;
-
-  // ----- trend -----
-  const currentVal = values[values.length - 1] || 0;
-  const prevVal = values.length >= 2 ? values[values.length - 2] : 0;
-  const trendRaw = prevVal > 0 ? ((currentVal - prevVal) / prevVal * 100) : 0;
-  const trendIcon = Math.abs(trendRaw) < 0.1 ? '→' : (trendRaw > 0 ? '↗' : '↘');
-  const trendColor = trendRaw >= 0 ? '#28a745' : '#dc3545';
-  const trendBg = trendRaw >= 0 ? '#d4edda' : '#f8d7da';
-  const trendDisplay = `${trendRaw >= 0 ? '+' : ''}${trendRaw.toFixed(1)}%`;
-
-  // ----- chart dimensions -----
-  const chartHeight = 200;   // px
-  const numRows = chartHeight; // 1 row per pixel
-  const cellHeight = 1;     // px
-
-  // ----- scale: all values and thresholds -----
-  const allValues = [...dataValues];
-  if (targetNum) allValues.push(targetNum);
-  if (maxNum) allValues.push(maxNum);
-  if (minNum) allValues.push(minNum);
-  const maxData = Math.max(...allValues);
-  const chartMax = (() => {
-    const withPad = maxData * 1.2;
-    if (withPad <= 10) return 10;
-    if (withPad <= 20) return 20;
-    if (withPad <= 50) return 50;
-    if (withPad <= 100) return 100;
-    if (withPad <= 200) return 200;
-    if (withPad <= 500) return 500;
-    if (withPad <= 1000) return 1000;
-    if (withPad <= 2000) return 2000;
-    if (withPad <= 5000) return 5000;
-    return Math.ceil(withPad / 10000) * 10000;
-  })();
-
-  // ----- helper: value → Y pixel position (0 = top, chartHeight = bottom) -----
-  const valueToY = (val) => {
-    if (val <= 0 || isNaN(val)) return chartHeight;
-    const pct = Math.min(100, (val / chartMax) * 100);
-    return (1 - pct / 100) * chartHeight;
-  };
-
-  // ----- helper: format number (no trailing .0) -----
-  const formatNumber = (n) => {
-    if (n == null || isNaN(n)) return '0';
-    const num = parseFloat(n);
-    if (Number.isInteger(num)) return num.toString();
-    const f = num.toFixed(1);
-    return f.endsWith('.0') ? f.slice(0, -2) : f;
-  };
-
-  // ----- Y‑axis: labels + threshold markers at exact Y positions -----
-  const yAxisLabels = [];
-  for (let i = 0; i <= 5; i++) {
-    const val = (5 - i) / 5 * chartMax;
-    const y = valueToY(val);
-    yAxisLabels.push({ label: formatNumber(val), y });
-  }
-
-  const thresholds = [];
-  if (targetNum) thresholds.push({ value: targetNum, label: 'Target', color: '#28a745', y: valueToY(targetNum) });
-  if (maxNum) thresholds.push({ value: maxNum, label: 'Max', color: '#ff9800', y: valueToY(maxNum) });
-  if (minNum) thresholds.push({ value: minNum, label: 'Min', color: '#dc3545', y: valueToY(minNum) });
-
-  const yMarkers = [...yAxisLabels, ...thresholds.map(t => ({ isThreshold: true, ...t }))];
-
-  // Build Y‑axis table (exactly chartHeight tall)
-  let yAxisHTML = `<table cellpadding="0" cellspacing="0" border="0" width="60" height="${chartHeight}" style="border-collapse:collapse;">`;
-  for (let row = 0; row < numRows; row++) {
-    const rowTop = row * cellHeight;
-    const rowBottom = (row + 1) * cellHeight;
-    const marker = yMarkers.find(m => m.y >= rowTop && m.y < rowBottom);
-    let content = '&nbsp;';
-    if (marker) {
-      if (marker.isThreshold) {
-        content = `<span style="display:inline-block; width:8px; height:8px; background:${marker.color}; border-radius:50%; margin-right:4px;"></span>
-                   <span style="font-size:9px; color:${marker.color}; font-weight:600;">${formatNumber(marker.value)}</span>`;
-      } else {
-        content = `<span style="font-size:10px; color:#666;">${marker.label}</span>`;
-      }
-    }
-    yAxisHTML += `<tr><td height="${cellHeight}" valign="top" align="right" style="font-size:1px; line-height:1; padding-right:8px; border-right:2px solid #cbd5e1;">${content}</td></tr>`;
-  }
-  yAxisHTML += `</table>`;
-
-  // ----- Prepare threshold rows for the bar table -----
-  // Map each pixel row (0‑199) to the threshold line(s) that should be drawn there
-  const thresholdAtRow = new Array(numRows).fill(null);
-  thresholds.forEach(th => {
-    // Round to nearest pixel row – best we can do in email
-    const rowIndex = Math.round(th.y);
-    if (rowIndex >= 0 && rowIndex < numRows) {
-      if (!thresholdAtRow[rowIndex]) thresholdAtRow[rowIndex] = [];
-      thresholdAtRow[rowIndex].push(th);
-    }
-  });
-
-  // ----- Build bar chart table row by row -----
-  const barGapPx = 8;        // horizontal gap between bars
-  const colWidth = `${100 / values.length}%`;
-
-  let barRows = '';
-  for (let row = 0; row < numRows; row++) {
-    const rowTop = row * cellHeight;
-    const rowBottom = (row + 1) * cellHeight;
-
-    // 1) Insert threshold line(s) for this row (if any)
-    if (thresholdAtRow[row]) {
-      thresholdAtRow[row].forEach(th => {
-        barRows += `<tr style="height:0; line-height:0; font-size:0;">
-          <td colspan="${values.length}" style="border-top:2px dashed ${th.color}; padding:0; margin:0;"></td>
-        </tr>`;
-      });
-    }
-
-    // 2) Normal bar row
-    barRows += '<tr>';
-    values.forEach((val, idx) => {
-      const barTopY = valueToY(val);
-      const isBarCell = (rowBottom > barTopY);
-      const isTopEdge = (rowTop <= barTopY && rowBottom > barTopY);
-      const displayValue = formatNumber(val);
-      const isCurrent = idx === values.length - 1;
-
-      let content = '';
-      let tdStyle = `padding:0 ${barGapPx / 2}px; margin:0; height:${cellHeight}px; width:${colWidth}; line-height:0; font-size:0; vertical-align:bottom;`;
-
-      if (isBarCell) {
-        content = `<div style="background-color:#0078D7; height:${cellHeight}px; width:100%;"></div>`;
-        if (isTopEdge) {
-          content = `<div style="background-color:#0078D7; font-size:10px; font-weight:700; color:#fff; text-align:center; line-height:12px; height:${cellHeight}px;">${displayValue}</div>`;
-        }
-      } else {
-        content = '<div style="height:' + cellHeight + 'px;">&nbsp;</div>';
-      }
-
-      barRows += `<td style="${tdStyle}">${content}</td>`;
-    });
-    barRows += '</tr>';
-  }
-
-  // Wrap bar rows in a table that is exactly chartHeight tall
-  const barTable = `<table cellpadding="0" cellspacing="0" border="0" width="100%" height="${chartHeight}" style="border-collapse:collapse;">${barRows}</table>`;
-
-  // ----- X‑axis table (placed directly below the bar table, no gap) -----
-  const xAxisRow = `<tr>
-    ${values.map((val, idx) => {
-    const weekLabel = weeks[idx]?.replace('2026-Week', 'W') || `W${idx + 1}`;
-    const isCurrent = idx === values.length - 1;
-    return `<td align="center" style="padding:0 ${barGapPx / 2}px; border-top:2px solid #cbd5e1; font-size:10px; color:#666; font-weight:${isCurrent ? '700' : '500'}; line-height:14px; padding-top:6px;">
-                ${weekLabel}
-                ${isCurrent ? '<div style="width:6px;height:6px;background:#0078D7;border-radius:50%;margin:2px auto 0;"></div>' : ''}
-              </td>`;
-  }).join('')}
-  </tr>`;
-  const xAxisTable = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">${xAxisRow}</table>`;
-
-  // ----- statistics -----
-  const averageValue = dataValues.reduce((a, b) => a + b, 0) / dataValues.length;
-  const currentValue = values[values.length - 1] || 0;
-  const prevValue = values.length >= 2 ? values[values.length - 2] : 0;
-  const trendVal = prevValue > 0 ? ((currentValue - prevValue) / prevValue * 100) : 0;
-  const trendClr = trendVal >= 0 ? '#4CAF50' : '#F44336';
-  const trendDisp = `${trendVal >= 0 ? '+' : ''}${trendVal.toFixed(1)}%`;
-
-  // ----- threshold badges (optional) -----
-  const badgeHTML = thresholds.map(th => {
-    const bg = th.label === 'Target' ? '#e8f5e9' : (th.label === 'Max' ? '#fff3e0' : '#ffebee');
-    return `<td style="padding:0 4px 0 0;">
-              <div style="display:inline-block; background:${bg}; border:1px solid ${th.color}; border-radius:12px; padding:4px 10px;">
-                <span style="font-size:10px; color:${th.color}; font-weight:600;">
-                  ${th.label === 'Target' ? '🎯' : (th.label === 'Max' ? '📈' : '📉')} ${th.label}: ${formatNumber(th.value)}
+            <tr><td style="padding:20px 30px 0;">
+              <div style="background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:14px 18px;">
+                <span style="font-size:14px;color:#5f4200;">
+                  <strong>AI Recommendations PDF is attached</strong> - open it for root-cause analysis,
+                  action plans and improvement roadmaps for each KPI.
                 </span>
               </div>
-            </td>`;
-  }).join('');
+            </td></tr>
 
-  // ----- FINAL HTML -----
-  return `
-<table border="0" cellpadding="0" cellspacing="0" width="100%"
-       style="background:#ffffff; border:1px solid #e5e7eb; border-radius:12px; margin-bottom:20px; box-shadow:0 4px 12px rgba(0,0,0,0.06);">
-  <tr>
-    <td style="padding:20px;">
+            <tr><td style="padding:16px 30px 0;">
+              <div style="background:#f8fbff;border:1px solid #dbeafe;border-radius:10px;padding:16px 18px;">
+                <div style="font-size:12px;font-weight:700;color:#0f6cbd;text-transform:uppercase;
+                            letter-spacing:0.08em;margin-bottom:8px;">Good Direction Guide</div>
+                <div style="font-size:14px;color:#1f2937;line-height:1.6;">
+                  <strong>Up</strong> = higher is better, for example Sales and OTD.<br />
+                  <strong>Down</strong> = lower is better, for example Scrap, accidents, and customer claims.<br />
+                  This direction is used for colors, alerts, and target management across the report.
+                </div>
+              </div>
+            </td></tr>
 
-      <!-- HEADER -->
-      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:20px;">
-        <tr>
-          <td valign="top">
-            <div style="font-weight:700; font-size:18px; color:#111827; margin-bottom:6px;">
-              ${kpi.subtitle || kpi.title}
-            </div>
-            ${kpi.indicator_sub_title ? `<div style="font-size:13px; color:#6b7280; margin-bottom:8px;">${kpi.indicator_sub_title}</div>` : ''}
-            ${thresholds.length ? `<table border="0" cellpadding="0" cellspacing="0"><tr>${badgeHTML}</tr></table>` : ''}
-            ${kpi.unit ? `<div style="font-size:12px; color:#9ca3af; margin-top:8px;">Unit: ${kpi.unit}</div>` : ''}
-          </td>
-          <td align="right" valign="top" width="170">
-            <table border="0" cellpadding="0" cellspacing="0" align="right" style="margin-bottom:8px;">
-              <tr><td align="center" style="background:${trendBg}; border:1.5px solid ${trendColor}; border-radius:22px; padding:6px 16px;">
-                <span style="font-size:16px; color:${trendColor}; font-weight:600;">${trendIcon}</span>
-              </td></tr>
-            </table>
-            <table border="0" cellpadding="0" cellspacing="0" align="right" style="margin-top:8px;">
-              <tr><td align="center" style="font-size:13px; color:#374151; background:#f3f4f6; padding:8px 16px; border-radius:20px; font-weight:500;">
-                👤 ${kpi.responsible}
-              </td></tr>
-            </table>
-          </td>
-        </tr>
+            <tr><td style="padding:30px;">${chartsHtml}</td></tr>
+
+            <tr><td style="padding:20px;background:#f8f9fa;border-top:1px solid #e9ecef;
+                            text-align:center;font-size:12px;color:#666;">
+              AVOCarbon KPI System | Generated ${new Date().toLocaleDateString('en-GB')}
+            </td></tr>
+          </table>
+        </td></tr>
       </table>
+    </body></html>`;
 
-      <!-- CHART AREA: Y‑axis + bars (aligned) + X‑axis below -->
-      <div style="margin-bottom:0;">
-        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;">
-          <tr>
-            <td width="60" valign="top" style="padding-right:6px;">
-              ${yAxisHTML}
-            </td>
-            <td valign="bottom" style="padding-left:6px; height:${chartHeight}px; padding:0; line-height:0; vertical-align:bottom;">
-              ${barTable}
-            </td>
-          </tr>
-        </table>
-        <!-- X‑axis directly below, no margin -->
-        <div style="margin-left:66px; margin-top:0; padding-top:0; line-height:0;">
-          ${xAxisTable}
-        </div>
-      </div>
+    // â”€â”€ Generate PDF attachment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    let pdfAttachment = null;
+    try {
+      console.log(`ðŸ“„ Generating recommendations PDF for ${responsible.name}â€¦`);
+      const pdfBuffer = await generateKPIRecommendationsPDFBuffer(pool, responsibleId, reportWeek);
+      if (pdfBuffer) {
+        const weekLabel = reportWeek.replace('2026-Week', 'Week_');
+        pdfAttachment = {
+          filename: `KPI_Recommendations_${responsible.name.replace(/ /g, '_')}_${weekLabel}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        };
+        console.log(`ðŸ“„ PDF ready â€” ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
+      }
+    } catch (pdfErr) {
+      console.error(`âš ï¸ PDF generation failed for ${responsible.name}:`, pdfErr.message);
+    }
 
-      <!-- STATS FOOTER -->
-      <table border="0" cellpadding="0" cellspacing="0" width="100%"
-             style="background:#0f172a; border-radius:12px; margin-top:24px; border-collapse:collapse;">
-        <tr>
-          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
-            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">CURRENT</div>
-            <div style="font-size:20px; font-weight:700; color:#ffffff;">${formatNumber(currentValue)}</div>
-            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">Week ${weeks[weeks.length - 1]?.replace('2026-Week', '') || '5'}</div>
-          </td>
-          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
-            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">TARGET</div>
-            <div style="font-size:20px; font-weight:700; color:#22c55e;">${targetNum ? formatNumber(targetNum) : 'N/A'}</div>
-            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">Achievement</div>
-          </td>
-          <td width="25%" align="center" style="padding:14px; border-right:1px solid rgba(255,255,255,0.15);">
-            <div style="font-size:10px; letter-spacing:0.6px; font-weight:600; color:rgba(255,255,255,0.75); margin-bottom:6px;">AVERAGE</div>
-            <div style="font-size:20px; font-weight:700; color:#ffffff;">${formatNumber(averageValue)}</div>
-            <div style="font-size:10px; color:rgba(255,255,255,0.6); margin-top:4px;">${dataValues.length} periods</div>
-          </td>
-         
-        </tr>
-      </table>
+    // â”€â”€ SEND EMAIL (with OLD target values in charts) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const transporter = createTransporter();
+    await transporter.sendMail({
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      to: responsible.email,
+      subject: `KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
+      html: emailHtml,
+      attachments: pdfAttachment ? [pdfAttachment] : [],
+    });
+    console.log(`Email sent to ${responsible.email}`);
 
-    </td>
-  </tr>
-</table>
-  `;
+    // â”€â”€ NOW apply all pending target updates for this responsible â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Email is already sent â€” safe to update Kpi.target and hist26.target
+    try {
+      const pending = await pool.query(
+        `SELECT p.id, p.kpi_id, p.week, p.new_target,
+                COALESCE(rk.target, k.target) AS current_kpi_target,
+                COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title
+         FROM public.pending_target_updates p
+         JOIN public."Kpi" k ON k.kpi_id = p.kpi_id
+         LEFT JOIN public.responsible_kpis rk
+           ON rk.kpi_id = k.kpi_id
+          AND rk.responsible_id = p.responsible_id
+         WHERE p.responsible_id = $1 AND p.applied = false`,
+        [responsibleId]
+      );
+
+      console.log(`ðŸ“‹ ${pending.rows.length} pending target update(s) to apply for ${responsible.name}`);
+
+      for (const row of pending.rows) {
+        const newVal = parseFloat(row.new_target);
+        const currVal = parseFloat(row.current_kpi_target);
+
+        if (isNaN(newVal)) {
+          console.warn(`âš ï¸ Skipping KPI ${row.kpi_id} â€” new_target "${row.new_target}" is not a number`);
+          continue;
+        }
+
+        // 1. Update the responsible-specific KPI assignment target
+        await upsertResponsibleKpiAssignment(
+          pool,
+          responsibleId,
+          row.kpi_id,
+          { target: String(newVal) },
+          { preserveMissing: true }
+        );
+        console.log(`ðŸŽ¯ KPI target updated: "${row.indicator_title}" (${row.kpi_id}) ${currVal} â†’ ${newVal}`);
+
+        // 2. Update kpi_values_hist26.target for that week
+        await pool.query(
+          `UPDATE public.kpi_values_hist26
+           SET target = $1
+           WHERE responsible_id = $2 AND kpi_id = $3 AND week = $4`,
+          [newVal, responsibleId, row.kpi_id, row.week]
+        );
+        console.log(`ðŸ“ kpi_values_hist26.target updated: KPI ${row.kpi_id} week ${row.week} â†’ ${newVal}`);
+
+        await pool.query(
+          `UPDATE public.kpi_values
+           SET target_snapshot = $1
+           WHERE responsible_id = $2 AND kpi_id = $3 AND week = $4`,
+          [newVal, responsibleId, row.kpi_id, row.week]
+        );
+
+        // 3. Mark as applied
+        await pool.query(
+          `UPDATE public.pending_target_updates SET applied = true WHERE id = $1`,
+          [row.id]
+        );
+      }
+
+      console.log(`All pending target updates applied for ${responsible.name}`);
+
+    } catch (applyErr) {
+      console.error(`âŒ Failed to apply pending target updates for ${responsible.name}:`, applyErr.message);
+    }
+
+  } catch (error) {
+    console.error(`âŒ generateWeeklyReportEmail failed for responsible ${responsibleId}:`, error.message);
+    throw error;
+  }
+};
+let submissionEmailCronRunning = false;
+
+const runKpiSubmissionEmailJob = async (week = getCurrentWeek()) => {
+  const lockId = "send_kpi_weekly_email_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+
+  try {
+    if (submissionEmailCronRunning) return;
+    submissionEmailCronRunning = true;
+
+    const recipients = await getKpiEmailRecipientsForWeek(week);
+    for (const recipient of recipients) {
+      await sendKPIEmail(recipient.responsible_id, week);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+
+    console.log(`KPI submission emails sent to ${recipients.length} responsibles for ${week}`);
+  } catch (error) {
+    console.error("Scheduled KPI submission email error:", error.message);
+  } finally {
+    submissionEmailCronRunning = false;
+    await releaseJobLock(lockId, lock.lockHash);
+  }
 };
 
-// Helper function for number formatting
-const formatNumber = (num) => {
-  if (num === null || num === undefined || isNaN(num)) return '0';
-  const number = parseFloat(num);
 
-  if (Number.isInteger(number)) {
-    return number.toString();
+
+// ---------- Cron: weekly KPI submission email ----------
+// let cronRunning = false;
+// cron.schedule("54  10 * * *", async () => {
+//   const lockId = "send_kpi_weekly_email_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (cronRunning) return;
+//     cronRunning = true;
+//     const now = new Date();
+//     const startOfYear = new Date(now.getFullYear(), 0, 1);
+//     const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
+//     const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
+//     const forcedWeek = `${now.getFullYear()}-Week${currentWeek}`;
+//     const resps = await pool.query(
+//       `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
+//        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
+//       [forcedWeek]
+//     );
+//     for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
+//     console.log(`KPI emails sent to ${resps.rows.length} responsibles`);
+//   } catch (err) {
+//     console.error("Scheduled email error:", err.message);
+//   } finally {
+//     cronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
+
+
+// ---------- Cron: weekly reports ----------
+// let reportCronRunning = false;
+// cron.schedule("21 17 * * *", async () => {
+//   const lockId = "weekly_kpi_report_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (reportCronRunning) return;
+//     reportCronRunning = true;
+//     const now = new Date();
+//     const year = now.getFullYear();
+//     const getWeekNumber = (date) => {
+//       const d = new Date(date); d.setHours(0, 0, 0, 0);
+//       d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//       const yearStart = new Date(d.getFullYear(), 0, 1);
+//       return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//     };
+//     const weekNumber = getWeekNumber(now);
+//     const previousWeek = `${year}-Week${weekNumber - 1}`;
+//     const resps = await pool.query(
+//       `SELECT DISTINCT r.responsible_id, r.email, r.name
+//        FROM public."Responsible" r JOIN public.kpi_values_hist26 h ON r.responsible_id = h.responsible_id
+//        WHERE r.email IS NOT NULL AND r.email != ''
+//        GROUP BY r.responsible_id, r.email, r.name HAVING COUNT(h.hist_id) > 0`
+//     );
+//     for (const [index, resp] of resps.rows.entries()) {
+//       try {
+//         await generateWeeklyReportEmail(resp.responsible_id, previousWeek);
+//         await new Promise(resolve => setTimeout(resolve, 1500));
+//       } catch (err) {
+//         console.error(`Failed for ${resp.name}:`, err.message);
+//       }
+//     }
+//     console.log(`Weekly reports sent`);
+//   } catch (error) {
+//     console.error("Report cron error:", error.message);
+//   } finally {
+//     reportCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
+
+// ============================================================
+// createIndividualKPIChart
+// ============================================================
+const createIndividualKPIChart = (kpi) => {
+  const target = kpi.target && kpi.target !== 'None' ? Number(kpi.target) : null;
+  const high_limit = kpi.high_limit && kpi.high_limit !== 'None' ? Number(kpi.high_limit) : null;
+  const low_limit = kpi.low_limit && kpi.low_limit !== 'None' ? Number(kpi.low_limit) : null;
+  const direction = inferKpiDirection(kpi);
+  const thresholdLineValues = getReadableThresholdLineValues(low_limit, target, high_limit);
+  const displayHigh = thresholdLineValues.displayHigh;
+  const displayLow = thresholdLineValues.displayLow;
+  const displayTarget = thresholdLineValues.displayTarget;
+
+  const weeklyData = kpi.weeklyData || { weeks: [], values: [] };
+  const weeks = weeklyData.weeks.slice(0, 12);
+  const values = weeklyData.values.slice(0, 12);
+
+  if (!values || values.length === 0) {
+    return `<table border="0" cellpadding="15" cellspacing="0" width="100%"
+              style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;margin-bottom:15px;">
+      <tr><td style="text-align:center;color:#999;font-size:14px;padding:20px;">
+        <div>No data for ${kpi.subtitle || kpi.title}</div>
+      </td></tr></table>`;
   }
 
-  const formatted = number.toFixed(1);
-  return formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted;
+  const fmt = (num) => {
+    if (num === null || num === undefined || isNaN(num)) return '0';
+    const w = Math.abs(num - Math.round(num)) < 0.0001;
+    if (num >= 1e6) return (num / 1e6).toFixed(w ? 0 : 1) + 'M';
+    if (num >= 1e3) return (num / 1e3).toFixed(w ? 0 : 1) + 'k';
+    if (w) return Math.round(num).toString();
+    if (num < 1) return num.toFixed(2);
+    return num.toFixed(1);
+  };
+  const avg = values.reduce((a, b) => a + b, 0) / values.length;
+  const currentValue = values[values.length - 1];
+
+  const currentStatus = getKpiStatus(currentValue, low_limit, high_limit, direction);
+  const trendColor = currentStatus.isGood === false ? '#dc2626' : '#22c55e';
+
+  const statusArrow = currentStatus.isGood === false
+    ? (direction === 'down' ? '\u2197' : '\u2198')
+    : (direction === 'down' ? '\u2198' : '\u2197');
+
+
+
+  const pointColors = values.map((v) =>
+    getKpiStatus(v, low_limit, high_limit, direction).isGood === false
+      ? '#dc2626'
+      : '#22c55e'
+  );
+
+  const weekLabels = weeks.map(w =>
+    typeof w === 'string' && w.includes('-Week')
+      ? `W${w.split('-Week')[1]}`
+      : w   // already a month label like "Feb 2026"
+  );
+
+
+  const datasets = [
+    {
+      label: (kpi.subtitle || kpi.title || '').substring(0, 40),
+      data: values,
+      borderColor: '#94a3b8',
+      borderWidth: 2,
+      lineTension: 0,
+      pointBackgroundColor: pointColors,
+      pointBorderColor: '#ffffff',
+      pointBorderWidth: 2,
+      pointRadius: 7,
+      fill: false
+    }
+  ];
+  const axisRange = getAutoChartAxisRange(values, displayLow, displayTarget, displayHigh);
+
+  if (high_limit !== null) {
+    datasets.push({
+      label: `High Limit (${fmt(high_limit)})`,
+      data: new Array(values.length).fill(displayHigh),
+      borderColor: '#f97316', borderWidth: 2, borderDash: [6, 4],
+      lineTension: 0, pointRadius: 0, fill: false
+    });
+  }
+
+  if (target !== null) {
+    datasets.push({
+      label: `Target (${fmt(target)})`,
+      data: new Array(values.length).fill(displayTarget),
+      borderColor: '#16a34a', borderWidth: 2.25,
+      lineTension: 0, pointRadius: 0, fill: false
+    });
+  }
+
+  if (low_limit !== null) {
+    datasets.push({
+      label: `Low Limit (${fmt(low_limit)})`,
+      data: new Array(values.length).fill(displayLow),
+      borderColor: '#dc2626', borderWidth: 2, borderDash: [6, 4],
+      lineTension: 0, pointRadius: 0, fill: false
+    });
+  }
+
+  const chartConfig = {
+    type: 'line',
+    data: { labels: weekLabels, datasets },
+    options: {
+      legend: { display: false },
+      scales: {
+        xAxes: [{ ticks: { fontSize: 10 }, gridLines: { color: 'rgba(0,0,0,0.05)' } }],
+        yAxes: [{
+          ticks: {
+            fontSize: 10,
+            beginAtZero: false,
+            min: axisRange.min,
+            max: axisRange.max
+          },
+          gridLines: { color: 'rgba(0,0,0,0.05)' }
+        }]
+      }
+    }
+  };
+
+  const chartUrl =
+    `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}` +
+    `&w=320&h=170&bkg=white`;
+
+  const badges = `
+    <table border="0" cellpadding="5" cellspacing="0" width="100%" style="margin-top:10px;">
+      <tr>
+        <td align="center" width="33%">${target !== null
+      ? `<div style="background:#e8f5e9;color:#2e7d32;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #a5d6a7;display:inline-block;">Target: ${target}</div>`
+      : `<div style="background:#f5f5f5;color:#9e9e9e;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #e0e0e0;display:inline-block;">Target: N/A</div>`}</td>
+        <td align="center" width="33%">${high_limit !== null
+      ? `<div style="background:#fff3e0;color:#e65100;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #ffb74d;display:inline-block;">High Limit: ${high_limit}</div>`
+      : `<div style="background:#f5f5f5;color:#9e9e9e;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #e0e0e0;display:inline-block;">High Limit: N/A</div>`}</td>
+        <td align="center" width="33%">${low_limit !== null
+      ? `<div style="background:#ffebee;color:#c62828;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #ef5350;display:inline-block;">Low Limit: ${low_limit}</div>`
+      : `<div style="background:#f5f5f5;color:#9e9e9e;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:700;border:1px solid #e0e0e0;display:inline-block;">Low Limit: N/A</div>`}</td>
+      </tr>
+    </table>`;
+  const thresholdReadabilityNote = thresholdLineValues.hasTightCluster ? `
+    <div style="margin-top:8px;text-align:center;font-size:10px;color:#64748b;line-height:1.4;">
+      Threshold lines are slightly spaced in the chart for readability. Exact values are shown above.
+    </div>
+  ` : '';
+
+  const hasComments = kpi.comments && kpi.comments.length > 0;
+  const correctiveActionDueDate = kpi.correctiveAction?.dueDate
+    ? formatInputDate(kpi.correctiveAction.dueDate)
+    : '';
+  const correctiveActionWeekLabel = kpi.correctiveAction?.week
+    ? weekToMonthLabel(kpi.correctiveAction.week) || String(kpi.correctiveAction.week).replace('2026-Week', 'Week ')
+    : '';
+  const hasCA = kpi.correctiveAction && (
+    kpi.correctiveAction.rootCause ||
+    kpi.correctiveAction.implementedSolution ||
+    kpi.correctiveAction.evidence ||
+    correctiveActionDueDate
+  );
+  const hasSide = hasComments || hasCA;
+  const leftWidth = hasSide ? '52%' : '100%';
+  const rightWidth = hasSide ? '48%' : '0%';
+
+  const caStatusBadge = hasCA && kpi.correctiveAction.status ? `
+    <span style="display:inline-block;font-size:9px;font-weight:700;padding:2px 8px;
+                 border-radius:10px;margin-left:6px;
+                 background:${kpi.correctiveAction.status === 'Waiting for validation' ? '#fff3e0' : '#ffebee'};
+                 color:${kpi.correctiveAction.status === 'Waiting for validation' ? '#e65100' : '#c62828'};
+                 border:1px solid ${kpi.correctiveAction.status === 'Waiting for validation' ? '#ffcc80' : '#ef9a9a'};">
+      ${kpi.correctiveAction.status}
+    </span>` : '';
+
+  const rightColumn = hasSide ? `
+    <td width="${rightWidth}" valign="top"
+        style="padding:18px 16px 18px 20px;
+               border-left:3px solid #e2e8f0;
+               background:#f8fafc;
+               border-radius:0 8px 8px 0;">
+
+      ${hasComments ? `
+      <div style="margin-bottom:${hasCA ? '14px' : '0'};">
+        <div style="font-size:11px;font-weight:700;color:#0078D7;
+                    margin-bottom:10px;padding-bottom:6px;
+                    border-bottom:1px solid #bfdbfe;letter-spacing:0.4px;">
+          COMMENTS
+        </div>
+        ${kpi.comments.map(c => `
+          <table border="0" cellpadding="10" cellspacing="0" width="100%"
+                 style="background:#eff6ff;border-radius:8px;
+                        border-left:4px solid #3b82f6;margin-bottom:8px;">
+            <tr><td style="font-size:10px;font-weight:800;color:#1d4ed8;
+                           text-transform:uppercase;letter-spacing:0.5px;
+                           padding-bottom:4px;">
+              ${weekToMonthLabel(c.week || '') || (c.week || '').replace('2026-Week', 'Week ')}
+            </td></tr>
+            <tr><td style="font-size:12px;color:#1e3a5f;line-height:1.5;">${c.text}</td></tr>
+          </table>`).join('')}
+      </div>` : ''}
+
+      ${hasCA ? `
+      <div>
+        <div style="font-size:11px;font-weight:700;color:#c62828;
+                    margin-bottom:10px;padding-bottom:6px;
+                    border-bottom:1px solid #fecaca;letter-spacing:0.4px;
+                    display:flex;align-items:center;">
+          CORRECTIVE ACTION ${caStatusBadge}
+        </div>
+
+        ${correctiveActionWeekLabel ? `
+        <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;
+                    letter-spacing:0.08em;margin:0 0 8px;">
+          Action Week: ${correctiveActionWeekLabel}
+        </div>` : ''}
+
+        ${kpi.correctiveAction.rootCause ? `
+        <table border="0" cellpadding="0" cellspacing="0" width="100%"
+               style="margin-bottom:8px;">
+          <tr><td style="padding:8px 10px;background:#fff5f5;border-radius:6px;
+                         border-left:3px solid #ef4444;">
+            <div style="font-size:9px;font-weight:800;color:#dc2626;
+                        text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+              Root Cause
+            </div>
+            <div style="font-size:11px;color:#374151;line-height:1.5;">
+              ${kpi.correctiveAction.rootCause}
+            </div>
+          </td></tr>
+        </table>` : ''}
+
+        ${kpi.correctiveAction.implementedSolution ? `
+        <table border="0" cellpadding="0" cellspacing="0" width="100%"
+               style="margin-bottom:8px;">
+          <tr><td style="padding:8px 10px;background:#fffbeb;border-radius:6px;
+                         border-left:3px solid #f59e0b;">
+            <div style="font-size:9px;font-weight:800;color:#d97706;
+                        text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+              Implemented Solution
+            </div>
+            <div style="font-size:11px;color:#374151;line-height:1.5;">
+              ${kpi.correctiveAction.implementedSolution}
+            </div>
+          </td></tr>
+        </table>` : ''}
+
+        ${correctiveActionDueDate ? `
+        <table border="0" cellpadding="0" cellspacing="0" width="100%"
+               style="margin-bottom:8px;">
+          <tr><td style="padding:8px 10px;background:#f5f3ff;border-radius:6px;
+                         border-left:3px solid #7c3aed;">
+            <div style="font-size:9px;font-weight:800;color:#6d28d9;
+                        text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+              Due Date
+            </div>
+            <div style="font-size:11px;color:#374151;line-height:1.5;">
+              ${correctiveActionDueDate}
+            </div>
+          </td></tr>
+        </table>` : ''}
+
+        ${kpi.correctiveAction.evidence ? `
+        <table border="0" cellpadding="0" cellspacing="0" width="100%">
+          <tr><td style="padding:8px 10px;background:#f0f9ff;border-radius:6px;
+                         border-left:3px solid #3b82f6;">
+            <div style="font-size:9px;font-weight:800;color:#2563eb;
+                        text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
+              Evidence
+            </div>
+            <div style="font-size:11px;color:#374151;line-height:1.5;">
+              ${kpi.correctiveAction.evidence}
+            </div>
+          </td></tr>
+        </table>` : ''}
+      </div>` : ''}
+
+    </td>` : '';
+
+  return `
+<table border="0" cellpadding="0" cellspacing="0" width="100%"
+       style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;
+              margin-bottom:15px;box-sizing:border-box;">
+  <tr><td style="padding:18px 20px;">
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:8px;">
+      <tr>
+        <td style="font-weight:700;font-size:13px;color:#333;padding-right:10px;">
+          ${kpi.subtitle || kpi.title}
+        </td>
+        <td align="center" valign="middle" style="padding:0 8px;">
+          <div style="background:#f1f5f9;border:1px solid #e2e8f0;padding:4px 10px;
+                      border-radius:8px;display:inline-block;">
+            <span style="font-size:11px;color:#475569;font-weight:600;">${kpi.responsible || 'N/A'}</span>
+          </div>
+        </td>
+        <td align="right" width="36">
+          <div style="background:${trendColor};color:#fff;padding:4px 8px;border-radius:6px;
+                      font-weight:700;font-size:12px;display:inline-block;">${statusArrow}</div>
+        </td>
+      </tr>
+    </table>
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:14px;">
+      <tr><td align="center">
+        <span style="background:#8b5cf6;color:white;padding:5px 12px;border-radius:20px;
+                     font-size:12px;font-weight:700;display:inline-block;">
+          Current: ${currentValue.toFixed(kpi.unit === '%' ? 1 : 2)} ${kpi.unit || ''}
+          &nbsp;|&nbsp;
+          Avg: ${avg.toFixed(kpi.unit === '%' ? 1 : 2)} ${kpi.unit || ''}
+        </span>
+      </td></tr>
+    </table>
+    <table border="0" cellpadding="0" cellspacing="0" width="100%">
+      <tr>
+        <td width="${leftWidth}" valign="top"
+            style="padding-right:${hasSide ? '20px' : '0'};">
+          ${badges}
+          ${thresholdReadabilityNote}
+          <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top:10px;">
+            <tr><td align="center">
+              <img src="${chartUrl}" width="320" height="170" alt="KPI trend chart"
+                   style="display:block;width:100%;max-width:320px;
+                          border:1px solid #f0f0f0;border-radius:6px;" />
+            </td></tr>
+          </table>
+          <table border="0" cellpadding="3" cellspacing="0" width="100%"
+                 style="margin-top:8px;border-top:1px solid #f0f0f0;">
+            <tr><td align="center">
+              <table border="0" cellpadding="0" cellspacing="6"><tr>
+                <td><table border="0" cellpadding="0" cellspacing="3"><tr>
+                  <td width="10" height="10" style="background:#22c55e;border-radius:50%;font-size:0;">&nbsp;</td>
+                  <td style="font-size:10px;color:#666;">Good direction</td>
+                </tr></table></td>
+                <td><table border="0" cellpadding="0" cellspacing="3"><tr>
+                  <td width="10" height="10" style="background:#dc2626;border-radius:50%;font-size:0;">&nbsp;</td>
+                  <td style="font-size:10px;color:#666;">Outside good direction</td>
+                </tr></table></td>
+              </tr></table>
+            </td></tr>
+          </table>
+        </td>
+        ${rightColumn}
+      </tr>
+    </table>
+  </td></tr>
+</table>`;
 };
 
-// ========== UPDATED getDepartmentKPIReport FUNCTION ==========
-// This function now includes target_value, minimum_value, and maximum_value from the Kpi table
+// ============================================================
+// generateManagerReportHtml
+// ============================================================
+const generateManagerReportHtml = (reportData) => {
+  const { plant, week, kpisByDepartment, stats } = reportData;
+  let kpiSections = '';
+  const departments = Object.keys(kpisByDepartment).sort();
+  departments.forEach(department => {
+    const kpis = kpisByDepartment[department];
+    if (kpis.length === 0) return;
+    const color = getDepartmentColor(department);
+    function createKPIRows(kpis) {
+      let rows = '';
+      for (let i = 0; i < kpis.length; i += 2) {
+        const rowKPIs = kpis.slice(i, i + 2);
+        rows += '<tr>';
+        rowKPIs.forEach(kpi => { rows += `<td width="50%" valign="top" style="padding:12px;">${createIndividualKPIChart(kpi)}</td>`; });
+        const empty = 2 - rowKPIs.length;
+        for (let j = 0; j < empty; j++) rows += '<td width="50%" style="padding:12px;"></td>';
+        rows += '</tr>';
+      }
+      return rows;
+    }
+    kpiSections += `
+      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom:40px;">
+        <tr><td>
+          <table border="0" cellpadding="0" cellspacing="0" width="100%"
+                 style="margin-bottom:20px;padding-bottom:10px;border-bottom:3px solid ${color};">
+            <tr><td style="padding:5px 0;">
+              <span style="font-size:20px;font-weight:700;color:#2c3e50;
+                           text-transform:uppercase;">${department}</span>
+              <span style="font-size:12px;color:#6c757d;background:#f8f9fa;
+                           padding:5px 14px;border-radius:12px;margin-left:10px;">${kpis.length} KPIs</span>
+            </td></tr>
+          </table>
+          <table border="0" cellpadding="10" cellspacing="0" width="100%">
+            ${createKPIRows(kpis)}
+          </table>
+        </td></tr>
+      </table>`;
+  });
+  return `<!DOCTYPE html><html>
+<head><meta charset="utf-8"><title>Plant Weekly KPI Dashboard</title>
+<style>body{margin:0;padding:0;font-family:Arial,sans-serif;background:#f8f9fa;}</style></head>
+<body>
+  <div style="padding:30px 20px;max-width:1400px;margin:0 auto;">
+    <div style="background:white;border-radius:12px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.05);margin-bottom:30px;">
+      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI CODIR DASHBOARD</h1>
+      <div style="font-size:14px;color:#6c757d;">
+        <strong>${plant.plant_name}</strong>  Week: <strong>${week.replace('2026-Week', 'W')}</strong>
+        Manager: <strong>${plant.manager || 'N/A'}</strong></div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:15px;
+                  background:#f8f9fa;padding:20px;border-radius:8px;margin-top:20px;">
+        <div style="text-align:center;">
+          <div style="font-size:28px;font-weight:800;color:#0078D7;">${stats.totalDepartments}</div>
+          <div style="font-size:12px;color:#6c757d;">Departments</div></div>
+        <div style="text-align:center;">
+          <div style="font-size:28px;font-weight:800;color:#28a745;">${stats.totalKPIs}</div>
+          <div style="font-size:12px;color:#6c757d;">Total KPIs</div></div>
+        <div style="text-align:center;">
+          <div style="font-size:28px;font-weight:800;color:#6f42c1;">${week.replace('2026-Week', 'W')}</div>
+          <div style="font-size:12px;color:#6c757d;">Current Week</div></div>
+      </div>
+    </div>
+    <div style="background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
+      ${kpiSections || '<div style="text-align:center;padding:60px;color:#6c757d;">No KPI data available</div>'}
+    </div>
+    <div style="background:#2c3e50;color:white;padding:25px;border-radius:12px;text-align:center;margin-top:30px;">
+      <div style="font-size:16px;font-weight:600;margin-bottom:10px;">AVOCarbon Plant Analytics</div>
+      <div style="font-size:13px;opacity:0.8;">Weekly KPI Performance Monitoring</div>
+    </div>
+  </div>
+</body></html>`;
+};
+
+const getDepartmentColor = (departmentName) => {
+  if (!departmentName) return '#6c757d';
+  if (departmentName.includes('Sales')) return '#667eea';
+  if (departmentName.includes('Production')) return '#4facfe';
+  if (departmentName.includes('Quality')) return '#43e97b';
+  if (departmentName.includes('VOH')) return '#909d6f';
+  if (departmentName.includes('Engineering')) return '#36a07b';
+  if (departmentName.includes('Human resources')) return '#78d69a';
+  if (departmentName.includes('Stocks')) return '#6a772a';
+  if (departmentName.includes('AR/AP')) return '#96ce25';
+  if (departmentName.includes('Cash')) return '#54591b';
+  const colorMap = {
+    'Production': '#667eea', 'Quality': '#f093fb', 'Maintenance': '#4facfe',
+    'Safety': '#43e97b', 'Operations': '#fa709a', 'Engineering': '#30cfd0',
+    'Supply-chain': '#f6d365', 'Administration': '#a8edea', 'Finance': '#f093fb',
+    'HR': '#4facfe', 'IT': '#667eea', 'Sales': '#43e97b', 'Other': '#6c757d'
+  };
+  return colorMap[departmentName] || '#6c757d';
+};
+
+// ---------- KPI Trends page ----------
+app.get("/kpi-trends", async (req, res) => {
+  try {
+    const { responsible_id } = req.query;
+    const resResp = await pool.query(
+      `SELECT r.*, p.name AS plant_name, d.name AS department_name
+       FROM public."Responsible" r JOIN public."Plant" p ON r.plant_id = p.plant_id
+       JOIN public."Department" d ON r.department_id = d.department_id
+       WHERE r.responsible_id = $1`, [responsible_id]);
+    const responsible = resResp.rows[0];
+    if (!responsible) throw new Error("Responsible not found");
+
+    const historyRes = await pool.query(
+      `WITH KPIHistory AS (
+         SELECT h.kpi_id, h.week, h.new_value, h.updated_at, h.comment,
+                ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+                ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
+         FROM public.kpi_values_hist26 h
+         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+         LEFT JOIN public.kpi_values kv
+           ON kv.kpi_values_id = h.kpi_values_id
+         LEFT JOIN public.responsible_kpis rk
+           ON rk.responsible_kpi_id = kv.responsible_kpi_id
+         WHERE h.responsible_id = $1
+           AND h.new_value IS NOT NULL AND h.new_value != ''
+           AND h.new_value ~ '^[0-9.]+$'
+       )
+       SELECT * FROM KPIHistory WHERE rn = 1
+       ORDER BY kpi_id, CAST(SPLIT_PART(week, 'Week', 2) AS INTEGER)`,
+      [responsible_id]
+    );
+
+    if (!historyRes.rows.length) {
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+        <body style="font-family:'Inter',sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);
+          min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px;margin:0;">
+          <div style="background:rgba(255,255,255,0.95);border-radius:24px;padding:60px 40px;
+                      text-align:center;max-width:500px;">
+            <h1 style="color:#2c3e50;font-size:28px;">No KPI Trends Available</h1>
+            <p style="color:#666;font-size:16px;">Start filling KPI forms to see trend charts.</p>
+            <a href="/form?responsible_id=${responsible_id}&week=${getCurrentWeek()}"
+               style="display:inline-block;margin-top:20px;padding:15px 30px;
+                      background:linear-gradient(135deg,#667eea,#764ba2);color:white;
+                      text-decoration:none;border-radius:12px;font-weight:600;">
+              Start Filling KPIs</a>
+          </div>
+        </body></html>`);
+    }
+
+    const kpiData = processKPIChartData(historyRes.rows);
+    const html = generateTrendsDashboardHTML(responsible, kpiData);
+    res.send(html);
+  } catch (err) {
+    console.error("KPI Trends error:", err);
+    res.status(500).send(createErrorHTML(err.message));
+  }
+});
+
+function processKPIChartData(rows) {
+  const kpis = new Map();
+  const weeksSet = new Set();
+
+  rows.forEach(row => {
+    const kpiId = row.kpi_id;
+    if (!kpis.has(kpiId)) {
+      kpis.set(kpiId, {
+        id: kpiId, title: row.indicator_title || row.indicator_sub_title || 'Untitled KPI', subtitle: row.indicator_sub_title,
+        unit: row.unit || '',
+        target: row.target && row.target !== 'None' ? parseFloat(row.target) : null,
+        direction: inferKpiDirection(row),
+        min: row.min && row.min !== 'None' ? parseFloat(row.min) : null,
+        max: row.max && row.max !== 'None' ? parseFloat(row.max) : null,
+        high_limit: row.high_limit && row.high_limit !== 'None' ? parseFloat(row.high_limit) : null,
+        low_limit: row.low_limit && row.low_limit !== 'None' ? parseFloat(row.low_limit) : null,
+        tolerance_type: row.tolerance_type,
+        up_tolerance: row.up_tolerance, low_tolerance: row.low_tolerance,
+        values: [], weeks: [], colors: [], comments: []
+      });
+    }
+    const value = parseFloat(row.new_value);
+    const kpi = kpis.get(kpiId);
+    kpi.values.push(value);
+    kpi.weeks.push(row.week);
+    if (row.comment && row.comment.trim()) kpi.comments.push({ week: row.week, text: row.comment, date: row.updated_at });
+    kpi.colors.push(getDotColor(value, kpi.low_limit, kpi.high_limit, kpi.direction));
+    weeksSet.add(row.week);
+  });
+
+  const allWeeks = Array.from(weeksSet).sort((a, b) => {
+    const [ya, wa] = a.includes('Week') ? [parseInt(a.split('-Week')[0]), parseInt(a.split('-Week')[1])] : [0, parseInt(a.replace('Week', ''))];
+    const [yb, wb] = b.includes('Week') ? [parseInt(b.split('-Week')[0]), parseInt(b.split('-Week')[1])] : [0, parseInt(b.replace('Week', ''))];
+    return ya !== yb ? ya - yb : wa - wb;
+  });
+
+  for (const [, kpi] of kpis) {
+    const vals = kpi.values.filter(v => !isNaN(v) && v > 0);
+    if (vals.length === 0) continue;
+    kpi.average = vals.reduce((a, b) => a + b, 0) / vals.length;
+    kpi.maxValue = Math.max(...vals);
+    kpi.minValue = Math.min(...vals);
+    if (vals.length >= 2) {
+      const cur = vals[vals.length - 1], prev = vals[vals.length - 2];
+      kpi.trend = ((cur - prev) / prev) * 100;
+      kpi.trendIcon = cur > prev ? '\u2197' : cur < prev ? '\u2198' : '\u2192';
+      kpi.trendColor = cur > prev ? '#10b981' : cur < prev ? '#ef4444' : '#6b7280';
+    } else { kpi.trend = 0; kpi.trendIcon = '\u2192'; kpi.trendColor = '#6b7280'; }
+    if (kpi.low_limit !== null || kpi.high_limit !== null) {
+      const latest = vals[vals.length - 1];
+      kpi.achievementVsLimit = !needsCorrectiveAction(latest, kpi.low_limit, kpi.high_limit, kpi.direction);
+      kpi.achievementColor = getDotColor(latest, kpi.low_limit, kpi.high_limit, kpi.direction);
+    }
+  }
+
+  return { kpis: Array.from(kpis.values()), allWeeks, totalKPIs: kpis.size, totalWeeks: allWeeks.length };
+}
+
+function generateTrendsDashboardHTML(responsible, kpiData) {
+  const { kpis, allWeeks, totalKPIs, totalWeeks } = kpiData;
+  return `<!DOCTYPE html><html>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>KPI Trends - ${responsible.name}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:'Segoe UI',sans-serif;background:linear-gradient(rgba(0,0,0,0.7),rgba(0,0,0,0.7)),
+      url('https://images.unsplash.com/photo-1542744095-fcf48d80b0fd?w=1920') center/cover fixed;
+      color:#fff;min-height:100vh;}
+    .container{max-width:1400px;margin:0 auto;padding:20px;}
+    .dashboard-header{background:rgba(31,41,55,0.95);border:1px solid rgba(255,255,255,0.1);
+      backdrop-filter:blur(10px);border-radius:24px;padding:40px;margin-bottom:30px;}
+    .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-top:30px;}
+    .stat-card{background:rgba(255,255,255,0.1);border-radius:16px;padding:20px;border:1px solid rgba(255,255,255,0.2);}
+    .stat-value{font-size:32px;font-weight:700;margin-bottom:5px;}
+    .stat-label{font-size:14px;opacity:0.8;text-transform:uppercase;letter-spacing:0.5px;}
+    .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(600px,1fr));gap:30px;margin-bottom:40px;}
+    @media(max-width:1300px){.kpi-grid{grid-template-columns:1fr;}}
+    .kpi-card{background:rgba(255,255,255,0.95);color:#1f2937;border-radius:20px;padding:30px;
+      border:1px solid rgba(255,255,255,0.2);transition:all 0.3s ease;}
+    .kpi-card:hover{transform:translateY(-5px);box-shadow:0 20px 40px rgba(0,0,0,0.3);}
+    .kpi-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:25px;}
+    .chart-container{height:300px;margin:25px 0;position:relative;}
+    .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-top:25px;}
+    .stat-box{background:#f9fafb;border-radius:12px;padding:15px;text-align:center;border:1px solid #e5e7eb;}
+    .stat-box .label{font-size:12px;color:#6b7280;margin-bottom:5px;text-transform:uppercase;}
+    .stat-box .value{font-size:20px;font-weight:700;color:#111827;}
+    .footer{text-align:center;margin-top:50px;padding:30px;border-top:1px solid rgba(255,255,255,0.1);}
+    @media(max-width:768px){.kpi-grid{grid-template-columns:1fr;}.stats-row{grid-template-columns:repeat(2,1fr);}}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="dashboard-header">
+      <h1 style="font-size:36px;font-weight:800;color:#fff;margin-bottom:10px;">KPI Trends & Analytics</h1>
+      <p style="font-size:18px;opacity:0.9;margin-bottom:25px;">Performance metrics across all production weeks</p>
+      <div style="display:flex;gap:30px;flex-wrap:wrap;">
+        <div><div style="font-size:12px;opacity:0.6;margin-bottom:5px;">OPERATOR</div>
+          <div style="font-size:18px;font-weight:600;">${responsible.name}</div></div>
+        <div><div style="font-size:12px;opacity:0.6;margin-bottom:5px;">FACTORY</div>
+          <div style="font-size:18px;font-weight:600;">${responsible.plant_name}</div></div>
+        <div><div style="font-size:12px;opacity:0.6;margin-bottom:5px;">DEPARTMENT</div>
+          <div style="font-size:18px;font-weight:600;">${responsible.department_name}</div></div>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value" style="color:#60a5fa;">${totalKPIs}</div>
+          <div class="stat-label">Active KPIs</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:#34d399;">${totalWeeks}</div>
+          <div class="stat-label">Production Weeks</div></div>
+        <div class="stat-card">
+          <div class="stat-value" style="color:#fbbf24;">${kpis.reduce((acc, k) => acc + k.values.length, 0)}</div>
+          <div class="stat-label">Data Points</div></div>
+        <div class="stat-card">
+          <div class="stat-value" style="color:#f87171;">${kpis.filter(k => k.low_limit !== null).length}</div>
+          <div class="stat-label">KPIs with Limits</div></div>
+      </div>
+    </header>
+    <main>
+      <div class="kpi-grid">
+        ${kpis.map((kpi, index) => generateKPIChartHTML(kpi, index)).join('')}
+      </div>
+    </main>
+    <footer class="footer">
+      <p style="color:rgba(255,255,255,0.8);">AVOCarbon Industrial Analytics | ${new Date().getFullYear()}</p>
+    </footer>
+  </div>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      ${kpis.map((kpi, index) => initializeChartJS(kpi, index)).join('\n')}
+    });
+  </script>
+</body></html>`;
+}
+
+function generateKPIChartHTML(kpi, index) {
+  const chartId = `chart-${index}`;
+  return `
+    <div class="kpi-card">
+      <div class="kpi-header">
+        <div>
+          <h3 style="font-size:20px;font-weight:700;color:#111827;margin-bottom:5px;">${kpi.title}</h3>
+          ${kpi.subtitle ? `<p style="font-size:14px;color:#6b7280;">${kpi.subtitle}</p>` : ''}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          ${kpi.unit ? `<span style="padding:6px 12px;border-radius:20px;font-size:12px;
+            font-weight:600;background:#f3f4f6;color:#374151;">Unit: ${kpi.unit}</span>` : ''}
+          <span style="padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;
+            background:${kpi.trendColor}20;color:${kpi.trendColor};">
+            ${kpi.trendIcon} ${Math.abs(kpi.trend).toFixed(1)}%</span>
+        </div>
+      </div>
+      <div class="chart-container"><canvas id="${chartId}"></canvas></div>
+      
+      <!-- Three key metrics side by side - Target, High Limit, Low Limit -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:25px 0;">
+        <!-- Target Box -->
+        <div style="background:#f9fafb;border-radius:12px;padding:15px;text-align:center;border:1px solid #e5e7eb;">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:5px;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:4px;">
+            <span>Target</span>
+          </div>
+          <div style="font-size:24px;font-weight:700;color:#f97316;">
+            ${kpi.target !== null ? kpi.target.toFixed(2) : 'N/A'}
+          </div>
+        </div>
+        
+        <!-- High Limit Box -->
+        <div style="background:#f9fafb;border-radius:12px;padding:15px;text-align:center;border:1px solid #e5e7eb;">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:5px;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:4px;">
+            <span>High Limit</span>
+          </div>
+          <div style="font-size:24px;font-weight:700;color:#f97316;">
+            ${kpi.high_limit !== null ? kpi.high_limit.toFixed(2) : 'N/A'}
+          </div>
+        </div>
+        
+        <!-- Low Limit Box -->
+        <div style="background:#f9fafb;border-radius:12px;padding:15px;text-align:center;border:1px solid #e5e7eb;">
+          <div style="font-size:12px;color:#6b7280;margin-bottom:5px;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:4px;">
+            <span>Low Limit</span>
+          </div>
+          <div style="font-size:24px;font-weight:700;color:#ef4444;">
+            ${kpi.low_limit !== null ? kpi.low_limit.toFixed(2) : 'N/A'}
+          </div>
+        </div>
+      </div>
+      
+      <!-- Secondary stats row (Average and Trend) -->
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:15px;margin-bottom:25px;">
+        <div class="stat-box">
+          <div class="label">Average</div>
+          <div class="value" style="color:#3b82f6;">${kpi.average ? kpi.average.toFixed(2) : 'N/A'}</div>
+        </div>
+        <div class="stat-box">
+          <div class="label">Trend</div>
+          <div class="value" style="color:${kpi.trendColor};">${kpi.trendIcon} ${Math.abs(kpi.trend).toFixed(1)}%</div>
+        </div>
+      </div>
+      
+      <div style="display:flex;gap:15px;margin-top:15px;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:12px;height:12px;border-radius:50%;background:#22c55e;"></div>
+          <span style="font-size:12px;color:#6b7280;">Within good direction</span></div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:12px;height:12px;border-radius:50%;background:#ef4444;"></div>
+          <span style="font-size:12px;color:#6b7280;">Outside good direction</span></div>
+      </div>
+    </div>`;
+}
+
+function initializeChartJS(kpi, index) {
+  const chartId = `chart-${index}`;
+  const weekLabels = kpi.weeks.map(w =>
+    w.includes('Week') ? `W${w.split('-Week')[1] || w.replace('Week', '')}` : w
+  );
+  const lowLimit = kpi.low_limit != null ? parseFloat(kpi.low_limit) : null;
+  const highLimit = kpi.high_limit != null ? parseFloat(kpi.high_limit) : null;
+  const direction = kpi.direction === 'down' ? 'down' : 'up';
+  const axisRange = getAutoChartAxisRange(kpi.values, lowLimit, null, highLimit);
+
+  const pointColors = JSON.stringify(kpi.values.map((v) => {
+    const status = getKpiStatus(v, lowLimit, highLimit, direction);
+    if (status.isGood === null) return '#6b7280';
+    return status.isGood ? '#22c55e' : '#ef4444';
+  }));
+
+  const extraDatasets = [];
+  if (highLimit !== null) {
+    extraDatasets.push(`{
+      label: 'High Limit',
+      data: Array(${kpi.values.length}).fill(${highLimit}),
+      type: 'line', borderColor: '#f97316',
+      borderDash: [6,4], borderWidth: 2,
+      pointRadius: 0, fill: false, tension: 0, order: 1
+    }`);
+  }
+  if (lowLimit !== null) {
+    extraDatasets.push(`{
+      label: 'Low Limit',
+      data: Array(${kpi.values.length}).fill(${lowLimit}),
+      type: 'line', borderColor: '#ef4444',
+      borderDash: [6,4], borderWidth: 2,
+      pointRadius: 0, fill: false, tension: 0, order: 1
+    }`);
+  }
+
+  return `(function(){
+    const ctx${index} = document.getElementById('${chartId}').getContext('2d');
+    const pc${index}  = ${pointColors};
+    new Chart(ctx${index}, {
+      type: 'line',
+      data: {
+        labels: ${JSON.stringify(weekLabels)},
+        datasets: [
+          {
+            label: '${kpi.title}',
+            data: ${JSON.stringify(kpi.values)},
+            borderColor: '#94a3b8',
+            borderWidth: 2,
+            backgroundColor: pc${index},
+            pointBackgroundColor: pc${index},
+            pointBorderColor: '#ffffff',
+            pointBorderWidth: 2,
+            pointRadius: 9,
+            pointHoverRadius: 12,
+            showLine: true,
+            tension: 0,
+            fill: false,
+            order: 2
+          }
+          ${extraDatasets.length ? ',' + extraDatasets.join(',') : ''}
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'top', labels: { font: { size: 12 }, padding: 20, usePointStyle: true } },
+          tooltip: {
+            backgroundColor: 'rgba(31,41,55,0.9)',
+            padding: 12, cornerRadius: 8,
+            callbacks: {
+              label: function(ctx) {
+                if (ctx.dataset.label === 'High Limit') return 'High Limit: ' + ctx.parsed.y;
+                if (ctx.dataset.label === 'Low Limit')  return 'Low Limit: '  + ctx.parsed.y;
+                return '${kpi.unit ? kpi.unit + ': ' : ''}' + ctx.parsed.y.toFixed(2);
+              }
+            }
+          }
+        },
+        scales: {
+          x: { grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { font: { size: 11 } } },
+          y: { beginAtZero: false, min: ${axisRange.min}, max: ${axisRange.max}, grid: { color: 'rgba(0,0,0,0.05)' },
+               ticks: { font: { size: 11 },
+                  callback: function(v){ return v + '${kpi.unit ? ' ' + kpi.unit : ''}'; } } }
+        },
+        interaction: { intersect: false, mode: 'index' }
+      }
+    });
+  })();`;
+}
+
+function createErrorHTML(message) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+    <body style="font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#ef4444,#dc2626);
+      min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px;margin:0;">
+      <div style="background:rgba(255,255,255,0.95);border-radius:24px;padding:50px 40px;text-align:center;max-width:500px;">
+        <div style="font-size:72px;color:#ef4444;margin-bottom:30px;">âŒ</div>
+        <h1 style="color:#1f2937;font-size:28px;">Error Loading KPI Trends</h1>
+        <div style="color:#6b7280;padding:15px;background:#fef2f2;border-radius:12px;margin:20px 0;">${message}</div>
+        <a href="/" style="display:inline-block;padding:15px 30px;background:linear-gradient(135deg,#ef4444,#dc2626);
+          color:white;text-decoration:none;border-radius:12px;font-weight:600;">Return to Home</a>
+      </div>
+    </body></html>`;
+}
+
+const getPreviousWeek = (currentWeek) => {
+  const [yearStr, weekStr] = currentWeek.split('-Week');
+  let year = parseInt(yearStr), weekNumber = parseInt(weekStr) - 1;
+  if (weekNumber < 1) { year--; weekNumber = 52; }
+  return `${year}-Week${weekNumber}`;
+};
+
+const weekToMonthLabel = (weekStr) => {
+  const match = weekStr.match(/(\d{4})-Week(\d+)/);
+  if (!match) return weekStr;
+  const date = new Date(parseInt(match[1]), 0, 1 + (parseInt(match[2]) - 1) * 7);
+  return date.toLocaleString('en-US', { month: 'short', year: 'numeric' }); // "Feb 2026"
+};
+
 
 const getDepartmentKPIReport = async (plantId, week) => {
   try {
-    // 1. Get plant and manager info
     const plantRes = await pool.query(
-      `
-      SELECT p.plant_id, p.name AS plant_name, p.manager, p.manager_email
-      FROM public."Plant" p
-      WHERE p.plant_id = $1 AND p.manager_email IS NOT NULL
-      `,
+      `SELECT p.plant_id, p.name AS plant_name, p.manager, p.manager_email
+       FROM public."Plant" p WHERE p.plant_id = $1 AND p.manager_email IS NOT NULL`,
       [plantId]
     );
-
     const plant = plantRes.rows[0];
-    if (!plant || !plant.manager_email) {
-      return null;
-    }
-
-    // 2. Get KPIs with target, min, max values - UPDATED QUERY
-    // In getDepartmentKPIReport function, update the kpiRes query:
+    if (!plant || !plant.manager_email) return null;
 
     const kpiRes = await pool.query(
-      `
-WITH LatestKPIValues AS (
-  SELECT 
-    h.kpi_id,
-    h.responsible_id,
-    r.name AS responsible_name,
-    h.week,
-    h.new_value,
-    h.updated_at,
-    r.department_id,
-    d.name AS department_name,
-    k.indicator_title,
-    k.indicator_sub_title,
-    k.unit,
-    k.target_value,
-    k.minimum_value,
-    k.maximum_value,
-    ROW_NUMBER() OVER (
-      PARTITION BY h.kpi_id, h.responsible_id, h.week 
-      ORDER BY h.updated_at DESC
-    ) as rn
-  FROM public.kpi_values_hist26 h
-  JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-  JOIN public."Department" d ON r.department_id = d.department_id
-  JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-  WHERE r.plant_id = $1 
-    AND h.week = $2
-    AND h.new_value IS NOT NULL
-    AND h.new_value != ''
-    AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'  -- FIXED: Cast to text first
-)
-SELECT * FROM LatestKPIValues WHERE rn = 1
-ORDER BY indicator_title
-  `,
+      `WITH LatestKPIValues AS (
+         SELECT h.kpi_id, h.responsible_id, r.name AS responsible_name, h.week, h.new_value,
+                h.updated_at, h.comment, r.department_id, d.name AS department_name,
+                ${buildResolvedResponsibleKpiSelect("k", "rk", "kv")},
+                ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.responsible_id, h.week ORDER BY h.updated_at DESC) as rn
+         FROM public.kpi_values_hist26 h
+         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
+         JOIN public."Department" d ON r.department_id = d.department_id
+         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+         LEFT JOIN public.kpi_values kv
+           ON kv.kpi_values_id = h.kpi_values_id
+         LEFT JOIN public.responsible_kpis rk
+           ON rk.responsible_kpi_id = kv.responsible_kpi_id
+         WHERE r.plant_id = $1 AND h.week = $2
+           AND h.new_value IS NOT NULL AND h.new_value != ''
+           AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'
+       )
+       SELECT lkv.*,
+              ca.root_cause, ca.implemented_solution, ca.evidence, ca.status AS ca_status,
+              ca.due_date AS ca_due_date, ca.week AS ca_week
+       FROM LatestKPIValues lkv
+       LEFT JOIN LATERAL (
+         SELECT root_cause, implemented_solution, evidence, status, due_date, week
+         FROM public.corrective_actions
+         WHERE kpi_id = lkv.kpi_id
+           AND responsible_id = lkv.responsible_id
+         ORDER BY
+           CASE
+             WHEN week = lkv.week
+              AND (
+                NULLIF(BTRIM(COALESCE(root_cause, '')), '') IS NOT NULL
+                OR NULLIF(BTRIM(COALESCE(implemented_solution, '')), '') IS NOT NULL
+                OR NULLIF(BTRIM(COALESCE(evidence, '')), '') IS NOT NULL
+                OR due_date IS NOT NULL
+              ) THEN 0
+             WHEN
+                NULLIF(BTRIM(COALESCE(root_cause, '')), '') IS NOT NULL
+                OR NULLIF(BTRIM(COALESCE(implemented_solution, '')), '') IS NOT NULL
+                OR NULLIF(BTRIM(COALESCE(evidence, '')), '') IS NOT NULL
+                OR due_date IS NOT NULL THEN 1
+             WHEN week = lkv.week THEN 2
+             ELSE 3
+           END,
+           COALESCE(updated_date, created_date) DESC,
+           corrective_action_id DESC
+         LIMIT 1
+       ) ca ON TRUE
+       WHERE lkv.rn = 1 ORDER BY lkv.indicator_title`,
       [plantId, week]
     );
 
-    if (!kpiRes.rows.length) {
-      console.log(`No KPI data found for plant ${plantId} week ${week}`);
-      return null;
-    }
+    if (!kpiRes.rows.length) return null;
 
-    // 3. Get WEEKLY TREND DATA for ALL KPIs (last 12 weeks)
     const weeklyTrendRes = await pool.query(
-      `
-WITH WeeklyKPIData AS (
-  SELECT 
-    k.kpi_id,
-    k.indicator_title,
-    k.indicator_sub_title,
-    k.unit,
-    k.target_value,
-    k.minimum_value,
-    k.maximum_value,
-    h.week,
-    AVG(CAST(h.new_value AS NUMERIC)) as avg_value,
-    MIN(CAST(h.new_value AS NUMERIC)) as min_value,
-    MAX(CAST(h.new_value AS NUMERIC)) as max_value,
-    COUNT(*) as data_points,
-    CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
-  FROM public.kpi_values_hist26 h
-  JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-  JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-  WHERE r.plant_id = $1 
-    AND h.new_value IS NOT NULL
-    AND h.new_value != ''
-    AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'  -- FIXED: Cast to text first
-    AND h.week LIKE '2026-Week%'
-  GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, 
-           k.target_value, k.minimum_value, k.maximum_value, h.week
-)
-SELECT * FROM WeeklyKPIData
-ORDER BY kpi_id, week_num DESC
-LIMIT 500
-      `,
+      `WITH WeeklyKPIData AS (
+         SELECT k.kpi_id,
+                COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
+                COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
+                COALESCE(rk.unit, k.unit) AS unit,
+                ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
+                COALESCE(rk.min, k.min) AS min,
+                COALESCE(rk.max, k.max) AS max,
+                ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit,
+                ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
+                h.week, AVG(CAST(h.new_value AS NUMERIC)) as avg_value,
+                CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
+         FROM public.kpi_values_hist26 h
+         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
+         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
+         LEFT JOIN public.kpi_values kv
+           ON kv.kpi_values_id = h.kpi_values_id
+         LEFT JOIN public.responsible_kpis rk
+           ON rk.responsible_kpi_id = kv.responsible_kpi_id
+         WHERE r.plant_id = $1 AND h.new_value IS NOT NULL AND h.new_value != ''
+           AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$' AND h.week LIKE '2026-Week%'
+         GROUP BY k.kpi_id,
+                  COALESCE(rk.indicator_title, k.indicator_title),
+                  COALESCE(rk.indicator_sub_title, k.indicator_sub_title),
+                  COALESCE(rk.unit, k.unit),
+                  ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")},
+                  COALESCE(rk.min, k.min),
+                  COALESCE(rk.max, k.max),
+                  ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")},
+                  ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")},
+                  h.week
+       )
+       SELECT * FROM WeeklyKPIData ORDER BY kpi_id, week_num DESC LIMIT 500`,
       [plantId]
     );
 
-    // Helper function to extract department from indicator_title
-    const extractDepartmentFromTitle = (indicatorTitle) => {
-      if (!indicatorTitle) return 'Other';
-      if (indicatorTitle.includes('Actual - ')) {
-        const extracted = indicatorTitle.split('Actual - ')[1];
-        if (extracted.includes('/')) {
-          return extracted.split('/')[0].trim();
-        } else if (extracted.includes('(')) {
-          return extracted.split('(')[0].trim();
-        }
-        return extracted.trim();
+    const extractDept = (t) => {
+      if (!t) return 'Other';
+      if (t.includes('Actual - ')) {
+        const ex = t.split('Actual - ')[1];
+        if (ex.includes('/')) return ex.split('/')[0].trim();
+        if (ex.includes('(')) return ex.split('(')[0].trim();
+        return ex.trim();
       }
-      return indicatorTitle;
+      return t;
     };
 
-    // 4. Organize data by department
     const kpisByDepartment = {};
     const weeklyDataByKPI = {};
 
-    // First, organize weekly trend data
+    // Accumulate weekly values grouped into months
     weeklyTrendRes.rows.forEach(row => {
-      const kpiKey = `${row.kpi_id}_${row.indicator_title}`;
-      const derivedDept = extractDepartmentFromTitle(row.indicator_title);
+      const key = `${row.kpi_id}_${row.indicator_title}`;
+      const dept = extractDept(row.indicator_title);
+      const month = weekToMonthLabel(row.week); // e.g. "Feb 2026"
 
-      if (!weeklyDataByKPI[kpiKey]) {
-        weeklyDataByKPI[kpiKey] = {
-          kpi_id: row.kpi_id,
-          title: row.indicator_title,
-          subtitle: row.indicator_sub_title || '',
-          unit: row.unit || '',
-          target_value: row.target_value,
-          minimum_value: row.minimum_value,
-          maximum_value: row.maximum_value,
-          department: derivedDept,
-          weeks: [],
-          values: []
+      if (!weeklyDataByKPI[key]) {
+        weeklyDataByKPI[key] = {
+          kpi_id: row.kpi_id, title: row.indicator_title, subtitle: row.indicator_sub_title || '',
+          unit: row.unit || '', target: row.target, min: row.min, max: row.max,
+          high_limit: row.high_limit, low_limit: row.low_limit,
+          department: dept,
+          _monthlyMap: {},  // { "Feb 2026": { sum, count } }
+          weeks: [], values: []
         };
       }
 
-      weeklyDataByKPI[kpiKey].weeks.push(row.week);
-      weeklyDataByKPI[kpiKey].values.push(parseFloat(row.avg_value));
+      const mm = weeklyDataByKPI[key]._monthlyMap;
+      if (!mm[month]) mm[month] = { sum: 0, count: 0 };
+      mm[month].sum += parseFloat(row.avg_value);
+      mm[month].count += 1;
     });
 
-    // Then, organize current week data by extracted department
+    // Convert monthly map â†’ sorted arrays
+    Object.values(weeklyDataByKPI).forEach(kpi => {
+      const mm = kpi._monthlyMap || {};
+      const sortedMonths = Object.keys(mm).sort((a, b) => new Date(a) - new Date(b));
+      kpi.weeks = sortedMonths;                                        // ["Jan 2026", "Feb 2026", â€¦]
+      kpi.values = sortedMonths.map(m => mm[m].sum / mm[m].count);     // monthly average
+      delete kpi._monthlyMap;
+    });
+
     kpiRes.rows.forEach(row => {
-      const derivedDepartment = extractDepartmentFromTitle(row.indicator_title);
-      const kpiKey = `${row.kpi_id}_${row.indicator_title}`;
-
-      if (!kpisByDepartment[derivedDepartment]) {
-        kpisByDepartment[derivedDepartment] = [];
-      }
-
-      let existingKpi = kpisByDepartment[derivedDepartment].find(k =>
-        k.id === row.kpi_id && k.title === row.indicator_title
-      );
-
-      if (!existingKpi) {
-        const value = parseFloat(row.new_value);
-
-        existingKpi = {
-          id: row.kpi_id,
-          title: row.indicator_title,
-          subtitle: row.indicator_sub_title || '',
-          unit: row.unit || '',
-          target_value: row.target_value,
-          minimum_value: row.minimum_value,
-          maximum_value: row.maximum_value,
-          department: derivedDepartment,
-          originalDepartment: row.department_name,
-          currentValue: value,
-          weeklyData: weeklyDataByKPI[kpiKey] || { weeks: [], values: [] },
-          lastUpdated: row.updated_at,
-          responsible: row.responsible_name || ''
+      const dept = extractDept(row.indicator_title);
+      const key = `${row.kpi_id}_${row.indicator_title}`;
+      if (!kpisByDepartment[dept]) kpisByDepartment[dept] = [];
+      let existing = kpisByDepartment[dept].find(k => k.id === row.kpi_id && k.title === row.indicator_title);
+      if (!existing) {
+        existing = {
+          id: row.kpi_id, title: row.indicator_title, subtitle: row.indicator_sub_title || '',
+          unit: row.unit || '', target: row.target, min: row.min, max: row.max,
+          high_limit: row.high_limit, low_limit: row.low_limit,
+          department: dept, originalDepartment: row.department_name,
+          currentValue: parseFloat(row.new_value),
+          weeklyData: weeklyDataByKPI[key] || { weeks: [], values: [] },
+          lastUpdated: row.updated_at, responsible: row.responsible_name || '',
+          comments: [], correctiveAction: null
         };
-
-        kpisByDepartment[derivedDepartment].push(existingKpi);
+        kpisByDepartment[dept].push(existing);
+      }
+      if (row.comment && row.comment.trim())
+        existing.comments.push({ week: row.week, text: row.comment.trim() });
+      if (!existing.correctiveAction && (row.root_cause || row.implemented_solution || row.evidence || row.ca_due_date)) {
+        existing.correctiveAction = {
+          rootCause: (row.root_cause || '').trim(),
+          implementedSolution: (row.implemented_solution || '').trim(),
+          evidence: (row.evidence || '').trim(),
+          dueDate: row.ca_due_date || null,
+          week: row.ca_week || null,
+          status: row.ca_status || ''
+        };
       }
     });
 
-    // Sort departments alphabetically
-    const sortedDepartments = {};
-    Object.keys(kpisByDepartment)
-      .sort()
-      .forEach(dept => {
-        sortedDepartments[dept] = kpisByDepartment[dept];
-      });
+    const sortedDepts = {};
+    Object.keys(kpisByDepartment).sort().forEach(d => { sortedDepts[d] = kpisByDepartment[d]; });
 
     return {
-      plant: plant,
-      week: week,
-      kpisByDepartment: sortedDepartments,
+      plant, week, kpisByDepartment: sortedDepts,
       stats: {
-        totalDepartments: Object.keys(sortedDepartments).length,
-        totalKPIs: Object.values(sortedDepartments).reduce((sum, kpis) => sum + kpis.length, 0),
+        totalDepartments: Object.keys(sortedDepts).length,
+        totalKPIs: Object.values(sortedDepts).reduce((s, k) => s + k.length, 0),
         totalValues: kpiRes.rows.length
       }
     };
@@ -3809,1868 +13566,94 @@ LIMIT 500
     return null;
   }
 };
-// ========== UPDATED HTML GENERATION ==========
-const generateManagerReportHtml = (reportData) => {
-  const { plant, week, kpisByDepartment, stats } = reportData;
 
-  // Create KPI sections by department
-  let kpiSections = '';
-
-  // Get departments sorted alphabetically
-  const departments = Object.keys(kpisByDepartment).sort();
-
-  departments.forEach(department => {
-    const kpis = kpisByDepartment[department];
-    if (kpis.length === 0) return;
-
-    const color = getDepartmentColor(department);
-
-    kpiSections += `
-      <!-- Department Section -->
-      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 40px;">
-        <tr>
-          <td>
-            <!-- Department Header -->
-            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="
-              margin-bottom: 20px;
-              padding-bottom: 10px;
-              border-bottom: 3px solid ${color};
-            ">
-              <tr>
-                <td style="padding: 5px 0;">
-                  <table border="0" cellpadding="0" cellspacing="0">
-                 <tr>
-  <td style="padding: 5px 0;">
-    <table border="0" cellpadding="0" cellspacing="0">
-      <tr>
-        <td style="
-          width: 21px;
-          height: 14px;
-          background: ${color};
-          border-radius: 50%;
-        "></td>
-        <td width="10" style="width: 10px;"></td> <!-- Spacer cell -->
-        <td style="
-          font-size: 20px;
-          font-weight: 700;
-          color: #2c3e50;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-          padding-right: 10px;
-             ">${department}</td>
-             <td style="
-             font-size: 12px;
-             color: #6c757d;
-              background: #f8f9fa;
-              padding: 5px 14px;
-               border-radius: 12px;
-              font-weight: 600;
-              ">${kpis.length} KPIs</td>
-               </tr>
-              </table>
-                </td>
-                 </tr>
-                  </table>
-                </td>
-              </tr>
-            </table>
-            
-            <!-- KPI Cards Grid: 3 per row using table -->
-            <table border="0" cellpadding="10" cellspacing="0" width="100%">
-              ${createKPIRows(kpis)}
-            </table>
-          </td>
-        </tr>
-      </table>
-    `;
-  });
-
-  // Helper function to create KPI rows with 3 cards each
-  function createKPIRows(kpis) {
-    let rows = '';
-    for (let i = 0; i < kpis.length; i += 3) {
-      const rowKPIs = kpis.slice(i, i + 3);
-      // Add a border-bottom to all rows except the last one
-      const borderStyle = (i + 3 < kpis.length) ? 'border-bottom: 2px solid #e9ecef;' : '';
-      rows += `<tr style="${borderStyle}">`;
-
-      rowKPIs.forEach(kpi => {
-        rows += `<td width="33%" valign="top" style="padding: 20px 15px;">${createIndividualKPIChart(kpi)}</td>`;
-      });
-
-      // Fill empty cells
-      const emptyCells = 3 - rowKPIs.length;
-      for (let j = 0; j < emptyCells; j++) {
-        rows += '<td width="33%" style="padding: 20px 15px;"></td>';
-      }
-
-      rows += '</tr>';
-    }
-    return rows;
-  }
-
-  // Return complete HTML (ONCE - NOT DUPLICATED)
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Plant Weekly KPI Dashboard - ${plant.plant_name}</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-    
-    body {
-      margin: 0;
-      padding: 0;
-      font-family: 'Inter', Arial, sans-serif;
-      background: #f8f9fa;
-    }
-    
-    /* Responsive grid for smaller screens */
-    @media (max-width: 1200px) {
-      .kpi-grid {
-        grid-template-columns: repeat(2, 1fr) !important;
-      }
-    }
-    
-    @media (max-width: 768px) {
-      .kpi-grid {
-        grid-template-columns: 1fr !important;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div style="padding: 30px 20px; max-width: 1400px; margin: 0 auto;">
-    <!-- Header -->
-    <div style="
-      background: white;
-      border-radius: 12px;
-      padding: 30px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-      margin-bottom: 30px;
-    ">
-      <div style="
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        margin-bottom: 20px;
-      ">
-        <div>
-          <h1 style="
-            margin: 0 0 8px 0;
-            font-size: 28px;
-            font-weight: 800;
-            color: #2c3e50;
-            letter-spacing: -0.5px;
-          ">
-            📊 PLANT WEEKLY KPI DASHBOARD
-          </h1>
-          <div style="font-size: 14px; color: #6c757d;">
-            Plant: <strong style="color: #495057;">${plant.plant_name}</strong> • 
-            Week: <strong style="color: #495057;">${week.replace('2026-Week', 'W')}</strong> • 
-            Manager: <strong style="color: #495057;">${plant.manager || 'N/A'}</strong>
-          </div>
-          <div style="
-           margin-top: 6px;
-           font-size: 12.5px;
-           color: #6c757d;
-            ">
-           For any question, please contact 
-           <a href="mailto:taha.khiari@avocarbon.com"
-           style="color:#0078D7; text-decoration:none; font-weight:500;">
-           taha.khiari@avocarbon.com
-           </a>
-          </div>
-
-        </div>
-        
-        <div style="text-align: right;">
-          <div style="font-size: 13px; color: #6c757d; margin-bottom: 5px;">Updated</div>
-          <div style="font-size: 14px; font-weight: 600; color: #495057;">
-            ${new Date().toLocaleDateString('en-GB', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric'
-  })}
-          </div>
-        </div>
-      </div>
-      
-      <!-- Summary Stats -->
-      <div style="
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 15px;
-        background: #f8f9fa;
-        padding: 20px;
-        border-radius: 8px;
-      ">
-        <div style="text-align: center;">
-          <div style="
-            font-size: 28px;
-            font-weight: 800;
-            color: #0078D7;
-            margin-bottom: 5px;
-          ">${stats.totalDepartments}</div>
-          <div style="font-size: 12px; color: #6c757d; font-weight: 500;">Departments</div>
-        </div>
-        
-        <div style="text-align: center;">
-          <div style="
-            font-size: 28px;
-            font-weight: 800;
-            color: #28a745;
-            margin-bottom: 5px;
-          ">${stats.totalKPIs}</div>
-          <div style="font-size: 12px; color: #6c757d; font-weight: 500;">Total KPIs</div>
-        </div>
-        
-     
-        
-        <div style="text-align: center;">
-          <div style="
-            font-size: 28px;
-            font-weight: 800;
-            color: #6f42c1;
-            margin-bottom: 5px;
-          ">${week.replace('2026-Week', 'W')}</div>
-          <div style="font-size: 12px; color: #6c757d; font-weight: 500;">Current Week</div>
-        </div>
-      </div>
-    </div>
-    
-    <!-- KPI Sections by Department -->
-    <div style="
-      background: white;
-      padding: 30px;
-      border-radius: 12px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-    ">
-      ${kpiSections || '<div style="text-align: center; padding: 60px; color: #6c757d;">No KPI data available</div>'}
-    </div>
-    
-    <!-- Footer -->
-    <div style="
-      background: #2c3e50;
-      color: white;
-      padding: 25px;
-      border-radius: 12px;
-      text-align: center;
-      margin-top: 30px;
-    ">
-      <div style="margin-bottom: 20px;">
-        <div style="font-size: 16px; font-weight: 600; margin-bottom: 10px;">
-          AVOCarbon Plant Analytics
-        </div>
-        <div style="font-size: 13px; opacity: 0.8;">
-          Weekly KPI Performance Monitoring
-        </div>
-      </div>
-      
-      <div style="
-        display: flex;
-        justify-content: center;
-        gap: 30px;
-        flex-wrap: wrap;
-        border-top: 1px solid rgba(255,255,255,0.1);
-        padding-top: 20px;
-      ">
-        <div>
-          <div style="font-size: 11px; opacity: 0.6; margin-bottom: 5px;">Contact</div>
-          <div style="font-size: 13px;">
-            <a href="mailto:${plant.manager_email}" 
-               style="color: #4facfe; text-decoration: none;">${plant.manager_email}</a>
-          </div>
-        </div>
-        
-        <div>
-          <div style="font-size: 11px; opacity: 0.6; margin-bottom: 5px;">Week</div>
-          <div style="font-size: 13px; font-weight: 500;">
-            ${week.replace('2026-Week', 'Week ')}
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-  `;
-};
-
-
-
-// Helper function for department colors (unchanged)
-const getDepartmentColor = (departmentName) => {
-  // First, handle the extracted department names
-  if (departmentName.includes('Sales')) return '#667eea'; // Blue
-  if (departmentName.includes('Production')) return '#4facfe'; // Light Blue
-  if (departmentName.includes('Quality')) return '#43e97b'; // Green
-  if (departmentName.includes('VOH')) return '#909d6fff'; // Pink
-  if (departmentName.includes('Engineering')) return '#36a07bff'; // Pink
-  if (departmentName.includes('Human resources')) return '#78d69aff'; // Pink
-  if (departmentName.includes('Stocks')) return '#6a772aff'; // Pink
-  if (departmentName.includes('AR/AP')) return '#96ce25ff'; // Pink
-  if (departmentName.includes('Cash')) return '#54591bff'; // Pink
-  // Fallback to original mapping
-  const colorMap = {
-    'Production': '#667eea',
-    'Quality': '#f093fb',
-    'Maintenance': '#4facfe',
-    'Safety': '#43e97b',
-    'Operations': '#fa709a',
-    'Engineering': '#30cfd0',
-    'Supply-chain': '#f6d365',
-    'Administration': '#a8edea',
-    'Finance': '#f093fb',
-    'HR': '#4facfe',
-    'IT': '#667eea',
-    'Sales': '#43e97b',
-    'Other': '#6c757d'
-  };
-
-  return colorMap[departmentName] || '#6c757d';
-};
-// Helper function (unchanged)
-const getPreviousWeek = (currentWeek) => {
-  const [yearStr, weekStr] = currentWeek.split('-Week');
-  let year = parseInt(yearStr);
-  let weekNumber = parseInt(weekStr);
-
-  weekNumber -= 1;
-  if (weekNumber < 1) {
-    year -= 1;
-    weekNumber = 52;
-  }
-
-  return `${year}-Week${weekNumber}`;
-};
-
-const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
-  try {
-    // Get responsible info
-    const resResp = await pool.query(
-      `
-      SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1
-      `,
-      [responsibleId]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible) throw new Error(`Responsible ${responsibleId} not found`);
-
-    console.log(`Generating report for ${responsible.name}, week: ${reportWeek}`);
-
-    // Generate charts data with multiple weeks
-    const chartsData = await generateWeeklyReportData(responsibleId, reportWeek);
-
-    let chartsHtml = '';
-    let hasData = false;
-    let toleranceTypes = new Set();
-    let frequencies = new Set();
-
-    if (chartsData && chartsData.length > 0) {
-      hasData = true;
-      chartsData.forEach(chart => {
-        chartsHtml += generateVerticalBarChart(chart);
-      });
-    } else {
-      // Check if there's any data at all
-      const checkRes = await pool.query(
-        `SELECT COUNT(*) FROM public.kpi_values_hist26 WHERE responsible_id = $1`,
-        [responsibleId]
-      );
-
-      if (parseInt(checkRes.rows[0].count) === 0) {
-        chartsHtml = `
-          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
-            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📊</div>
-            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">No KPI Data Available</p>
-            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
-              Start filling your KPI forms to track your performance over time.
-            </p>
-            <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
-               style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
-                      background: #28a745; color: white; text-decoration: none; 
-                      border-radius: 6px; font-weight: 600; font-size: 14px;">
-              ✏️ Start Tracking KPIs
-            </a>
-          </div>
-        `;
-      } else {
-        chartsHtml = `
-          <div style="text-align: center; padding: 60px; background: #f8f9fa; border-radius: 12px; margin-bottom: 20px; border: 2px dashed #dee2e6;">
-            <div style="font-size: 48px; color: #adb5bd; margin-bottom: 20px;">📈</div>
-            <p style="color: #495057; margin: 0; font-size: 18px; font-weight: 500;">Insufficient Data</p>
-            <p style="color: #6c757d; margin: 10px 0 0 0; font-size: 14px;">
-              Fill your KPI form for week ${reportWeek} to generate performance charts.
-            </p>
-            <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${reportWeek}"
-               style="display: inline-block; margin-top: 20px; padding: 12px 24px; 
-                      background: #0078D7; color: white; text-decoration: none; 
-                      border-radius: 6px; font-weight: 600; font-size: 14px;">
-              ✏️ Fill KPI Form
-            </a>
-          </div>
-        `;
-      }
-    }
-
-
-
-    const emailHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>KPI Codir Report</title>
-  <style>
-    @media only screen and (max-width: 600px) {
-      .header-buttons {
-        flex-direction: column;
-        gap: 10px !important;
-      }
-      .view-history-btn {
-        width: 100% !important;
-        text-align: center !important;
-      }
-    }
-  </style>
-</head>
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background: #f4f6f9; line-height: 1.4;">
-  <!-- Simple container for Outlook -->
-  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background: #f4f6f9;">
- <tr>
-  <td align="center" style="padding: 20px;">
-    <!-- Header Content -->
-    <table border="0" cellpadding="0" cellspacing="0" width="100%">
-      <tr>
-        <td style="background: #0078D7; padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
-          <h1 style="margin: 0; color: white; font-size: 24px; font-weight: 600;">📊 KPI Performance Report</h1>
-        </td>
-      </tr>
-  
-    </table>
-  </td>
-</tr>
-          
-          <!-- Responsible Info -->
-          <tr>
-            <td style="padding: 25px 30px; border-bottom: 1px solid #e9ecef;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td width="33%" align="center" style="padding: 10px;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Responsible</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.name}</div>
-                  </td>
-                  <td width="34%" align="center" style="padding: 10px; border-left: 1px solid #e9ecef; border-right: 1px solid #e9ecef;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Group</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.plant_name}</div>
-                  </td>
-                  <td width="33%" align="center" style="padding: 10px;">
-                    <div style="font-size: 11px; color: #666; text-transform: uppercase; margin-bottom: 5px;">Department</div>
-                    <div style="font-size: 16px; font-weight: 600; color: #333;">${responsible.department_name}</div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          
-          <!-- KPI Summary Info -->
-          ${hasData ? `
-          <tr>
-            <td style="padding: 20px 30px; background: #f8f9fa; border-bottom: 1px solid #e9ecef;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td align="center" style="color: #666; font-size: 12px;">
-                    <p style="margin: 0 0 5px 0;">
-                      <strong>${chartsData ? chartsData.length : 0} KPIs Tracked</strong> | 
-      
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          ` : ''}
-          
-          <!-- Charts Section -->
-          <tr>
-            <td style="padding: 30px;">
-              ${chartsHtml}
-            </td>
-          </tr>
-          
-          <!-- Action Section -->
-          <tr>
-            <td style="padding: 20px 30px; background: #f8f9fa; border-top: 1px solid #e9ecef;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td align="center">
-                    <p style="margin: 15px 0 0 0; color: #666; font-size: 12px; text-align: center;">
-                      Click any button above to access different views of your KPI performance
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          
-          <!-- Footer -->
-          <tr>
-            <td style="padding: 20px 30px; background: #f8f9fa; border-top: 1px solid #e9ecef; border-radius: 0 0 8px 8px;">
-              <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                <tr>
-                  <td align="center" style="color: #666; font-size: 12px;">
-                    <p style="margin: 0 0 5px 0;">
-                      <strong>AVOCarbon KPI System</strong> | Automated Performance Report
-                    </p>
-                    <p style="margin: 0; font-size: 11px; color: #999;">
-                      Generated on ${new Date().toLocaleDateString('en-GB', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    })} • 
-                      Contact: <a href="mailto:administration.STS@avocarbon.com" 
-                                style="color: #0078D7; text-decoration: none;">administration.STS@avocarbon.com</a>
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-`;
-
-    // Send email
-    const transporter = createTransporter();
-    const mailOptions = {
-      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `📊 KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
-      html: emailHtml
-    };
-
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`✅ Weekly report sent to ${responsible.email} for week ${reportWeek}`);
-
-    return info;
-
-  } catch (error) {
-    console.error(`❌ Failed to send weekly report to responsible ID ${responsibleId}:`, error.message);
-    throw error;
-  }
-};
-
-// Email sender function (unchanged)
 const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
   try {
-    const prevWeek = getPreviousWeek(currentWeek);
-    const reportData = await getDepartmentKPIReport(plantId, prevWeek);
-
-    if (!reportData || reportData.stats.totalKPIs === 0) {
-      console.log(`⚠️ No department KPI data to send for plant ${plantId} week ${prevWeek}`);
-      return null;
-    }
+    const reportWeek = currentWeek;
+    const reportData = await getDepartmentKPIReport(plantId, reportWeek);
+    if (!reportData || reportData.stats.totalKPIs === 0) return null;
 
     const emailHtml = generateManagerReportHtml(reportData);
 
+    // â”€â”€ Generate plant-wide recommendations PDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    let pdfAttachment = null;
+    try {
+      console.log(`ðŸ“„ Generating plant-wide recommendations PDF for plant=${plantId}â€¦`);
+      const pdfBuffer = await generatePlantKPIRecommendationsPDFBuffer(pool, plantId, reportWeek);
+      if (pdfBuffer) {
+        const weekLabel = reportWeek.replace('2026-Week', 'Week_');
+        pdfAttachment = {
+          filename: `KPI_Recommendations_${reportData.plant.plant_name.replace(/ /g, '_')}_${weekLabel}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        };
+        console.log(`ðŸ“„ Plant PDF ready â€” ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
+      }
+    } catch (pdfErr) {
+      // Never block the main email if PDF generation fails
+      console.error(`Could not generate plant recommendations PDF:`, pdfErr.message);
+    }
+
+    // â”€â”€ Send email with optional PDF attachment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const transporter = createTransporter();
-    const mailOptions = {
+    await transporter.sendMail({
       from: '"AVOCarbon Plant Analytics" <administration.STS@avocarbon.com>',
       to: reportData.plant.manager_email,
-      subject: `📊 Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${prevWeek.replace('2026-Week', '')}`,
-      html: emailHtml
-    };
+      subject: `Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${reportWeek.replace('2026-Week', '')}`,
+      html: emailHtml,
+      attachments: pdfAttachment ? [pdfAttachment] : [],
+    });
 
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`✅ Weekly KPI report sent to ${reportData.plant.manager_email} for plant ${reportData.plant.plant_name} (Week ${prevWeek})`);
-
-    return info;
+    console.log(`KPI report${pdfAttachment ? ' + recommendations PDF' : ''} sent to ${reportData.plant.manager_email}`);
   } catch (error) {
-    console.error(`❌ Failed to send KPI report for plant ${plantId}:`, error.message);
-    return null;
+    console.error(`Failed to send report for plant ${plantId}:`, error.message);
   }
 };
-// ---------- Update Cron Job for Department Reports ----------
-// ---------- Schedule Department Reports ----------
 
-cron.schedule(
-  "00 11 * * 1", // Every day at 8:02 PM
-  async () => {
-    const lockId = 'department_report_job';
-    const lock = await acquireJobLock(lockId, 60); // 60 minute TTL
-
-    // Exit immediately if we didn't get the lock
-    if (!lock.acquired) {
-      console.log(`⏭️ [Department Report] Skipping - lock held by another instance`);
-      return;
-    }
-
-    try {
-      const now = new Date();
-
-      // Get week number
-      const getWeekNumber = (date) => {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-        const yearStart = new Date(d.getFullYear(), 0, 1);
-        const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-        return weekNo;
-      };
-
-      const weekNumber = getWeekNumber(now);
-      const currentWeek = `2026-Week${weekNumber}`;
-
-      console.log(`📊 [Department Report] Starting for week ${currentWeek}...`);
-
-      // Get all plants with managers
-      const plantsRes = await pool.query(`
-        SELECT plant_id, name, manager_email 
-        FROM public."Plant" 
-        WHERE manager_email IS NOT NULL AND manager_email != ''
-      `);
-
-      console.log(`📊 [Department Report] Found ${plantsRes.rows.length} plants with managers`);
-
-      const results = [];
-      for (const [index, plant] of plantsRes.rows.entries()) {
-        try {
-          console.log(`  🏭 [${index + 1}/${plantsRes.rows.length}] Processing ${plant.name}...`);
-          await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-          console.log(`  ✅ [${index + 1}/${plantsRes.rows.length}] Sent to ${plant.name}`);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'success'
-          });
-
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        } catch (err) {
-          console.error(`  ❌ [${index + 1}/${plantsRes.rows.length}] Failed for ${plant.name}:`, err.message);
-          results.push({
-            plant_id: plant.plant_id,
-            name: plant.name,
-            status: 'error',
-            message: err.message
-          });
-        }
-      }
-
-      const succeeded = results.filter(r => r.status === 'success').length;
-      console.log(`✅ [Department Report] Completed. Sent: ${succeeded}/${results.length}`);
-
-    } catch (error) {
-      console.error("❌ [Department Report] Error:", error.message);
-    } finally {
-      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis"
-  }
-);
-
-
-// ========== CORRECTIVE ACTION FORM PAGE ==========
-app.get("/corrective-action-form", async (req, res) => {
-  try {
-    const { responsible_id, kpi_id, week } = req.query;
-
-    const resResp = await pool.query(
-      `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
-      [responsible_id]
-    );
-
-    const responsible = resResp.rows[0];
-    if (!responsible) return res.status(404).send("Responsible not found");
-
-    const kpiResp = await pool.query(
-      `SELECT k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, k.target_value,
-              kv.value
-       FROM public."Kpi" k
-       LEFT JOIN public.kpi_values kv ON k.kpi_id = kv.kpi_id 
-       WHERE k.kpi_id = $1 AND kv.responsible_id = $2 AND kv.week = $3`,
-      [kpi_id, responsible_id, week]
-    );
-
-    const kpi = kpiResp.rows[0];
-    if (!kpi) return res.status(404).send("KPI not found");
-
-    const existingCA = await pool.query(
-      `SELECT * FROM public.corrective_actions
-       WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3
-       ORDER BY created_date DESC LIMIT 1`,
-      [responsible_id, kpi_id, week]
-    );
-
-    const existingData = existingCA.rows[0] || {};
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Corrective Action Form</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }
-          .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }
-          .header { background: linear-gradient(135deg, #d32f2f 0%, #f44336 100%); color: white; padding: 25px; text-align: center; }
-          .header h1 { margin: 0; font-size: 24px; font-weight: 600; }
-          .alert-badge { background: rgba(255,255,255,0.2); display: inline-block; padding: 8px 16px; border-radius: 20px; margin-top: 10px; font-size: 13px; }
-          .form-section { padding: 30px; }
-          .info-box { background: #fff3e0; border-left: 4px solid #ff9800; padding: 20px; margin-bottom: 25px; border-radius: 4px; }
-          .info-row { display: flex; margin-bottom: 12px; font-size: 14px; }
-          .info-label { font-weight: 600; width: 140px; color: #333; }
-          .info-value { flex: 1; color: #666; }
-          .performance-box { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
-          .perf-item { text-align: center; padding: 15px; background: #f8f9fa; border-radius: 6px; }
-          .perf-label { font-size: 11px; color: #666; margin-bottom: 8px; text-transform: uppercase; }
-          .perf-value { font-size: 24px; font-weight: 700; }
-          .perf-value.current { color: #d32f2f; }
-          .perf-value.target_value { color: #4caf50; }
-          .perf-value.gap { color: #ff9800; }
-          .form-group { margin-bottom: 25px; }
-          label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; font-size: 14px; }
-          label .required { color: #d32f2f; margin-left: 4px; }
-          textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; font-family: 'Segoe UI', sans-serif; box-sizing: border-box; min-height: 100px; resize: vertical; }
-          textarea:focus { border-color: #d32f2f; outline: none; box-shadow: 0 0 0 2px rgba(211,47,47,0.1); }
-          .help-text { font-size: 12px; color: #666; margin-top: 5px; font-style: italic; }
-          .submit-btn { background: #d32f2f; color: white; border: none; padding: 14px 30px; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; }
-          .submit-btn:hover { background: #b71c1c; }
-          .status-badge { display: inline-block; padding: 6px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-          .status-open { background: #ffebee; color: #c62828; }
-          .status-completed { background: #e8f5e9; color: #2e7d32; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <div style="font-size: 40px;margin-bottom:10px;">⚠️</div>
-            <h1>Corrective Action Form</h1>
-            <div class="alert-badge">Week ${week} - Performance Below target_value</div>
-          </div>
-
-          <div class="form-section">
-            <div class="info-box">
-              <div class="info-row">
-                <div class="info-label">Responsible:</div>
-                <div class="info-value">${responsible.name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Plant:</div>
-                <div class="info-value">${responsible.plant_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">Department:</div>
-                <div class="info-value">${responsible.department_name}</div>
-              </div>
-              <div class="info-row">
-                <div class="info-label">KPI:</div>
-                <div class="info-value">${kpi.indicator_title}</div>
-              </div>
-            </div>
-
-            <div class="performance-box">
-              <div class="perf-item">
-                <div class="perf-label">Current Value</div>
-                <div class="perf-value current">${kpi.value || '0'}${kpi.unit || ''}</div>
-              </div>
-              <div class="perf-item">
-                <div class="perf-label">target_value</div>
-                <div class="perf-value target_value">${kpi.target_value || 'N/A'}${kpi.unit || ''}</div>
-              </div>
-              <div class="perf-item">
-                <div class="perf-label">Gap</div>
-                <div class="perf-value gap">
-                  ${kpi.target_value ? (parseFloat(kpi.target_value) - parseFloat(kpi.value || 0)).toFixed(2) : 'N/A'}${kpi.unit || ''}
-                </div>
-              </div>
-            </div>
-
-            ${existingData.corrective_action_id ? `
-            <div style="background:#e3f2fd;padding:15px;border-radius:6px;margin-bottom:20px;">
-              <strong>Status:</strong> 
-              <span class="status-badge status-${existingData.status.toLowerCase()}">${existingData.status}</span>
-              <div style="font-size:12px;color:#666;margin-top:8px;">
-                Last updated: ${new Date(existingData.updated_date).toLocaleString()}
-              </div>
-            </div>
-            ` : ''}
-
-            <form action="/submit-corrective-action" method="POST">
-              <input type="hidden" name="responsible_id" value="${responsible_id}">
-              <input type="hidden" name="kpi_id" value="${kpi_id}">
-              <input type="hidden" name="week" value="${week}">
-              ${existingData.corrective_action_id ?
-        `<input type="hidden" name="corrective_action_id" value="${existingData.corrective_action_id}">`
-        : ''}
-
-              <div class="form-group">
-                <label>Root Cause Analysis<span class="required">*</span></label>
-                <textarea name="root_cause" required placeholder="Describe the root cause of the performance gap...">${existingData.root_cause || ''}</textarea>
-                <div class="help-text">Use the 5 Whys technique or fishbone diagram to identify the root cause</div>
-              </div>
-
-              <div class="form-group">
-                <label>Implemented Solution<span class="required">*</span></label>
-                <textarea name="implemented_solution" required placeholder="Describe the corrective actions taken...">${existingData.implemented_solution || ''}</textarea>
-                <div class="help-text">Detail the specific actions, responsibilities, and timeline</div>
-              </div>
-
-              <div class="form-group">
-                <label>Evidence of Improvement<span class="required">*</span></label>
-                <textarea name="evidence" required placeholder="Provide evidence that the solution is effective...">${existingData.evidence || ''}</textarea>
-                <div class="help-text">Include data, observations, or metrics showing improvement</div>
-              </div>
-
-              <button type="submit" class="submit-btn">
-                ${existingData.corrective_action_id ? '✓ Update' : '📝 Submit'} Corrective Action
-              </button>
-            </form>
-          </div>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("Error loading corrective action form:", err);
-    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
-  }
-});
-
-// ========== SUBMIT CORRECTIVE ACTION ==========
-app.post("/submit-corrective-action", async (req, res) => {
-  try {
-    const {
-      responsible_id, kpi_id, week,
-      root_cause, implemented_solution, evidence,
-      corrective_action_id
-    } = req.body;
-
-    if (corrective_action_id) {
-      await pool.query(
-        `UPDATE public.corrective_actions
-         SET root_cause = $1, implemented_solution = $2, evidence = $3,
-             status = 'Completed', updated_date = NOW()
-         WHERE corrective_action_id = $4`,
-        [root_cause, implemented_solution, evidence, corrective_action_id]
-      );
-    } else {
-      await pool.query(
-        `INSERT INTO public.corrective_actions 
-         (responsible_id, kpi_id, week, root_cause, implemented_solution, evidence, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'Completed')`,
-        [responsible_id, kpi_id, week, root_cause, implemented_solution, evidence]
-      );
-    }
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Corrective Action Submitted</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-          .success-container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
-          h1 { color: #4caf50; font-size: 28px; margin-bottom: 15px; }
-          p { font-size: 16px; color: #333; margin-bottom: 25px; line-height: 1.6; }
-          a { display: inline-block; padding: 12px 25px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 5px; }
-          a:hover { background: #005ea6; }
-        </style>
-      </head>
-      <body>
-        <div class="success-container">
-          <h1>✅ Corrective Action Submitted!</h1>
-          <p>Your corrective action has been successfully recorded for week ${week}.</p>
-          <a href="/dashboard?responsible_id=${responsible_id}">Go to Dashboard</a>
-          <a href="/corrective-actions-list?responsible_id=${responsible_id}">View All Actions</a>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("Error submitting corrective action:", err);
-    res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
-  }
-});
-
-// ========== VIEW CORRECTIVE ACTIONS LIST ==========
-app.get("/corrective-actions-list", async (req, res) => {
-  try {
-    const { responsible_id } = req.query;
-
-    const actionsRes = await pool.query(
-      `SELECT ca.*, k.indicator_title, k.indicator_sub_title, k.unit
-      FROM public.corrective_actions ca
-      JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
-      WHERE ca.responsible_id = $1
-      ORDER BY ca.created_date DESC`,
-      [responsible_id]
-    );
-
-    const actions = actionsRes.rows;
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Corrective Actions History</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }
-          .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          h1 { color: #0078D7; margin-bottom: 25px; }
-          table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-          th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
-          th { background: #0078D7; color: white; font-weight: 600; }
-          tr:nth-child(even) { background: #f8f9fa; }
-          .status-badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-          .status-open { background: #ffebee; color: #c62828; }
-          .status-completed { background: #e8f5e9; color: #2e7d32; }
-          .action-link { color: #0078D7; text-decoration: none; font-weight: 600; }
-          .action-link:hover { text-decoration: underline; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>📋 Corrective Actions History</h1>
-          <table>
-            <thead>
-              <tr>
-                <th>Week</th>
-                <th>KPI</th>
-                <th>Status</th>
-                <th>Created</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${actions.length === 0 ?
-        '<tr><td colspan="5" style="text-align:center;padding:40px;color:#999;">No corrective actions found</td></tr>'
-        :
-        actions.map(action => `
-                  <tr>
-                    <td>${action.week}</td>
-                    <td>
-                      <strong>${action.indicator_title}</strong>
-                      ${action.indicator_sub_title ? `<br><small>${action.indicator_sub_title}</small>` : ''}
-                    </td>
-                    <td>
-                      <span class="status-badge status-${action.status.toLowerCase()}">
-                        ${action.status}
-                      </span>
-                    </td>
-                    <td>${new Date(action.created_date).toLocaleDateString()}</td>
-                    <td>
-                      <a href="/corrective-action-form?responsible_id=${responsible_id}&kpi_id=${action.kpi_id}&week=${action.week}" class="action-link">
-                        ${action.status === 'Open' ? 'Complete' : 'View'}
-                      </a>
-                    </td>
-                  </tr>`
-        ).join('')}
-            </tbody>
-          </table>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("Error loading corrective actions list:", err);
-    res.status(500).send(`<p style="color:red;">Error: ${err.message}</p>`);
-  }
-});
-
-
-//endppoints tree kpi 
-// ========== PLANT HIERARCHY APIs ==========
-
-// 1. Get all root plants (plants without parent/owner)
-// 1. Get all root plants (plants without parent/owner) - UPDATED
-app.get('/api/plants/roots', async (req, res) => {
-  try {
-    const result = await pool.query(`
-            SELECT 
-                p.plant_id,
-                p.name,
-                p.manager,
-                p.manager_email,
-                p.created_at,
-                -- Count responsible persons
-                COUNT(DISTINCT r.responsible_id) as responsible_count,
-                -- Count child plants
-                COUNT(DISTINCT c.plant_id) as child_plant_count,
-                -- Count total KPIs for all children
-                COALESCE(
-                    (SELECT COUNT(DISTINCT kv.kpi_id)
-                     FROM "Plant" p2
-                     LEFT JOIN "Responsible" r2 ON r2.plant_id = p2.plant_id
-                     LEFT JOIN kpi_values kv ON kv.responsible_id = r2.responsible_id
-                     WHERE p2.parent_id = p.plant_id
-                     AND kv.kpi_id IS NOT NULL),
-                    0
-                ) as total_child_kpis
-            FROM "Plant" p
-            LEFT JOIN "Responsible" r ON r.plant_id = p.plant_id
-            LEFT JOIN "Plant" c ON c.parent_id = p.plant_id
-            WHERE p.parent_id IS NULL
-            GROUP BY p.plant_id, p.name, p.manager, p.manager_email, p.created_at
-            ORDER BY p.name
-        `);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching root plants:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-// 2. Get child plants for a parent plant
-// Update your SQL query to include has_children flag:
-app.get('/api/plants/:plantId/children', async (req, res) => {
-  try {
-    const { plantId } = req.params;
-    const result = await pool.query(`
-            SELECT 
-                p.plant_id,
-                p.name,
-                p.manager,
-                p.manager_email,
-                p.created_at,
-                p.parent_id,
-                -- Check if this plant has children
-                EXISTS(
-                    SELECT 1 FROM "Plant" c 
-                    WHERE c.parent_id = p.plant_id
-                ) as has_children,
-                COUNT(DISTINCT r.responsible_id) as responsible_count,
-                -- Only count KPIs if no children
-                CASE WHEN EXISTS(
-                    SELECT 1 FROM "Plant" c WHERE c.parent_id = p.plant_id
-                ) THEN 0
-                ELSE COALESCE(
-                    (SELECT COUNT(DISTINCT kv.kpi_id)
-                     FROM "Responsible" r2
-                     LEFT JOIN kpi_values kv ON kv.responsible_id = r2.responsible_id
-                     WHERE r2.plant_id = p.plant_id
-                     AND kv.kpi_id IS NOT NULL), 
-                    0
-                ) END as kpi_count
-            FROM "Plant" p
-            LEFT JOIN "Responsible" r ON r.plant_id = p.plant_id
-            WHERE p.parent_id = $1
-            GROUP BY p.plant_id, p.name, p.manager, p.manager_email, p.created_at, p.parent_id
-            ORDER BY p.name
-        `, [plantId]);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-// ========== KPI APIs ==========
-
-// 3. Get indicators for a plant (FIXED - removed DISTINCT from JSON)
-
-app.get('/api/plants/:plantId/indicators', async (req, res) => {
-  try {
-    const { plantId } = req.params;
-    const { week } = req.query;
-
-    const result = await pool.query(`
-            SELECT 
-                k.kpi_id,
-                k.indicator_title,
-                k.indicator_sub_title,
-                k.unit,
-                k.good_direction,
-                k.tolerance_percent,
-                k.created_at,
-                -- Count responsible persons for this KPI in this plant
-                COUNT(DISTINCT r.responsible_id) as responsible_count,
-                -- Count values for this KPI
-                COUNT(DISTINCT kv.kpi_values_id) as value_count,
-                -- Get current week values
-                COALESCE(
-                    (SELECT json_agg(jsonb_build_object(
-                        'value_id', kv2.kpi_values_id,
-                        'week', kv2.week,
-                        'value', kv2.value,
-                        'target', kv2.target_snapshot
-                    ))
-                    FROM kpi_values kv2
-                    WHERE kv2.kpi_id = k.kpi_id 
-                        AND kv2.week = COALESCE($2, '2026-Week7')
-                        AND EXISTS (
-                            SELECT 1 FROM "Responsible" r2 
-                            WHERE r2.responsible_id = kv2.responsible_id 
-                            AND r2.plant_id = $1
-                        )
-                    LIMIT 10),
-                    '[]'
-                ) as current_week_values
-            FROM "Kpi" k
-            -- Get KPIs through responsible persons in this plant
-            INNER JOIN "Responsible" r ON r.plant_id = $1
-            INNER JOIN kpi_values kv ON kv.kpi_id = k.kpi_id AND kv.responsible_id = r.responsible_id
-            GROUP BY k.kpi_id, k.indicator_title, k.indicator_sub_title, k.unit, 
-                     k.good_direction, k.tolerance_percent, k.created_at
-            ORDER BY k.indicator_title
-        `, [plantId, week || '2026-Week7']);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching indicators:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 4. Get indicator subtitles with details (SIMPLIFIED VERSION)
-app.get('/api/plants/:plantId/indicators/:kpiId/subtitles', async (req, res) => {
-  try {
-    const { plantId, kpiId } = req.params;
-    const { week } = req.query;
-
-    const result = await pool.query(`
-      SELECT 
-        k.kpi_id,
-        k.indicator_title,
-        COALESCE(k.indicator_sub_title, 'No subtitle') as indicator_subtitle,
-        k.unit,
-        k.good_direction,
-        k.tolerance_percent,
-        r.responsible_id,
-        r.name as responsible_name,
-        r.email as responsible_email,
-        r.phone as responsible_phone,
-        r.created_at as responsible_created,
-        d.name as department_name,
-        kvh.hist_id,
-        kvh.old_value,
-        kvh.new_value as value,
-        kvh.week,
-        kvh.updated_at as value_date,
-        CASE 
-            WHEN kvh.new_value IS NULL THEN 'No Data'
-            WHEN k.good_direction = 'high' AND kvh.new_value::numeric >= k.tolerance_percent THEN 'Above Target'
-            WHEN k.good_direction = 'low' AND kvh.new_value::numeric <= k.tolerance_percent THEN 'Below Target'
-            ELSE 'Within Target'
-        END as status,
-        ROUND(
-            CASE 
-                WHEN k.tolerance_percent > 0 
-                THEN ((kvh.new_value::numeric - k.tolerance_percent) / k.tolerance_percent) * 100
-                ELSE NULL
-            END, 2
-        ) as deviation_percent
-      FROM "Kpi" k
-      INNER JOIN "Responsible" r ON r.plant_id = $1
-      LEFT JOIN "Department" d ON d.department_id = r.department_id
-      LEFT JOIN kpi_values_hist26 kvh 
-        ON kvh.kpi_id = k.kpi_id 
-        AND kvh.responsible_id = r.responsible_id
-        AND ($2::varchar IS NULL OR kvh.week = $2)
-      WHERE k.kpi_id = $3
-      ORDER BY k.indicator_sub_title, r.name
-    `, [plantId, week || null, kpiId]);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching KPI history:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 5. Get all departments
-app.get('/api/departments', async (req, res) => {
-  try {
-    const result = await pool.query(`
-            SELECT 
-                d.department_id,
-                d.name,
-                d.created_at,
-                d.updated_at,
-                COUNT(DISTINCT r.responsible_id) as responsible_count
-            FROM "Department" d
-            LEFT JOIN "Responsible" r ON r.department_id = d.department_id
-            GROUP BY d.department_id, d.name, d.created_at, d.updated_at
-            ORDER BY d.name
-        `);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching departments:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 6. Get responsible persons for a plant
-app.get('/api/plants/:plantId/responsible', async (req, res) => {
-  try {
-    const { plantId } = req.params;
-    const result = await pool.query(`
-            SELECT 
-                r.responsible_id,
-                r.name,
-                r.email,
-                r.phone,
-                r.created_at,
-                d.name as department_name,
-                COUNT(DISTINCT kv.kpi_values_id) as kpi_value_count
-            FROM "Responsible" r
-            LEFT JOIN "Department" d ON d.department_id = r.department_id
-            LEFT JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
-            WHERE r.plant_id = $1
-            GROUP BY r.responsible_id, r.name, r.email, r.phone, 
-                     r.created_at, d.department_id, d.name
-            ORDER BY r.name
-        `, [plantId]);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching responsible persons:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 7. Get complete plant hierarchy (SIMPLIFIED)
-app.get('/api/plants/hierarchy', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      WITH RECURSIVE plant_tree AS (
-        SELECT
-          plant_id,
-          name::text,          -- cast to text so recursive concat matches
-          manager::text,
-          manager_email::text,
-          parent_id,
-          created_at,
-          0            AS level,
-          name::text   AS path_name
-        FROM "Plant"
-        WHERE parent_id IS NULL
-
-        UNION ALL
-
-        SELECT
-          p.plant_id,
-          p.name::text,
-          p.manager::text,
-          p.manager_email::text,
-          p.parent_id,
-          p.created_at,
-          pt.level + 1,
-          pt.path_name || ' > ' || p.name::text
-        FROM "Plant" p
-        INNER JOIN plant_tree pt ON p.parent_id = pt.plant_id
-      )
-      SELECT
-        pt.plant_id,
-        pt.name,
-        pt.manager,
-        pt.manager_email,
-        pt.parent_id,
-        pt.level,
-        pt.path_name,
-        (SELECT COUNT(*) FROM "Responsible" r WHERE r.plant_id = pt.plant_id) AS responsible_count,
-        (SELECT COUNT(*) FROM "Plant"       c WHERE c.parent_id = pt.plant_id) AS child_count
-      FROM plant_tree pt
-      ORDER BY pt.path_name
-    `);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching plant hierarchy:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-
-// 8. Search across plants, KPIs, and responsible persons
-app.get('/api/search', async (req, res) => {
-  try {
-    const { q, type } = req.query;
-    if (!q) {
-      return res.json([]);
-    }
-
-    const searchTerm = `%${q}%`;
-
-    if (type === 'plant') {
-      const result = await pool.query(`
-                SELECT 
-                    'plant' as type,
-                    plant_id as id,
-                    name,
-                    manager as subtitle,
-                    'Plant' as category
-                FROM "Plant"
-                WHERE name ILIKE $1 OR manager ILIKE $1
-                LIMIT 10
-            `, [searchTerm]);
-      res.json(result.rows);
-    } else if (type === 'kpi') {
-      const result = await pool.query(`
-                SELECT 
-                    'kpi' as type,
-                    kpi_id as id,
-                    indicator_title as name,
-                    COALESCE(indicator_sub_title, 'No subtitle') as subtitle,
-                    'KPI' as category
-                FROM "Kpi"
-                WHERE indicator_title ILIKE $1 OR indicator_sub_title ILIKE $1
-                LIMIT 10
-            `, [searchTerm]);
-      res.json(result.rows);
-    } else {
-      // General search
-      const plants = await pool.query(`
-                SELECT 
-                    'plant' as type,
-                    plant_id as id,
-                    name,
-                    manager as subtitle,
-                    'Plant' as category
-                FROM "Plant"
-                WHERE name ILIKE $1 OR manager ILIKE $1
-                LIMIT 5
-            `, [searchTerm]);
-
-      const kpis = await pool.query(`
-                SELECT 
-                    'kpi' as type,
-                    kpi_id as id,
-                    indicator_title as name,
-                    COALESCE(indicator_sub_title, 'No subtitle') as subtitle,
-                    'KPI' as category
-                FROM "Kpi"
-                WHERE indicator_title ILIKE $1 OR indicator_sub_title ILIKE $1
-                LIMIT 5
-            `, [searchTerm]);
-
-      const responsible = await pool.query(`
-                SELECT 
-                    'responsible' as type,
-                    responsible_id as id,
-                    name,
-                    email as subtitle,
-                    'Responsible Person' as category
-                FROM "Responsible"
-                WHERE name ILIKE $1 OR email ILIKE $1
-                LIMIT 5
-            `, [searchTerm]);
-
-      res.json([...plants.rows, ...kpis.rows, ...responsible.rows]);
-    }
-  } catch (error) {
-    console.error('Error searching:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 9. Get weekly KPI values for a plant
-app.get('/api/plants/:plantId/weekly-values', async (req, res) => {
-  const { plantId } = req.params;
-  const { week } = req.query;
-
-  try {
-    const result = await pool.query(`
-      WITH latest_hist AS (
-        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
-               h.responsible_id,
-               h.kpi_id,
-               h.week,
-               CASE
-                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
-                 THEN NULLIF(trim(h.new_value), '')::numeric
-                 ELSE NULL
-               END AS new_value,
-               h.target
-        FROM   kpi_values_hist26 h
-        WHERE  ($2::varchar IS NULL OR h.week = $2)
-        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
-      )
-
-      SELECT
-        k.kpi_id,
-        k.indicator_title,
-        k.indicator_sub_title,
-        k.unit,
-        k.good_direction,
-        k.minimum_value,
-        k.maximum_value,
-        r.responsible_id,
-        r.name              AS responsible_name,
-        d.name              AS department_name,
-        lh.week,
-        lh.new_value        AS value,
-        lh.target,
-
-        CASE
-          WHEN lh.new_value IS NULL
-            THEN 'No Data'
-
-          WHEN k.good_direction = 'UP'
-           AND k.maximum_value IS NOT NULL
-           AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
-            THEN 'Above Maximum'
-
-          WHEN k.good_direction = 'DOWN'
-           AND k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'Below Minimum'
-
-          WHEN k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'Below Minimum'
-
-          ELSE 'On Target'
-        END AS status
-
-      FROM   "Responsible"  r
-      JOIN   latest_hist    lh ON lh.responsible_id = r.responsible_id
-      JOIN   "Kpi"          k  ON k.kpi_id           = lh.kpi_id
-      LEFT   JOIN "Department" d ON d.department_id  = r.department_id
-      WHERE  r.plant_id = $1
-      ORDER  BY k.indicator_title, r.name
-    `, [plantId, week || null]);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching weekly values:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 10. Get plant statistics
-app.get('/api/stats', async (req, res) => {
-  try {
-    const stats = await pool.query(`
-            SELECT 
-                (SELECT COUNT(*) FROM "Plant") as total_plants,
-                (SELECT COUNT(*) FROM "Plant" WHERE parent_id IS NULL) as root_plants,
-                (SELECT COUNT(*) FROM "Plant" WHERE parent_id IS NOT NULL) as child_plants,
-                (SELECT COUNT(*) FROM "Kpi") as total_kpis,
-                (SELECT COUNT(*) FROM "Responsible") as total_responsible,
-                (SELECT COUNT(*) FROM "Department") as total_departments,
-                (SELECT COUNT(*) FROM kpi_values) as total_kpi_values,
-                (SELECT COUNT(DISTINCT week) FROM kpi_values) as total_weeks
-        `);
-    res.json(stats.rows[0]);
-  } catch (error) {
-    console.error('Error fetching stats:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 11. Test endpoint
-app.get('/api/test', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW() as current_time');
-    res.json({
-      status: 'Server is running',
-      database_time: result.rows[0].current_time,
-      message: 'API server is connected to PostgreSQL'
-    });
-  } catch (error) {
-    console.error('Test endpoint error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 12. Get basic plant information (for debugging)
-app.get('/api/plants', async (req, res) => {
-  try {
-    const result = await pool.query(`
-            SELECT 
-                plant_id,
-                name,
-                manager,
-                parent_id
-            FROM "Plant"
-            ORDER BY name
-            LIMIT 50
-        `);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching plants:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 13. Get basic KPI information (for debugging)
-app.get('/api/indicators', async (req, res) => {
-  try {
-    const result = await pool.query(`
-            SELECT 
-                kpi_id,
-                indicator_title,
-                indicator_sub_title,
-                unit
-            FROM "Kpi"
-            ORDER BY indicator_title
-            LIMIT 50
-        `);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching indicators:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 14. Get plant with indicators (simpler endpoint for testing)
-app.get('/api/plants/:plantId/indicators-simple', async (req, res) => {
-  try {
-    const { plantId } = req.params;
-
-    const result = await pool.query(`
-            SELECT DISTINCT
-                k.kpi_id,
-                k.indicator_title,
-                k.indicator_sub_title,
-                k.unit,
-                k.good_direction
-            FROM "Responsible" r
-            INNER JOIN kpi_values kv ON kv.responsible_id = r.responsible_id
-            INNER JOIN "Kpi" k ON k.kpi_id = kv.kpi_id
-            WHERE r.plant_id = $1
-            ORDER BY k.indicator_title
-        `, [plantId]);
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Error fetching simple indicators:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// 1. GET /api/plants/:plantId/performance?week=XXXX
-//    Returns aggregated RED / GREEN counts per indicator_title.
-//    Used by the frontend performanceMap to colour the KPI cards.
-// ---------------------------------------------------------------------------
-app.get('/api/plants/:plantId/performance', async (req, res) => {
-  const { plantId } = req.params;
-  const { week } = req.query;
-
-  try {
-    const result = await pool.query(`
-      WITH RECURSIVE plant_tree AS (
-        SELECT plant_id
-        FROM   "Plant"
-        WHERE  plant_id = $1
-
-        UNION ALL
-
-        SELECT p.plant_id
-        FROM   "Plant"    p
-        JOIN   plant_tree pt ON p.parent_id = pt.plant_id
-      ),
-
-      latest_hist AS (
-        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
-               h.responsible_id,
-               h.kpi_id,
-               CASE
-                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
-                 THEN NULLIF(trim(h.new_value), '')::numeric
-                 ELSE NULL
-               END AS new_value,
-               h.target
-        FROM   kpi_values_hist26 h
-        WHERE  h.week = $2
-        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
-      )
-
-      SELECT
-        k.indicator_title,
-        k.good_direction,
-        k.minimum_value,
-        k.maximum_value,
-
-        CASE
-          WHEN lh.new_value IS NULL
-            THEN 'NO_DATA'
-
-          WHEN k.good_direction = 'UP'
-           AND k.maximum_value IS NOT NULL
-           AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
-            THEN 'RED'
-
-          WHEN k.good_direction = 'DOWN'
-           AND k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'RED'
-
-          WHEN k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'RED'
-
-          ELSE 'GREEN'
-        END AS performance_status,
-
-        COUNT(*) AS count
-
-      FROM   plant_tree    pt
-      JOIN   "Responsible" r  ON r.plant_id        = pt.plant_id
-      JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
-      JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
-      GROUP  BY
-        k.indicator_title,
-        k.good_direction,
-        k.minimum_value,
-        k.maximum_value,
-        performance_status
-      ORDER  BY k.indicator_title
-    `, [plantId, week]);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error in /performance:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
-app.get('/api/plants/:plantId/indicators/:kpiId/performance', async (req, res) => {
-  const { plantId, kpiId } = req.params;
-  const { week } = req.query;
-
-  try {
-    const result = await pool.query(`
-      WITH latest_hist AS (
-        SELECT DISTINCT ON (h.responsible_id)
-               h.responsible_id,
-               h.kpi_id,
-               CASE
-                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
-                 THEN NULLIF(trim(h.new_value), '')::numeric
-                 ELSE NULL
-               END AS new_value,
-               h.target
-        FROM   kpi_values_hist26 h
-        WHERE  h.kpi_id = $2
-          AND  h.week   = $3
-        ORDER  BY h.responsible_id, h.updated_at DESC
-      )
-
-      SELECT
-        k.kpi_id,
-        r.responsible_id,
-        r.name           AS responsible_name,
-        lh.new_value,
-        lh.target,
-        k.minimum_value,
-        k.maximum_value,
-        k.good_direction,
-
-        CASE
-          WHEN lh.new_value IS NULL
-            THEN 'NO_DATA'
-
-          WHEN k.good_direction = 'UP'
-           AND k.maximum_value IS NOT NULL
-           AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
-            THEN 'RED'
-
-          WHEN k.good_direction = 'DOWN'
-           AND k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'RED'
-
-          WHEN k.minimum_value IS NOT NULL
-           AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-            THEN 'RED'
-
-          ELSE 'GREEN'
-        END AS performance_status
-
-      FROM   "Responsible" r
-      JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
-      JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
-      WHERE  r.plant_id = $1
-        AND  k.kpi_id   = $2
-      ORDER  BY r.name
-    `, [plantId, kpiId, week]);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error in /indicators/:kpiId/performance:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-//by department
-app.get('/api/performance/by-departments', async (req, res) => {
-  const { week, plantId } = req.query;
-
-  try {
-    const result = await pool.query(`
-      WITH RECURSIVE plant_scope AS (
-        -- If plantId provided, walk that subtree; otherwise all plants
-        SELECT plant_id
-        FROM   "Plant"
-        WHERE  ($2::int IS NULL OR plant_id = $2::int)
-
-        UNION ALL
-
-        SELECT p.plant_id
-        FROM   "Plant"    p
-        JOIN   plant_scope ps ON p.parent_id = ps.plant_id
-        WHERE  $2::int IS NOT NULL   -- only recurse when filtering by plant
-      ),
-
-      latest_hist AS (
-        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
-               h.responsible_id,
-               h.kpi_id,
-               CASE
-                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
-                 THEN NULLIF(trim(h.new_value), '')::numeric
-                 ELSE NULL
-               END AS new_value
-        FROM   kpi_values_hist26 h
-        WHERE  h.week = $1
-        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
-      ),
-
-      perf AS (
-        SELECT
-          COALESCE(d.name, 'No Department') AS department_name,
-          CASE
-            WHEN lh.new_value IS NULL
-              THEN 'NO_DATA'
-            WHEN k.good_direction = 'UP'
-             AND k.maximum_value IS NOT NULL
-             AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
-              THEN 'RED'
-            WHEN k.good_direction = 'DOWN'
-             AND k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(REPLACE(trim(k.minimum_value::text), ',', ''), '')::numeric
-              THEN 'RED'
-            WHEN k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(REPLACE(trim(k.minimum_value::text), ',', ''), '')::numeric
-              THEN 'RED'
-            ELSE 'GREEN'
-          END AS performance_status
-        FROM   plant_scope   ps
-        JOIN   "Responsible" r  ON r.plant_id        = ps.plant_id
-        LEFT   JOIN "Department" d ON d.department_id = r.department_id
-        JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
-        JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
-      )
-
-      SELECT
-        department_name,
-        COUNT(*) FILTER (WHERE performance_status = 'GREEN')   AS on_target,
-        COUNT(*) FILTER (WHERE performance_status = 'RED')     AS off_target,
-        COUNT(*) FILTER (WHERE performance_status = 'NO_DATA') AS no_data,
-        COUNT(*)                                                AS total,
-        ROUND(
-          100.0 * COUNT(*) FILTER (WHERE performance_status = 'GREEN') /
-          NULLIF(COUNT(*) FILTER (WHERE performance_status IN ('GREEN','RED')), 0)
-        , 1) AS health_pct
-      FROM perf
-      GROUP BY department_name
-      ORDER BY off_target DESC, department_name
-    `, [week, plantId || null]);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error in /performance/by-departments:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-app.get('/api/performance/by-plants', async (req, res) => {
-  const { week } = req.query;
-
-  try {
-    const result = await pool.query(`
-      WITH latest_hist AS (
-        SELECT DISTINCT ON (h.responsible_id, h.kpi_id)
-               h.responsible_id,
-               h.kpi_id,
-               CASE
-                 WHEN NULLIF(trim(h.new_value), '') ~ '^-?[0-9]+(\.[0-9]+)?$'
-                 THEN NULLIF(trim(h.new_value), '')::numeric
-                 ELSE NULL
-               END AS new_value
-        FROM   kpi_values_hist26 h
-        WHERE  h.week = $1
-        ORDER  BY h.responsible_id, h.kpi_id, h.updated_at DESC
-      ),
-
-      perf AS (
-        SELECT
-          p.plant_id,
-          p.name AS plant_name,
-          p.parent_id,
-          CASE
-            WHEN lh.new_value IS NULL
-              THEN 'NO_DATA'
-            WHEN k.good_direction = 'UP'
-             AND k.maximum_value IS NOT NULL
-             AND lh.new_value > NULLIF(REPLACE(trim(k.maximum_value::text), ',', ''), '')::numeric
-              THEN 'RED'
-            WHEN k.good_direction = 'DOWN'
-             AND k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-              THEN 'RED'
-            WHEN k.minimum_value IS NOT NULL
-             AND lh.new_value < NULLIF(trim(k.minimum_value::text), '')::numeric
-              THEN 'RED'
-            ELSE 'GREEN'
-          END AS performance_status
-        FROM   "Plant"       p
-        JOIN   "Responsible" r  ON r.plant_id        = p.plant_id
-        JOIN   latest_hist   lh ON lh.responsible_id = r.responsible_id
-        JOIN   "Kpi"         k  ON k.kpi_id           = lh.kpi_id
-      )
-
-      SELECT
-        plant_id,
-        plant_name,
-        parent_id,
-        COUNT(*) FILTER (WHERE performance_status = 'GREEN')   AS on_target,
-        COUNT(*) FILTER (WHERE performance_status = 'RED')     AS off_target,
-        COUNT(*) FILTER (WHERE performance_status = 'NO_DATA') AS no_data,
-        COUNT(*)                                                AS total
-      FROM perf
-      GROUP BY plant_id, plant_name, parent_id
-      ORDER BY off_target DESC, plant_name
-    `, [week]);
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error in /performance/by-plants:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
-
+// ---------- Cron: weekly manager/plant report ----------
+// let managerCronRunning = false;
+// cron.schedule("18 17 * * *", async () => {
+//   const lockId = "department_report_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (managerCronRunning) return;
+//     managerCronRunning = true;
+//     const now = new Date();
+//     const year = now.getFullYear();
+//     const getWeekNumber = (date) => {
+//       const d = new Date(date); d.setHours(0, 0, 0, 0);
+//       d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+//       const yearStart = new Date(d.getFullYear(), 0, 1);
+//       return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+//     };
+//     const weekNumber = getWeekNumber(now);
+//     const currentWeek = `${year}-Week${weekNumber}`;
+//     console.log(`[Manager Report] Sending reports for week ${currentWeek}...`);
+//     const plantsRes = await pool.query(
+//       `SELECT plant_id, name, manager_email FROM public."Plant"
+//        WHERE manager_email IS NOT NULL AND manager_email != ''`
+//     );
+//     console.log(`ðŸ“‹ Found ${plantsRes.rows.length} plants with manager emails`);
+//     for (const plant of plantsRes.rows) {
+//       try {
+//         await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+//         console.log(`Report sent for plant: ${plant.name}`);
+//         await new Promise(resolve => setTimeout(resolve, 1500));
+//       } catch (err) {
+//         console.error(`  âŒ Failed for plant ${plant.name}:`, err.message);
+//       }
+//     }
+//     console.log(`[Manager Report] All plant reports sent`);
+//   } catch (error) {
+//     console.error("âŒ [Manager Report] Cron error:", error.message);
+//   } finally {
+//     managerCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
+
+
+registerRecommendationRoutes(app, pool, createTransporter);
 // ---------- Start server ----------
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+app.listen(port, () => console.log(`ðŸš€ Server running on port ${port}`));
