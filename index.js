@@ -5759,7 +5759,7 @@ const getWeekLabelForDate = (date = new Date()) => {
 };
 
 const KPI_EMAIL_CONFIG = {
-  appBaseUrl: "http://localhost:5000",
+  appBaseUrl: "https://kpi-form.azurewebsites.net",
   enableKpiSubmissionEmailCron: true,
   kpiSubmissionEmailCron: "0 9 * * 2",
   timezone: "Africa/Tunis",
@@ -12298,13 +12298,13 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
               </p>
               <table border="0" cellpadding="0" cellspacing="0" align="center"><tr>
                 <td style="padding:0 8px;">
-                  <a href="http://localhost:5000/kpi-trends?responsible_id=${responsible.responsible_id}"
+                  <a href="https://kpi-form.azurewebsites.net/kpi-trends?responsible_id=${responsible.responsible_id}"
                      style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
                             text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
                     View KPI Graphics</a>
                 </td>
                 <td style="padding:0 8px;">
-                  <a href="http://localhost:5000/dashboard?responsible_id=${responsible.responsible_id}"
+                  <a href="https://kpi-form.azurewebsites.net/dashboard?responsible_id=${responsible.responsible_id}"
                      style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
                             text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
                     View Dashboard</a>
