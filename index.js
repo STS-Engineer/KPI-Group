@@ -5869,9 +5869,9 @@ const generateEmailHtml = ({ responsible, week }) => {
              alt="AVOCarbon Logo" style="width:90px;height:90px;object-fit:contain;">
       </div>
       
-      <!-- KPI codir with cadre/border - directly under logo and centered -->
+      <!-- KPI plant with cadre/border - directly under logo and centered -->
       <div style="border:2px solid #0078D7;border-radius:8px;padding:6px 25px;display:inline-block;margin:0 auto 15px auto;">
-        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI codir</span>
+        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI Plant</span>
       </div>
       
       <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${week}</h2>
@@ -12666,7 +12666,7 @@ const runKpiSubmissionEmailJob = async (week = getCurrentWeek()) => {
 
 // ---------- Cron: weekly KPI submission email ----------
 let cronRunning = false;
-cron.schedule("50  09 * * 1", async () => {
+cron.schedule("30 10 * * 1", async () => {
   const lockId = "send_kpi_weekly_email_job";
   const lock = await acquireJobLock(lockId);
   if (!lock.acquired) return;
@@ -12677,14 +12677,26 @@ cron.schedule("50  09 * * 1", async () => {
     const startOfYear = new Date(now.getFullYear(), 0, 1);
     const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
     const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
-    const forcedWeek = `${now.getFullYear()}-Week${currentWeek}`;
+
+    // Use previous week, handling year rollover (Week 1 → last week of prev year)
+    let targetYear = now.getFullYear();
+    let targetWeek = currentWeek - 1;
+    if (targetWeek < 1) {
+      targetYear -= 1;
+      const startOfPrevYear = new Date(targetYear, 0, 1);
+      const endOfPrevYear = new Date(targetYear, 11, 31);
+      const dayOfPrevYear = Math.floor((endOfPrevYear - startOfPrevYear) / (24 * 60 * 60 * 1000));
+      targetWeek = Math.ceil((dayOfPrevYear + startOfPrevYear.getDay() + 1) / 7);
+    }
+
+    const forcedWeek = `${targetYear}-Week${targetWeek}`;
     const resps = await pool.query(
       `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
       [forcedWeek]
     );
     for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
-    console.log(`KPI emails sent to ${resps.rows.length} responsibles`);
+    console.log(`KPI emails sent to ${resps.rows.length} responsibles for ${forcedWeek}`);
   } catch (err) {
     console.error("Scheduled email error:", err.message);
   } finally {
@@ -13127,7 +13139,7 @@ const generateManagerReportHtml = (reportData) => {
 <body>
   <div style="padding:30px 20px;max-width:1400px;margin:0 auto;">
     <div style="background:white;border-radius:12px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.05);margin-bottom:30px;">
-      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI CODIR DASHBOARD</h1>
+      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI Plant DASHBOARD</h1>
       <div style="font-size:14px;color:#6c757d;">
         <strong>${plant.plant_name}</strong>  Week: <strong>${week.replace('2026-Week', 'W')}</strong>
         Manager: <strong>${plant.manager || 'N/A'}</strong></div>
