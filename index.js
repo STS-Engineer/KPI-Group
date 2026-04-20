@@ -274,6 +274,64 @@ const updateKpiValueSnapshots = async (
   );
 };
 
+const syncKpiValuesHistorySequence = async (db) => {
+  await db.query(
+    `
+    SELECT setval(
+      pg_get_serial_sequence('public.kpi_values_hist26', 'hist_id'),
+      COALESCE((SELECT MAX(hist_id) FROM public.kpi_values_hist26), 0) + 1,
+      false
+    )
+    `
+  );
+};
+
+const insertKpiValueHistory = async (
+  db,
+  {
+    kpiValuesId,
+    responsibleId,
+    kpiId,
+    week,
+    oldValue,
+    newValue,
+    comment
+  }
+) => {
+  const insertQuery = `
+    INSERT INTO public.kpi_values_hist26
+      (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value, comment)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+  `;
+  const insertParams = [
+    kpiValuesId,
+    responsibleId,
+    kpiId,
+    week,
+    oldValue,
+    newValue,
+    comment ?? null
+  ];
+
+  try {
+    await db.query(insertQuery, insertParams);
+  } catch (error) {
+    const isOutOfSyncHistorySequence =
+      error?.code === "23505" &&
+      error?.constraint === "kpi_values_hist26_pkey";
+
+    if (!isOutOfSyncHistorySequence) {
+      throw error;
+    }
+
+    await syncKpiValuesHistorySequence(db);
+    console.warn(
+      "[kpi_values_hist26] Realigned hist_id sequence after duplicate primary key and retried insert."
+    );
+    await db.query(insertQuery, insertParams);
+  }
+};
+
 const upsertResponsibleKpiAssignment = async (
   db,
   responsibleId,
@@ -5691,7 +5749,20 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
   if (!responsible) throw new Error("Responsible not found");
 
   const kpiRes = await pool.query(
-    `SELECT kv.kpi_values_id, kv.value, kv.week, k.kpi_id,
+    `SELECT kv.kpi_values_id,
+           COALESCE(
+             (
+               SELECT NULLIF(BTRIM(h.new_value::text), '')
+               FROM public.kpi_values_hist26 h
+               WHERE h.kpi_values_id = kv.kpi_values_id
+                 AND h.responsible_id = $1
+                 AND h.week = $2
+               ORDER BY h.updated_at DESC, h.hist_id DESC
+               LIMIT 1
+             ),
+             NULLIF(BTRIM(kv.value::text), '')
+           ) AS value,
+           kv.week, k.kpi_id,
            ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
            COALESCE(
              (SELECT MAX(updated_at) FROM public.kpi_values_hist26
@@ -5700,7 +5771,7 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
            (SELECT h.comment FROM public.kpi_values_hist26 h
             WHERE h.kpi_values_id = kv.kpi_values_id
               AND h.responsible_id = $1 AND h.week = $2
-            ORDER BY h.updated_at DESC LIMIT 1) as latest_comment
+            ORDER BY h.updated_at DESC, h.hist_id DESC LIMIT 1) as latest_comment
     FROM public.kpi_values kv
     JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
     LEFT JOIN public.responsible_kpis rk
@@ -7396,7 +7467,17 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
         <p>You have successfully submitted all corrective actions for week ${week}.<br>
            The quality team will review your submissions.</p>
         <a href="/corrective-actions-list?responsible_id=${responsible_id}">View Corrective Actions</a>
-      </div></body></html>`);
+      </div>
+      <script>
+        try {
+          if (window.localStorage) {
+            window.localStorage.removeItem("kpi-form-draft:${responsible_id}:${week}");
+          }
+        } catch (err) {
+          // Ignore storage cleanup errors after a successful submit.
+        }
+      </script>
+      </body></html>`);
   } catch (err) {
     res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
@@ -7469,13 +7550,15 @@ app.post("/redirect", async (req, res) => {
         item.kpi_values_id,
         defaultResponsibleName
       );
-      await pool.query(
-        `INSERT INTO public.kpi_values_hist26
-         (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value, comment)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [item.kpi_values_id, responsible_id, effectiveKpiId, week, old_value, item.value,
-        comments[item.kpi_values_id] || null]
-      );
+      await insertKpiValueHistory(pool, {
+        kpiValuesId: item.kpi_values_id,
+        responsibleId: responsible_id,
+        kpiId: effectiveKpiId,
+        week,
+        oldValue: old_value,
+        newValue: item.value,
+        comment: comments[item.kpi_values_id] || null
+      });
 
       await pool.query(
         `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
@@ -7564,10 +7647,14 @@ app.post("/redirect", async (req, res) => {
 
 app.get("/api/kpi-chart-data", async (req, res) => {
   try {
-    const { responsible_id, kpi_id, week } = req.query;
+    const { responsible_id, kpi_id, kpi_values_id, week } = req.query;
+    const resolvedKpiValuesId = String(kpi_values_id || "").trim();
+    const resolvedKpiId = String(kpi_id || "").trim();
+    const chartIdentifierField = resolvedKpiValuesId ? "kpi_values_id" : "kpi_id";
+    const chartIdentifierValue = resolvedKpiValuesId || resolvedKpiId;
 
-    if (!responsible_id || !kpi_id || !week) {
-      return res.status(400).json({ error: "Missing responsible_id, kpi_id, or week" });
+    if (!responsible_id || !chartIdentifierValue || !week) {
+      return res.status(400).json({ error: "Missing responsible_id, kpi_values_id or kpi_id, or week" });
     }
 
     const histRes = await pool.query(
@@ -7578,12 +7665,12 @@ app.get("/api/kpi-chart-data", async (req, res) => {
         updated_at
       FROM public.kpi_values_hist26
       WHERE responsible_id = $1
-        AND kpi_id = $2
+        AND ${chartIdentifierField} = $2
         AND new_value IS NOT NULL
         AND new_value <> ''
-      ORDER BY week, updated_at DESC
+      ORDER BY week, updated_at DESC, hist_id DESC
       `,
-      [responsible_id, kpi_id]
+      [responsible_id, chartIdentifierValue]
     );
 
     const currentRes = await pool.query(
@@ -7591,11 +7678,12 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       SELECT kv.value
       FROM public.kpi_values kv
       WHERE kv.responsible_id = $1
-        AND kv.kpi_id = $2
+        AND kv.${chartIdentifierField} = $2
         AND kv.week = $3
+      ORDER BY kv.kpi_values_id DESC
       LIMIT 1
       `,
-      [responsible_id, kpi_id, week]
+      [responsible_id, chartIdentifierValue, week]
     );
 
     function weekLabelToDate(weekStr) {
@@ -7646,8 +7734,8 @@ app.get("/form", async (req, res) => {
 
     const histRes = await pool.query(
       `
-      SELECT DISTINCT ON (kpi_id, week)
-        kpi_id,
+      SELECT DISTINCT ON (kpi_values_id, week)
+        kpi_values_id,
         week,
         new_value,
         updated_at
@@ -7655,15 +7743,15 @@ app.get("/form", async (req, res) => {
       WHERE responsible_id = $1
         AND new_value IS NOT NULL
         AND new_value <> ''
-      ORDER BY kpi_id, week, updated_at DESC
+      ORDER BY kpi_values_id, week, updated_at DESC, hist_id DESC
       `,
       [responsible_id]
     );
 
-    const historyByKpi = {};
+    const historyByKpiValuesId = {};
     histRes.rows.forEach((row) => {
-      if (!historyByKpi[row.kpi_id]) historyByKpi[row.kpi_id] = [];
-      historyByKpi[row.kpi_id].push({
+      if (!historyByKpiValuesId[row.kpi_values_id]) historyByKpiValuesId[row.kpi_values_id] = [];
+      historyByKpiValuesId[row.kpi_values_id].push({
         week: row.week,
         value: parseFloat(row.new_value)
       });
@@ -7812,7 +7900,7 @@ app.get("/form", async (req, res) => {
       // â”€â”€ Corrective actions section (no footer add-btn inside) â”€â”€
 
 
-      const rawHistory = historyByKpi[kpi.kpi_id] || [];
+      const rawHistory = historyByKpiValuesId[kpi.kpi_values_id] || [];
       const sortedHistory = rawHistory
         .filter((h) => !isNaN(h.value))
         .sort((a, b) => weekLabelToDate(a.week) - weekLabelToDate(b.week));
@@ -9466,6 +9554,85 @@ function syncDomFromStore(kvId) {
           function getTrimmedText(node) { return getTextContent(node).trim(); }
           function getInputValue(node) { return node && typeof node.value === "string" ? node.value : ""; }
           function getTrimmedValue(node) { return getInputValue(node).trim(); }
+          const kpiFormDraftStorageKey = "kpi-form-draft:${responsible_id}:${week}";
+          const kpiFormDraftState = loadKpiFormDraftState();
+
+          function loadKpiFormDraftState() {
+            try {
+              const raw = window.localStorage ? window.localStorage.getItem(kpiFormDraftStorageKey) : null;
+              if (!raw) return {};
+              const parsed = JSON.parse(raw);
+              return parsed && typeof parsed === "object" ? parsed : {};
+            } catch (err) {
+              return {};
+            }
+          }
+
+          function persistKpiFormDraftState() {
+            try {
+              if (!window.localStorage) return;
+              const draftKeys = Object.keys(kpiFormDraftState);
+              if (!draftKeys.length) {
+                window.localStorage.removeItem(kpiFormDraftStorageKey);
+                return;
+              }
+              window.localStorage.setItem(kpiFormDraftStorageKey, JSON.stringify(kpiFormDraftState));
+            } catch (err) {
+              // Ignore storage errors so the form remains usable.
+            }
+          }
+
+          function ensureKpiFormDraftEntry(kvId) {
+            const key = String(kvId || "").trim();
+            if (!key) return null;
+            if (!kpiFormDraftState[key] || typeof kpiFormDraftState[key] !== "object") {
+              kpiFormDraftState[key] = {};
+            }
+            return kpiFormDraftState[key];
+          }
+
+          function hasKpiFormDraftField(kvId, fieldName) {
+            const key = String(kvId || "").trim();
+            if (!key || !fieldName) return false;
+            return Boolean(
+              kpiFormDraftState[key] &&
+              Object.prototype.hasOwnProperty.call(kpiFormDraftState[key], fieldName)
+            );
+          }
+
+          function getKpiFormDraftField(kvId, fieldName) {
+            if (!hasKpiFormDraftField(kvId, fieldName)) return "";
+            return String(kpiFormDraftState[String(kvId).trim()][fieldName] ?? "");
+          }
+
+          function setKpiFormDraftField(kvId, fieldName, value) {
+            const entry = ensureKpiFormDraftEntry(kvId);
+            if (!entry || !fieldName) return;
+            entry[fieldName] = String(value ?? "");
+            persistKpiFormDraftState();
+          }
+
+          function clearKpiFormDraftState() {
+            Object.keys(kpiFormDraftState).forEach(function(key) {
+              delete kpiFormDraftState[key];
+            });
+            persistKpiFormDraftState();
+          }
+
+          function applyDraftToValueInput(input) {
+            if (!input) return;
+            const kvId = input.dataset.kpiValuesId;
+            if (!hasKpiFormDraftField(kvId, "value")) return;
+            input.value = getKpiFormDraftField(kvId, "value");
+          }
+
+          function applyDraftToCommentInput(textarea) {
+            if (!textarea) return;
+            const nameMatch = String(textarea.name || "").match(/^comment_(.+)$/);
+            const kvId = nameMatch ? nameMatch[1] : "";
+            if (!kvId || !hasKpiFormDraftField(kvId, "comment")) return;
+            textarea.value = getKpiFormDraftField(kvId, "comment");
+          }
 
           function getCorrectiveActionStack(kvId) {
             return document.querySelector('.ca-actions-stack[data-kpi-values-id="' + kvId + '"]');
@@ -10005,13 +10172,15 @@ async function sendAssistantPrompt(message) {
 
   const responsibleId = new URLSearchParams(window.location.search).get("responsible_id");
   const week = card.dataset.currentWeek;
+  const resolvedKpiValuesId = String(card.dataset.kpiValuesId || kvId || "").trim();
   const kpiId = card.dataset.kpiId;
 
-  if (!responsibleId || !week || !kpiId) return;
+  if (!responsibleId || !week || (!resolvedKpiValuesId && !kpiId)) return;
 
   const url =
     "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
-    "&kpi_id=" + encodeURIComponent(kpiId) +
+    "&kpi_values_id=" + encodeURIComponent(resolvedKpiValuesId) +
+    "&kpi_id=" + encodeURIComponent(kpiId || "") +
     "&week=" + encodeURIComponent(week);
 
   const res = await fetch(url);
@@ -10027,18 +10196,28 @@ async function sendAssistantPrompt(message) {
   }
 
   const input = document.getElementById("value_" + kvId);
-  if (input && data.currentValue !== null) {
+  const hasDraftValue = hasKpiFormDraftField(kvId, "value");
+  if (input && hasDraftValue) {
+    input.value = getKpiFormDraftField(kvId, "value");
+  } else if (input && document.activeElement !== input && data.currentValue !== null) {
     input.value = data.currentValue;
   }
 
   const chart = kpiCharts[kvId];
   if (!chart) {
     buildKpiChart(kvId);
+    if (input && hasDraftValue) {
+      updateCurrentWeekBarFromInput(kvId, input.value);
+    }
     return;
   }
 
   chart.data.labels = data.labels;
   chart.data.datasets[0].data = data.values;
+  if (input && hasDraftValue) {
+    updateCurrentWeekBarFromInput(kvId, input.value);
+    return;
+  }
   updateKpiChart(kvId);
 }
 
@@ -10619,12 +10798,25 @@ function formatWeekLabelClient(weekStr) {
   // Value inputs
   document.querySelectorAll(".value-input").forEach(input => {
     const kvId = input.dataset.kpiValuesId;
-    checkLowLimit(input);
     buildKpiChart(kvId);
+    applyDraftToValueInput(input);
+    checkLowLimit(input);
+    updateCurrentWeekBarFromInput(kvId, input.value);
 
     input.addEventListener("input", function() {
+      setKpiFormDraftField(kvId, "value", this.value);
       checkLowLimit(this);
       updateCurrentWeekBarFromInput(kvId, this.value);
+    });
+  });
+
+  document.querySelectorAll(".comment-input").forEach(textarea => {
+    const nameMatch = String(textarea.name || "").match(/^comment_(.+)$/);
+    const kvId = nameMatch ? nameMatch[1] : "";
+    applyDraftToCommentInput(textarea);
+    textarea.addEventListener("input", function() {
+      if (!kvId) return;
+      setKpiFormDraftField(kvId, "comment", this.value);
     });
   });
 
@@ -12473,33 +12665,33 @@ const runKpiSubmissionEmailJob = async (week = getCurrentWeek()) => {
 
 
 // ---------- Cron: weekly KPI submission email ----------
-// let cronRunning = false;
-// cron.schedule("54  10 * * *", async () => {
-//   const lockId = "send_kpi_weekly_email_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
-//   try {
-//     if (cronRunning) return;
-//     cronRunning = true;
-//     const now = new Date();
-//     const startOfYear = new Date(now.getFullYear(), 0, 1);
-//     const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-//     const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
-//     const forcedWeek = `${now.getFullYear()}-Week${currentWeek}`;
-//     const resps = await pool.query(
-//       `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
-//        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
-//       [forcedWeek]
-//     );
-//     for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
-//     console.log(`KPI emails sent to ${resps.rows.length} responsibles`);
-//   } catch (err) {
-//     console.error("Scheduled email error:", err.message);
-//   } finally {
-//     cronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+let cronRunning = false;
+cron.schedule("50  09 * * 1", async () => {
+  const lockId = "send_kpi_weekly_email_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+  try {
+    if (cronRunning) return;
+    cronRunning = true;
+    const now = new Date();
+    const startOfYear = new Date(now.getFullYear(), 0, 1);
+    const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
+    const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
+    const forcedWeek = `${now.getFullYear()}-Week${currentWeek}`;
+    const resps = await pool.query(
+      `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
+       JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
+      [forcedWeek]
+    );
+    for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
+    console.log(`KPI emails sent to ${resps.rows.length} responsibles`);
+  } catch (err) {
+    console.error("Scheduled email error:", err.message);
+  } finally {
+    cronRunning = false;
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+  }
+}, { scheduled: true, timezone: "Africa/Tunis" });
 
 
 // ---------- Cron: weekly reports ----------
