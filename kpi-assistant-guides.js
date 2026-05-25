@@ -9,7 +9,7 @@ let guidesCache = {
   guides: []
 };
 
-const normalizeText = (value) => {
+const normalizeText = (value) => { 
   const text = String(value ?? "").trim();
   return text ? text : null;
 };
