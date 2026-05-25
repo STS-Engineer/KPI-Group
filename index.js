@@ -8,27 +8,77 @@ const cron = require("node-cron");
 const { registerRecommendationRoutes } = require('./kpi-recommendations');
 const { generateKPIRecommendationsPDFBuffer, generatePlantKPIRecommendationsPDFBuffer } = require('./kpi-recommendations');
 const {
-  RESPONSIBLE_KPI_OVERRIDE_FIELDS,
-  buildResolvedKpiFieldExpression,
-  buildResolvedKpiSearchExpression
-} = require("./responsible-kpi-sql");
-// const {
-//   buildDelayKnowledgeBaseContext
-// } = require("./delay-knowledge-base");  
-const app = express();  
+  buildDelayKnowledgeBaseContext
+} = require("./delay-knowledge-base");
+const {
+  buildKpiAssistantKnowledgeContext,
+  formatKpiAssistantGuidedQuestion
+} = require("./kpi-assistant-guides");
+const app = express();
 const port = process.env.PORT || 5000;
 
 // ---------- Postgres ----------
-const pool = new Pool({
+const sharedPostgresConfig = {
   user: "administrationSTS",
   host: "avo-adb-002.postgres.database.azure.com",
-  database: "indicator_test",
   password: "St$@0987",
   port: 5432,
   ssl: { rejectUnauthorized: false },
+};
+
+const pool = new Pool({
+  ...sharedPostgresConfig,
+  database: "KPI_Test",
+});
+
+const actionPlanPool = new Pool({
+  ...sharedPostgresConfig,
+  database: "Action Plan",
+});
+
+const OpenAI = require("openai");
+
+const openai = new OpenAI({
+  apiKey: process.env.SECRET_KEY
 });
 
 const NUMERIC_TEXT_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
+const KPI_KNOWLEDGE_BASE_MAX_DEPTH = 5;
+const KPI_KNOWLEDGE_BASE_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "how",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "this",
+  "to",
+  "with",
+  "de",
+  "des",
+  "du",
+  "et",
+  "la",
+  "le",
+  "les",
+  "pour",
+  "sur",
+  "une",
+  "un"
+]);
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -40,6 +90,52 @@ const normalizeOptionalTextInput = (value) => {
   if (value === undefined || value === null) return null;
   const text = String(value).trim();
   return text === "" ? null : text;
+};
+
+const ASSISTANT_EMPTY_TEXT_VALUES = new Set([
+  "null",
+  "undefined",
+  "not defined"
+]);
+
+const sanitizeAssistantKnowledgeBaseValue = (value) => {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+    return ASSISTANT_EMPTY_TEXT_VALUES.has(text.toLowerCase()) ? null : text;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const cleanedItems = value
+      .map((item) => sanitizeAssistantKnowledgeBaseValue(item))
+      .filter((item) => item !== null);
+
+    return cleanedItems.length ? cleanedItems : null;
+  }
+
+  if (typeof value === "object") {
+    const cleanedEntries = Object.entries(value).reduce((accumulator, [key, entryValue]) => {
+      const cleanedValue = sanitizeAssistantKnowledgeBaseValue(entryValue);
+      if (cleanedValue !== null) {
+        accumulator[key] = cleanedValue;
+      }
+      return accumulator;
+    }, {});
+
+    return Object.keys(cleanedEntries).length ? cleanedEntries : null;
+  }
+
+  return null;
 };
 
 const normalizeOptionalNumericInput = (value, { allowPercent = false } = {}) => {
@@ -54,72 +150,504 @@ const normalizeOptionalNumericInput = (value, { allowPercent = false } = {}) => 
   return NUMERIC_TEXT_PATTERN.test(normalized) ? normalized : null;
 };
 
-const toFiniteNumber = (value) => {
-  const numericValue = Number(value);
-  return Number.isFinite(numericValue) ? numericValue : null;
+const normalizeOptionalIntegerInput = (value) => {
+  const text = normalizeOptionalTextInput(value);
+  if (text === null || !/^\d+$/.test(text)) return null;
+  return Number(text);
 };
 
-const computeDerivedKpiLimits = ({
-  target,
-  up_tolerance,
-  low_tolerance,
-  tolerance_type
-} = {}) => {
-  const normalizedTarget = normalizeOptionalNumericInput(target);
-  const normalizedUpTolerance = normalizeOptionalNumericInput(up_tolerance, { allowPercent: true });
-  const normalizedLowTolerance = normalizeOptionalNumericInput(low_tolerance, { allowPercent: true });
-  const normalizedToleranceType = normalizeOptionalTextInput(tolerance_type)?.toLowerCase() || null;
+const loadKpiKnowledgeBaseForAssistant = async (kpiId) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) return null;
 
-  if (
-    normalizedTarget === null ||
-    normalizedUpTolerance === null ||
-    normalizedLowTolerance === null ||
-    normalizedToleranceType === null
-  ) {
-    return null;
-  }
+  const result = await pool.query(
+    `
+    SELECT
+      kpi_id,
+      kpi_name,
+      kpi_sub_title,
+      kpi_knowledge_base
+    FROM public.kpi
+    WHERE kpi_id = $1
+    LIMIT 1
+    `,
+    [normalizedKpiId]
+  );
 
-  const targetValue = toFiniteNumber(normalizedTarget);
-  const upToleranceValue = toFiniteNumber(normalizedUpTolerance);
-  const lowToleranceValue = toFiniteNumber(normalizedLowTolerance);
-
-  if (
-    targetValue === null ||
-    upToleranceValue === null ||
-    lowToleranceValue === null
-  ) {
-    return null;
-  }
-
-  let highLimitValue = null;
-  let lowLimitValue = null;
-
-  if (normalizedToleranceType === "relative") {
-    highLimitValue = targetValue * (1 + (upToleranceValue / 100));
-    lowLimitValue = targetValue * (1 + (lowToleranceValue / 100));
-  } else if (normalizedToleranceType === "absolute") {
-    highLimitValue = targetValue + upToleranceValue;
-    lowLimitValue = targetValue + lowToleranceValue;
-  } else {
-    return null;
-  }
+  const row = result.rows[0];
+  if (!row) return null;
 
   return {
-    high_limit: Number(highLimitValue.toFixed(6)),
-    low_limit: Number(lowLimitValue.toFixed(6))
+    ...row,
+    kpi_knowledge_base:
+      sanitizeAssistantKnowledgeBaseValue(row.kpi_knowledge_base) || null
   };
 };
 
+const buildStrictKpiKnowledgePrompt = (kpiRow, ragContext = null) => {
+  const kb = sanitizeAssistantKnowledgeBaseValue(kpiRow?.kpi_knowledge_base) || {};
+  const compactRagContext = ragContext?.available
+    ? sanitizeAssistantKnowledgeBaseValue({
+        summary: ragContext.summary,
+        top_matches: ragContext.top_matches
+      })
+    : null;
+
+  return `
+You are a KPI Support Assistant.
+
+CRITICAL RULES:
+- Use ONLY the KPI knowledge base JSON and matched KPI knowledge context below.
+- All answers and suggestions must come from that KPI-specific knowledge base.
+- Match the user's request against the JSON before answering.
+- NEVER invent generic causes, suggestions, or actions.
+- NEVER hardcode low limit, high limit, tolerance type, target, unit, or direction.
+- Current KPI KNOWLEDGE BASE JSON is always more important than previous conversation.
+- If previous conversation conflicts with the JSON, ignore previous conversation.
+- Always answer numeric KPI fields from the latest JSON only.
+- Use recent conversation context only to understand follow-up questions.
+- NEVER display null, undefined, empty string, or "Not defined".
+- If a field does not exist in the sanitized KPI knowledge base, omit it completely.
+- Hide empty sections completely.
+- Keep answers compact and business-friendly.
+- For diagnosis/root-cause requests, ask one question at a time.
+- Each diagnosis question must include suggestions generated from matching JSON knowledge.
+- Continue diagnosis until a probable root cause is found.
+
+MATCHED KPI KNOWLEDGE BASE RAG CONTEXT:
+${compactRagContext ? JSON.stringify(compactRagContext, null, 2) : "No focused match extracted for this request. Use the sanitized KPI JSON directly."}
+
+KPI KNOWLEDGE BASE JSON:
+${JSON.stringify(kb, null, 2)}
+
+RESPONSE LOGIC:
+
+DIAGNOSIS MODE:
+
+If the user describes a KPI problem, decrease, anomaly, weak performance, or asks for root cause analysis, start diagnosis mode.
+
+Trigger examples:
+- diminution
+- baisse
+- decrease
+- dropped
+- low performance
+- below target
+- issue
+- problème
+- root cause
+- cause racine
+- diagnose
+
+DIAGNOSIS RAG PROCESS:
+
+Step A — Understand the user request:
+- Extract the problem keywords from the user message.
+- Detect whether the user mentions decrease, target issue, financial issue, operational issue, scope issue, data issue, or root cause.
+
+Step B — Match the request against the KPI JSON:
+Search the extracted keywords inside:
+- kpi.name
+- kpi.display_name
+- kpi.explanation
+- kpi.sub_title
+- kpi.thresholds
+- kpi.target
+- kpi.calculation
+- subject_context.primary_subject_path
+- subject_context.knowledge_nodes
+- subject_context.linked_subjects
+- subject_context.cause_effect_links
+- target_allocations
+- scope_summary
+- search_index.keywords
+- search_index.subject_paths
+- search_index.allocation_scopes
+
+Step C — Generate suggestions:
+- Suggestions must come ONLY from matched or closely related JSON fields.
+- Prefer exact matches from search_index.keywords, subject path, knowledge nodes, cause-effect links, and target allocations.
+- If cause_effect_links exist, use them first.
+- If cause_effect_links are empty, use:
+  1. subject_context.primary_subject_path
+  2. subject_context.knowledge_nodes
+  3. target_allocations
+  4. scope_summary
+  5. kpi.thresholds
+  6. kpi.calculation
+- Do NOT suggest supplier, stock, overtime, planning, staffing, finance, quality, delay, budget, or cost unless those terms exist in the JSON or were explicitly mentioned by the user.
+- If the user mentions a term not found in JSON, keep it as user context and ask the user to connect it to one of the available JSON scopes/options.
+- Every suggestion must include its JSON source path.
+
+Step D — Ask one diagnostic question:
+- Ask only ONE question at a time.
+- The question must be based on the best JSON match.
+- Include 3 to 5 suggestions from the JSON.
+- Continue using conversation history until probable root cause is found.
+
+DIAGNOSIS RESPONSE FORMAT:
+
+❓<one focused question based on matched KPI knowledge>
+
+Suggestions:
+1. <suggestion from kpi_knowledge_base> — Source: <JSON path>
+2. <suggestion from kpi_knowledge_base> — Source: <JSON path>
+3. <suggestion from kpi_knowledge_base> — Source: <JSON path>
+
+ROOT CAUSE RULE:
+When enough answers are collected, return:
+
+🧩 Probable root cause
+├── Cause: <probable cause>
+├── Evidence from user answers
+├── KPI knowledge used
+└── Corrective actions based only on JSON
+
+0. SPECIFIC FIELD QUESTIONS
+
+If the user asks for ONE specific field, answer ONLY that field using the matching JSON value.
+
+Field mapping:
+- low limit => kpi.thresholds.low_limit
+- high limit => kpi.thresholds.high_limit
+- tolerance type => kpi.thresholds.tolerance_type
+- frequency => kpi.frequency
+- formula => kpi.formula
+- status => kpi.status
+- owner => kpi.ownership
+- target direction => kpi.target.direction
+- default target => kpi.target.default_value
+- target value => target_allocations[].target.value
+- unit => kpi.unit
+
+Output:
+<Field>: <JSON value>
+
+Related info:
+- Include only 1 to 3 closely related values from the same JSON area.
+- Related info must also come from JSON.
+- Do not show related info if no related values exist.
+
+1. KPI OVERVIEW QUESTIONS
+
+If the user asks:
+- what is this KPI
+- KPI overview
+- explain this KPI
+- KPI details
+- tell me about this KPI
+
+Return a compact overview using available JSON values only:
+🎯 KPI
+├── Name
+├── Unit
+├── Status
+├── Frequency
+├── Description
+└── Subject path
+
+Include compact:
+🧮 Calculation
+🎯 Target & Thresholds
+🌳 Subject Hierarchy
+
+2. TARGET QUESTIONS
+
+If user asks about target, thresholds, limits, allocations, or objective:
+Return ONLY available target information from:
+- kpi.target
+- kpi.thresholds
+- target_allocations
+
+3. CALCULATION QUESTIONS
+
+If user asks about calculation, formula, computation, or trend:
+Return ONLY available calculation information from:
+- kpi.formula
+- kpi.calculation
+
+4. SUBJECT / HIERARCHY QUESTIONS
+
+If user asks about subject, hierarchy, tree, knowledge nodes, or related subjects:
+Return ONLY available subject information from:
+- subject_context.primary_subject_path
+- subject_context.linked_subjects
+- subject_context.knowledge_nodes
+
+5. CAUSE / EFFECT QUESTIONS
+
+If user asks about causes, impact, effect, dependencies, or drivers:
+Return ONLY cause-effect information from:
+- subject_context.cause_effect_links
+
+If no links exist, say exactly:
+No cause-effect links are defined.
+
+6. RECOMMENDATION QUESTIONS
+
+If user asks about recommendations, improvement, actions, optimization, or corrective actions:
+Return ONLY recommendations directly supported by the JSON.
+If data is insufficient, say what knowledge should be added.
+
+7. FULL KNOWLEDGE TREE QUESTIONS
+
+If user asks for full tree, all knowledge, complete KPI, show everything, or detailed overview:
+Return the full KPI knowledge tree using only available JSON values.
+
+8. VAGUE FOLLOW-UP QUESTIONS
+
+If the user asks:
+- what else
+- another information
+- more
+- continue
+- why
+- explain more
+
+Use the recent conversation context to continue from the previous topic.
+Never answer "No additional information is available" if the JSON has related fields.
+
+OUTPUT STYLE RULES:
+- Use compact formatting.
+- Use trees only when useful.
+- Do not show unrelated sections.
+- Never display empty values.
+- Never display empty sections.
+`;
+};
+const normalizeKnowledgeBaseSearchText = (value) =>
+  String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+const tokenizeKnowledgeBaseText = (value, maxItems = 24) => {
+  const normalized = normalizeKnowledgeBaseSearchText(value);
+  if (!normalized) return [];
+
+  const tokens = normalized
+    .split(/[^\p{L}\p{N}_]+/u)
+    .map((token) => token.trim())
+    .filter(
+      (token) =>
+        token.length > 2 &&
+        !KPI_KNOWLEDGE_BASE_STOP_WORDS.has(token)
+    );
+
+  return [...new Set(tokens)].slice(0, maxItems);
+};
+
+const flattenKnowledgeBaseStrings = (value) => {
+  if (value === undefined || value === null) return [];
+
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return [String(value)];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(flattenKnowledgeBaseStrings);
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value).flatMap(flattenKnowledgeBaseStrings);
+  }
+
+  return [];
+};
+
+const uniqueKnowledgeBaseTexts = (values = [], maxItems = 20) => {
+  const seen = new Set();
+  const results = [];
+
+  for (const value of values) {
+    const text = normalizeOptionalTextInput(value);
+    const normalized = normalizeKnowledgeBaseSearchText(text);
+    if (!text || !normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    results.push(text);
+    if (results.length >= maxItems) break;
+  }
+
+  return results;
+};
+
+const buildKnowledgeBaseKeywordList = (values = [], maxItems = 40) => {
+  const phrases = uniqueKnowledgeBaseTexts(
+    flattenKnowledgeBaseStrings(values),
+    Math.min(maxItems, 18)
+  );
+  const tokens = uniqueKnowledgeBaseTexts(
+    phrases.flatMap((entry) => tokenizeKnowledgeBaseText(entry, maxItems)),
+    maxItems
+  );
+
+  return [...phrases, ...tokens].slice(0, maxItems);
+};
+
+const formatKnowledgeBaseTimestamp = (value) => {
+  if (!value) return null;
+  const dateValue = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(dateValue.getTime())) {
+    return normalizeOptionalTextInput(value);
+  }
+  return dateValue.toISOString();
+};
+
+const getPeopleDisplayName = (row = {}) => {
+  const firstName = normalizeOptionalTextInput(row.first_name);
+  const name = normalizeOptionalTextInput(row.name);
+
+  if (firstName && name && firstName !== name) {
+    return `${firstName} ${name}`;
+  }
+
+  return name || firstName || null;
+};
+
 const prepareKpiWritePayload = (payload = {}) => {
+  const rawSubjectNodeId = normalizeOptionalTextInput(payload.subject_node_id ?? payload.subject_id);
+  const rawTarget = normalizeOptionalTextInput(payload.target ?? payload.target_value);
+  const rawMinValue = normalizeOptionalTextInput(payload.min ?? payload.min_value);
+  const rawMaxValue = normalizeOptionalTextInput(payload.max ?? payload.max_value);
   const rawUpTolerance = normalizeOptionalTextInput(payload.up_tolerance);
   const rawLowTolerance = normalizeOptionalTextInput(payload.low_tolerance);
   const rawHighLimit = normalizeOptionalTextInput(payload.high_limit);
   const rawLowLimit = normalizeOptionalTextInput(payload.low_limit);
+  const rawReferenceKpiId = normalizeOptionalTextInput(payload.reference_kpi_id);
+  const rawOwnerRoleId = normalizeOptionalTextInput(payload.owner_role_id);
 
+  const subjectNodeId = rawSubjectNodeId === null ? null : Number(rawSubjectNodeId);
+  const targetValue = normalizeOptionalNumericInput(rawTarget);
+  const minValue = normalizeOptionalNumericInput(rawMinValue);
+  const maxValue = normalizeOptionalNumericInput(rawMaxValue);
   const upTolerance = normalizeOptionalNumericInput(rawUpTolerance, { allowPercent: true });
   const lowTolerance = normalizeOptionalNumericInput(rawLowTolerance, { allowPercent: true });
   const highLimit = normalizeOptionalNumericInput(rawHighLimit);
   const lowLimit = normalizeOptionalNumericInput(rawLowLimit);
+  const calculationMode = normalizeOptionalTextInput(payload.calculation_mode);
+  const calculationOn = normalizeOptionalTextInput(payload.calculation_on);
+  const frequency = normalizeOptionalTextInput(payload.frequency);
+  const targetDirection = normalizeOptionalTextInput(payload.target_direction || payload.direction);
+  const toleranceType = normalizeOptionalTextInput(payload.tolerance_type);
+  const displayTrend = normalizeOptionalTextInput(payload.display_trend);
+  const regression = normalizeOptionalTextInput(payload.regression);
+  const minType = normalizeOptionalTextInput(payload.min_type);
+  const maxType = normalizeOptionalTextInput(payload.max_type);
+  const nombrePeriode = normalizeOptionalTextInput(payload.nombre_periode);
+  const targetAutoAdjustment = normalizeOptionalTextInput(payload.target_auto_adjustment);
+  const referenceKpiId = rawReferenceKpiId === null ? null : Number(rawReferenceKpiId);
+  const ownerRoleId = rawOwnerRoleId === null ? null : Number(rawOwnerRoleId);
+  const kpiName = normalizeOptionalTextInput(payload.kpi_name ?? payload.indicator_sub_title);
+  const unit = normalizeOptionalTextInput(payload.unit);
+  const subject = normalizeOptionalTextInput(payload.subject);
+  const explanation = normalizeOptionalTextInput(payload.kpi_explanation ?? payload.definition);
+  const status = normalizeOptionalTextInput(payload.status) || "Active";
+  const normalizedCalculationMode = String(calculationMode || "").toLowerCase();
+  const normalizedCalculationOn = String(calculationOn || "").toLowerCase();
+  const normalizedDisplayTrend = String(displayTrend || "").toLowerCase();
+  const normalizedToleranceType = String(toleranceType || "").toLowerCase();
+
+  if (!kpiName) {
+    throw createHttpError(400, "KPI name is required.");
+  }
+
+  if (!frequency) {
+    throw createHttpError(400, "Frequency is required.");
+  }
+
+  if (!unit) {
+    throw createHttpError(400, "Unit is required.");
+  }
+
+  if (!targetDirection) {
+    throw createHttpError(400, "Direction is required.");
+  }
+
+  if (!explanation) {
+    throw createHttpError(400, "Definition is required.");
+  }
+
+  if (!calculationOn) {
+    throw createHttpError(400, "Calculation On is required.");
+  }
+
+  if (normalizedCalculationOn === "average" && !nombrePeriode) {
+    throw createHttpError(400, "Nombre periode is required.");
+  }
+
+  if (!calculationMode) {
+    throw createHttpError(400, "Calculation mode is required.");
+  }
+
+  if (!displayTrend) {
+    throw createHttpError(400, "Display trend is required.");
+  }
+
+  if (normalizedDisplayTrend === "yes" && !regression) {
+    throw createHttpError(400, "Regression is required when display trend is Yes.");
+  }
+
+  if (!minType) {
+    throw createHttpError(400, "Min selection is required.");
+  }
+
+  if (!maxType) {
+    throw createHttpError(400, "Max selection is required.");
+  }
+
+  if (String(minType).toLowerCase() === "valeur a entrer" && rawMinValue === null) {
+    throw createHttpError(400, "Min value is required.");
+  }
+
+  if (String(maxType).toLowerCase() === "valeur a entrer" && rawMaxValue === null) {
+    throw createHttpError(400, "Max value is required.");
+  }
+
+  if (!toleranceType) {
+    throw createHttpError(400, "Tolerance type is required.");
+  }
+
+  if (normalizedToleranceType === "relative" && rawUpTolerance === null) {
+    throw createHttpError(400, "Up tolerance is required.");
+  }
+
+  if (normalizedToleranceType === "relative" && rawLowTolerance === null) {
+    throw createHttpError(400, "Low tolerance is required.");
+  }
+
+  if (normalizedToleranceType === "absolute" && rawHighLimit === null) {
+    throw createHttpError(400, "High limit is required.");
+  }
+
+  if (normalizedToleranceType === "absolute" && rawLowLimit === null) {
+    throw createHttpError(400, "Low limit is required.");
+  }
+
+  if (!targetAutoAdjustment) {
+    throw createHttpError(400, "Target auto adjust is required.");
+  }
+
+  if (rawSubjectNodeId !== null && (!Number.isInteger(subjectNodeId) || subjectNodeId <= 0)) {
+    throw createHttpError(400, "Subject selection is invalid.");
+  }
+
+  if (rawTarget !== null && targetValue === null) {
+    throw createHttpError(400, "Target must be numeric.");
+  }
+
+  if (rawMinValue !== null && minValue === null) {
+    throw createHttpError(400, "Min value must be numeric.");
+  }
+
+  if (rawMaxValue !== null && maxValue === null) {
+    throw createHttpError(400, "Max value must be numeric.");
+  }
 
   if (rawUpTolerance !== null && upTolerance === null) {
     throw createHttpError(400, 'Up tolerance must be numeric. Use values like "100" or "100%".');
@@ -137,282 +665,2412 @@ const prepareKpiWritePayload = (payload = {}) => {
     throw createHttpError(400, "Low limit must be numeric.");
   }
 
-  const derivedLimits = computeDerivedKpiLimits({
-    target: payload.target,
-    up_tolerance: payload.up_tolerance,
-    low_tolerance: payload.low_tolerance,
-    tolerance_type: payload.tolerance_type
-  });
+  if (rawReferenceKpiId !== null && (!Number.isInteger(referenceKpiId) || referenceKpiId <= 0)) {
+    throw createHttpError(400, "Reference KPI_ID must be a valid integer.");
+  }
+
+  if (normalizedCalculationMode === "ratio" && referenceKpiId === null) {
+    throw createHttpError(400, "Reference KPI_ID is required for Ratio mode.");
+  }
+
+  if (rawOwnerRoleId !== null && (!Number.isInteger(ownerRoleId) || ownerRoleId <= 0)) {
+    throw createHttpError(400, "Owner role must be a valid integer.");
+  }
 
   return {
+    subject_id: subjectNodeId,
     indicator_title: normalizeOptionalTextInput(payload.indicator_title),
-    indicator_sub_title: normalizeOptionalTextInput(payload.indicator_sub_title),
-    unit: normalizeOptionalTextInput(payload.unit),
-    frequency: normalizeOptionalTextInput(payload.frequency),
-    target: normalizeOptionalTextInput(payload.target),
-    target_direction: normalizeOptionalTextInput(payload.target_direction),
-    tolerance_type: normalizeOptionalTextInput(payload.tolerance_type),
-    up_tolerance: upTolerance,
-    low_tolerance: lowTolerance,
-    max: normalizeOptionalTextInput(payload.max),
-    min: normalizeOptionalTextInput(payload.min),
-    calculation_on: normalizeOptionalTextInput(payload.calculation_on),
-    target_auto_adjustment: normalizeOptionalTextInput(payload.target_auto_adjustment),
-    high_limit: derivedLimits?.high_limit ?? (highLimit === null ? null : Number(highLimit)),
-    low_limit: derivedLimits?.low_limit ?? (lowLimit === null ? null : Number(lowLimit))
+    indicator_sub_title: kpiName,
+    kpi_name: kpiName,
+    kpi_sub_title: normalizeOptionalTextInput(payload.kpi_sub_title ?? payload.indicator_title),
+    kpi_code: normalizeOptionalTextInput(payload.kpi_code),
+    kpi_formula: normalizeOptionalTextInput(payload.kpi_formula),
+    unit,
+    subject,
+    definition: explanation,
+    kpi_explanation: explanation,
+    frequency,
+    target: targetValue === null ? null : Number(targetValue),
+    target_value: targetValue === null ? null : Number(targetValue),
+    target_direction: targetDirection,
+    tolerance_type: toleranceType,
+    up_tolerance: rawUpTolerance === null ? null : rawUpTolerance.replace(/\s+/g, ""),
+    low_tolerance: rawLowTolerance === null ? null : rawLowTolerance.replace(/\s+/g, ""),
+    max: maxValue === null ? null : Number(maxValue),
+    max_value: maxValue === null ? null : Number(maxValue),
+    min: minValue === null ? null : Number(minValue),
+    min_value: minValue === null ? null : Number(minValue),
+    nombre_periode: nombrePeriode,
+    calculation_mode: calculationMode,
+    display_trend: displayTrend,
+    regression,
+    min_type: minType,
+    max_type: maxType,
+    calculation_on: calculationOn,
+    target_auto_adjustment: targetAutoAdjustment,
+    reference_kpi_id: normalizedCalculationMode === "ratio" ? referenceKpiId : null,
+    owner_role_id: ownerRoleId,
+    status,
+    comments: normalizeOptionalTextInput(payload.comments),
+    high_limit: highLimit === null ? null : Number(highLimit),
+    low_limit: lowLimit === null ? null : Number(lowLimit)
   };
 };
 
-const getKpiDisplayTitle = (kpi = {}) =>
-  normalizeOptionalTextInput(kpi.indicator_title) ||
-  normalizeOptionalTextInput(kpi.title) ||
-  normalizeOptionalTextInput(kpi.indicator_sub_title) ||
-  "Untitled KPI";
+const normalizeOptionalDateInput = (value) => {
+  const text = normalizeOptionalTextInput(value);
+  if (text === null) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
 
-const KPI_VALUE_SNAPSHOT_FIELDS = new Set(["target", "high_limit", "low_limit"]);
-
-const buildKpiValueSnapshotExpression = (field, kpiValuesAlias = "kv") =>
-  `NULLIF(BTRIM(${kpiValuesAlias}.${field}_snapshot::text), '')`;
-
-const buildResolvedResponsibleKpiSelect = (
-  kpiAlias = "k",
-  responsibleKpiAlias = "rk",
-  kpiValuesAlias = null
-) =>
-  RESPONSIBLE_KPI_OVERRIDE_FIELDS
-    .map((field) => {
-      const resolvedFieldExpression = buildResolvedKpiFieldExpression(
-        field,
-        kpiAlias,
-        responsibleKpiAlias
-      );
-      const expression = kpiValuesAlias && KPI_VALUE_SNAPSHOT_FIELDS.has(field)
-        ? `COALESCE(
-    ${buildKpiValueSnapshotExpression(field, kpiValuesAlias)},
-    ${resolvedFieldExpression}
-  )`
-        : resolvedFieldExpression;
-
-      return `${expression} AS ${field}`;
-    })
-    .join(",\n          ");
-
-const normalizeSnapshotNumber = (value) => {
-  const normalizedValue = normalizeOptionalNumericInput(value);
-  const numericValue = toFiniteNumber(normalizedValue);
-  return numericValue === null ? null : Number(numericValue.toFixed(6));
+  const parsed = new Date(`${text}T00:00:00Z`);
+  return Number.isNaN(parsed.getTime()) ? null : text;
 };
 
-const buildKpiValueSnapshotPayload = (resolvedKpi = {}) => ({
-  target_snapshot: normalizeSnapshotNumber(resolvedKpi.target),
-  low_limit_snapshot: normalizeSnapshotNumber(resolvedKpi.low_limit),
-  high_limit_snapshot: normalizeSnapshotNumber(resolvedKpi.high_limit)
-});
+const formatDateOnlyValue = (value = new Date()) => {
+  if (!value) return null;
 
-const RESPONSIBLE_KPI_RESOLVED_SELECT = buildResolvedResponsibleKpiSelect("k", "rk");
-const RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES = buildResolvedResponsibleKpiSelect("k", "rk", "kv");
-const RESPONSIBLE_KPI_SEARCH_TITLE = buildResolvedKpiSearchExpression("indicator_title", "k", "rk");
-const RESPONSIBLE_KPI_SEARCH_SUBTITLE = buildResolvedKpiSearchExpression("indicator_sub_title", "k", "rk");
-const RESPONSIBLE_KPI_SEARCH_FREQUENCY = buildResolvedKpiSearchExpression("frequency", "k", "rk");
-const RESPONSIBLE_KPI_SEARCH_TARGET = buildResolvedKpiSearchExpression("target", "k", "rk");
+  if (typeof value === "string") {
+    const normalizedText = value.trim();
+    const dateOnlyMatch = normalizedText.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (dateOnlyMatch) {
+      return `${dateOnlyMatch[1]}-${dateOnlyMatch[2]}-${dateOnlyMatch[3]}`;
+    }
+  }
 
-const buildResolvedKpiValueFieldExpression = (
-  field,
-  kpiAlias = "k",
-  responsibleKpiAlias = "rk",
-  kpiValuesAlias = "kv"
-) =>
-  KPI_VALUE_SNAPSHOT_FIELDS.has(field)
-    ? `COALESCE(
-    ${buildKpiValueSnapshotExpression(field, kpiValuesAlias)},
-    ${buildResolvedKpiFieldExpression(field, kpiAlias, responsibleKpiAlias)}
-  )`
-    : buildResolvedKpiFieldExpression(field, kpiAlias, responsibleKpiAlias);
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
 
-const syncResponsibleKpiValueLinks = async (db, responsibleId, kpiId, responsibleKpiId) => {
-  if (!responsibleKpiId) return;
-
-  await db.query(
-    `
-    UPDATE public.kpi_values
-    SET responsible_kpi_id = $1
-    WHERE responsible_id = $2
-      AND kpi_id = $3
-      AND (responsible_kpi_id IS NULL OR responsible_kpi_id <> $1)
-    `,
-    [responsibleKpiId, responsibleId, kpiId]
-  );
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 };
 
-const updateKpiValueSnapshots = async (
+const prepareResponsibleParameterKpiPayload = (payload = {}) => {
+  const rawKpiId = normalizeOptionalTextInput(payload.kpi_id);
+  const rawValue = normalizeOptionalTextInput(payload.value);
+  const rawTarget = normalizeOptionalTextInput(payload.target);
+  const rawBestNewTarget = normalizeOptionalTextInput(payload.best_new_target);
+  const rawValueDate = normalizeOptionalTextInput(payload.value_date);
+  const kpiId = rawKpiId === null ? null : Number(rawKpiId);
+
+  const normalizedValue = normalizeOptionalNumericInput(rawValue);
+  const normalizedTarget = normalizeOptionalNumericInput(rawTarget);
+  const normalizedBestNewTarget = normalizeOptionalNumericInput(rawBestNewTarget);
+  const normalizedValueDate = normalizeOptionalDateInput(rawValueDate);
+
+  if (rawKpiId === null || !Number.isInteger(kpiId) || kpiId <= 0) {
+    throw createHttpError(400, "KPI Name is required.");
+  }
+
+  if (rawValue !== null && normalizedValue === null) {
+    throw createHttpError(400, "Value must be numeric.");
+  }
+
+  if (rawTarget !== null && normalizedTarget === null) {
+    throw createHttpError(400, "Target must be numeric.");
+  }
+
+  if (rawBestNewTarget !== null && normalizedBestNewTarget === null) {
+    throw createHttpError(400, "Best new target must be numeric.");
+  }
+
+  if (rawValueDate !== null && normalizedValueDate === null) {
+    throw createHttpError(400, "Date must use YYYY-MM-DD format.");
+  }
+
+  const location = normalizeOptionalTextInput(payload.location);
+  const localCurrency = normalizeOptionalTextInput(payload.local_currency);
+  const kpiType = normalizeOptionalTextInput(payload.kpi_type);
+
+  if (!location) {
+    throw createHttpError(400, "Location is required.");
+  }
+
+  if (!localCurrency) {
+    throw createHttpError(400, "Sell Currency is required.");
+  }
+
+  if (!kpiType) {
+    throw createHttpError(400, "KPI type is required.");
+  }
+
+  return {
+    kpi_id: kpiId,
+    location,
+    local_currency: localCurrency,
+    value: normalizedValue === null ? null : Number(normalizedValue),
+    value_date: normalizedValueDate,
+    target: normalizedTarget === null ? null : Number(normalizedTarget),
+    best_new_target: normalizedBestNewTarget === null ? null : Number(normalizedBestNewTarget),
+    kpi_type: kpiType
+  };
+};
+
+let responsibleParameterKpiSchemaPromise = null;
+let kpiRatioSchemaPromise = null;
+let kpiObjectSchemaPromise = null;
+let kpiAssistantConversationSchemaPromise = null;
+
+const ensureKpiRatioSchema = async () => {
+  if (!kpiRatioSchemaPromise) {
+    kpiRatioSchemaPromise = (async () => {
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS created_by_people_id INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS kpi_knowledge_base JSONB
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_target_allocation
+        ADD COLUMN IF NOT EXISTS created_by_people_id INTEGER
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'fk_kpi_created_by_people'
+          ) THEN
+            ALTER TABLE public.kpi
+            ADD CONSTRAINT fk_kpi_created_by_people
+            FOREIGN KEY (created_by_people_id)
+            REFERENCES public.people (people_id)
+            ON UPDATE NO ACTION
+            ON DELETE SET NULL;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_created_by_people
+        ON public.kpi (created_by_people_id)
+      `);
+
+      await pool.query(`
+        WITH ownership AS (
+          SELECT DISTINCT ON (a.kpi_id)
+            a.kpi_id,
+            COALESCE(a.created_by_people_id, a.set_by_people_id) AS created_by_people_id
+          FROM public.kpi_target_allocation a
+          WHERE COALESCE(a.created_by_people_id, a.set_by_people_id) IS NOT NULL
+          ORDER BY
+            a.kpi_id,
+            COALESCE(a.created_at, a.updated_at, NOW()) ASC,
+            a.kpi_target_allocation_id ASC
+        )
+        UPDATE public.kpi k
+        SET created_by_people_id = ownership.created_by_people_id
+        FROM ownership
+        WHERE k.kpi_id = ownership.kpi_id
+          AND k.created_by_people_id IS NULL
+      `);
+    })().catch((error) => {
+      kpiRatioSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return kpiRatioSchemaPromise;
+};
+
+const ensureResponsibleParameterKpiSchema = async () => {
+  if (!responsibleParameterKpiSchemaPromise) {
+    responsibleParameterKpiSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.responsible_parameter_kpis (
+          parameter_kpi_id BIGSERIAL PRIMARY KEY,
+          responsible_id INTEGER NOT NULL
+            REFERENCES public."Responsible" (responsible_id)
+            ON DELETE CASCADE,
+          kpi_id INTEGER
+            REFERENCES public."Kpi" (kpi_id)
+            ON DELETE SET NULL,
+          location VARCHAR(255) NOT NULL,
+          local_currency VARCHAR(50) NOT NULL,
+          value NUMERIC(18, 2),
+          value_date DATE,
+          target NUMERIC(18, 2),
+          best_new_target NUMERIC(18, 2),
+          kpi_type VARCHAR(120) NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.responsible_parameter_kpis
+        ADD COLUMN IF NOT EXISTS kpi_id INTEGER
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'fk_responsible_parameter_kpis_kpi'
+          ) THEN
+            ALTER TABLE public.responsible_parameter_kpis
+            ADD CONSTRAINT fk_responsible_parameter_kpis_kpi
+            FOREIGN KEY (kpi_id)
+            REFERENCES public."Kpi" (kpi_id)
+            ON DELETE SET NULL;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_responsible_parameter_kpis_responsible
+        ON public.responsible_parameter_kpis (responsible_id, created_at DESC)
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_responsible_parameter_kpis_kpi
+        ON public.responsible_parameter_kpis (kpi_id)
+      `);
+    })().catch((error) => {
+      responsibleParameterKpiSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return responsibleParameterKpiSchemaPromise;
+};
+
+const ensureKpiObjectSchema = async () => {
+  if (!kpiObjectSchemaPromise) {
+    kpiObjectSchemaPromise = (async () => {
+      await pool.query(`
+        ALTER TABLE public.kpi_target_allocation
+        ADD COLUMN IF NOT EXISTS unit_type_id INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_target_allocation
+        ADD COLUMN IF NOT EXISTS role_id INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_target_allocation
+        ADD COLUMN IF NOT EXISTS created_by_people_id INTEGER
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'fk_kpi_target_allocation_unit_type'
+          ) THEN
+            ALTER TABLE public.kpi_target_allocation
+            ADD CONSTRAINT fk_kpi_target_allocation_unit_type
+            FOREIGN KEY (unit_type_id)
+            REFERENCES public.unit_type (unit_type_id)
+            ON UPDATE NO ACTION
+            ON DELETE NO ACTION;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'fk_kpi_target_allocation_role'
+          ) THEN
+            ALTER TABLE public.kpi_target_allocation
+            ADD CONSTRAINT fk_kpi_target_allocation_role
+            FOREIGN KEY (role_id)
+            REFERENCES public.role (role_id)
+            ON UPDATE NO ACTION
+            ON DELETE NO ACTION;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_target_allocation_created_by
+        ON public.kpi_target_allocation (created_by_people_id)
+      `);
+    })().catch((error) => {
+      kpiObjectSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return kpiObjectSchemaPromise;
+};
+
+const ensureKpiAssistantConversationSchema = async () => {
+  if (!kpiAssistantConversationSchemaPromise) {
+    kpiAssistantConversationSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.kpi_assistant_conversation (
+          conversation_id BIGSERIAL PRIMARY KEY,
+          people_role_assignment_id INTEGER,
+          people_id INTEGER,
+          kpi_id INTEGER,
+          conversation JSONB NOT NULL DEFAULT '[]'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_assistant_conversation
+        ADD COLUMN IF NOT EXISTS people_id INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_assistant_conversation
+        ADD COLUMN IF NOT EXISTS kpi_id INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_assistant_conversation
+        ADD COLUMN IF NOT EXISTS conversation JSONB
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_assistant_conversation
+        ALTER COLUMN people_role_assignment_id DROP NOT NULL
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_assistant_conversation
+        ALTER COLUMN conversation SET DEFAULT '[]'::jsonb
+      `);
+
+      await pool.query(`
+        UPDATE public.kpi_assistant_conversation
+        SET conversation = '[]'::jsonb
+        WHERE conversation IS NULL
+      `);
+
+      await pool.query(`
+        UPDATE public.kpi_assistant_conversation kac
+        SET people_id = pra.people_id
+        FROM public.people_role_assignment pra
+        WHERE kac.people_role_assignment_id = pra.assignment_id
+          AND kac.people_id IS NULL
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'kpi_assistant_conversation_people_role_assignment_id_fkey'
+          ) THEN
+            ALTER TABLE public.kpi_assistant_conversation
+            ADD CONSTRAINT kpi_assistant_conversation_people_role_assignment_id_fkey
+            FOREIGN KEY (people_role_assignment_id)
+            REFERENCES public.people_role_assignment (assignment_id)
+            ON UPDATE NO ACTION
+            ON DELETE SET NULL;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'kpi_assistant_conversation_people_id_fkey'
+          ) THEN
+            ALTER TABLE public.kpi_assistant_conversation
+            ADD CONSTRAINT kpi_assistant_conversation_people_id_fkey
+            FOREIGN KEY (people_id)
+            REFERENCES public.people (people_id)
+            ON UPDATE NO ACTION
+            ON DELETE SET NULL;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'kpi_assistant_conversation_kpi_id_fkey'
+          ) THEN
+            ALTER TABLE public.kpi_assistant_conversation
+            ADD CONSTRAINT kpi_assistant_conversation_kpi_id_fkey
+            FOREIGN KEY (kpi_id)
+            REFERENCES public.kpi (kpi_id)
+            ON UPDATE NO ACTION
+            ON DELETE SET NULL;
+          END IF;
+        END
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_assistant_conversation_assignment
+        ON public.kpi_assistant_conversation (people_role_assignment_id, kpi_id, updated_at DESC)
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_assistant_conversation_people
+        ON public.kpi_assistant_conversation (people_id, kpi_id, updated_at DESC)
+      `);
+    })().catch((error) => {
+      kpiAssistantConversationSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return kpiAssistantConversationSchemaPromise;
+};
+
+const loadKpiAssistantConversationRow = async (
   db,
-  kpiValuesId,
   {
-    responsible_kpi_id,
-    target_snapshot,
-    low_limit_snapshot,
-    high_limit_snapshot
+    assignmentId = null,
+    peopleId = null,
+    kpiId = null,
+    forUpdate = false
   } = {}
 ) => {
-  await db.query(
-    `
-    UPDATE public."kpi_values"
-    SET
-      responsible_kpi_id = $1,
-      target_snapshot = $2,
-      low_limit_snapshot = $3,
-      high_limit_snapshot = $4
-    WHERE kpi_values_id = $5
-    `,
-    [
-      responsible_kpi_id ?? null,
-      target_snapshot ?? null,
-      low_limit_snapshot ?? null,
-      high_limit_snapshot ?? null,
-      kpiValuesId
-    ]
-  );
-};
+  const normalizedAssignmentId = normalizeOptionalIntegerInput(assignmentId);
+  const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
 
-const syncKpiValuesHistorySequence = async (db) => {
-  await db.query(
-    `
-    SELECT setval(
-      pg_get_serial_sequence('public.kpi_values_hist26', 'hist_id'),
-      COALESCE((SELECT MAX(hist_id) FROM public.kpi_values_hist26), 0) + 1,
-      false
-    )
-    `
-  );
-};
-
-const insertKpiValueHistory = async (
-  db,
-  {
-    kpiValuesId,
-    responsibleId,
-    kpiId,
-    week,
-    oldValue,
-    newValue,
-    comment
+  if (!normalizedAssignmentId && !normalizedPeopleId) {
+    return null;
   }
-) => {
-  const insertQuery = `
-    INSERT INTO public.kpi_values_hist26
-      (kpi_values_id, responsible_id, kpi_id, week, old_value, new_value, comment)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
-  `;
-  const insertParams = [
-    kpiValuesId,
-    responsibleId,
-    kpiId,
-    week,
-    oldValue,
-    newValue,
-    comment ?? null
-  ];
 
-  try {
-    await db.query(insertQuery, insertParams);
-  } catch (error) {
-    const isOutOfSyncHistorySequence =
-      error?.code === "23505" &&
-      error?.constraint === "kpi_values_hist26_pkey";
-
-    if (!isOutOfSyncHistorySequence) {
-      throw error;
-    }
-
-    await syncKpiValuesHistorySequence(db);
-    console.warn(
-      "[kpi_values_hist26] Realigned hist_id sequence after duplicate primary key and retried insert."
-    );
-    await db.query(insertQuery, insertParams);
-  }
-};
-
-const upsertResponsibleKpiAssignment = async (
-  db,
-  responsibleId,
-  kpiId,
-  payload = {},
-  { preserveMissing = false } = {}
-) => {
-  const normalizedPayload = prepareKpiWritePayload(payload);
-  const columnList = RESPONSIBLE_KPI_OVERRIDE_FIELDS.join(",\n        ");
-  const insertPlaceholders = RESPONSIBLE_KPI_OVERRIDE_FIELDS
-    .map((_, index) => `$${index + 3}`)
-    .join(", ");
-  const values = RESPONSIBLE_KPI_OVERRIDE_FIELDS.map((field) =>
-    Object.prototype.hasOwnProperty.call(payload, field)
-      ? normalizedPayload[field] ?? null
-      : null
-  );
-  const presenceFlags = RESPONSIBLE_KPI_OVERRIDE_FIELDS.map((field) =>
-    Object.prototype.hasOwnProperty.call(payload, field)
-  );
-  const updateAssignments = RESPONSIBLE_KPI_OVERRIDE_FIELDS
-    .map((field, index) => {
-      if (!preserveMissing) {
-        return `${field} = EXCLUDED.${field}`;
-      }
-
-      return `${field} = CASE
-        WHEN $${index + RESPONSIBLE_KPI_OVERRIDE_FIELDS.length + 3}
-        THEN EXCLUDED.${field}
-        ELSE public.responsible_kpis.${field}
-      END`;
-    })
-    .join(",\n        ");
-
-  const result = await db.query(
-    `
-    INSERT INTO public.responsible_kpis (
-      responsible_id,
-      kpi_id,
-      ${columnList},
-      updated_at
-    )
-    VALUES (
-      $1,
-      $2,
-      ${insertPlaceholders},
-      NOW()
-    )
-    ON CONFLICT (responsible_id, kpi_id)
-    DO UPDATE SET
-      ${updateAssignments},
-      updated_at = NOW()
-    RETURNING *
-    `,
-    preserveMissing
-      ? [responsibleId, kpiId, ...values, ...presenceFlags]
-      : [responsibleId, kpiId, ...values]
-  );
-
-  return result.rows[0];
-};
-
-const getResolvedResponsibleKpi = async (db, responsibleId, kpiId) => {
   const result = await db.query(
     `
     SELECT
-      rk.responsible_kpi_id,
-      rk.responsible_id,
-      k.kpi_id,
-      ${RESPONSIBLE_KPI_RESOLVED_SELECT}
-    FROM public.responsible_kpis rk
-    JOIN public."Kpi" k
-      ON k.kpi_id = rk.kpi_id
-    WHERE rk.responsible_id = $1
-      AND rk.kpi_id = $2
+      conversation_id,
+      people_role_assignment_id,
+      people_id,
+      conversation
+    FROM public.kpi_assistant_conversation
+    WHERE kpi_id IS NOT DISTINCT FROM $3
+      AND (
+        ($1::integer IS NOT NULL AND people_role_assignment_id = $1)
+        OR (
+          $2::integer IS NOT NULL
+          AND people_id = $2
+          AND ($1::integer IS NULL OR people_role_assignment_id IS NULL)
+        )
+      )
+    ORDER BY
+      CASE
+        WHEN $1::integer IS NOT NULL AND people_role_assignment_id = $1 THEN 0
+        WHEN $2::integer IS NOT NULL AND people_id = $2 THEN 1
+        ELSE 2
+      END,
+      updated_at DESC,
+      conversation_id DESC
     LIMIT 1
+    ${forUpdate ? "FOR UPDATE" : ""}
     `,
-    [responsibleId, kpiId]
+    [normalizedAssignmentId, normalizedPeopleId, normalizedKpiId]
   );
 
   return result.rows[0] || null;
+};
+
+const getResponsibleNameById = async (responsibleId) => {
+  const normalizedId = normalizeOptionalIntegerInput(responsibleId);
+  if (normalizedId === null) return null;
+
+  const result = await pool.query(
+    `
+    SELECT name, first_name
+    FROM public.people
+    WHERE people_id = $1
+    LIMIT 1
+    `,
+    [normalizedId]
+  );
+
+  return getPeopleDisplayName(result.rows[0]);
+};
+
+const loadPeopleContextByPeopleId = async (peopleId) => {
+  const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
+  if (!normalizedPeopleId) return null;
+
+  const peopleRes = await pool.query(
+    `
+    SELECT
+      p.people_id,
+      p.first_name,
+      p.name,
+      p.email,
+      u.unit_name AS plant_name
+    FROM public.people p
+    LEFT JOIN public.unit u
+      ON u.unit_id = p.work_at_unit_id
+    WHERE p.people_id = $1
+    LIMIT 1
+    `,
+    [normalizedPeopleId]
+  );
+
+  const row = peopleRes.rows[0];
+  if (!row) return null;
+
+  return {
+    people_id: row.people_id,
+    name: getPeopleDisplayName(row) || `People #${normalizedPeopleId}`,
+    email: normalizeOptionalTextInput(row.email),
+    plant_name: normalizeOptionalTextInput(row.plant_name) || "Allocated scope",
+    department_name: ""
+  };
+};
+
+const loadLegacyResponsibleIdentity = async (responsibleId) => {
+  const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
+  if (!normalizedResponsibleId) return null;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT responsible_id, name, email
+      FROM public."Responsible"
+      WHERE responsible_id = $1
+      LIMIT 1
+      `,
+      [normalizedResponsibleId]
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+      responsible_id: row.responsible_id,
+      name: normalizeOptionalTextInput(row.name),
+      email: normalizeOptionalTextInput(row.email)
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
+const findPeopleContextForLegacyResponsible = async (legacyResponsible = {}) => {
+  const legacyEmail = normalizeOptionalTextInput(legacyResponsible.email);
+  const legacyName = normalizeOptionalTextInput(legacyResponsible.name);
+  if (!legacyEmail && !legacyName) return null;
+
+  const result = await pool.query(
+    `
+    SELECT
+      p.people_id,
+      p.first_name,
+      p.name,
+      p.email,
+      u.unit_name AS plant_name
+    FROM public.people p
+    LEFT JOIN public.unit u
+      ON u.unit_id = p.work_at_unit_id
+    WHERE
+      ($1::text IS NOT NULL AND LOWER(COALESCE(p.email, '')) = LOWER($1))
+      OR (
+        $2::text IS NOT NULL
+        AND (
+          LOWER(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, '')))) = LOWER($2)
+          OR LOWER(COALESCE(p.name, '')) = LOWER($2)
+          OR LOWER(COALESCE(p.first_name, '')) = LOWER($2)
+        )
+      )
+    ORDER BY
+      CASE
+        WHEN $1::text IS NOT NULL AND LOWER(COALESCE(p.email, '')) = LOWER($1) THEN 0
+        WHEN $2::text IS NOT NULL
+          AND LOWER(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, '')))) = LOWER($2) THEN 1
+        WHEN $2::text IS NOT NULL AND LOWER(COALESCE(p.name, '')) = LOWER($2) THEN 2
+        WHEN $2::text IS NOT NULL AND LOWER(COALESCE(p.first_name, '')) = LOWER($2) THEN 3
+        ELSE 4
+      END,
+      p.people_id ASC
+    LIMIT 1
+    `,
+    [legacyEmail, legacyName]
+  );
+
+  const row = result.rows[0];
+  if (!row) return null;
+
+  return {
+    people_id: row.people_id,
+    name: getPeopleDisplayName(row) || legacyName || `People #${row.people_id}`,
+    email: normalizeOptionalTextInput(row.email) || legacyEmail,
+    plant_name: normalizeOptionalTextInput(row.plant_name) || "Allocated scope",
+    department_name: ""
+  };
+};
+
+
+const prepareKpiObjectPayload = (payload = {}) => {
+  const rawKpiId = normalizeOptionalTextInput(payload.kpi_id);
+  const rawPlantId = normalizeOptionalTextInput(payload.plant_id);
+  const rawZoneId = normalizeOptionalTextInput(payload.zone_id);
+  const rawUnitId = normalizeOptionalTextInput(payload.unit_id);
+  const rawUnitTypeId = normalizeOptionalTextInput(payload.unit_type_id);
+  const rawRoleId = normalizeOptionalTextInput(payload.role_id);
+  const rawProductId = normalizeOptionalTextInput(payload.product_id);
+  const rawProductLineId = normalizeOptionalTextInput(payload.product_line_id);
+  const rawMarketId = normalizeOptionalTextInput(payload.market_id);
+  const rawCustomerId = normalizeOptionalTextInput(payload.customer_id);
+  const rawSetByPeopleId = normalizeOptionalTextInput(payload.set_by_people_id);
+  const rawCreatedByPeopleId = normalizeOptionalTextInput(payload.created_by_people_id);
+  const rawApprovedByPeopleId = normalizeOptionalTextInput(payload.approved_by_people_id);
+  const rawTargetValue = normalizeOptionalTextInput(payload.target_value ?? payload.target);
+  const rawLastBestTarget = normalizeOptionalTextInput(payload.last_best_target ?? payload.best_new_target);
+  const rawPreviousTargetValue = normalizeOptionalTextInput(payload.previous_target_value ?? payload.value);
+  const rawTargetSetupDate = normalizeOptionalTextInput(payload.target_setup_date ?? payload.value_date);
+  const rawTargetStartDate = normalizeOptionalTextInput(payload.target_start_date);
+  const rawTargetEndDate = normalizeOptionalTextInput(payload.target_end_date);
+  const kpiId = rawKpiId === null ? null : Number(rawKpiId);
+  const plantId = rawPlantId === null ? null : Number(rawPlantId);
+  const zoneId = rawZoneId === null ? null : Number(rawZoneId);
+  const unitId = rawUnitId === null ? null : Number(rawUnitId);
+  const unitTypeId = rawUnitTypeId === null ? null : Number(rawUnitTypeId);
+  const roleId = rawRoleId === null ? null : Number(rawRoleId);
+  const productId = rawProductId === null ? null : Number(rawProductId);
+  const productLineId = rawProductLineId === null ? null : Number(rawProductLineId);
+  const marketId = rawMarketId === null ? null : Number(rawMarketId);
+  const customerId = rawCustomerId === null ? null : Number(rawCustomerId);
+  const setByPeopleId = rawSetByPeopleId === null ? null : Number(rawSetByPeopleId);
+  const createdByPeopleId = rawCreatedByPeopleId === null ? null : Number(rawCreatedByPeopleId);
+  const approvedByPeopleId = rawApprovedByPeopleId === null ? null : Number(rawApprovedByPeopleId);
+
+  const normalizedTargetValue = normalizeOptionalNumericInput(rawTargetValue);
+  const normalizedLastBestTarget = normalizeOptionalNumericInput(rawLastBestTarget);
+  const normalizedPreviousTargetValue = normalizeOptionalNumericInput(rawPreviousTargetValue);
+  const normalizedTargetSetupDate =
+    normalizeOptionalDateInput(rawTargetSetupDate) ||
+    formatDateOnlyValue(new Date());
+  const normalizedTargetStartDate = normalizeOptionalDateInput(rawTargetStartDate);
+  const normalizedTargetEndDate = normalizeOptionalDateInput(rawTargetEndDate);
+
+  if (rawKpiId === null || !Number.isInteger(kpiId) || kpiId <= 0) {
+    throw createHttpError(400, "KPI Name is required.");
+  }
+
+  if (rawTargetValue === null || normalizedTargetValue === null) {
+    throw createHttpError(400, "Target value is required and must be numeric.");
+  }
+
+  if (rawLastBestTarget !== null && normalizedLastBestTarget === null) {
+    throw createHttpError(400, "Last best target must be numeric.");
+  }
+
+  if (rawPreviousTargetValue !== null && normalizedPreviousTargetValue === null) {
+    throw createHttpError(400, "Previous target value must be numeric.");
+  }
+
+  if (rawTargetSetupDate !== null && normalizeOptionalDateInput(rawTargetSetupDate) === null) {
+    throw createHttpError(400, "Target setup date must use YYYY-MM-DD format.");
+  }
+
+  if (rawTargetStartDate !== null && normalizedTargetStartDate === null) {
+    throw createHttpError(400, "Target start date must use YYYY-MM-DD format.");
+  }
+
+  if (rawTargetEndDate !== null && normalizedTargetEndDate === null) {
+    throw createHttpError(400, "Target end date must use YYYY-MM-DD format.");
+  }
+
+  if (
+    normalizedTargetStartDate &&
+    normalizedTargetEndDate &&
+    normalizedTargetStartDate > normalizedTargetEndDate
+  ) {
+    throw createHttpError(400, "Target end date must be after the start date.");
+  }
+
+  const localCurrency = normalizeOptionalTextInput(payload.local_currency);
+  const kpiType = normalizeOptionalTextInput(payload.kpi_type);
+  const targetUnit = normalizeOptionalTextInput(payload.target_unit);
+  const targetStatus = normalizeOptionalTextInput(payload.target_status) || "Draft";
+  const functionName = normalizeOptionalTextInput(payload.function);
+  const normalizedKpiType = String(kpiType || "").trim().toLowerCase();
+
+  if (normalizedKpiType === "individual" && roleId === null) {
+    throw createHttpError(400, "Role is required for Individual KPI type.");
+  }
+
+  for (const [label, rawValue, numericValue] of [
+    ["Plant", rawPlantId, plantId],
+    ["Zone", rawZoneId, zoneId],
+    ["Unit", rawUnitId, unitId],
+    ["Unit type", rawUnitTypeId, unitTypeId],
+    ["Role", rawRoleId, roleId],
+    ["Product", rawProductId, productId],
+    ["Product line", rawProductLineId, productLineId],
+    ["Market", rawMarketId, marketId],
+    ["Customer", rawCustomerId, customerId],
+    ["Set by people", rawSetByPeopleId, setByPeopleId],
+    ["Created by people", rawCreatedByPeopleId, createdByPeopleId],
+    ["Approved by people", rawApprovedByPeopleId, approvedByPeopleId]
+  ]) {
+    if (rawValue !== null && (!Number.isInteger(numericValue) || numericValue <= 0)) {
+      throw createHttpError(400, `${label} must be a valid selection.`);
+    }
+  }
+
+  return {
+    kpi_id: kpiId,
+    local_currency: localCurrency,
+    plant_id: plantId,
+    zone_id: zoneId,
+    unit_id: unitId,
+    unit_type_id: unitTypeId,
+    role_id: roleId,
+    function: functionName,
+    product_id: productId,
+    product_line_id: productLineId,
+    market_id: marketId,
+    customer_id: customerId,
+    target_value: Number(normalizedTargetValue),
+    target_unit: targetUnit,
+    kpi_type: kpiType,
+    target_setup_date: normalizedTargetSetupDate,
+    target_start_date: normalizedTargetStartDate,
+    target_end_date: normalizedTargetEndDate,
+    last_best_target: normalizedLastBestTarget === null ? null : Number(normalizedLastBestTarget),
+    previous_target_value: normalizedPreviousTargetValue === null ? null : Number(normalizedPreviousTargetValue),
+    target_status: targetStatus,
+    set_by_people_id: setByPeopleId,
+    created_by_people_id: createdByPeopleId,
+    approved_by_people_id: approvedByPeopleId,
+    comments: normalizeOptionalTextInput(payload.comments)
+  };
+};
+
+const loadSubjectHierarchyData = async (db = pool) => {
+  const result = await db.query(`
+    SELECT
+      subject_id,
+      parent_subject_id,
+      subject_name,
+      subject_explanation,
+      subject_example,
+      knowledge,
+      status,
+      comments
+    FROM public.subject
+    ORDER BY subject_id
+  `);
+
+  const nodeMap = new Map();
+
+  result.rows.forEach((row) => {
+    const id = String(row.subject_id);
+    nodeMap.set(id, {
+      id,
+      name: normalizeOptionalTextInput(row.subject_name) || `Subject ${row.subject_id}`,
+      parent_id: row.parent_subject_id === null ? null : String(row.parent_subject_id),
+      parent_name: null,
+      level: 0,
+      full_path: normalizeOptionalTextInput(row.subject_name) || `Subject ${row.subject_id}`,
+      description: normalizeOptionalTextInput(row.subject_explanation) || "",
+      comment: normalizeOptionalTextInput(row.comments) || "",
+      why_important: normalizeOptionalTextInput(row.knowledge) || "",
+      subject_example: normalizeOptionalTextInput(row.subject_example) || "",
+      status: normalizeOptionalTextInput(row.status) || "",
+      children: []
+    });
+  });
+
+  nodeMap.forEach((node) => {
+    if (node.parent_id && nodeMap.has(node.parent_id)) {
+      nodeMap.get(node.parent_id).children.push(node);
+    }
+  });
+
+  const resolvePath = (node) => {
+    if (!node) return "";
+    if (node.__resolvedPath) return node.__resolvedPath;
+
+    if (node.parent_id && nodeMap.has(node.parent_id)) {
+      const parentNode = nodeMap.get(node.parent_id);
+      const parentPath = resolvePath(parentNode);
+      node.parent_name = parentNode.name || null;
+      node.level = (parentNode.level || 0) + 1;
+      node.__resolvedPath = `${parentPath} / ${node.name}`;
+    } else {
+      node.parent_name = null;
+      node.level = 0;
+      node.__resolvedPath = node.name;
+    }
+
+    node.full_path = node.__resolvedPath;
+    return node.__resolvedPath;
+  };
+
+  const roots = [];
+  const pathById = new Map();
+
+  nodeMap.forEach((node) => {
+    resolvePath(node);
+    pathById.set(String(node.id), node.full_path);
+
+    if (!node.parent_id || !nodeMap.has(node.parent_id)) {
+      roots.push(node);
+    }
+
+    delete node.__resolvedPath;
+  });
+
+  const sortNodes = (nodes = []) => {
+    nodes.sort((left, right) => String(left.name || "").localeCompare(String(right.name || "")));
+    nodes.forEach((node) => sortNodes(node.children));
+    return nodes;
+  };
+
+  return {
+    tree: sortNodes(roots),
+    nodeMap,
+    pathById
+  };
+};
+
+const buildKpiKnowledgeBaseScopeLabel = (parts = []) =>
+  parts
+    .map((value) => normalizeOptionalTextInput(value))
+    .filter(Boolean)
+    .join(" / ");
+
+const buildKpiKnowledgeBaseAllocationEntry = (row = {}) => {
+  const scopeLabel = buildKpiKnowledgeBaseScopeLabel([
+    row.plant_name,
+    row.zone_name,
+    row.unit_name,
+    row.unit_type_name,
+    row.role_name,
+    row.function_name,
+    row.product_name,
+    row.product_line_name,
+    row.market_name,
+    row.customer_name
+  ]) || `Allocation ${row.kpi_target_allocation_id}`;
+
+  return {
+    allocation_id: row.kpi_target_allocation_id,
+    scope_label: scopeLabel,
+    target: {
+      value: row.target_value ?? null,
+      unit: row.target_unit || null,
+      local_currency: row.local_currency || null,
+      type: row.kpi_type || null,
+      status: row.target_status || null
+    },
+    baseline: {
+      previous_target_value: row.previous_target_value ?? null,
+      last_best_target: row.last_best_target ?? null
+    },
+    dates: {
+      setup_date: normalizeOptionalDateInput(row.target_setup_date),
+      start_date: normalizeOptionalDateInput(row.target_start_date),
+      end_date: normalizeOptionalDateInput(row.target_end_date),
+      created_at: formatKnowledgeBaseTimestamp(row.created_at),
+      updated_at: formatKnowledgeBaseTimestamp(row.updated_at)
+    },
+    scope: {
+      plant: row.plant_id ? { id: row.plant_id, name: row.plant_name || "" } : null,
+      zone: row.zone_id ? { id: row.zone_id, name: row.zone_name || "" } : null,
+      unit: row.unit_id ? { id: row.unit_id, name: row.unit_name || "" } : null,
+      unit_type: row.unit_type_id ? { id: row.unit_type_id, name: row.unit_type_name || "" } : null,
+      role: row.role_id ? { id: row.role_id, name: row.role_name || "" } : null,
+      function_name: row.function_name || null,
+      product: row.product_id ? { id: row.product_id, name: row.product_name || "" } : null,
+      product_line: row.product_line_id ? { id: row.product_line_id, name: row.product_line_name || "" } : null,
+      market: row.market_id ? { id: row.market_id, name: row.market_name || "" } : null,
+      customer: row.customer_id ? { id: row.customer_id, name: row.customer_name || "" } : null
+    },
+    people: {
+      set_by: row.set_by_people_id
+        ? { id: row.set_by_people_id, name: getPeopleDisplayName(row.set_by_people || {}) || "" }
+        : null,
+      created_by: row.created_by_people_id
+        ? { id: row.created_by_people_id, name: getPeopleDisplayName(row.created_by_people || {}) || "" }
+        : null,
+      approved_by: row.approved_by_people_id
+        ? { id: row.approved_by_people_id, name: getPeopleDisplayName(row.approved_by_people || {}) || "" }
+        : null
+    },
+    comments: normalizeOptionalTextInput(row.comments) || "",
+    keywords: buildKnowledgeBaseKeywordList([
+      scopeLabel,
+      row.function_name,
+      row.plant_name,
+      row.zone_name,
+      row.unit_name,
+      row.unit_type_name,
+      row.role_name,
+      row.product_name,
+      row.product_line_name,
+      row.market_name,
+      row.customer_name,
+      row.comments,
+      row.kpi_type,
+      row.target_status
+    ], 18)
+  };
+};
+
+const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) return null;
+
+  const [
+    kpiResult,
+    subjectLinksResult,
+    targetAllocationsResult,
+    subjectHierarchy
+  ] = await Promise.all([
+    db.query(
+      `
+      SELECT
+        k.kpi_id,
+        k.kpi_name,
+        k.kpi_sub_title,
+        k.kpi_code,
+        k.kpi_explanation,
+        k.kpi_formula,
+        k.target_value,
+        k.target_direction,
+        k.target_auto_adjustment,
+        k.min_value,
+        k.min_type,
+        k.max_value,
+        k.max_type,
+        k.low_limit,
+        k.high_limit,
+        k.tolerance_type,
+        k.low_tolerance,
+        k.up_tolerance,
+        k.unit,
+        k.frequency,
+        k.nombre_periode,
+        k.calculation_mode,
+        k.calculation_on,
+        k.display_trend,
+        k.regression,
+        k.reference_kpi_id,
+        reference_kpi.kpi_name AS reference_kpi_name,
+        k.owner_role_id,
+        owner_role.role_name AS owner_role_name,
+        k.status,
+        k.comments,
+        k.created_at,
+        k.updated_at,
+        k.created_by_people_id,
+        created_by_people.name AS created_by_name,
+        created_by_people.first_name AS created_by_first_name
+      FROM public.kpi k
+      LEFT JOIN public.kpi reference_kpi
+        ON reference_kpi.kpi_id = k.reference_kpi_id
+      LEFT JOIN public.role owner_role
+        ON owner_role.role_id = k.owner_role_id
+      LEFT JOIN public.people created_by_people
+        ON created_by_people.people_id = k.created_by_people_id
+      WHERE k.kpi_id = $1
+      LIMIT 1
+      `,
+      [normalizedKpiId]
+    ),
+    db.query(
+      `
+      SELECT
+        sk.subject_kpi_id,
+        sk.subject_id,
+        sk.importance_level,
+        sk.is_primary,
+        sk.comments,
+        s.parent_subject_id,
+        s.subject_name,
+        s.subject_explanation,
+        s.subject_example,
+        s.knowledge,
+        s.status AS subject_status
+      FROM public.subject_kpi sk
+      JOIN public.subject s
+        ON s.subject_id = sk.subject_id
+      WHERE sk.kpi_id = $1
+      ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+      `,
+      [normalizedKpiId]
+    ),
+    db.query(
+      `
+      SELECT
+        a.kpi_target_allocation_id,
+        a.kpi_id,
+        a.plant_id,
+        plant.unit_name AS plant_name,
+        a.zone_id,
+        zone.zone_name,
+        a.unit_id,
+        unit_scope.unit_name AS unit_name,
+        a.unit_type_id,
+        unit_type.unit_type_name,
+        a.role_id,
+        role.role_name,
+        a."function" AS function_name,
+        a.product_id,
+        product.product_name,
+        a.product_line_id,
+        product_line.product_line_name,
+        a.market_id,
+        market.market_name,
+        a.customer_id,
+        customer.customer_name,
+        a.target_value,
+        a.target_unit,
+        a.local_currency,
+        a.kpi_type,
+        a.target_setup_date,
+        a.target_start_date,
+        a.target_end_date,
+        a.last_best_target,
+        a.previous_target_value,
+        a.target_status,
+        a.set_by_people_id,
+        a.created_by_people_id,
+        a.approved_by_people_id,
+        a.comments,
+        a.created_at,
+        a.updated_at,
+        set_by_people.name AS set_by_people_name,
+        set_by_people.first_name AS set_by_people_first_name,
+        created_by_people.name AS created_by_people_name,
+        created_by_people.first_name AS created_by_people_first_name,
+        approved_by_people.name AS approved_by_people_name,
+        approved_by_people.first_name AS approved_by_people_first_name
+      FROM public.kpi_target_allocation a
+      LEFT JOIN public.unit plant
+        ON plant.unit_id = a.plant_id
+      LEFT JOIN public.zone zone
+        ON zone.zone_id = a.zone_id
+      LEFT JOIN public.unit unit_scope
+        ON unit_scope.unit_id = a.unit_id
+      LEFT JOIN public.unit_type unit_type
+        ON unit_type.unit_type_id = a.unit_type_id
+      LEFT JOIN public.role role
+        ON role.role_id = a.role_id
+      LEFT JOIN public.product product
+        ON product.product_id = a.product_id
+      LEFT JOIN public.product_line product_line
+        ON product_line.product_line_id = a.product_line_id
+      LEFT JOIN public.market market
+        ON market.market_id = a.market_id
+      LEFT JOIN public.customer customer
+        ON customer.customer_id = a.customer_id
+      LEFT JOIN public.people set_by_people
+        ON set_by_people.people_id = a.set_by_people_id
+      LEFT JOIN public.people created_by_people
+        ON created_by_people.people_id = a.created_by_people_id
+      LEFT JOIN public.people approved_by_people
+        ON approved_by_people.people_id = a.approved_by_people_id
+      WHERE a.kpi_id = $1
+      ORDER BY COALESCE(a.updated_at, a.created_at) DESC, a.kpi_target_allocation_id DESC
+      `,
+      [normalizedKpiId]
+    ),
+    loadSubjectHierarchyData(db)
+  ]);
+
+  if (!kpiResult.rows.length) {
+    return null;
+  }
+
+  return {
+    kpi: kpiResult.rows[0],
+    subject_links: subjectLinksResult.rows,
+    target_allocations: targetAllocationsResult.rows.map((row) => ({
+      ...row,
+      set_by_people: {
+        name: row.set_by_people_name,
+        first_name: row.set_by_people_first_name
+      },
+      created_by_people: {
+        name: row.created_by_people_name,
+        first_name: row.created_by_people_first_name
+      },
+      approved_by_people: {
+        name: row.approved_by_people_name,
+        first_name: row.approved_by_people_first_name
+      }
+    })),
+    subject_hierarchy: subjectHierarchy
+  };
+};
+
+const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = {}) => {
+  if (!sourceData?.kpi) return null;
+
+  const { kpi, subject_links: subjectLinks, target_allocations: targetAllocations, subject_hierarchy: subjectHierarchy } = sourceData;
+  const flatKnowledgeNodes = new Map();
+  const causeEffectLinks = new Map();
+
+  const buildSubjectTree = (subjectNode, rootSubjectId, depthFromRoot = 0) => {
+    if (!subjectNode || depthFromRoot > KPI_KNOWLEDGE_BASE_MAX_DEPTH) {
+      return null;
+    }
+
+    const childNodes = depthFromRoot >= KPI_KNOWLEDGE_BASE_MAX_DEPTH
+      ? []
+      : (Array.isArray(subjectNode.children) ? subjectNode.children : [])
+        .map((childNode) => buildSubjectTree(childNode, rootSubjectId, depthFromRoot + 1))
+        .filter(Boolean);
+
+    const nodeEntry = {
+      node_id: `subject:${subjectNode.id}`,
+      subject_id: Number(subjectNode.id),
+      parent_subject_id: normalizeOptionalIntegerInput(subjectNode.parent_id),
+      root_subject_id: normalizeOptionalIntegerInput(rootSubjectId),
+      name: subjectNode.name || `Subject ${subjectNode.id}`,
+      path: subjectHierarchy.pathById.get(String(subjectNode.id)) || subjectNode.full_path || subjectNode.name || "",
+      hierarchy_level: Number(subjectNode.level || 0),
+      depth_from_root: depthFromRoot,
+      description: subjectNode.description || "",
+      knowledge: subjectNode.why_important || "",
+      example: subjectNode.subject_example || "",
+      status: subjectNode.status || "",
+      comments: subjectNode.comment || "",
+      keywords: buildKnowledgeBaseKeywordList([
+        subjectNode.name,
+        subjectNode.full_path,
+        subjectNode.description,
+        subjectNode.why_important,
+        subjectNode.subject_example,
+        subjectNode.comment
+      ], 18),
+      children: childNodes
+    };
+
+    const flatNodeEntry = {
+      node_id: nodeEntry.node_id,
+      subject_id: nodeEntry.subject_id,
+      parent_subject_id: nodeEntry.parent_subject_id,
+      root_subject_id: nodeEntry.root_subject_id,
+      name: nodeEntry.name,
+      path: nodeEntry.path,
+      hierarchy_level: nodeEntry.hierarchy_level,
+      depth_from_root: nodeEntry.depth_from_root,
+      description: nodeEntry.description,
+      knowledge: nodeEntry.knowledge,
+      example: nodeEntry.example,
+      status: nodeEntry.status,
+      comments: nodeEntry.comments,
+      keywords: nodeEntry.keywords,
+      children_ids: childNodes.map((childNode) => childNode.node_id)
+    };
+
+    const existingFlatNode = flatKnowledgeNodes.get(flatNodeEntry.node_id);
+    if (
+      !existingFlatNode ||
+      Number(flatNodeEntry.depth_from_root) < Number(existingFlatNode.depth_from_root)
+    ) {
+      flatKnowledgeNodes.set(flatNodeEntry.node_id, flatNodeEntry);
+    }
+
+    childNodes.forEach((childNode) => {
+      const relation = {
+        source_node_id: nodeEntry.node_id,
+        source_subject_id: nodeEntry.subject_id,
+        target_node_id: childNode.node_id,
+        target_subject_id: childNode.subject_id,
+        relation_type: "parent_child_influence",
+        relation_basis: "subject_hierarchy",
+        description: `${nodeEntry.name} provides the parent context for ${childNode.name}.`
+      };
+      const relationKey = [
+        relation.source_node_id,
+        relation.target_node_id,
+        relation.relation_type
+      ].join("|");
+      if (!causeEffectLinks.has(relationKey)) {
+        causeEffectLinks.set(relationKey, relation);
+      }
+    });
+
+    return nodeEntry;
+  };
+
+  const linkedSubjects = subjectLinks.map((link) => {
+    const subjectNode = subjectHierarchy.nodeMap.get(String(link.subject_id));
+    const knowledgeTree = subjectNode
+      ? buildSubjectTree(subjectNode, link.subject_id, 0)
+      : null;
+
+    return {
+      subject_kpi_id: link.subject_kpi_id,
+      subject_id: link.subject_id,
+      is_primary: Boolean(link.is_primary),
+      importance_level: normalizeOptionalTextInput(link.importance_level) || "",
+      assignment_comments: normalizeOptionalTextInput(link.comments) || "",
+      path: subjectHierarchy.pathById.get(String(link.subject_id)) || normalizeOptionalTextInput(link.subject_name) || "",
+      subject_name: normalizeOptionalTextInput(link.subject_name) || "",
+      subject_description: normalizeOptionalTextInput(link.subject_explanation) || "",
+      subject_knowledge: normalizeOptionalTextInput(link.knowledge) || "",
+      subject_example: normalizeOptionalTextInput(link.subject_example) || "",
+      subject_status: normalizeOptionalTextInput(link.subject_status) || "",
+      keywords: buildKnowledgeBaseKeywordList([
+        link.subject_name,
+        link.subject_explanation,
+        link.knowledge,
+        link.subject_example,
+        link.comments
+      ], 18),
+      knowledge_tree: knowledgeTree
+    };
+  });
+
+  const primarySubject = linkedSubjects.find((entry) => entry.is_primary) || linkedSubjects[0] || null;
+  const allocationEntries = targetAllocations.map((row) => buildKpiKnowledgeBaseAllocationEntry(row));
+  const scopeSummary = {
+    plants: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.plant?.name), 12),
+    zones: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.zone?.name), 12),
+    units: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.unit?.name), 12),
+    unit_types: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.unit_type?.name), 12),
+    roles: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.role?.name), 12),
+    functions: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.function_name), 12),
+    products: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.product?.name), 12),
+    product_lines: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.product_line?.name), 12),
+    markets: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.market?.name), 12),
+    customers: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.customer?.name), 12)
+  };
+
+  return {
+    schema_version: "1.0.0",
+    generated_at: new Date().toISOString(),
+    generation_context: {
+      reason,
+      max_subject_depth: KPI_KNOWLEDGE_BASE_MAX_DEPTH,
+      source_tables: ["kpi", "subject_kpi", "subject", "kpi_target_allocation"],
+      purpose: ["solution_search", "training", "rag", "diagnosis"]
+    },
+    kpi: {
+      kpi_id: kpi.kpi_id,
+      name: kpi.kpi_name || "",
+      sub_title: kpi.kpi_sub_title || "",
+      display_name: [kpi.kpi_sub_title, kpi.kpi_name].filter(Boolean).join(" - ") || kpi.kpi_name || `KPI ${kpi.kpi_id}`,
+      code: kpi.kpi_code || "",
+      explanation: kpi.kpi_explanation || "",
+      formula: kpi.kpi_formula || "",
+      unit: kpi.unit || "",
+      frequency: kpi.frequency || "",
+      status: kpi.status || "",
+      comments: kpi.comments || "",
+      target: {
+        default_value: kpi.target_value ?? null,
+        direction: kpi.target_direction || null,
+        auto_adjustment: kpi.target_auto_adjustment || null
+      },
+      thresholds: {
+        min_value: kpi.min_value ?? null,
+        min_type: kpi.min_type || null,
+        max_value: kpi.max_value ?? null,
+        max_type: kpi.max_type || null,
+        low_limit: kpi.low_limit ?? null,
+        high_limit: kpi.high_limit ?? null,
+        tolerance_type: kpi.tolerance_type || null,
+        low_tolerance: kpi.low_tolerance || null,
+        up_tolerance: kpi.up_tolerance || null
+      },
+      calculation: {
+        mode: kpi.calculation_mode || null,
+        calculation_on: kpi.calculation_on || null,
+        nombre_periode: kpi.nombre_periode || null,
+        display_trend: kpi.display_trend || null,
+        regression: kpi.regression || null
+      },
+      ownership: {
+        owner_role_id: kpi.owner_role_id ?? null,
+        owner_role_name: kpi.owner_role_name || null,
+        created_by_people_id: kpi.created_by_people_id ?? null,
+        created_by_name: getPeopleDisplayName({
+          name: kpi.created_by_name,
+          first_name: kpi.created_by_first_name
+        }) || null
+      },
+      reference_kpi: kpi.reference_kpi_id
+        ? {
+            kpi_id: kpi.reference_kpi_id,
+            name: kpi.reference_kpi_name || ""
+          }
+        : null,
+      timestamps: {
+        created_at: formatKnowledgeBaseTimestamp(kpi.created_at),
+        updated_at: formatKnowledgeBaseTimestamp(kpi.updated_at)
+      }
+    },
+    subject_context: {
+      primary_subject_id: primarySubject?.subject_id || null,
+      primary_subject_path: primarySubject?.path || null,
+      linked_subjects: linkedSubjects,
+      knowledge_nodes: Array.from(flatKnowledgeNodes.values()).sort((left, right) => {
+        const depthDiff = Number(left.depth_from_root || 0) - Number(right.depth_from_root || 0);
+        if (depthDiff !== 0) return depthDiff;
+        return String(left.path || left.name || "").localeCompare(String(right.path || right.name || ""));
+      }),
+      cause_effect_links: Array.from(causeEffectLinks.values())
+    },
+    target_allocations: allocationEntries,
+    scope_summary: scopeSummary,
+    search_index: {
+      keywords: buildKnowledgeBaseKeywordList([
+        kpi.kpi_name,
+        kpi.kpi_sub_title,
+        kpi.kpi_code,
+        kpi.kpi_explanation,
+        kpi.kpi_formula,
+        primarySubject?.path,
+        linkedSubjects.map((entry) => entry.subject_name),
+        linkedSubjects.map((entry) => entry.subject_description),
+        linkedSubjects.map((entry) => entry.subject_knowledge),
+        allocationEntries.map((entry) => entry.scope_label),
+        allocationEntries.map((entry) => entry.comments),
+        Object.values(scopeSummary)
+      ], 80),
+      subject_paths: uniqueKnowledgeBaseTexts(linkedSubjects.map((entry) => entry.path), 20),
+      allocation_scopes: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope_label), 20)
+    },
+    ai_usage: {
+      instructions: "Use KPI definition first, then the subject tree and cause-effect links, then target allocation scope and comments.",
+      preferred_order: ["kpi", "subject_context", "target_allocations", "scope_summary"]
+    }
+  };
+};
+
+const refreshKpiKnowledgeBaseForKpiId = async (db, kpiId, options = {}) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) return null;
+
+  const sourceData = await loadKpiKnowledgeBaseSourceData(db, normalizedKpiId);
+  if (!sourceData) return null;
+
+  const knowledgeBase = buildKpiKnowledgeBaseDocument(sourceData, options);
+  if (!knowledgeBase) return null;
+
+  await db.query(
+    `
+    UPDATE public.kpi
+    SET kpi_knowledge_base = $2::jsonb
+    WHERE kpi_id = $1
+    `,
+    [normalizedKpiId, JSON.stringify(knowledgeBase)]
+  );
+
+  return knowledgeBase;
+};
+
+const refreshKpiKnowledgeBases = async (db, kpiIds = [], options = {}) => {
+  const uniqueKpiIds = [...new Set(
+    (Array.isArray(kpiIds) ? kpiIds : [])
+      .map((value) => normalizeOptionalIntegerInput(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+  )];
+
+  for (const kpiId of uniqueKpiIds) {
+    await refreshKpiKnowledgeBaseForKpiId(db, kpiId, options);
+  }
+};
+
+const buildKpiAssistantMessagesForOpenAI = ({
+  kpiRow,
+  existingConversation,
+  message,
+  ragContext
+}) => {
+  const systemPrompt = buildStrictKpiKnowledgePrompt(kpiRow, ragContext);
+
+  return [
+    { role: "system", content: systemPrompt },
+    ...(Array.isArray(existingConversation) ? existingConversation : []).slice(-10).map((entry) => ({
+      role: entry.role,
+      content: entry.content || entry.text || ""
+    })),
+    {
+      role: "system",
+      content:
+        "Use the current KPI knowledge base JSON as the source of truth. Use the matched KPI knowledge context first, then the rest of the KPI JSON. Ignore old conversation values if they conflict."
+    },
+    { role: "user", content: message }
+  ];
+};
+
+const writeSseEvent = (res, eventName, payload) => {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+};
+
+const loadRoleOptions = async () => {
+  const result = await pool.query(`
+    SELECT role_id, role_name
+    FROM public.role
+    ORDER BY role_name, role_id
+  `);
+
+  return result.rows.map((row) => ({
+    value: String(row.role_id),
+    label: [normalizeOptionalTextInput(row.role_name), normalizeOptionalTextInput(row.role_code)]
+      .filter(Boolean)
+      .join(" · ") || `Role ${row.role_id}`
+  }));
+};
+
+const loadKpiTargetAllocationLookups = async () => {
+  const [
+    unitsResult,
+    unitTypesResult,
+    zonesResult,
+    productLinesResult,
+    productsResult,
+    marketsResult,
+    customersResult,
+    peopleResult,
+    multisiteAssignmentsResult
+  ] = await Promise.all([
+    pool.query(`
+      SELECT
+        u.unit_id,
+        u.unit_name,
+        u.unit_type_id,
+        ut.unit_type_name,
+        u.selling_currency,
+        u.operating_currency
+      FROM public.unit u
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      ORDER BY ut.unit_type_name, u.unit_name, u.unit_id
+    `),
+    pool.query(`
+      SELECT unit_type_id, unit_type_name
+      FROM public.unit_type
+      ORDER BY unit_type_name, unit_type_id
+    `),
+    pool.query(`
+      SELECT
+        zone_id,
+        zone_name,
+        responsable_zone,
+        role
+      FROM public.zone
+      ORDER BY zone_name, zone_id
+    `),
+    pool.query(`
+      SELECT product_line_id, product_line_name
+      FROM public.product_line
+      ORDER BY product_line_name, product_line_id
+    `),
+    pool.query(`
+      SELECT product_id, product_name
+      FROM public.product
+      ORDER BY product_name, product_id
+    `),
+    pool.query(`
+      SELECT market_id, market_name
+      FROM public.market
+      ORDER BY market_name, market_id
+    `),
+    pool.query(`
+      SELECT customer_id, customer_name
+      FROM public.customer
+      ORDER BY customer_name, customer_id
+    `),
+    pool.query(`
+      SELECT people_id, name, first_name
+      FROM public.people
+      ORDER BY name, first_name, people_id
+    `),
+    pool.query(`
+      SELECT
+        u.unit_id,
+        u.unit_name,
+        u.unit_type_id,
+        ut.unit_type_name,
+        u.selling_currency,
+        u.operating_currency,
+        p.people_id,
+        p.name,
+        p.first_name,
+        pra.role_id,
+        COALESCE(r.role_name, '') AS role_name,
+        COALESCE(pra.is_primary, false) AS is_primary
+      FROM public.unit u
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      LEFT JOIN public.people p
+        ON p.work_at_unit_id = u.unit_id
+      LEFT JOIN public.people_role_assignment pra
+        ON pra.people_id = p.people_id
+       AND pra.assignment_status = 'ACTIVE'
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      ORDER BY
+        ut.unit_type_name,
+        u.unit_name,
+        r.role_name,
+        pra.is_primary DESC,
+        p.name,
+        p.first_name,
+        p.people_id
+    `)
+  ]);
+
+  const unitOptions = unitsResult.rows.map((row) => ({
+    value: String(row.unit_id),
+    label: normalizeOptionalTextInput(row.unit_name) || `Unit ${row.unit_id}`,
+    unit_type_id: normalizeOptionalIntegerInput(row.unit_type_id),
+    unit_type_name: normalizeOptionalTextInput(row.unit_type_name) || "",
+    selling_currency: normalizeOptionalTextInput(row.selling_currency) || "",
+    operating_currency: normalizeOptionalTextInput(row.operating_currency) || ""
+  }));
+  const multisiteAssignmentsMap = new Map(
+    unitOptions.map((unit) => [
+      String(unit.value),
+      {
+        value: String(unit.value),
+        label: unit.label,
+        unit_type_id: unit.unit_type_id,
+        unit_type_name: unit.unit_type_name,
+        selling_currency: unit.selling_currency,
+        operating_currency: unit.operating_currency,
+        responsibles: []
+      }
+    ])
+  );
+
+  multisiteAssignmentsResult.rows.forEach((row) => {
+    const unitId = normalizeOptionalIntegerInput(row.unit_id);
+    if (!unitId) return;
+
+    const unitKey = String(unitId);
+    if (!multisiteAssignmentsMap.has(unitKey)) {
+      multisiteAssignmentsMap.set(unitKey, {
+        value: unitKey,
+        label: normalizeOptionalTextInput(row.unit_name) || `Unit ${unitKey}`,
+        unit_type_id: normalizeOptionalIntegerInput(row.unit_type_id),
+        unit_type_name: normalizeOptionalTextInput(row.unit_type_name) || "",
+        selling_currency: normalizeOptionalTextInput(row.selling_currency) || "",
+        operating_currency: normalizeOptionalTextInput(row.operating_currency) || "",
+        responsibles: []
+      });
+    }
+
+    if (!normalizeOptionalIntegerInput(row.people_id)) return;
+
+    multisiteAssignmentsMap.get(unitKey).responsibles.push({
+      people_id: String(row.people_id),
+      label: getPeopleDisplayName(row) || `Person ${row.people_id}`,
+      role_id: normalizeOptionalIntegerInput(row.role_id),
+      role_name: normalizeOptionalTextInput(row.role_name) || "",
+      is_primary: Boolean(row.is_primary)
+    });
+  });
+
+  return {
+    plants: unitOptions,
+    units: unitOptions,
+    unitTypes: unitTypesResult.rows.map((row) => ({
+      value: String(row.unit_type_id),
+      label: normalizeOptionalTextInput(row.unit_type_name) || `Unit type ${row.unit_type_id}`
+    })),
+    multisiteAssignments: Array.from(multisiteAssignmentsMap.values()),
+   zones: zonesResult.rows.map((row) => ({
+    value: String(row.zone_id),
+    zone_id: String(row.zone_id),
+
+    label:
+     normalizeOptionalTextInput(row.zone_name) ||
+    `Zone ${row.zone_id}`,
+
+    zone_name:
+    normalizeOptionalTextInput(row.zone_name) || "",
+
+    responsable_zone:
+    normalizeOptionalTextInput(row.responsable_zone) || "",
+
+    role:
+     normalizeOptionalTextInput(row.role) || ""
+   })),
+    productLines: productLinesResult.rows.map((row) => ({
+      value: String(row.product_line_id),
+      label: normalizeOptionalTextInput(row.product_line_name) || `Product line ${row.product_line_id}`
+    })),
+    products: productsResult.rows.map((row) => ({
+      value: String(row.product_id),
+      label: normalizeOptionalTextInput(row.product_name) || `Product ${row.product_id}`
+    })),
+    markets: marketsResult.rows.map((row) => ({
+      value: String(row.market_id),
+      label: normalizeOptionalTextInput(row.market_name) || `Market ${row.market_id}`
+    })),
+    customers: customersResult.rows.map((row) => ({
+      value: String(row.customer_id),
+      label: normalizeOptionalTextInput(row.customer_name) || `Customer ${row.customer_id}`
+    })),
+    people: peopleResult.rows.map((row) => ({
+      value: String(row.people_id),
+      label: getPeopleDisplayName(row) || `Person ${row.people_id}`
+    }))
+  };
+};
+
+const loadFormResponsibleContext = async (responsibleId) => {
+  const normalizedResponsibleId =
+    normalizeOptionalIntegerInput(responsibleId);
+
+  if (!normalizedResponsibleId) return null;
+
+  const result = await pool.query(
+    `
+    SELECT
+      people_id,
+      name,
+      first_name,
+      email
+    FROM public.people
+    WHERE people_id = $1
+    LIMIT 1
+    `,
+    [normalizedResponsibleId]
+  );
+
+  if (!result.rows.length) {
+    return null;
+  }
+
+  return {
+    people_id: result.rows[0].people_id,
+    name: getPeopleDisplayName(result.rows[0]),
+    email: result.rows[0].email
+  };
+};
+
+
+const getDashboardOwnerDisplayName = async (responsibleId) => {
+  return (await loadFormResponsibleContext(responsibleId))?.name || "KPI Workspace";
+};
+
+const resolveResponsiblePeopleId = async (responsibleId) => {
+  const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
+  if (!normalizedResponsibleId) return null;
+
+  const responsibleContext = await loadFormResponsibleContext(normalizedResponsibleId);
+  return normalizeOptionalIntegerInput(
+    responsibleContext?.people_id ?? normalizedResponsibleId
+  );
+};
+
+const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
+  const subjectId = row.subject_id === null || row.subject_id === undefined
+    ? null
+    : String(row.subject_id);
+  const subjectPath = subjectId ? subjectPathById.get(subjectId) || row.subject_name || "" : "";
+  const setByPeopleDisplayName = getPeopleDisplayName({
+    name: row.set_by_people_name,
+    first_name: row.set_by_people_first_name
+  }) || "";
+
+  return {
+    kpi_id: row.kpi_id,
+    indicator_title: row.kpi_sub_title || "",
+    indicator_sub_title: row.kpi_name || "",
+    kpi_code: row.kpi_code || "",
+    kpi_formula: row.kpi_formula || "",
+    unit: row.unit || "",
+    subject: subjectPath,
+    subject_node_id: subjectId,
+    definition: row.kpi_explanation || "",
+    frequency: row.frequency || "",
+    target: row.allocation_target_value ?? row.target_value,
+    target_direction: row.target_direction || "",
+    tolerance_type: row.tolerance_type || "",
+    up_tolerance: row.up_tolerance || "",
+    low_tolerance: row.low_tolerance || "",
+    max: row.max_value,
+    min: row.min_value,
+    calculation_on: row.calculation_on || "",
+    nombre_periode: row.nombre_periode || "",
+    calculation_mode: row.calculation_mode || "",
+    display_trend: row.display_trend || "",
+    regression: row.regression || "",
+    min_type: row.min_type || "",
+    max_type: row.max_type || "",
+    reference_kpi_id: row.reference_kpi_id,
+    target_auto_adjustment: row.target_auto_adjustment || "",
+    high_limit: row.high_limit,
+    low_limit: row.low_limit,
+    owner_role_id: row.owner_role_id,
+    status: row.status || "Active",
+    comments: row.comments || "",
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    created_by_people_id: row.created_by_people_id ?? null,
+    kpi_knowledge_base: row.kpi_knowledge_base ?? null,
+    full_subject_path: subjectPath,
+    kpi_target_allocation_id: row.kpi_target_allocation_id ?? null,
+    allocation_target_value: row.allocation_target_value ?? null,
+    allocation_target_unit: row.allocation_target_unit || "",
+    allocation_target_status: row.allocation_target_status || "",
+    set_by_people_id: row.set_by_people_id ?? null,
+    set_by_people_display_name: setByPeopleDisplayName
+  };
+};
+
+const annotateOwnedKpisForResponsible = (rows = [], responsiblePeopleId = null) => {
+  const normalizedResponsiblePeopleId = normalizeOptionalIntegerInput(responsiblePeopleId);
+
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const normalizedCreatedByPeopleId = normalizeOptionalIntegerInput(row?.created_by_people_id);
+
+    return {
+      ...row,
+      is_owned_by_responsible:
+        normalizedResponsiblePeopleId !== null &&
+        normalizedCreatedByPeopleId !== null &&
+        normalizedCreatedByPeopleId === normalizedResponsiblePeopleId
+    };
+  });
+};
+
+const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = null } = {}) => {
+  const subjectHierarchy = await loadSubjectHierarchyData();
+  const searchText = normalizeOptionalTextInput(search) || "";
+  const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
+  const params =
+  normalizedResponsibleId === null
+    ? [searchText, `%${searchText}%`, kpiId]
+    : [searchText, `%${searchText}%`, kpiId, normalizedResponsibleId];
+
+  const result = await pool.query(
+    `
+    SELECT
+      k.kpi_id,
+      k.kpi_name,
+      k.kpi_sub_title,
+      k.kpi_code,
+      k.kpi_formula,
+      k.kpi_explanation,
+      k.target_value,
+      k.target_direction,
+      k.target_auto_adjustment,
+      k.min_value,
+      k.min_type,
+      k.max_value,
+      k.max_type,
+      k.low_limit,
+      k.high_limit,
+      k.tolerance_type,
+      k.low_tolerance,
+      k.up_tolerance,
+      k.unit,
+      k.frequency,
+      k.nombre_periode,
+      k.calculation_mode,
+      k.calculation_on,
+      k.display_trend,
+      k.regression,
+      k.reference_kpi_id,
+      k.owner_role_id,
+      k.status,
+      k.comments,
+      k.created_at,
+      k.updated_at,
+      k.created_by_people_id,
+      k.kpi_knowledge_base,
+      primary_subject.subject_id,
+      assignment.kpi_target_allocation_id,
+      assignment.target_value AS allocation_target_value,
+      assignment.target_unit AS allocation_target_unit,
+      assignment.target_status AS allocation_target_status,
+      assignment.set_by_people_id,
+      set_by_people.name AS set_by_people_name,
+      set_by_people.first_name AS set_by_people_first_name
+    FROM public.kpi k
+
+    ${normalizedResponsibleId === null ? "" : `
+    LEFT JOIN LATERAL (
+      SELECT
+        a.kpi_target_allocation_id,
+        a.target_value,
+        a.target_unit,
+        a.target_status,
+        a.set_by_people_id
+      FROM public.kpi_target_allocation a
+      WHERE a.kpi_id = k.kpi_id
+        AND a.set_by_people_id = $4
+      ORDER BY COALESCE(a.updated_at, a.created_at) DESC, a.kpi_target_allocation_id DESC
+      LIMIT 1
+    ) assignment ON TRUE
+    LEFT JOIN public.people set_by_people
+      ON set_by_people.people_id = assignment.set_by_people_id
+    `}
+
+    ${normalizedResponsibleId === null ? `
+    LEFT JOIN LATERAL (
+      SELECT
+        NULL::integer AS kpi_target_allocation_id,
+        NULL::numeric AS target_value,
+        NULL::varchar AS target_unit,
+        NULL::varchar AS target_status,
+        NULL::integer AS set_by_people_id
+    ) assignment ON TRUE
+    LEFT JOIN public.people set_by_people
+      ON 1 = 0
+    ` : ""}
+
+    LEFT JOIN LATERAL (
+      SELECT sk.subject_id
+      FROM public.subject_kpi sk
+      WHERE sk.kpi_id = k.kpi_id
+      ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+      LIMIT 1
+    ) primary_subject ON TRUE
+
+    WHERE
+      ($3::integer IS NULL OR k.kpi_id = $3)
+      ${normalizedResponsibleId === null ? "" : `
+      AND k.created_by_people_id = $4
+      `}
+      AND (
+        $1 = ''
+        OR COALESCE(k.kpi_name, '') ILIKE $2
+        OR COALESCE(k.kpi_sub_title, '') ILIKE $2
+        OR COALESCE(k.kpi_code, '') ILIKE $2
+        OR COALESCE(k.kpi_explanation, '') ILIKE $2
+        OR COALESCE(k.frequency, '') ILIKE $2
+        OR EXISTS (
+          SELECT 1
+          FROM public.subject_kpi sk2
+          JOIN public.subject s2
+            ON s2.subject_id = sk2.subject_id
+          WHERE sk2.kpi_id = k.kpi_id
+            AND COALESCE(s2.subject_name, '') ILIKE $2
+        )
+      )
+
+    ORDER BY k.kpi_id DESC
+    `,
+    params
+  );
+
+  return result.rows.map((row) => mapKpiRowToClient(row, subjectHierarchy.pathById));
+};
+
+const resolveSubjectIdForKpiPayload = async (payload = {}) => {
+  if (Number.isInteger(payload.subject_id) && payload.subject_id > 0) {
+    return payload.subject_id;
+  }
+
+  const subjectText = normalizeOptionalTextInput(payload.subject);
+  if (!subjectText) return null;
+
+  const subjectHierarchy = await loadSubjectHierarchyData();
+  const loweredSubjectText = subjectText.toLowerCase();
+
+  for (const [subjectId, fullPath] of subjectHierarchy.pathById.entries()) {
+    if (String(fullPath || "").toLowerCase() === loweredSubjectText) {
+      return Number(subjectId);
+    }
+  }
+
+  for (const [subjectId, node] of subjectHierarchy.nodeMap.entries()) {
+    if (String(node?.name || "").toLowerCase() === loweredSubjectText) {
+      return Number(subjectId);
+    }
+  }
+
+  return null;
+};
+
+const upsertPrimarySubjectKpiLink = async (client, kpiId, subjectId) => {
+  await client.query(
+    `
+    UPDATE public.subject_kpi
+    SET is_primary = FALSE
+    WHERE kpi_id = $1
+    `,
+    [kpiId]
+  );
+
+  const existing = await client.query(
+    `
+    SELECT subject_kpi_id
+    FROM public.subject_kpi
+    WHERE kpi_id = $1
+      AND subject_id = $2
+    ORDER BY subject_kpi_id ASC
+    LIMIT 1
+    `,
+    [kpiId, subjectId]
+  );
+
+  if (existing.rows.length) {
+    await client.query(
+      `
+      UPDATE public.subject_kpi
+      SET
+        is_primary = TRUE,
+        importance_level = COALESCE(importance_level, 'Primary')
+      WHERE subject_kpi_id = $1
+      `,
+      [existing.rows[0].subject_kpi_id]
+    );
+    return;
+  }
+
+  await client.query(
+    `
+    INSERT INTO public.subject_kpi (
+      subject_id,
+      kpi_id,
+      importance_level,
+      is_primary,
+      comments
+    )
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [subjectId, kpiId, "Primary", true, null]
+  );
+};
+
+const loadKpiTargetAllocationRowsForUi = async ({ allocationId = null, responsibleId = null } = {}) => {
+  const subjectHierarchy = await loadSubjectHierarchyData();
+  const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
+  const result = await pool.query(
+    `
+    SELECT
+      a.kpi_target_allocation_id,
+      a.kpi_id,
+      a.plant_id,
+      plant.unit_name AS plant_name,
+      plant.unit_type_id AS plant_unit_type_id,
+      a.zone_id,
+      zone.zone_name,
+      zone.responsable_zone,
+      a.unit_id,
+      unit_scope.unit_name AS unit_name,
+      a.unit_type_id,
+      unit_type.unit_type_name,
+      a.role_id,
+      role.role_name,
+      a.function,
+      a.product_id,
+      product.product_name,
+      a.product_line_id,
+      product_line.product_line_name,
+      a.market_id,
+      market.market_name,
+      a.customer_id,
+      customer.customer_name,
+      a.target_value,
+      a.target_unit,
+      a.local_currency,
+      a.kpi_type,
+      TO_CHAR(a.target_setup_date, 'YYYY-MM-DD') AS target_setup_date,
+      TO_CHAR(a.target_start_date, 'YYYY-MM-DD') AS target_start_date,
+      TO_CHAR(a.target_end_date, 'YYYY-MM-DD') AS target_end_date,
+      a.last_best_target,
+      a.previous_target_value,
+      a.target_status,
+      a.set_by_people_id,
+      a.created_by_people_id,
+      set_by_people.name AS set_by_people_name,
+      set_by_people.first_name AS set_by_people_first_name,
+      created_by_people.name AS created_by_people_name,
+      created_by_people.first_name AS created_by_people_first_name,
+      a.approved_by_people_id,
+      approved_by_people.name AS approved_by_people_name,
+      approved_by_people.first_name AS approved_by_people_first_name,
+      a.comments,
+      a.created_at,
+      a.updated_at,
+      k.kpi_name,
+      k.kpi_sub_title,
+      k.frequency,
+      primary_subject.subject_id AS subject_id
+    FROM public.kpi_target_allocation a
+    LEFT JOIN public.kpi k
+      ON k.kpi_id = a.kpi_id
+    LEFT JOIN public.unit plant
+      ON plant.unit_id = a.plant_id
+    LEFT JOIN public.unit_type unit_type
+      ON unit_type.unit_type_id = a.unit_type_id
+    LEFT JOIN public.zone zone
+      ON zone.zone_id = a.zone_id
+    LEFT JOIN public.unit unit_scope
+      ON unit_scope.unit_id = a.unit_id
+    LEFT JOIN public.role role
+      ON role.role_id = a.role_id
+    LEFT JOIN public.product product
+      ON product.product_id = a.product_id
+    LEFT JOIN public.product_line product_line
+      ON product_line.product_line_id = a.product_line_id
+    LEFT JOIN public.market market
+      ON market.market_id = a.market_id
+    LEFT JOIN public.customer customer
+      ON customer.customer_id = a.customer_id
+    LEFT JOIN public.people set_by_people
+      ON set_by_people.people_id = a.set_by_people_id
+    LEFT JOIN public.people created_by_people
+      ON created_by_people.people_id = a.created_by_people_id
+    LEFT JOIN public.people approved_by_people
+      ON approved_by_people.people_id = a.approved_by_people_id
+    LEFT JOIN LATERAL (
+      SELECT sk.subject_id
+      FROM public.subject_kpi sk
+      WHERE sk.kpi_id = a.kpi_id
+      ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+      LIMIT 1
+    ) primary_subject ON TRUE
+    WHERE ($1::integer IS NULL OR a.kpi_target_allocation_id = $1)
+      AND (
+        $2::integer IS NULL
+        OR a.set_by_people_id = $2
+        OR a.created_by_people_id = $2
+      )
+    ORDER BY a.created_at DESC, a.kpi_target_allocation_id DESC
+    `,
+    [allocationId, normalizedResponsibleId]
+  );
+
+  return result.rows.map((row) => ({
+    ...row,
+    unit_type_id: row.unit_type_id ?? row.plant_unit_type_id ?? null,
+    unit_type_name: row.unit_type_name || "",
+    role_name: row.role_name || "",
+    frequency: row.frequency || "",
+    responsable_zone: normalizeOptionalTextInput(row.responsable_zone) || "",
+    kpi_subject: row.subject_id ? subjectHierarchy.pathById.get(String(row.subject_id)) || "" : "",
+    kpi_group: row.kpi_sub_title || "",
+    set_by_people_display_name: getPeopleDisplayName({
+      name: row.set_by_people_name,
+      first_name: row.set_by_people_first_name
+    }) || normalizeOptionalTextInput(row.responsable_zone) || "",
+    created_by_people_display_name: getPeopleDisplayName({
+      name: row.created_by_people_name,
+      first_name: row.created_by_people_first_name
+    }) || "",
+    approved_by_people_display_name: getPeopleDisplayName({
+      name: row.approved_by_people_name,
+      first_name: row.approved_by_people_first_name
+    }) || ""
+  }));
+};
+
+const buildPreparedKpiObjectRows = (
+  payload = {},
+  defaultSetByPeopleId = null,
+  defaultCreatedByPeopleId = null
+) => {
+  const payloadHasSetByPeopleId = Object.prototype.hasOwnProperty.call(payload, "set_by_people_id");
+  const payloadHasCreatedByPeopleId = Object.prototype.hasOwnProperty.call(payload, "created_by_people_id");
+  const basePayload = {
+    ...payload,
+    set_by_people_id: payloadHasSetByPeopleId
+      ? payload.set_by_people_id
+      : defaultSetByPeopleId,
+    created_by_people_id: payloadHasCreatedByPeopleId
+      ? payload.created_by_people_id
+      : defaultCreatedByPeopleId
+  };
+  const requestedRows = Array.isArray(payload.unit_allocations)
+    ? payload.unit_allocations.filter(
+      (row) => normalizeOptionalTextInput(row?.target_value ?? row?.target) !== null
+    )
+    : [];
+  const baseAllocationId =
+    normalizeOptionalIntegerInput(
+      payload.kpi_target_allocation_id ?? payload.allocation_id ?? payload.parameter_object_id
+    );
+
+  if (!requestedRows.length) {
+    const preparedPayload = prepareKpiObjectPayload(basePayload);
+    return [
+      baseAllocationId
+        ? {
+            ...preparedPayload,
+            kpi_target_allocation_id: baseAllocationId
+          }
+        : preparedPayload
+    ];
+  }
+
+  return requestedRows.map((row) => {
+    const preparedPayload = prepareKpiObjectPayload({
+      ...basePayload,
+      ...row,
+      kpi_id: row.kpi_id ?? payload.kpi_id,
+      kpi_type: row.kpi_type ?? payload.kpi_type,
+      plant_id: row.plant_id ?? row.unit_id ?? payload.plant_id,
+      zone_id: row.zone_id ?? payload.zone_id,
+      unit_id: row.unit_id ?? payload.unit_id,
+      unit_type_id: row.unit_type_id ?? payload.unit_type_id,
+      role_id: row.role_id ?? payload.role_id,
+      function: row.function ?? payload.function,
+      product_id: row.product_id ?? payload.product_id,
+      product_line_id: row.product_line_id ?? payload.product_line_id,
+      market_id: row.market_id ?? payload.market_id,
+      customer_id: row.customer_id ?? payload.customer_id,
+      target_value: row.target_value ?? payload.target_value,
+      target_unit: row.target_unit ?? payload.target_unit,
+      local_currency: row.local_currency ?? payload.local_currency,
+      target_setup_date: row.target_setup_date ?? payload.target_setup_date,
+      target_start_date: row.target_start_date ?? payload.target_start_date,
+      target_end_date: row.target_end_date ?? payload.target_end_date,
+      last_best_target: row.last_best_target ?? payload.last_best_target,
+      previous_target_value: row.previous_target_value ?? payload.previous_target_value,
+      target_status: row.target_status ?? payload.target_status,
+      set_by_people_id: Object.prototype.hasOwnProperty.call(row, "set_by_people_id")
+        ? row.set_by_people_id
+        : (payloadHasSetByPeopleId ? payload.set_by_people_id : defaultSetByPeopleId),
+      created_by_people_id: Object.prototype.hasOwnProperty.call(row, "created_by_people_id")
+        ? row.created_by_people_id
+        : (payloadHasCreatedByPeopleId ? payload.created_by_people_id : defaultCreatedByPeopleId),
+      approved_by_people_id: row.approved_by_people_id ?? payload.approved_by_people_id,
+      comments: row.comments ?? payload.comments
+    });
+    const rowAllocationId =
+      normalizeOptionalIntegerInput(
+        row.kpi_target_allocation_id ?? row.allocation_id
+      );
+
+    return rowAllocationId
+      ? {
+          ...preparedPayload,
+          kpi_target_allocation_id: rowAllocationId
+        }
+      : preparedPayload;
+  });
+};
+
+const getKpiObjectInsertValues = (payload = {}) => ([
+  payload.kpi_id,
+  payload.plant_id,
+  payload.zone_id,
+  payload.unit_id,
+  payload.function,
+  payload.product_id,
+  payload.product_line_id,
+  payload.market_id,
+  payload.customer_id,
+  payload.target_value,
+  payload.target_unit,
+  payload.local_currency,
+  payload.kpi_type,
+  payload.unit_type_id,
+  payload.role_id,
+  payload.target_setup_date,
+  payload.target_start_date,
+  payload.target_end_date,
+  payload.last_best_target,
+  payload.previous_target_value,
+  payload.target_status,
+  payload.set_by_people_id,
+  payload.created_by_people_id,
+  payload.approved_by_people_id,
+  payload.comments
+]);
+
+const getKpiTargetAllocationScopeKey = (row = {}) => {
+  const normalizedZoneId = normalizeOptionalIntegerInput(row.zone_id);
+  const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
+  const normalizedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+  const normalizedUnitTypeId = normalizeOptionalIntegerInput(row.unit_type_id);
+  const normalizedRoleId = normalizeOptionalIntegerInput(row.role_id);
+  const normalizedProductId = normalizeOptionalIntegerInput(row.product_id);
+  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
+  const normalizedMarketId = normalizeOptionalIntegerInput(row.market_id);
+  const normalizedCustomerId = normalizeOptionalIntegerInput(row.customer_id);
+  const normalizedFunction = normalizeOptionalTextInput(row.function);
+  const normalizedKpiType = normalizeOptionalTextInput(row.kpi_type);
+
+  const scopeIdentifier = normalizedZoneId
+    ? `zone:${normalizedZoneId}`
+    : (normalizedUnitId ? `unit:${normalizedUnitId}` : "");
+
+  if (!scopeIdentifier) {
+    return "";
+  }
+
+  return [
+    scopeIdentifier,
+    normalizedKpiId ? `kpi:${normalizedKpiId}` : "",
+    normalizedKpiType ? `type:${String(normalizedKpiType).toLowerCase()}` : "",
+    normalizedUnitTypeId ? `unitType:${normalizedUnitTypeId}` : "",
+    normalizedRoleId ? `role:${normalizedRoleId}` : "",
+    normalizedFunction ? `function:${String(normalizedFunction).toLowerCase()}` : "",
+    normalizedProductId ? `product:${normalizedProductId}` : "",
+    normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "",
+    normalizedMarketId ? `market:${normalizedMarketId}` : "",
+    normalizedCustomerId ? `customer:${normalizedCustomerId}` : ""
+  ]
+    .filter(Boolean)
+    .join("|");
+};
+
+const getKpiTargetAllocationGroupIds = async (allocationId) => {
+  const normalizedAllocationId = normalizeOptionalIntegerInput(allocationId);
+  if (!normalizedAllocationId) return [];
+
+  const anchorResult = await pool.query(
+    `
+    SELECT
+      kpi_target_allocation_id,
+      kpi_id,
+      kpi_type,
+      unit_type_id,
+      role_id,
+      "function",
+      product_id,
+      product_line_id,
+      market_id,
+      customer_id,
+      created_at
+    FROM public.kpi_target_allocation
+    WHERE kpi_target_allocation_id = $1
+    LIMIT 1
+    `,
+    [normalizedAllocationId]
+  );
+
+  const anchorRow = anchorResult.rows[0];
+  if (!anchorRow) return [];
+
+  const siblingResult = await pool.query(
+    `
+    SELECT kpi_target_allocation_id
+    FROM public.kpi_target_allocation
+    WHERE kpi_id = $1
+      AND COALESCE(kpi_type, '') = COALESCE($2, '')
+      AND COALESCE(unit_type_id, 0) = COALESCE($3, 0)
+      AND COALESCE(role_id, 0) = COALESCE($4, 0)
+      AND COALESCE("function", '') = COALESCE($5, '')
+      AND COALESCE(product_id, 0) = COALESCE($6, 0)
+      AND COALESCE(product_line_id, 0) = COALESCE($7, 0)
+      AND COALESCE(market_id, 0) = COALESCE($8, 0)
+      AND COALESCE(customer_id, 0) = COALESCE($9, 0)
+      AND created_at = $10
+    ORDER BY kpi_target_allocation_id ASC
+    `,
+    [
+      anchorRow.kpi_id,
+      anchorRow.kpi_type,
+      anchorRow.unit_type_id,
+      anchorRow.role_id,
+      anchorRow.function,
+      anchorRow.product_id,
+      anchorRow.product_line_id,
+      anchorRow.market_id,
+      anchorRow.customer_id,
+      anchorRow.created_at
+    ]
+  );
+
+  const groupIds = siblingResult.rows
+    .map((row) => normalizeOptionalIntegerInput(row.kpi_target_allocation_id))
+    .filter((value) => Number.isInteger(value));
+
+  return groupIds.length ? groupIds : [normalizedAllocationId];
+};
+
+const getKpiTargetAllocationFamilyIds = async (allocationId) => {
+  const normalizedAllocationId = normalizeOptionalIntegerInput(allocationId);
+  if (!normalizedAllocationId) return [];
+
+  const anchorResult = await pool.query(
+    `
+    SELECT
+      kpi_target_allocation_id,
+      kpi_id,
+      created_by_people_id,
+      created_at
+    FROM public.kpi_target_allocation
+    WHERE kpi_target_allocation_id = $1
+    LIMIT 1
+    `,
+    [normalizedAllocationId]
+  );
+
+  const anchorRow = anchorResult.rows[0];
+  if (!anchorRow) return [];
+
+  const siblingResult = await pool.query(
+    `
+    SELECT kpi_target_allocation_id
+    FROM public.kpi_target_allocation
+    WHERE kpi_id = $1
+      AND COALESCE(created_by_people_id, 0) = COALESCE($2, 0)
+      AND created_at = $3
+    ORDER BY kpi_target_allocation_id ASC
+    `,
+    [
+      anchorRow.kpi_id,
+      anchorRow.created_by_people_id,
+      anchorRow.created_at
+    ]
+  );
+
+  const familyIds = siblingResult.rows
+    .map((row) => normalizeOptionalIntegerInput(row.kpi_target_allocation_id))
+    .filter((value) => Number.isInteger(value));
+
+  return familyIds.length ? familyIds : [normalizedAllocationId];
+};
+
+const loadKpiTargetAllocationGroupRowsForUi = async (allocationId) => {
+  const groupIds = await getKpiTargetAllocationGroupIds(allocationId);
+  if (!groupIds.length) return [];
+
+  const rowCollections = await Promise.all(
+    groupIds.map((groupAllocationId) =>
+      loadKpiTargetAllocationRowsForUi({ allocationId: groupAllocationId, responsibleId: null })
+    )
+  );
+
+  return rowCollections
+    .flat()
+    .filter(Boolean)
+    .sort((left, right) => Number(left.kpi_target_allocation_id) - Number(right.kpi_target_allocation_id));
+};
+
+const loadKpiTargetAllocationFamilyRowsForUi = async (allocationId) => {
+  const familyIds = await getKpiTargetAllocationFamilyIds(allocationId);
+  if (!familyIds.length) return [];
+
+  const rowCollections = await Promise.all(
+    familyIds.map((familyAllocationId) =>
+      loadKpiTargetAllocationRowsForUi({ allocationId: familyAllocationId, responsibleId: null })
+    )
+  );
+
+  return rowCollections
+    .flat()
+    .filter(Boolean)
+    .sort((left, right) => Number(left.kpi_target_allocation_id) - Number(right.kpi_target_allocation_id));
 };
 
 app.use(cors());
@@ -424,37 +3082,54 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // GET all KPIs
 app.get("/api/kpis", async (req, res) => {
   try {
-    const { search = "" } = req.query;
+    await ensureKpiRatioSchema();
+
+    const searchText = normalizeOptionalTextInput(req.query.search) || "";
 
     const result = await pool.query(
       `
       SELECT
-        kpi_id,
-        indicator_title,
-        indicator_sub_title,
-        unit,
-        frequency,
-        target,
-        tolerance_type,
-        up_tolerance,
-        low_tolerance,
-        max,
-        min,
-        calculation_on,
-        target_auto_adjustment,
-        high_limit,
-        low_limit,
-        created_at
-      FROM public."Kpi"
+        k.kpi_id,
+        k.kpi_name,
+        k.kpi_sub_title,
+        k.kpi_code,
+        k.unit,
+        k.target_value,
+        k.status,
+        primary_subject.subject_id
+      FROM public.kpi k
+      LEFT JOIN LATERAL (
+        SELECT sk.subject_id
+        FROM public.subject_kpi sk
+        WHERE sk.kpi_id = k.kpi_id
+        ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+        LIMIT 1
+      ) primary_subject ON TRUE
       WHERE
-        COALESCE(indicator_title, '') ILIKE $1
-        OR COALESCE(indicator_sub_title, '') ILIKE $1
-      ORDER BY kpi_id DESC
+        $1 = ''
+        OR COALESCE(k.kpi_name, '') ILIKE $2
+        OR COALESCE(k.kpi_sub_title, '') ILIKE $2
+        OR COALESCE(k.kpi_code, '') ILIKE $2
+      ORDER BY k.kpi_name ASC
       `,
-      [`%${search}%`]
+      [searchText, `%${searchText}%`]
     );
 
-    res.json(result.rows);
+    const subjectHierarchy = await loadSubjectHierarchyData();
+
+    res.json(result.rows.map((row) => ({
+      kpi_id: row.kpi_id,
+      kpi_name: row.kpi_name || "",
+      indicator_sub_title: row.kpi_name || "",
+      indicator_title: row.kpi_sub_title || "",
+      kpi_code: row.kpi_code || "",
+      unit: row.unit || "",
+      target: row.target_value,
+      status: row.status || "Active",
+      subject: row.subject_id
+        ? subjectHierarchy.pathById.get(String(row.subject_id)) || "Other KPIs"
+        : "Other KPIs"
+    })));
   } catch (err) {
     console.error("GET /api/kpis error:", err.message);
     res.status(500).json({ error: err.message });
@@ -464,168 +3139,521 @@ app.get("/api/kpis", async (req, res) => {
 // GET one KPI
 app.get("/api/kpis/:id", async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-      SELECT
-        kpi_id,
-        indicator_title,
-        indicator_sub_title,
-        unit,
-        frequency,
-        target,
-        target_direction,
-        tolerance_type,
-        up_tolerance,
-        low_tolerance,
-        max,
-        min,
-        calculation_on,
-        target_auto_adjustment,
-        high_limit,
-        low_limit,
-        created_at
-      FROM public."Kpi"
-      WHERE kpi_id = $1
-      LIMIT 1
-      `,
-      [req.params.id]
-    );
+    await ensureKpiRatioSchema();
+    const rows = await loadKpiRowsForUi({ kpiId: Number(req.params.id) });
 
-    if (!result.rows.length) {
+    if (!rows.length) {
       return res.status(404).json({ error: "KPI not found" });
     }
 
-    res.json(result.rows[0]);
+    res.json(rows[0]);
   } catch (err) {
     console.error("GET /api/kpis/:id error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
+app.post("/api/kpis/:id/knowledge-base/refresh", async (req, res) => {
+  try {
+    await ensureKpiRatioSchema();
+
+    const kb = await refreshKpiKnowledgeBaseForKpiId(pool, req.params.id, {
+      reason: "manual_refresh"
+    });
+
+    if (!kb) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    res.json(kb);
+  } catch (error) {
+    console.error("Refresh KPI knowledge base error:", error);
+    res.status(500).json({ error: "Failed to refresh KPI knowledge base" });
+  }
+});
+
+app.post("/api/kpis/:id/ai-support", async (req, res) => {
+  let client;
+  const wantsStream = req.body?.stream === true || req.body?.stream === "true";
+
+  try {
+    await ensureKpiRatioSchema();
+    await ensureKpiAssistantConversationSchema();
+
+    const kpiId = normalizeOptionalIntegerInput(req.params.id);
+    const message = normalizeOptionalTextInput(req.body.message);
+    const peopleId =
+      normalizeOptionalIntegerInput(req.body.people_id) ||
+      normalizeOptionalIntegerInput(req.body.responsible_id);
+
+    if (!kpiId) {
+      return res.status(400).json({ error: "KPI ID is required." });
+    }
+
+    if (!message) {
+      return res.status(400).json({ error: "Message is required." });
+    }
+
+    if (!peopleId) {
+      return res.status(400).json({ error: "people_id or responsible_id is required." });
+    }
+
+    const kpiRow = await loadKpiKnowledgeBaseForAssistant(kpiId);
+
+    if (!kpiRow || !kpiRow.kpi_knowledge_base) {
+      return res.json({
+        answer:
+          "No KPI knowledge base is available for this KPI. Please refresh or generate kpi_knowledge_base first."
+      });
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    let conversationRow = await loadKpiAssistantConversationRow(client, {
+      peopleId,
+      kpiId,
+      forUpdate: true
+    });
+
+    if (!conversationRow) {
+      const inserted = await client.query(
+        `
+        INSERT INTO public.kpi_assistant_conversation (
+          people_id,
+          kpi_id,
+          conversation
+        )
+        VALUES ($1, $2, '[]'::jsonb)
+        RETURNING conversation_id, people_id, kpi_id, conversation
+        `,
+        [peopleId, kpiId]
+      );
+
+      conversationRow = inserted.rows[0];
+    }
+
+    const existingConversation = Array.isArray(conversationRow.conversation)
+      ? conversationRow.conversation
+      : [];
+
+    const storedKpiKnowledgeContext = buildStoredKpiKnowledgeBaseContext({
+      knowledgeBase: kpiRow.kpi_knowledge_base,
+      message,
+      conversationHistory: existingConversation,
+      selectedKpiSummary: null,
+      selectedKpi: {
+        kpi_id: kpiRow.kpi_id,
+        title: kpiRow.kpi_name,
+        subtitle: kpiRow.kpi_sub_title
+      }
+    });
+    const messagesForOpenAI = buildKpiAssistantMessagesForOpenAI({
+      kpiRow,
+      existingConversation,
+      message,
+      ragContext: storedKpiKnowledgeContext
+    });
+    let answer = "";
+
+    if (wantsStream) {
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+      }
+
+      const completionStream = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: messagesForOpenAI,
+        temperature: 0.2,
+        stream: true
+      });
+
+      for await (const chunk of completionStream) {
+        const delta = chunk?.choices?.[0]?.delta?.content || "";
+        if (!delta) continue;
+        answer += delta;
+        writeSseEvent(res, "delta", { delta });
+      }
+    } else {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: messagesForOpenAI,
+        temperature: 0.2
+      });
+
+      answer = completion.choices?.[0]?.message?.content || "";
+    }
+
+    const nextConversation = [
+      ...existingConversation,
+      {
+        role: "user",
+        content: message,
+        text: message,
+        ts: Date.now()
+      },
+      {
+        role: "assistant",
+        content: answer,
+        text: answer,
+        ts: Date.now()
+      }
+    ].slice(-50);
+
+    await client.query(
+      `
+      UPDATE public.kpi_assistant_conversation
+      SET
+        conversation = $2::jsonb,
+        updated_at = NOW()
+      WHERE conversation_id = $1
+      `,
+      [conversationRow.conversation_id, JSON.stringify(nextConversation)]
+    );
+
+    await client.query("COMMIT");
+
+    if (wantsStream) {
+      writeSseEvent(res, "done", {
+        answer,
+        conversation: nextConversation,
+        kpi_id: kpiRow.kpi_id,
+        kpi_name: kpiRow.kpi_name
+      });
+      res.end();
+      return;
+    }
+
+    res.json({
+      answer,
+      conversation: nextConversation,
+      kpi_id: kpiRow.kpi_id,
+      kpi_name: kpiRow.kpi_name
+    });
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
+    console.error("POST /api/kpis/:id/ai-support error:", error);
+    if (wantsStream && !res.headersSent) {
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+      }
+    }
+
+    if (wantsStream) {
+      writeSseEvent(res, "error", {
+        error: "Failed to answer KPI question"
+      });
+      res.end();
+      return;
+    }
+
+    res.status(500).json({ error: "Failed to answer KPI question" });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+app.delete("/api/kpis/:id/ai-support/conversation", async (req, res) => {
+  try {
+    await ensureKpiAssistantConversationSchema();
+
+    const kpiId = normalizeOptionalIntegerInput(req.params.id);
+    const peopleId =
+      normalizeOptionalIntegerInput(req.body?.people_id) ||
+      normalizeOptionalIntegerInput(req.body?.responsible_id) ||
+      normalizeOptionalIntegerInput(req.query?.people_id) ||
+      normalizeOptionalIntegerInput(req.query?.responsible_id);
+
+    if (!kpiId) {
+      return res.status(400).json({ error: "KPI ID is required." });
+    }
+
+    if (!peopleId) {
+      return res.status(400).json({ error: "people_id or responsible_id is required." });
+    }
+
+    await pool.query(
+      `
+      DELETE FROM public.kpi_assistant_conversation
+      WHERE kpi_id = $1
+        AND people_id = $2
+      `,
+      [kpiId, peopleId]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("DELETE /api/kpis/:id/ai-support/conversation error:", error);
+    res.status(500).json({ error: "Failed to reset KPI assistant conversation" });
+  }
+});
 // CREATE KPI
 app.post("/api/kpis", async (req, res) => {
+  let client;
+
   try {
+    await ensureKpiRatioSchema();
     const {
-      indicator_title,
-      indicator_sub_title,
+      subject_id,
+      kpi_name,
+      kpi_sub_title,
+      kpi_code,
+      kpi_formula,
       unit,
+      kpi_explanation,
       frequency,
-      target,
+      target_value,
       target_direction,
       tolerance_type,
       up_tolerance,
       low_tolerance,
-      max,
-      min,
+      max_value,
+      min_value,
+      min_type,
+      max_type,
+      nombre_periode,
       calculation_on,
+      calculation_mode,
+      display_trend,
+      regression,
+      reference_kpi_id,
       target_auto_adjustment,
+      owner_role_id,
+      status,
+      comments,
       high_limit,
       low_limit
     } = prepareKpiWritePayload(req.body);
+    const createdByPeopleId = normalizeOptionalIntegerInput(req.body.created_by_people_id);
+    const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
+      subject_id,
+      subject: req.body.subject
+    });
 
-    const result = await pool.query(
+    if (!resolvedSubjectId) {
+      throw createHttpError(400, "Subject selection is required.");
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const result = await client.query(
       `
-      INSERT INTO public."Kpi" (
-        indicator_title,
-        indicator_sub_title,
+      INSERT INTO public.kpi (
+        kpi_name,
+        kpi_sub_title,
+        kpi_code,
+        kpi_formula,
         unit,
+        kpi_explanation,
         frequency,
-        target,
+        target_value,
+        target_direction,
         tolerance_type,
         up_tolerance,
         low_tolerance,
-        max,
-        min,
+        max_value,
+        min_value,
+        min_type,
+        max_type,
+        nombre_periode,
         calculation_on,
+        calculation_mode,
+        reference_kpi_id,
         target_auto_adjustment,
+        display_trend,
+        regression,
+        owner_role_id,
+        status,
+        comments,
         high_limit,
-        low_limit
+        low_limit,
+        created_by_people_id
       )
       VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29
       )
       RETURNING *;
       `,
       [
-        indicator_title,
-        indicator_sub_title,
+        kpi_name,
+        kpi_sub_title,
+        kpi_code,
+        kpi_formula,
         unit,
+        kpi_explanation,
         frequency,
-        target,
+        target_value,
+        target_direction,
         tolerance_type,
         up_tolerance,
         low_tolerance,
-        max,
-        min,
+        max_value,
+        min_value,
+        min_type,
+        max_type,
+        nombre_periode,
         calculation_on,
+        calculation_mode,
+        reference_kpi_id,
         target_auto_adjustment,
+        display_trend,
+        regression,
+        owner_role_id,
+        status,
+        comments,
         high_limit,
-        low_limit
+        low_limit,
+        createdByPeopleId
       ]
     );
 
-    res.status(201).json(result.rows[0]);
+    const newKpi = result.rows[0];
+    await upsertPrimarySubjectKpiLink(client, newKpi.kpi_id, resolvedSubjectId);
+    await refreshKpiKnowledgeBaseForKpiId(client, newKpi.kpi_id, {
+      reason: "kpi_created"
+    });
+
+    await client.query("COMMIT");
+    const rows = await loadKpiRowsForUi({ kpiId: newKpi.kpi_id });
+    res.status(201).json(rows[0] || newKpi);
   } catch (err) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
     console.error("POST /api/kpis error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to create KPI" });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
 // UPDATE KPI
 app.put("/api/kpis/:id", async (req, res) => {
+  let client;
+
   try {
+    await ensureKpiRatioSchema();
     const {
-      indicator_title,
-      indicator_sub_title,
+      subject_id,
+      kpi_name,
+      kpi_sub_title,
+      kpi_code,
+      kpi_formula,
       unit,
+      kpi_explanation,
       frequency,
-      target,
+      target_value,
       target_direction,
       tolerance_type,
       up_tolerance,
       low_tolerance,
-      max,
-      min,
+      max_value,
+      min_value,
+      min_type,
+      max_type,
+      nombre_periode,
       calculation_on,
+      calculation_mode,
+      display_trend,
+      regression,
+      reference_kpi_id,
       target_auto_adjustment,
+      owner_role_id,
+      status,
+      comments,
       high_limit,
       low_limit
     } = prepareKpiWritePayload(req.body);
+    const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
+      subject_id,
+      subject: req.body.subject
+    });
 
-    const result = await pool.query(
+    if (!resolvedSubjectId) {
+      throw createHttpError(400, "Subject selection is required.");
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const result = await client.query(
       `
-      UPDATE public."Kpi"
+      UPDATE public.kpi
       SET
-        indicator_title = $1,
-        indicator_sub_title = $2,
-        unit = $3,
-        frequency = $4,
-        target = $5,
-        tolerance_type = $6,
-        up_tolerance = $7,
-        low_tolerance = $8,
-        max = $9,
-        min = $10,
-        calculation_on = $11,
-        target_auto_adjustment = $12,
-        high_limit = $13,
-        low_limit = $14
-      WHERE kpi_id = $15
+        kpi_name = $1,
+        kpi_sub_title = $2,
+        kpi_code = $3,
+        kpi_formula = $4,
+        unit = $5,
+        kpi_explanation = $6,
+        frequency = $7,
+        target_value = $8,
+        target_direction = $9,
+        tolerance_type = $10,
+        up_tolerance = $11,
+        low_tolerance = $12,
+        max_value = $13,
+        min_value = $14,
+        min_type = $15,
+        max_type = $16,
+        nombre_periode = $17,
+        calculation_on = $18,
+        calculation_mode = $19,
+        display_trend = $20,
+        regression = $21,
+        reference_kpi_id = $22,
+        target_auto_adjustment = $23,
+        owner_role_id = $24,
+        status = $25,
+        comments = $26,
+        high_limit = $27,
+        low_limit = $28,
+        updated_at = NOW()
+      WHERE kpi_id = $29
       RETURNING *;
       `,
       [
-        indicator_title,
-        indicator_sub_title,
+        kpi_name,
+        kpi_sub_title,
+        kpi_code,
+        kpi_formula,
         unit,
+        kpi_explanation,
         frequency,
-        target,
+        target_value,
+        target_direction,
         tolerance_type,
         up_tolerance,
         low_tolerance,
-        max,
-        min,
+        max_value,
+        min_value,
+        min_type,
+        max_type,
+        nombre_periode,
         calculation_on,
+        calculation_mode,
+        display_trend,
+        regression,
+        reference_kpi_id,
         target_auto_adjustment,
+        owner_role_id,
+        status,
+        comments,
         high_limit,
         low_limit,
         req.params.id
@@ -633,32 +3661,121 @@ app.put("/api/kpis/:id", async (req, res) => {
     );
 
     if (!result.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
       return res.status(404).json({ error: "KPI not found" });
     }
 
-    res.json(result.rows[0]);
+    await upsertPrimarySubjectKpiLink(client, Number(req.params.id), resolvedSubjectId);
+    await refreshKpiKnowledgeBaseForKpiId(client, Number(req.params.id), {
+      reason: "kpi_updated"
+    });
+    await client.query("COMMIT");
+
+    const rows = await loadKpiRowsForUi({ kpiId: Number(req.params.id) });
+    res.json(rows[0] || result.rows[0]);
   } catch (err) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
     console.error("PUT /api/kpis/:id error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to update KPI" });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
+const deleteKpiDependentRecords = async (client, kpiId) => {
+  const allocationResult = await client.query(
+    `
+    SELECT kpi_target_allocation_id
+    FROM public.kpi_target_allocation
+    WHERE kpi_id = $1
+    `,
+    [kpiId]
+  );
+  const allocationIds = allocationResult.rows
+    .map((row) => normalizeOptionalIntegerInput(row.kpi_target_allocation_id))
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  await client.query(
+    `DELETE FROM public.kpi_assistant_conversation WHERE kpi_id = $1`,
+    [kpiId]
+  );
+
+  if (allocationIds.length) {
+    await client.query(
+      `DELETE FROM public.kpi_result WHERE kpi_target_allocation_id = ANY($1::int[])`,
+      [allocationIds]
+    );
+  }
+
+  await client.query(
+    `DELETE FROM public.kpi_target_allocation WHERE kpi_id = $1`,
+    [kpiId]
+  );
+
+  await client.query(
+    `DELETE FROM public.subject_kpi WHERE kpi_id = $1`,
+    [kpiId]
+  );
+};
+
+const deleteKpiTargetAllocationDependentRecords = async (client, allocationIds = []) => {
+  const normalizedAllocationIds = Array.from(
+    new Set(
+      (Array.isArray(allocationIds) ? allocationIds : [allocationIds])
+        .map((value) => normalizeOptionalIntegerInput(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+  if (!normalizedAllocationIds.length) {
+    return [];
+  }
+
+  await client.query(
+    `DELETE FROM public.kpi_result WHERE kpi_target_allocation_id = ANY($1::int[])`,
+    [normalizedAllocationIds]
+  );
+
+  return normalizedAllocationIds;
+};
+
 // DELETE KPI
 app.delete("/api/kpis/:id", async (req, res) => {
+  let client;
+
   try {
-    const result = await pool.query(
-      `DELETE FROM public."Kpi" WHERE kpi_id = $1 RETURNING kpi_id`,
+    await ensureKpiAssistantConversationSchema();
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    await deleteKpiDependentRecords(client, req.params.id);
+
+    const result = await client.query(
+      `DELETE FROM public.kpi WHERE kpi_id = $1 RETURNING kpi_id`,
       [req.params.id]
     );
 
     if (!result.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
       return res.status(404).json({ error: "KPI not found" });
     }
 
+    await client.query("COMMIT");
     res.json({ success: true });
   } catch (err) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
     console.error("DELETE /api/kpis/:id error:", err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
@@ -1031,34 +4148,54 @@ app.get("/kpi-admin", async (req, res) => {
 
       .row-actions {
         display: flex;
-        gap: 10px;
+        gap: 12px;
         flex-wrap: wrap;
       }
 
       .icon-btn {
-        border: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 38px;
+        height: 38px;
+        padding: 0;
         border-radius: 12px;
-        padding: 10px 14px;
-        font-size: 12px;
-        font-weight: 800;
+        background: #ffffff;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.08);
         cursor: pointer;
-        transition: all 0.18s ease;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+      }
+
+      .icon-btn svg {
+        width: 18px;
+        height: 18px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.9;
+        stroke-linecap: round;
+        stroke-linejoin: round;
       }
 
       .icon-btn:hover {
         transform: translateY(-1px);
+        box-shadow: 0 14px 30px rgba(15,23,42,0.12);
+      }
+
+      .icon-btn:focus-visible {
+        outline: 2px solid rgba(37,99,235,0.20);
+        outline-offset: 3px;
       }
 
       .edit-btn {
-        background: rgba(37,99,235,0.08);
-        color: #1d4ed8;
-        border: 1px solid rgba(37,99,235,0.10);
+        background: #ffffff;
+        color: #2563eb;
+        border: 1px solid rgba(37,99,235,0.18);
       }
 
       .delete-btn {
-        background: rgba(239,68,68,0.08);
-        color: #dc2626;
-        border: 1px solid rgba(239,68,68,0.10);
+        background: #ffffff;
+        color: #ef4444;
+        border: 1px solid rgba(239,68,68,0.18);
       }
 
       .drawer {
@@ -1103,14 +4240,14 @@ app.get("/kpi-admin", async (req, res) => {
         overflow: auto;
       }
 
-      .section-title {
-        margin: 24px 0 12px;
-        font-size: 12px;
-        font-weight: 900;
-        color: #4f46e5;
-        text-transform: uppercase;
-        letter-spacing: 0.14em;
-      }
+     .section-title {
+     margin: 0 0 8px;
+     font-size: 10px;
+     font-weight: 900;
+     color: #000;
+     text-transform: uppercase;
+     letter-spacing: 0.14em;
+    }
 
       .form-grid {
         display: grid;
@@ -1124,6 +4261,19 @@ app.get("/kpi-admin", async (req, res) => {
         gap: 8px;
       }
 
+   .hierarchy-tree-field {
+      grid-column: 1 / -1;
+      width: 100%;
+      }
+
+     .tree-select-panel {
+      width: 100%;
+     }
+
+     .tree-list {
+      width: 100%;
+     }
+
       .field.full {
         grid-column: 1 / -1;
       }
@@ -1136,19 +4286,13 @@ app.get("/kpi-admin", async (req, res) => {
 
       .field input,
       .field textarea,
-      .field select {
-        width: 100%;
-        border: 1px solid rgba(148,163,184,0.24);
-        background: #ffffff;
-        color: #0f172a;
-        border-radius: 16px;
-        padding: 13px 14px;
-        font-size: 14px;
-        font-family: inherit;
-        outline: none;
-        transition: all 0.18s ease;
-        box-shadow: 0 2px 6px rgba(15,23,42,0.03);
-      }
+    .field select {
+  background: transparent !important;
+  border-radius: 0 !important;
+  color: #000 !important;
+  box-shadow: none !important;
+  border: 1px solid #ccc !important;
+}
 
       .field input:focus,
       .field textarea:focus,
@@ -1260,27 +4404,13 @@ app.get("/kpi-admin", async (req, res) => {
       </div>
 
       <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">Total KPIs</div>
-          <div class="stat-value" id="statTotal">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Monthly KPIs</div>
-          <div class="stat-value" id="statMonthly">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">With Targets</div>
-          <div class="stat-value" id="statTargets">0</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Tolerance Rules</div>
-          <div class="stat-value" id="statTolerance">0</div>
-        </div>
+     
+       
       </div>
 
       <div class="toolbar">
         <div class="search-wrap">
-          <input id="search" class="search" placeholder="Search by title, subtitle, frequency..." />
+          <input id="search" class="search" placeholder="Search by title, subtitle, subject, frequency..." />
         </div>
       </div>
 
@@ -1296,6 +4426,7 @@ app.get("/kpi-admin", async (req, res) => {
               <tr>
                 <th>ID</th>
                 <th>Indicator</th>
+                <th>Subject</th>
                 <th>Unit</th>
                 <th>Frequency</th>
                 <th>Target</th>
@@ -1306,7 +4437,7 @@ app.get("/kpi-admin", async (req, res) => {
               </tr>
             </thead>
             <tbody id="tableBody">
-              <tr><td colspan="9" class="empty-state">Loading KPIs...</td></tr>
+              <tr><td colspan="10" class="empty-state">Loading KPIs...</td></tr>
             </tbody>
           </table>
         </div>
@@ -1333,9 +4464,14 @@ app.get("/kpi-admin", async (req, res) => {
             <input id="indicator_sub_title" />
           </div>
           <div class="field">
+            <label>Subject</label>
+            <input id="subject" />
+          </div>
+          <div class="field">
             <label>Unit</label>
             <input id="unit" />
           </div>
+
         </div>
 
         <div class="section-title">Performance Rules</div>
@@ -1346,7 +4482,10 @@ app.get("/kpi-admin", async (req, res) => {
           </div>
           <div class="field">
             <label>Calculation On</label>
-            <input id="calculation_on" />
+            <select id="calculation_on">
+              <option value="Value">Value</option>
+              <option value="Average">Average</option>
+            </select>
           </div>
           <div class="field">
             <label>Target</label>
@@ -1354,7 +4493,10 @@ app.get("/kpi-admin", async (req, res) => {
           </div>
           <div class="field">
             <label>Target Auto Adjustment</label>
-            <input id="target_auto_adjustment" />
+            <select id="target_auto_adjustment">
+              <option value="Yes" selected>Yes</option>
+              <option value="No">No</option>
+            </select>
           </div>
         </div>
 
@@ -1391,13 +4533,12 @@ app.get("/kpi-admin", async (req, res) => {
         </div>
       </div>
 
-      <div class="drawer-footer">
-        <button class="btn btn-danger" onclick="deleteKpi()">Delete</button>
-        <div style="display:flex; gap:10px;">
-          <button class="btn btn-soft" onclick="closeDrawer()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
-        </div>
-      </div>
+  <div class="modal-footer">
+  <div class="footer-actions">
+    <button class="btn btn-soft" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
+  </div>
+</div>
     </div>
 
     <div id="toast" class="toast"></div>
@@ -1430,11 +4571,8 @@ app.get("/kpi-admin", async (req, res) => {
         const withTargets = rows.filter(r => r.target !== null && r.target !== undefined && String(r.target).trim() !== "").length;
         const tolerance = rows.filter(r => r.tolerance_type && String(r.tolerance_type).trim() !== "").length;
 
-        document.getElementById("statTotal").textContent = total;
-        document.getElementById("statMonthly").textContent = monthly;
-        document.getElementById("statTargets").textContent = withTargets;
-        document.getElementById("statTolerance").textContent = tolerance;
-        document.getElementById("rowCount").textContent = total;
+
+    
       }
 
       function renderTable(rows) {
@@ -1444,7 +4582,7 @@ app.get("/kpi-admin", async (req, res) => {
         const tbody = document.getElementById("tableBody");
 
         if (!currentRows.length) {
-          tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No KPI found.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No KPI found.</td></tr>';
           return;
         }
 
@@ -1455,6 +4593,7 @@ app.get("/kpi-admin", async (req, res) => {
               <div class="kpi-title">\${escapeHtml(row.indicator_title || 'Untitled KPI')}</div>
               <div class="kpi-subtitle">\${escapeHtml(row.indicator_sub_title || '')}</div>
             </td>
+            <td>\${escapeHtml(row.subject || '')}</td>
             <td><span class="pill pill-blue">\${escapeHtml(row.unit || '-')}</span></td>
             <td><span class="pill pill-indigo">\${escapeHtml(row.frequency || '-')}</span></td>
             <td>\${escapeHtml(row.target || '-')}</td>
@@ -1463,8 +4602,33 @@ app.get("/kpi-admin", async (req, res) => {
             <td><span class="pill pill-gold">\${escapeHtml(row.tolerance_type || '-')}</span></td>
             <td>
               <div class="row-actions">
-                <button class="icon-btn edit-btn" onclick="openEditDrawer(\${row.kpi_id})">Edit</button>
-                <button class="icon-btn delete-btn" onclick="deleteRowQuick(\${row.kpi_id})">Delete</button>
+                <button
+                  type="button"
+                  class="icon-btn edit-btn"
+                  onclick="openEditDrawer(\${row.kpi_id})"
+                  aria-label="Edit KPI"
+                  title="Edit KPI"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
+                    <path d="M13.5 6.5l4 4"></path>
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="icon-btn delete-btn"
+                  onclick="deleteRowQuick(\${row.kpi_id})"
+                  aria-label="Delete KPI"
+                  title="Delete KPI"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 6h18"></path>
+                    <path d="M8 6V4h8v2"></path>
+                    <path d="M19 6l-1 14H6L5 6"></path>
+                    <path d="M10 11v6"></path>
+                    <path d="M14 11v6"></path>
+                  </svg>
+                </button>
               </div>
             </td>
           </tr>
@@ -1478,7 +4642,7 @@ app.get("/kpi-admin", async (req, res) => {
           renderTable(data);
         } catch (err) {
           document.getElementById("tableBody").innerHTML =
-            '<tr><td colspan="9" class="empty-state">Failed to load KPI table.</td></tr>';
+            '<tr><td colspan="10" class="empty-state">Failed to load KPI table.</td></tr>';
         }
       }
 
@@ -1658,38 +4822,56 @@ app.get("/kpi-admin", async (req, res) => {
         if (value === null || value === undefined || value === "") return "";
         const text = String(value).trim();
         if (!text) return "";
-        return String(toleranceType || "").trim().toLowerCase() === "relative"
-          ? text.replace(/%+$/g, "") + "%"
-          : text.replace(/%+$/g, "");
+        return String(toleranceType || "").trim().toLowerCase() === "relative" && !text.includes("%")
+          ? text + "%"
+          : text;
       }
 
-      function resetForm() {
-        const fields = [
-          "kpi_id","indicator_title","indicator_sub_title","unit",
-          "frequency","target","tolerance_type","up_tolerance","low_tolerance",
-          "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
-        ];
+    function handleToleranceTypeChange(source) {
+     syncToleranceInputs(source);
 
-        fields.forEach(id => {
-          const el = document.getElementById(id);
-          if (el) el.value = "";
-        });
-      }
+        const toleranceType = document.getElementById("tolerance_type").value;
 
-      function fillForm(data) {
-        const fields = [
-          "kpi_id","indicator_title","indicator_sub_title","unit",
-          "frequency","target","tolerance_type","up_tolerance","low_tolerance",
-          "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
-        ];
+        if (String(toleranceType).trim().toLowerCase() === "relative") {
+        recalculateLimits(source);
+        }
+    }
 
-        fields.forEach(id => {
-          const el = document.getElementById(id);
-          if (el) el.value = data[id] ?? "";
-        });
+    function resetForm() {
+      const fields = [
+        "kpi_id","indicator_title","indicator_sub_title","unit","subject","definition",
+        "frequency","target","tolerance_type","up_tolerance","low_tolerance",
+        "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
+      ];
 
+      fields.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = "";
+      });
+
+      document.getElementById("calculation_on").value = "Value";
+      document.getElementById("target_auto_adjustment").value = "Yes";
+      document.getElementById("tolerance_type").value = "Relative";
+      handleToleranceTypeChange();
+    }
+
+    function fillForm(data) {
+     const fields = [
+    "kpi_id","indicator_title","indicator_sub_title","unit","subject","definition",
+    "frequency","target","tolerance_type","up_tolerance","low_tolerance",
+    "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
+    ];
+
+    fields.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = data[id] ?? "";
+    });
+
+    handleToleranceTypeChange();
+  }
         document.getElementById("up_tolerance").value = formatToleranceForInput(data.up_tolerance, data.tolerance_type);
         document.getElementById("low_tolerance").value = formatToleranceForInput(data.low_tolerance, data.tolerance_type);
+        handleToleranceTypeChange();
       }
 
       function openNewDrawer() {
@@ -1713,18 +4895,30 @@ app.get("/kpi-admin", async (req, res) => {
         }
       }
 
+
+    
+
       function buildPayload() {
         return {
           indicator_title: document.getElementById("indicator_title").value,
           indicator_sub_title: document.getElementById("indicator_sub_title").value,
           unit: document.getElementById("unit").value,
+          subject: document.getElementById("subject").value,
+          definition: document.getElementById("definition").value,
           frequency: document.getElementById("frequency").value,
-          target: document.getElementById("target").value,
+          target: getSafeValue("target"),
           tolerance_type: document.getElementById("tolerance_type").value,
           up_tolerance: document.getElementById("up_tolerance").value,
           low_tolerance: document.getElementById("low_tolerance").value,
           max: document.getElementById("max").value,
           min: document.getElementById("min").value,
+          target_direction: document.getElementById("direction").value,
+          nombre_periode: document.getElementById("nombre_periode").value,
+          calculation_mode: document.getElementById("calculation_mode").value,
+          display_trend: document.getElementById("display_trend").value,
+          regression: document.getElementById("regression").value,
+          min_type: document.getElementById("min_type").value,
+          max_type: document.getElementById("max_type").value,
           calculation_on: document.getElementById("calculation_on").value,
           target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
           high_limit: document.getElementById("high_limit").value || null,
@@ -1757,7 +4951,8 @@ app.get("/kpi-admin", async (req, res) => {
           showToast("KPI saved successfully");
           closeDrawer();
         } catch (err) {
-          showToast("Save failed");
+          console.error("SAVE KPI ERROR:", error);
+          showToast("Save failed: " + error.message);
         }
       }
 
@@ -1772,7 +4967,9 @@ app.get("/kpi-admin", async (req, res) => {
         if (!ok) return;
 
         try {
-          const res = await fetch('/api/kpis/' + id, { method: "DELETE" });
+          const res = await fetch('/api/kpis/' + kpiId, {
+            method: "DELETE"
+          });
           if (!res.ok) {
             showToast("Delete failed");
             return;
@@ -1815,6 +5012,13 @@ app.get("/kpi-admin", async (req, res) => {
         loadKpis(e.target.value);
       });
 
+      const parameterSearchInput = document.getElementById("parameterSearch");
+      if (parameterSearchInput) {
+        parameterSearchInput.addEventListener("input", (e) => {
+          applyParameterSearch(e.target.value);
+        });
+      }
+
       loadKpis();
     </script>
   </body>
@@ -1831,22 +5035,26 @@ app.get("/api/responsibles/:responsibleId/kpi-graphs", async (req, res) => {
       `
       SELECT
           k.kpi_id,
-          ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+          k.indicator_title,
+          k.indicator_sub_title,
           kv.week,
           kv.value
       FROM public.kpi_values kv
       JOIN public."Kpi" k
         ON k.kpi_id = kv.kpi_id
-      LEFT JOIN public.responsible_kpis rk
-        ON rk.responsible_kpi_id = kv.responsible_kpi_id
       WHERE kv.responsible_id = $1
-        AND kv.value IS NOT NULL
-        AND kv.value <> ''
-        AND kv.week <> 'Initial'
-      ORDER BY k.kpi_id ASC, kv."Date" ASC NULLS LAST, kv.week ASC
+      ORDER BY k.kpi_id ASC, kv.week ASC
       `,
       [responsibleId]
     );
+
+    const result1 = await pool.query(
+      `SELECT name FROM public."Responsible" WHERE responsible_id = $1`,
+      [responsibleId]
+    );
+
+    const responsibleName = result1.rows[0]?.name || "Unknown";
+
 
     const grouped = {};
 
@@ -1864,8 +5072,8 @@ app.get("/api/responsibles/:responsibleId/kpi-graphs", async (req, res) => {
         };
       }
 
-      grouped[row.kpi_id].labels.push(row.week);
-      grouped[row.kpi_id].values.push(Number(row.value) || 0);
+      grouped[row.kpi_id].labels.push(row.month_label);
+      grouped[row.kpi_id].values.push(Number(row.new_value_num) || 0);
     }
 
     res.json(Object.values(grouped));
@@ -1880,102 +5088,141 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   let client;
 
   try {
-    const requestedKpiId = normalizeOptionalTextInput(req.body.kpi_id);
-    const existingTemplateKpiId = requestedKpiId === null ? null : Number(requestedKpiId);
-    if (requestedKpiId !== null && (!Number.isInteger(existingTemplateKpiId) || existingTemplateKpiId <= 0)) {
-      throw createHttpError(400, "kpi_id must be a positive integer.");
+    await ensureKpiRatioSchema();
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+
+    if (!responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
     }
 
     const {
-      indicator_title,
-      indicator_sub_title,
+      subject_id,
+      kpi_name,
+      kpi_sub_title,
+      kpi_code,
+      kpi_formula,
       unit,
+      kpi_explanation,
       frequency,
-      target,
+      target_value,
       target_direction,
       tolerance_type,
       up_tolerance,
       low_tolerance,
-      max,
-      min,
+      max_value,
+      min_value,
+      nombre_periode,
+      calculation_mode,
+      display_trend,
+      regression,
+      min_type,
+      max_type,
       calculation_on,
       target_auto_adjustment,
+      reference_kpi_id,
+      owner_role_id,
+      status,
+      comments,
       high_limit,
       low_limit
     } = prepareKpiWritePayload(req.body);
+    const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
+      subject_id,
+      subject: req.body.subject
+    });
+
+    if (!resolvedSubjectId) {
+      throw createHttpError(400, "Subject selection is required.");
+    }
 
     client = await pool.connect();
     await client.query("BEGIN");
 
-    let kpiIdToAssign = existingTemplateKpiId;
+    const insertKpi = await client.query(
+      `
+  INSERT INTO public.kpi (
+  kpi_name,
+  kpi_sub_title,
+  kpi_code,
+  kpi_formula,
+  unit,
+  kpi_explanation,
+  frequency,
+  target_value,
+  target_direction,
+  tolerance_type,
+  up_tolerance,
+  low_tolerance,
+  max_value,
+  min_value,
+  nombre_periode,
+  calculation_mode,
+  display_trend,
+  regression,
+  min_type,
+  max_type,
+  calculation_on,
+  target_auto_adjustment,
+  reference_kpi_id,
+  owner_role_id,
+  status,
+  comments,
+  high_limit,
+  low_limit,
+  created_by_people_id
+)
+VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+)
+      RETURNING *
+      `,
+      [
+        kpi_name,
+        kpi_sub_title,
+        kpi_code,
+        kpi_formula,
+        unit,
+        kpi_explanation,
+        frequency,
+        target_value,
+        target_direction,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max_value,
+        min_value,
+        nombre_periode,
+        calculation_mode,
+        display_trend,
+        regression,
+        min_type,
+        max_type,
+        calculation_on,
+        target_auto_adjustment,
+        reference_kpi_id,
+        owner_role_id,
+        status,
+        comments,
+        high_limit,
+        low_limit,
+        responsiblePeopleId
+      ]
+    );
 
-    if (kpiIdToAssign !== null) {
-      const existingTemplate = await client.query(
-        `SELECT kpi_id FROM public."Kpi" WHERE kpi_id = $1 LIMIT 1`,
-        [kpiIdToAssign]
-      );
-
-      if (!existingTemplate.rows.length) {
-        throw createHttpError(404, "KPI template not found.");
-      }
-    } else {
-      const insertKpi = await client.query(
-        `
-        INSERT INTO public."Kpi" (
-          indicator_sub_title,
-          unit,
-          frequency,
-          target,
-          target_direction,
-          tolerance_type,
-          up_tolerance,
-          low_tolerance,
-          max,
-          min,
-          calculation_on,
-          target_auto_adjustment,
-          indicator_title,
-          high_limit,
-          low_limit
-        )
-        VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8,
-          $9, $10, $11, $12, $13, $14, $15
-        )
-        RETURNING *
-        `,
-        [
-          indicator_sub_title,
-          unit,
-          frequency,
-          target,
-          target_direction,
-          tolerance_type,
-          up_tolerance,
-          low_tolerance,
-          max,
-          min,
-          calculation_on,
-          target_auto_adjustment,
-          indicator_title,
-          high_limit,
-          low_limit
-        ]
-      );
-
-      kpiIdToAssign = insertKpi.rows[0].kpi_id;
-    }
-
-    const assignment = await upsertResponsibleKpiAssignment(client, responsibleId, kpiIdToAssign, req.body, {
-      preserveMissing: true
+    const newKpi = insertKpi.rows[0];
+    await upsertPrimarySubjectKpiLink(client, newKpi.kpi_id, resolvedSubjectId);
+    await refreshKpiKnowledgeBaseForKpiId(client, newKpi.kpi_id, {
+      reason: "responsible_kpi_created"
     });
-    await syncResponsibleKpiValueLinks(client, responsibleId, kpiIdToAssign, assignment.responsible_kpi_id);
 
-    const createdKpi = await getResolvedResponsibleKpi(client, responsibleId, kpiIdToAssign);
 
     await client.query("COMMIT");
-
-    res.status(201).json(createdKpi);
+    const rows = await loadKpiRowsForUi({
+      kpiId: newKpi.kpi_id,
+      responsibleId: responsiblePeopleId
+    });
+    res.status(201).json(rows[0] || newKpi);
   } catch (error) {
     if (client) {
       await client.query("ROLLBACK").catch(() => { });
@@ -1991,31 +5238,15 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
 
 app.get("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   const { responsibleId } = req.params;
-  const search = req.query.search || "";
-  const searchTerm = `%${search}%`;
-
   try {
-    const result = await pool.query(
-      `
-      SELECT
-          k.kpi_id,
-          ${RESPONSIBLE_KPI_RESOLVED_SELECT}
-      FROM public.responsible_kpis rk
-      JOIN public."Kpi" k
-        ON k.kpi_id = rk.kpi_id
-      WHERE rk.responsible_id = $1
-        AND (
-          ${RESPONSIBLE_KPI_SEARCH_TITLE} ILIKE $2
-          OR ${RESPONSIBLE_KPI_SEARCH_SUBTITLE} ILIKE $2
-          OR ${RESPONSIBLE_KPI_SEARCH_FREQUENCY} ILIKE $2
-          OR ${RESPONSIBLE_KPI_SEARCH_TARGET} ILIKE $2
-        )
-      ORDER BY k.kpi_id DESC
-      `,
-      [responsibleId, searchTerm]
-    );
-
-    res.json(result.rows);
+    await ensureKpiRatioSchema();
+    const includeAll = String(req.query.include_all || "").trim() === "1";
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    const rows = await loadKpiRowsForUi({
+      search: req.query.search || "",
+      responsibleId: includeAll ? null : responsibleId
+    });
+    res.json(annotateOwnedKpisForResponsible(rows, responsiblePeopleId));
   } catch (error) {
     console.error("GET /api/responsibles/:responsibleId/kpis error:", error);
     res.status(500).json({ error: "Failed to load KPIs" });
@@ -2026,13 +5257,19 @@ app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   const { responsibleId, kpiId } = req.params;
 
   try {
-    const result = await getResolvedResponsibleKpi(pool, responsibleId, kpiId);
+    await ensureKpiRatioSchema();
+    const includeAll = String(req.query.include_all || "").trim() === "1";
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    const rows = await loadKpiRowsForUi({
+      kpiId: Number(kpiId),
+      responsibleId: includeAll ? null : responsibleId
+    });
 
-    if (!result) {
-      return res.status(404).json({ error: "KPI not found for this responsible" });
+    if (!rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
     }
 
-    res.json(result);
+    res.json(annotateOwnedKpisForResponsible(rows, responsiblePeopleId)[0]);
   } catch (error) {
     console.error("GET one KPI error:", error);
     res.status(500).json({ error: "Failed to load KPI" });
@@ -2041,31 +5278,153 @@ app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
 
 app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   const { responsibleId, kpiId } = req.params;
+  let client;
 
   try {
-    const existingAssignment = await pool.query(
-      `
-      SELECT responsible_kpi_id
-      FROM public.responsible_kpis
-      WHERE responsible_id = $1 AND kpi_id = $2
-      LIMIT 1
-      `,
-      [responsibleId, kpiId]
-    );
+    await ensureKpiRatioSchema();
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
 
-    if (!existingAssignment.rows.length) {
-      return res.status(404).json({ error: "KPI not found or not allowed" });
+    if (!responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
     }
 
-    const assignment = await upsertResponsibleKpiAssignment(pool, responsibleId, kpiId, req.body, {
-      preserveMissing: true
+    const {
+      subject_id,
+      kpi_name,
+      kpi_sub_title,
+      kpi_code,
+      kpi_formula,
+      unit,
+      kpi_explanation,
+      frequency,
+      target_value,
+      target_direction,
+      tolerance_type,
+      up_tolerance,
+      low_tolerance,
+      max_value,
+      min_value,
+      nombre_periode,
+      calculation_mode,
+      display_trend,
+      regression,
+      min_type,
+      max_type,
+      calculation_on,
+      target_auto_adjustment,
+      reference_kpi_id,
+      owner_role_id,
+      status,
+      comments,
+      high_limit,
+      low_limit
+    } = prepareKpiWritePayload(req.body);
+    const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
+      subject_id,
+      subject: req.body.subject
     });
-    await syncResponsibleKpiValueLinks(pool, responsibleId, kpiId, assignment.responsible_kpi_id);
-    const result = await getResolvedResponsibleKpi(pool, responsibleId, kpiId);
-    res.json(result);
+
+    if (!resolvedSubjectId) {
+      throw createHttpError(400, "Subject selection is required.");
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const result = await client.query(
+      `
+      UPDATE public.kpi
+      SET
+          kpi_name = $1,
+          kpi_sub_title = $2,
+          kpi_code = $3,
+          kpi_formula = $4,
+          unit = $5,
+          kpi_explanation = $6,
+          frequency = $7,
+          target_value = $8,
+          target_direction = $9,
+          tolerance_type = $10,
+          up_tolerance = $11,
+          low_tolerance = $12,
+          max_value = $13,
+          min_value = $14,
+          nombre_periode = $15,
+          calculation_mode = $16,
+          display_trend = $17,
+          regression = $18,
+          min_type = $19,
+          max_type = $20,
+          calculation_on = $21,
+          target_auto_adjustment = $22,
+          reference_kpi_id = $23,
+          owner_role_id = $24,
+          status = $25,
+          comments = $26,
+          high_limit = $27,
+          low_limit = $28,
+          updated_at = NOW()
+      WHERE kpi_id = $29
+        AND created_by_people_id = $30
+      RETURNING *
+      `,
+      [
+        kpi_name,
+        kpi_sub_title,
+        kpi_code,
+        kpi_formula,
+        unit,
+        kpi_explanation,
+        frequency,
+        target_value,
+        target_direction,
+        tolerance_type,
+        up_tolerance,
+        low_tolerance,
+        max_value,
+        min_value,
+        nombre_periode,
+        calculation_mode,
+        display_trend,
+        regression,
+        min_type,
+        max_type,
+        calculation_on,
+        target_auto_adjustment,
+        reference_kpi_id,
+        owner_role_id,
+        status,
+        comments,
+        high_limit,
+        low_limit,
+        kpiId,
+        responsiblePeopleId
+      ]
+    );
+
+    if (!result.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    await upsertPrimarySubjectKpiLink(client, Number(kpiId), resolvedSubjectId);
+    await client.query("COMMIT");
+
+    const rows = await loadKpiRowsForUi({
+      kpiId: Number(kpiId),
+      responsibleId: responsiblePeopleId
+    });
+    res.json(rows[0] || result.rows[0]);
   } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
     console.error(error);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to update KPI" });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
@@ -2074,54 +5433,797 @@ app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   let client;
 
   try {
+    await ensureKpiRatioSchema();
+    await ensureKpiAssistantConversationSchema();
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+
+    if (!responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
+    }
+
     client = await pool.connect();
     await client.query("BEGIN");
 
-    const assignmentResult = await client.query(
+    const ownedKpiResult = await client.query(
       `
-      DELETE FROM public.responsible_kpis
-      WHERE responsible_id = $1
-        AND kpi_id = $2
-      RETURNING responsible_kpi_id
+      SELECT kpi_id
+      FROM public.kpi
+      WHERE kpi_id = $1
+        AND created_by_people_id = $2
+      LIMIT 1
       `,
-      [responsibleId, kpiId]
+      [kpiId, responsiblePeopleId]
     );
 
-    if (!assignmentResult.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "KPI not found or not allowed" });
+    if (!ownedKpiResult.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
+      return res.status(404).json({ error: "KPI not found" });
     }
 
-    await client.query(
-      `DELETE FROM public.kpi_values WHERE responsible_id = $1 AND kpi_id = $2`,
-      [responsibleId, kpiId]
+    await deleteKpiDependentRecords(client, kpiId);
+
+    const result = await client.query(
+      `
+      DELETE FROM public.kpi
+      WHERE kpi_id = $1
+        AND created_by_people_id = $2
+      RETURNING *
+      `,
+      [kpiId, responsiblePeopleId]
     );
-    await client.query(
-      `DELETE FROM public.kpi_values_hist26 WHERE responsible_id = $1 AND kpi_id = $2`,
-      [responsibleId, kpiId]
-    );
-    await client.query(
-      `DELETE FROM public.corrective_actions WHERE responsible_id = $1 AND kpi_id = $2`,
-      [responsibleId, kpiId]
-    );
-    await client.query(
-      `DELETE FROM public.pending_target_updates WHERE responsible_id = $1 AND kpi_id = $2`,
-      [responsibleId, kpiId]
-    );
+
+    if (!result.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
+      return res.status(404).json({ error: "KPI not found" });
+    }
 
     await client.query("COMMIT");
-
     res.json({ success: true });
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => { });
+      await client.query("ROLLBACK").catch(() => {});
     }
     console.error(error);
-    res.status(500).json({ error: "Failed to delete KPI" });
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to delete KPI"
+    });
   } finally {
     if (client) {
       client.release();
     }
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/parameter-kpis", async (req, res) => {
+  const { responsibleId } = req.params;
+
+  try {
+    await ensureResponsibleParameterKpiSchema();
+
+    const result = await pool.query(
+      `
+      SELECT
+        pk.parameter_kpi_id,
+        pk.kpi_id,
+        pk.location,
+        pk.local_currency,
+        pk.value,
+        pk.value_date,
+        pk.target,
+        pk.best_new_target,
+        pk.kpi_type,
+        pk.created_at,
+        pk.updated_at,
+        r.name AS responsible_name,
+        k.subject AS kpi_subject,
+        k.indicator_title AS kpi_group,
+        k.indicator_sub_title AS kpi_name
+      FROM public.responsible_parameter_kpis pk
+      JOIN public."Responsible" r
+        ON r.responsible_id = pk.responsible_id
+      LEFT JOIN public."Kpi" k
+        ON k.kpi_id = pk.kpi_id
+      WHERE pk.responsible_id = $1
+      ORDER BY pk.created_at DESC, pk.parameter_kpi_id DESC
+      `,
+      [responsibleId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("GET parameter KPIs error:", error);
+    res.status(500).json({ error: "Failed to load parameter KPIs" });
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/parameter-kpis/:parameterKpiId", async (req, res) => {
+  const { responsibleId, parameterKpiId } = req.params;
+
+  try {
+    await ensureResponsibleParameterKpiSchema();
+
+    const result = await pool.query(
+      `
+      SELECT
+        pk.parameter_kpi_id,
+        pk.kpi_id,
+        pk.location,
+        pk.local_currency,
+        pk.value,
+        pk.value_date,
+        pk.target,
+        pk.best_new_target,
+        pk.kpi_type,
+        pk.created_at,
+        pk.updated_at,
+        r.name AS responsible_name,
+        k.subject AS kpi_subject,
+        k.indicator_title AS kpi_group,
+        k.indicator_sub_title AS kpi_name
+      FROM public.responsible_parameter_kpis pk
+      JOIN public."Responsible" r
+        ON r.responsible_id = pk.responsible_id
+      LEFT JOIN public."Kpi" k
+        ON k.kpi_id = pk.kpi_id
+      WHERE pk.responsible_id = $1
+        AND pk.parameter_kpi_id = $2
+      LIMIT 1
+      `,
+      [responsibleId, parameterKpiId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Parameter KPI not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("GET one parameter KPI error:", error);
+    res.status(500).json({ error: "Failed to load parameter KPI" });
+  }
+});
+
+app.post("/api/responsibles/:responsibleId/parameter-kpis", async (req, res) => {
+  const { responsibleId } = req.params;
+
+  try {
+    await ensureResponsibleParameterKpiSchema();
+
+    const {
+      kpi_id,
+      location,
+      local_currency,
+      value,
+      value_date,
+      target,
+      best_new_target,
+      kpi_type
+    } = prepareResponsibleParameterKpiPayload(req.body);
+
+    const result = await pool.query(
+      `
+      INSERT INTO public.responsible_parameter_kpis (
+        responsible_id,
+        kpi_id,
+        location,
+        local_currency,
+        value,
+        value_date,
+        target,
+        best_new_target,
+        kpi_type
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+      `,
+      [
+        responsibleId,
+        kpi_id,
+        location,
+        local_currency,
+        value,
+        value_date,
+        target,
+        best_new_target,
+        kpi_type
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("POST parameter KPI error:", error);
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to create parameter KPI"
+    });
+  }
+});
+
+app.post("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
+  const { responsibleId } = req.params;
+  let client;
+  try {
+    await ensureKpiRatioSchema();
+    await ensureKpiObjectSchema();
+    const responsiblePeopleContext = await loadPeopleContextByPeopleId(responsibleId);
+    const normalizedResponsiblePeopleId =
+      responsiblePeopleContext?.people_id ||
+      normalizeOptionalIntegerInput(responsibleId);
+    const createdByPeopleId =
+      normalizeOptionalIntegerInput(req.body.created_by_people_id) ||
+      normalizedResponsiblePeopleId;
+    const preparedRows = buildPreparedKpiObjectRows({
+      ...req.body,
+      set_by_people_id: req.body.set_by_people_id || normalizedResponsiblePeopleId,
+      created_by_people_id: req.body.created_by_people_id || createdByPeopleId
+    }, normalizedResponsiblePeopleId, createdByPeopleId);
+
+    if (!preparedRows.length) {
+      throw createHttpError(400, "Enter at least one unit target value.");
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const insertedIds = [];
+    const touchedKpiIds = new Set();
+
+    for (const preparedRow of preparedRows) {
+      const preparedKpiId = normalizeOptionalIntegerInput(preparedRow.kpi_id);
+      if (preparedKpiId) {
+        touchedKpiIds.add(preparedKpiId);
+      }
+
+      const result = await client.query(
+        `
+        INSERT INTO public.kpi_target_allocation (
+          kpi_id,
+          plant_id,
+          zone_id,
+          unit_id,
+          "function",
+          product_id,
+          product_line_id,
+          market_id,
+          customer_id,
+          target_value,
+          target_unit,
+          local_currency,
+          kpi_type,
+          unit_type_id,
+          role_id,
+          target_setup_date,
+          target_start_date,
+          target_end_date,
+          last_best_target,
+          previous_target_value,
+          target_status,
+          set_by_people_id,
+          created_by_people_id,
+          approved_by_people_id,
+          comments
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+        RETURNING kpi_target_allocation_id
+        `,
+        getKpiObjectInsertValues(preparedRow)
+      );
+
+      if (result.rows[0]?.kpi_target_allocation_id) {
+        insertedIds.push(result.rows[0].kpi_target_allocation_id);
+      }
+    }
+
+    await refreshKpiKnowledgeBases(client, Array.from(touchedKpiIds), {
+      reason: "target_allocation_created"
+    });
+    await client.query("COMMIT");
+
+    // await sendKpiTargetAllocationAssignmentNotifications({
+    //   req,
+    //   actorResponsibleId: normalizedResponsiblePeopleId || responsibleId,
+    //   allocationIds: insertedIds
+    // }).catch((notificationError) => {
+    //   console.error("KPI target allocation notification error:", notificationError);
+    // });
+
+    const rows = await Promise.all(
+      insertedIds.map((allocationId) =>
+        loadKpiTargetAllocationRowsForUi({
+          allocationId,
+          responsibleId: normalizedResponsiblePeopleId || responsibleId
+        })
+      )
+    );
+
+    const createdRows = rows.flat().filter(Boolean);
+    res.status(201).json(createdRows.length === 1 ? createdRows[0] : createdRows);
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    console.error("POST KPI object error:", error);
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to create KPI target allocation"
+    });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
+  const { responsibleId } = req.params;
+  try {
+    await ensureKpiObjectSchema();
+    const rows = await loadKpiTargetAllocationRowsForUi({ responsibleId });
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.json(rows);
+  } catch (error) {
+    console.error("GET KPI objects error:", error);
+    res.status(500).json({ error: "Failed to load KPI target allocations" });
+  }
+});
+
+app.get("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req, res) => {
+  const { responsibleId, kpiObjectId } = req.params;
+
+  try {
+    await ensureKpiObjectSchema();
+    const anchorRows = await loadKpiTargetAllocationRowsForUi({
+      allocationId: Number(kpiObjectId),
+      responsibleId
+    });
+
+    if (!anchorRows.length) {
+      return res.status(404).json({ error: "KPI target allocation not found" });
+    }
+
+    const relatedAllocations = await loadKpiTargetAllocationGroupRowsForUi(Number(kpiObjectId));
+    const primaryRow =
+      relatedAllocations.find(
+        (row) => Number(row.kpi_target_allocation_id) === Number(kpiObjectId)
+      ) || relatedAllocations[0] || anchorRows[0];
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.json({
+      ...(primaryRow || anchorRows[0]),
+      related_allocations: relatedAllocations.length ? relatedAllocations : anchorRows
+    });
+  } catch (error) {
+    console.error("GET one KPI object error:", error);
+    res.status(500).json({ error: "Failed to load KPI target allocation" });
+  }
+});
+
+app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req, res) => {
+  const { responsibleId, kpiObjectId } = req.params;
+  let client;
+  let transactionCompleted = false;
+
+  try {
+    await ensureKpiRatioSchema();
+    await ensureKpiObjectSchema();
+    const responsiblePeopleContext = await loadPeopleContextByPeopleId(responsibleId);
+    const normalizedResponsiblePeopleId =
+      responsiblePeopleContext?.people_id ||
+      normalizeOptionalIntegerInput(responsibleId);
+    const anchorAllocationId = normalizeOptionalIntegerInput(kpiObjectId);
+    const existingGroupRows = await loadKpiTargetAllocationGroupRowsForUi(Number(kpiObjectId));
+    const existingFamilyRows = await loadKpiTargetAllocationFamilyRowsForUi(Number(kpiObjectId));
+
+    if (!existingGroupRows.length) {
+      return res.status(404).json({ error: "KPI target allocation not found" });
+    }
+
+    const preservedCreatedByPeopleId =
+      normalizeOptionalIntegerInput(req.body.created_by_people_id) ||
+      normalizeOptionalIntegerInput(existingGroupRows[0]?.created_by_people_id) ||
+      normalizedResponsiblePeopleId;
+    const preservedGroupCreatedAt =
+      existingGroupRows[0]?.created_at || new Date().toISOString();
+    const preparedRows = buildPreparedKpiObjectRows({
+      ...req.body,
+      kpi_target_allocation_id: req.body.kpi_target_allocation_id || kpiObjectId,
+      set_by_people_id: req.body.set_by_people_id || normalizedResponsiblePeopleId,
+      created_by_people_id: req.body.created_by_people_id || preservedCreatedByPeopleId
+    }, normalizedResponsiblePeopleId, preservedCreatedByPeopleId);
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const availableExistingRows = existingFamilyRows.length
+      ? existingFamilyRows
+      : existingGroupRows;
+    const existingRowsByAllocationId = new Map(
+      availableExistingRows
+        .map((row) => [
+          normalizeOptionalIntegerInput(row.kpi_target_allocation_id),
+          row
+        ])
+        .filter(([allocationId]) => Number.isInteger(allocationId) && allocationId > 0)
+    );
+    const existingRowsByScopeKey = new Map(
+      availableExistingRows
+        .map((row) => [getKpiTargetAllocationScopeKey(row), row])
+        .filter(([scopeKey]) => Boolean(scopeKey))
+    );
+    const anchorExistingRow = anchorAllocationId
+      ? existingRowsByAllocationId.get(anchorAllocationId) || null
+      : null;
+    const normalizedRequestedKpiType = String(
+      normalizeOptionalTextInput(req.body.kpi_type) ||
+      normalizeOptionalTextInput(anchorExistingRow?.kpi_type) ||
+      ""
+    ).trim().toLowerCase();
+    const normalizedAnchorKpiType = String(
+      normalizeOptionalTextInput(anchorExistingRow?.kpi_type) || ""
+    ).trim().toLowerCase();
+    const resultingAllocationIds = [];
+    const notificationAllocationIds = [];
+    const matchedExistingAllocationIds = new Set();
+    const touchedKpiIds = new Set();
+
+    existingFamilyRows.forEach((row) => {
+      const existingKpiId = normalizeOptionalIntegerInput(row?.kpi_id);
+      if (existingKpiId) {
+        touchedKpiIds.add(existingKpiId);
+      }
+    });
+
+    for (const preparedRow of preparedRows) {
+      const preparedKpiId = normalizeOptionalIntegerInput(preparedRow.kpi_id);
+      if (preparedKpiId) {
+        touchedKpiIds.add(preparedKpiId);
+      }
+
+      const preparedAllocationId = normalizeOptionalIntegerInput(preparedRow.kpi_target_allocation_id);
+      const scopeKey = getKpiTargetAllocationScopeKey(preparedRow);
+      const existingRow =
+        (preparedAllocationId
+          ? existingRowsByAllocationId.get(preparedAllocationId)
+          : null) ||
+        (!preparedAllocationId && preparedRows.length === 1 && anchorExistingRow
+          ? anchorExistingRow
+          : null) ||
+        (scopeKey ? existingRowsByScopeKey.get(scopeKey) : null);
+      const existingAssignedPeopleId = normalizeOptionalIntegerInput(existingRow?.set_by_people_id);
+      const preparedAssignedPeopleId = normalizeOptionalIntegerInput(preparedRow?.set_by_people_id);
+      const existingKpiId = normalizeOptionalIntegerInput(existingRow?.kpi_id);
+      if (existingKpiId) {
+        touchedKpiIds.add(existingKpiId);
+      }
+
+      if (existingRow?.kpi_target_allocation_id) {
+        matchedExistingAllocationIds.add(Number(existingRow.kpi_target_allocation_id));
+        const updateResult = await client.query(
+          `
+          UPDATE public.kpi_target_allocation
+          SET
+            kpi_id = $1,
+            plant_id = $2,
+            zone_id = $3,
+            unit_id = $4,
+            "function" = $5,
+            product_id = $6,
+            product_line_id = $7,
+            market_id = $8,
+            customer_id = $9,
+            target_value = $10,
+            target_unit = $11,
+            local_currency = $12,
+            kpi_type = $13,
+            unit_type_id = $14,
+            role_id = $15,
+            target_setup_date = $16,
+            target_start_date = $17,
+            target_end_date = $18,
+            last_best_target = $19,
+            previous_target_value = $20,
+            target_status = $21,
+            set_by_people_id = $22,
+            created_by_people_id = $23,
+            approved_by_people_id = $24,
+            comments = $25,
+            updated_at = NOW()
+          WHERE kpi_target_allocation_id = $26
+          RETURNING kpi_target_allocation_id
+          `,
+          [
+            ...getKpiObjectInsertValues(preparedRow),
+            existingRow.kpi_target_allocation_id,
+          ]
+        );
+
+        if (updateResult.rows[0]?.kpi_target_allocation_id) {
+          resultingAllocationIds.push(updateResult.rows[0].kpi_target_allocation_id);
+          if (existingAssignedPeopleId !== preparedAssignedPeopleId) {
+            notificationAllocationIds.push(updateResult.rows[0].kpi_target_allocation_id);
+          }
+        }
+        continue;
+      }
+
+      const insertResult = await client.query(
+        `
+        INSERT INTO public.kpi_target_allocation (
+          kpi_id,
+          plant_id,
+          zone_id,
+          unit_id,
+          "function",
+          product_id,
+          product_line_id,
+          market_id,
+          customer_id,
+          target_value,
+          target_unit,
+          local_currency,
+          kpi_type,
+          unit_type_id,
+          role_id,
+          target_setup_date,
+          target_start_date,
+          target_end_date,
+          last_best_target,
+          previous_target_value,
+          target_status,
+          set_by_people_id,
+          created_by_people_id,
+          approved_by_people_id,
+          comments,
+          created_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+        RETURNING kpi_target_allocation_id
+        `,
+        [
+          ...getKpiObjectInsertValues(preparedRow),
+          preservedGroupCreatedAt
+        ]
+      );
+
+      if (insertResult.rows[0]?.kpi_target_allocation_id) {
+        resultingAllocationIds.push(insertResult.rows[0].kpi_target_allocation_id);
+        notificationAllocationIds.push(insertResult.rows[0].kpi_target_allocation_id);
+      }
+    }
+
+    const rowsToPrune =
+      preparedRows.length === 1 &&
+      existingFamilyRows.length > existingGroupRows.length &&
+      (
+        normalizedRequestedKpiType === "individual" ||
+        (
+          Boolean(normalizedAnchorKpiType) &&
+          Boolean(normalizedRequestedKpiType) &&
+          normalizedAnchorKpiType !== normalizedRequestedKpiType
+        )
+      )
+        ? existingFamilyRows
+        : existingGroupRows;
+
+    for (const existingRow of rowsToPrune) {
+      const existingAllocationId = normalizeOptionalIntegerInput(existingRow?.kpi_target_allocation_id);
+      if (!existingAllocationId || matchedExistingAllocationIds.has(existingAllocationId)) {
+        continue;
+      }
+
+      await deleteKpiTargetAllocationDependentRecords(client, existingAllocationId);
+
+      await client.query(
+        `
+        DELETE FROM public.kpi_target_allocation
+        WHERE kpi_target_allocation_id = $1
+        `,
+        [existingAllocationId]
+      );
+    }
+
+    await refreshKpiKnowledgeBases(client, Array.from(touchedKpiIds), {
+      reason: "target_allocation_updated"
+    });
+    await client.query("COMMIT");
+    transactionCompleted = true;
+
+    // await sendKpiTargetAllocationAssignmentNotifications({
+    //   req,
+    //   actorResponsibleId: normalizedResponsiblePeopleId || responsibleId,
+    //   allocationIds: notificationAllocationIds
+    // }).catch((notificationError) => {
+    //   console.error("KPI target allocation notification error:", notificationError);
+    // });
+
+    const refreshedRowIds = Array.from(
+      new Set(
+        resultingAllocationIds
+          .map((allocationId) => Number(allocationId))
+          .filter((allocationId) => Number.isInteger(allocationId) && allocationId > 0)
+      )
+    );
+
+    const refreshedRows = await Promise.all(
+      refreshedRowIds.map((allocationId) =>
+        loadKpiTargetAllocationRowsForUi({
+          allocationId: Number(allocationId),
+          responsibleId: null
+        })
+      )
+    );
+    const relatedAllocations = refreshedRows
+      .flat()
+      .filter(Boolean)
+      .sort((left, right) => Number(left.kpi_target_allocation_id) - Number(right.kpi_target_allocation_id));
+    const primaryRow =
+      relatedAllocations.find(
+        (row) => Number(row.kpi_target_allocation_id) === Number(kpiObjectId)
+      ) || relatedAllocations[0] || null;
+
+    res.json({
+      ...(primaryRow || {}),
+      related_allocations: relatedAllocations
+    });
+  } catch (error) {
+    console.error("PUT KPI object error:", error);
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to update KPI target allocation"
+    });
+  } finally {
+    if (client) {
+      if (!transactionCompleted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+      client.release();
+    }
+  }
+});
+
+app.delete("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req, res) => {
+  const { kpiObjectId } = req.params;
+  let client;
+
+  try {
+    await ensureKpiRatioSchema();
+    await ensureKpiObjectSchema();
+    const groupIds = await getKpiTargetAllocationGroupIds(kpiObjectId);
+    if (!groupIds.length) {
+      return res.status(404).json({ error: "KPI target allocation not found" });
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    await deleteKpiTargetAllocationDependentRecords(client, groupIds);
+
+    const result = await client.query(
+      `
+      DELETE FROM public.kpi_target_allocation
+      WHERE kpi_target_allocation_id = ANY($1::int[])
+      RETURNING kpi_target_allocation_id, kpi_id
+      `,
+      [groupIds]
+    );
+
+    if (!result.rows.length) {
+      await client.query("ROLLBACK").catch(() => {});
+      return res.status(404).json({ error: "KPI target allocation not found" });
+    }
+
+    await refreshKpiKnowledgeBases(
+      client,
+      result.rows.map((row) => row.kpi_id),
+      { reason: "target_allocation_deleted" }
+    );
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      deleted_ids: result.rows
+        .map((row) => Number(row.kpi_target_allocation_id))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    });
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    console.error("DELETE KPI object error:", error);
+    res.status(500).json({ error: "Failed to delete KPI target allocation" });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+});
+
+app.put("/api/responsibles/:responsibleId/parameter-kpis/:parameterKpiId", async (req, res) => {
+  const { responsibleId, parameterKpiId } = req.params;
+
+  try {
+    await ensureResponsibleParameterKpiSchema();
+
+    const {
+      kpi_id,
+      location,
+      local_currency,
+      value,
+      value_date,
+      target,
+      best_new_target,
+      kpi_type
+    } = prepareResponsibleParameterKpiPayload(req.body);
+
+    const result = await pool.query(
+      `
+      UPDATE public.responsible_parameter_kpis
+      SET
+        kpi_id = $1,
+        location = $2,
+        local_currency = $3,
+        value = $4,
+        value_date = $5,
+        target = $6,
+        best_new_target = $7,
+        kpi_type = $8,
+        updated_at = NOW()
+      WHERE parameter_kpi_id = $9
+        AND responsible_id = $10
+      RETURNING *
+      `,
+      [
+        kpi_id,
+        location,
+        local_currency,
+        value,
+        value_date,
+        target,
+        best_new_target,
+        kpi_type,
+        parameterKpiId,
+        responsibleId
+      ]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Parameter KPI not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("PUT parameter KPI error:", error);
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to update parameter KPI"
+    });
+  }
+});
+
+app.delete("/api/responsibles/:responsibleId/parameter-kpis/:parameterKpiId", async (req, res) => {
+  const { responsibleId, parameterKpiId } = req.params;
+
+  try {
+    await ensureResponsibleParameterKpiSchema();
+
+    const result = await pool.query(
+      `
+      DELETE FROM public.responsible_parameter_kpis
+      WHERE parameter_kpi_id = $1
+        AND responsible_id = $2
+      RETURNING parameter_kpi_id
+      `,
+      [parameterKpiId, responsibleId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "Parameter KPI not found" });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("DELETE parameter KPI error:", error);
+    res.status(500).json({ error: "Failed to delete parameter KPI" });
   }
 });
 
@@ -2135,7 +6237,12 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
       WITH ranked AS (
         SELECT
           h.kpi_id,
-          ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+          k.indicator_title,
+          k.indicator_sub_title,
+          k.high_limit,
+          k.low_limit,
+          k.target,
+          k.target_direction,
           date_trunc('month', h.updated_at)::date AS month_start,
           to_char(date_trunc('month', h.updated_at), 'Mon YYYY') AS month_label,
           COALESCE(NULLIF(h.new_value, ''), '0')::numeric AS new_value_num,
@@ -2147,10 +6254,6 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
         FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k
           ON k.kpi_id = h.kpi_id
-        LEFT JOIN public.kpi_values kv
-          ON kv.kpi_values_id = h.kpi_values_id
-        LEFT JOIN public.responsible_kpis rk
-          ON rk.responsible_kpi_id = kv.responsible_kpi_id
         WHERE h.responsible_id = $1
       )
       SELECT
@@ -2160,6 +6263,7 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
         high_limit,
         low_limit,
         target,
+        target_direction,
         month_start,
         month_label,
         new_value_num
@@ -2182,7 +6286,8 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
           values: [],
           targetValue: row.target !== null && row.target !== "" ? Number(row.target) : null,
           highLimitValue: row.high_limit !== null ? Number(row.high_limit) : null,
-          lowLimitValue: row.low_limit !== null ? Number(row.low_limit) : null
+          lowLimitValue: row.low_limit !== null ? Number(row.low_limit) : null,
+          targetDirection: row.target_direction || "Up"
         };
       }
 
@@ -2198,7 +6303,8 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
       values: item.values,
       targetValue: item.targetValue,
       highLimitValue: item.highLimitValue,
-      lowLimitValue: item.lowLimitValue
+      lowLimitValue: item.lowLimitValue,
+      targetDirection: item.targetDirection
     }));
 
     res.json(finalRows);
@@ -2208,15 +6314,65 @@ app.get("/api/responsibles/:responsibleId/kpi-history-monthly", async (req, res)
   }
 });
 
+//get manufacturing data
+app.get("/api/manufacturing-strategy/zone", async (req, res) => {
+  const { unit_id, product_id } = req.query;
+
+  if (!unit_id || !product_id) {
+    return res.json({ zones: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT DISTINCT
+        ms.zone_id,
+        z.zone_name,
+        z.responsable_zone
+      FROM public.manufacturing_strategy ms
+      LEFT JOIN public.zone z
+        ON z.zone_id = ms.zone_id
+      WHERE ms.plant_id = $1
+        AND ms.product_id = $2
+        AND ms.strategy_status = 'active'
+        AND ms.zone_id IS NOT NULL
+      ORDER BY z.zone_name, ms.zone_id
+      `,
+      [unit_id, product_id]
+    );
+
+    res.json({
+      zones: result.rows.map((row) => ({
+        zone_id: row.zone_id,
+        zone_name: row.zone_name || `Zone ${row.zone_id}`,
+        responsable_zone: normalizeOptionalTextInput(row.responsable_zone) || ""
+      }))
+    });
+  } catch (err) {
+    console.error("manufacturing-strategy/zone error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+    
 app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
   const { responsibleId } = req.params;
+  const [
+    responsibleContext,
+    subjectHierarchyData,
+    roleOptions,
+    allocationLookups
+  ] = await Promise.all([
+    loadFormResponsibleContext(responsibleId),
+    loadSubjectHierarchyData(),
+    loadRoleOptions(),
+    loadKpiTargetAllocationLookups()
+  ]);
 
-  const responsibleResult = await pool.query(
-    `SELECT name FROM public."Responsible" WHERE responsible_id = $1`,
-    [responsibleId]
-  );
-
-  const responsibleName = responsibleResult.rows[0]?.name || "Unknown";
+  const responsibleName = responsibleContext?.name || "KPI Workspace";
+  const dashboardResponsibleId = responsibleContext?.people_id || responsibleId;
+  const kpiSubjectHierarchy = subjectHierarchyData.tree;
 
   res.send(`
   <!DOCTYPE html>
@@ -2278,6 +6434,7 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         min-height: 100vh;
       }
 
+    
       .layout {
         display: grid;
         grid-template-columns: 280px 1fr;
@@ -2404,6 +6561,7 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       .content {
         padding: 24px;
       }
+        
 
       .topbar {
         display: flex;
@@ -2487,6 +6645,56 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         top: -120px;
         right: -80px;
       }
+
+/* Main KPI modal */
+.kpi-modal,
+.modal-content {
+    width: 96%;
+    max-width: 1650px;
+
+    height: 96vh;        /* increase height */
+    max-height: 96vh;
+
+    border-radius: 20px;
+    overflow: hidden;
+
+    display: flex;
+    flex-direction: column;
+}
+
+/* Scrollable content */
+.modal-body,
+.kpi-modal-body {
+    flex: 1;
+    overflow-y: auto;
+
+    padding: 24px 28px;
+}
+
+/* Footer fixed at bottom */
+.modal-footer {
+    padding: 18px 24px;
+    border-top: 1px solid #e5e7eb;
+    background: white;
+}
+
+/* Bigger sections */
+.form-section {
+    padding: 18px;
+    margin-bottom: 16px;
+}
+
+/* Better input height */
+input,
+select,
+textarea {
+    min-height: 48px;
+}
+
+/* Definition textarea */
+textarea {
+    min-height: 110px;
+}
 
       .hero-panel::after {
         content: "";
@@ -2641,211 +6849,1289 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         margin-top: 4px;
       }
 
+      .section-head.section-head--nested {
+        margin: 0 0 14px;
+      }
+
+      .section-head.section-head--nested h2 {
+        font-size: 17px;
+        font-weight: 900;
+      }
+
+      .section-head.section-head--nested p {
+        font-size: 12px;
+      }
+
       .grid {
         display: grid;
         grid-template-columns: repeat(3, minmax(0,1fr));
         gap: 16px;
       }
 
-      .kpi-card {
-        position: relative;
-        overflow: hidden;
+      .kpi-table-shell {
+        grid-column: 1 / -1;
         background: rgba(255,255,255,0.94);
         border: 1px solid rgba(15,23,42,0.06);
-        border-radius: 22px;
+        border-radius: 24px;
         box-shadow: var(--shadow-md);
-        padding: 18px;
-        transition: all 0.22s ease;
+        overflow: hidden;
       }
 
-      .kpi-card:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.11);
+      .kpi-table-wrap {
+        overflow-x: auto;
       }
 
-      .kpi-card::before {
-        content: "";
-        position: absolute;
-        width: 110px;
-        height: 110px;
-        border-radius: 50%;
-        background: radial-gradient(circle, rgba(37,99,235,0.06), transparent 70%);
-        top: -20px;
-        right: -20px;
+      .kpi-table {
+        width: 100%;
+        min-width: 640px;
+        border-collapse: collapse;
       }
 
-      .kpi-head {
-        position: relative;
-        z-index: 1;
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        gap: 10px;
-        margin-bottom: 12px;
+      .kpi-table thead tr {
+        background: linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%);
       }
 
-      .kpi-title {
-        font-size: 17px;
+      .kpi-table th {
+        padding: 16px 18px;
+        text-align: left;
+        font-size: 11px;
         font-weight: 900;
-        letter-spacing: -0.02em;
-        color: #0f172a;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: #64748b;
+        border-bottom: 1px solid #e2e8f0;
       }
 
-      .kpi-subtitle {
-        margin-top: 6px;
-        color: var(--muted);
-        font-size: 12px;
+      .kpi-table td {
+        padding: 18px;
+        border-bottom: 1px solid #e2e8f0;
+        vertical-align: middle;
+        background: rgba(255,255,255,0.96);
+      }
+
+      .kpi-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+
+      .kpi-table tbody tr:hover td {
+        background: #f8fbff;
+      }
+
+      .kpi-row-title {
+        font-size: 15px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .kpi-row-subtitle {
+        font-size: 14px;
+        color: #475569;
         line-height: 1.5;
       }
 
-      .pill {
+      .kpi-table-actions {
+        width: 140px;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .table-actions-group {
         display: inline-flex;
         align-items: center;
-        padding: 7px 10px;
-        border-radius: 999px;
+        justify-content: flex-end;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .parameter-section {
+        margin-top: 24px;
+      }
+
+      .parameter-section-shell {
+        background: rgba(255,255,255,0.78);
+        border: 1px solid rgba(15,23,42,0.05);
+        border-radius: 26px;
+        box-shadow: var(--shadow-md);
+        padding: 20px;
+      }
+
+      .allocation-table .kpi-table-actions {
+        width: 190px;
+      }
+
+      .allocation-row-meta {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.5;
+      }
+
+      .allocation-target-value {
+        font-size: 15px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .parameter-table-shell {
+        grid-column: 1 / -1;
+        background: rgba(255,255,255,0.95);
+        border: 1px solid rgba(15,23,42,0.06);
+        border-radius: 24px;
+        box-shadow: var(--shadow-md);
+        overflow: hidden;
+      }
+
+      .parameter-table-wrap {
+        overflow-x: auto;
+      }
+
+      .parameter-table {
+        width: 100%;
+        min-width: 1120px;
+        border-collapse: collapse;
+      }
+
+      .parameter-table thead tr {
+        background:
+          radial-gradient(circle at top right, rgba(6,182,212,0.09), transparent 36%),
+          linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%);
+      }
+
+      .parameter-table th {
+        padding: 16px 18px;
+        text-align: left;
         font-size: 11px;
         font-weight: 900;
-        white-space: nowrap;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.12em;
+        color: #64748b;
+        border-bottom: 1px solid #e2e8f0;
       }
 
-      .pill-blue {
-        background: rgba(37,99,235,0.08);
-        color: #1d4ed8;
+      .parameter-table td {
+        padding: 16px 18px;
+        border-bottom: 1px solid #e2e8f0;
+        background: rgba(255,255,255,0.98);
+        color: #0f172a;
+        vertical-align: middle;
       }
 
-.meta {
-  position: relative;
-  z-index: 1;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0,1fr));
-  gap: 10px;
-  margin-top: 14px;
-}
+      .parameter-table tbody tr:last-child td {
+        border-bottom: none;
+      }
 
-.meta-box {
-  position: relative;
-  background: linear-gradient(180deg, #fbfdff 0%, #f4f8fc 100%);
-  border: 1px solid #e4ecf5;
-  border-radius: 16px;
-  padding: 12px 14px;
-  min-height: 74px;
-  overflow: hidden;
-  transition: all 0.2s ease;
-}
+      .parameter-table tbody tr:hover td {
+        background: #f8fbff;
+      }
 
-.meta-box:hover {
-  transform: translateY(-1px);
-  border-color: #d7e3f1;
-  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
-}
+      .parameter-table-title {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(79,70,229,0.10);
+        color: #4338ca;
+        font-size: 12px;
+        font-weight: 900;
+        letter-spacing: 0.04em;
+      }
 
-.meta-box::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 3px;
-  background: transparent;
-}
+      .parameter-table-subvalue {
+        font-size: 13px;
+        font-weight: 800;
+        color: #0f172a;
+      }
 
-.meta-box.primary::before {
-  background: linear-gradient(90deg, #2563eb, #06b6d4);
-}
+      .parameter-table-meta {
+        font-size: 12px;
+        color: #64748b;
+        margin-top: 4px;
+      }
 
-.meta-box.success::before {
-  background: linear-gradient(90deg, #10b981, #22c55e);
-}
+      .parameter-table-actions {
+        width: 140px;
+        text-align: right;
+        white-space: nowrap;
+      }
 
-.meta-box.warning::before {
-  background: linear-gradient(90deg, #f59e0b, #f97316);
-}
+      .parameter-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(16,185,129,0.10);
+        color: #047857;
+        font-size: 11px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
 
-.meta-box.danger::before {
-  background: linear-gradient(90deg, #ef4444, #f87171);
-}
+      .parameter-section-shell {
+        background:
+          radial-gradient(circle at top center, rgba(37,99,235,0.08), transparent 34%),
+          linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(245,249,255,0.96) 100%);
+        border: 1px solid rgba(148,163,184,0.18);
+        border-radius: 34px;
+        box-shadow: 0 26px 58px rgba(15,23,42,0.10);
+        padding: 18px;
+      }
 
-.meta-box.neutral::before {
-  background: linear-gradient(90deg, #94a3b8, #cbd5e1);
-}
-
-
-  .meta-box .label {
-  font-size: 10px;
-  color: #64748b;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  margin-bottom: 8px;
-}
-
-   .meta-box .value {
-  font-size: 17px;
-  color: #0f172a;
-  font-weight: 900;
-  line-height: 1.25;
-  letter-spacing: -0.02em;
-  word-break: break-word;
-}
-
-.meta-box .subvalue {
-  margin-top: 4px;
-  font-size: 11px;
-  color: #94a3b8;
-  font-weight: 700;
-}
-
-.meta-box.compact .value {
-  font-size: 15px;
-}
-
-.meta-box.wide {
-  grid-column: 1 / -1;
-}
-
-.value-muted {
-  color: #475569;
-}
-
-.value-number {
-  font-variant-numeric: tabular-nums;
-}
-
-      .card-actions {
-        position: relative;
-        z-index: 1;
+      .parameter-matrix-hero {
         display: flex;
-        gap: 10px;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 18px;
         flex-wrap: wrap;
-        margin-top: 14px;
+        padding: 14px 14px 22px;
+      }
+
+      .parameter-matrix-title h2 {
+        font-size: 28px;
+        font-weight: 900;
+        color: #0f172a;
+        letter-spacing: -0.04em;
+      }
+
+      .parameter-matrix-title p {
+        margin-top: 10px;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #64748b;
+        max-width: 640px;
+      }
+
+      .parameter-matrix-add-btn {
+        min-width: 190px;
+        justify-content: center;
+      }
+
+      .parameter-matrix-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 0 14px 18px;
+      }
+
+      .parameter-matrix-search {
+        flex: 1;
+        min-width: 280px;
+        max-width: 440px;
+      }
+
+      .parameter-results-meta {
+        font-size: 13px;
+        font-weight: 800;
+        color: #64748b;
+      }
+
+      .parameter-matrix-table-shell {
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(148,163,184,0.18);
+        border-radius: 28px;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.92), 0 16px 34px rgba(15,23,42,0.08);
+        overflow: hidden;
+      }
+
+      .parameter-matrix-table-wrap {
+        overflow-x: auto;
+      }
+
+      .parameter-matrix-table {
+        width: 100%;
+        min-width: 1260px;
+        border-collapse: separate;
+        border-spacing: 0;
+      }
+
+      .parameter-matrix-table thead tr {
+        background:
+          radial-gradient(circle at top center, rgba(37,99,235,0.05), transparent 38%),
+          linear-gradient(180deg, #fbfdff 0%, #eef5ff 100%);
+      }
+
+      .parameter-matrix-table th {
+        padding: 18px 22px;
+        text-align: left;
+        font-size: 11px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: #64748b;
+        border-bottom: 1px solid rgba(226,232,240,0.95);
+        white-space: nowrap;
+      }
+
+      .parameter-matrix-table td {
+        padding: 22px;
+        border-bottom: 1px solid rgba(226,232,240,0.92);
+        background: rgba(255,255,255,0.98);
+        vertical-align: middle;
+        color: #0f172a;
+      }
+
+      .parameter-matrix-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+
+      .parameter-matrix-table tbody tr:hover td {
+        background: #f8fbff;
+      }
+
+      .parameter-matrix-kpi-title {
+        font-size: 15px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.4;
+      }
+
+      .parameter-matrix-kpi-path {
+        margin-top: 8px;
+        font-size: 13px;
+        color: #64748b;
+        line-height: 1.65;
+      }
+
+      .parameter-matrix-cell-main {
+        font-size: 14px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.5;
+      }
+
+      .parameter-matrix-cell-sub {
+        margin-top: 7px;
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.55;
+      }
+
+      .parameter-matrix-target-main {
+        font-size: 16px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .parameter-matrix-target-sub {
+        margin-top: 7px;
+        font-size: 12px;
+        color: #64748b;
+      }
+
+      .parameter-status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-radius: 14px;
+        font-size: 12px;
+        font-weight: 900;
+        letter-spacing: 0.02em;
+        border: 1px solid transparent;
+      }
+
+      .parameter-status-badge::before {
+        content: "";
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: 0.9;
+      }
+
+      .parameter-status-draft {
+        background: rgba(245,158,11,0.12);
+        color: #d97706;
+        border-color: rgba(245,158,11,0.14);
+      }
+
+      .parameter-status-active {
+        background: rgba(16,185,129,0.12);
+        color: #059669;
+        border-color: rgba(16,185,129,0.14);
+      }
+
+      .parameter-status-approved {
+        background: rgba(37,99,235,0.12);
+        color: #2563eb;
+        border-color: rgba(37,99,235,0.14);
+      }
+
+      .parameter-status-closed {
+        background: rgba(148,163,184,0.16);
+        color: #475569;
+        border-color: rgba(148,163,184,0.20);
+      }
+
+      .parameter-status-neutral {
+        background: rgba(226,232,240,0.75);
+        color: #475569;
+        border-color: rgba(203,213,225,0.9);
+      }
+
+      .parameter-owner {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .parameter-owner-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, rgba(191,219,254,0.92), rgba(167,243,208,0.88));
+        color: #1d4ed8;
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0.02em;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+      }
+
+      .parameter-owner-name {
+        font-size: 14px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.4;
+      }
+
+      .parameter-owner-sub {
+        margin-top: 4px;
+        font-size: 12px;
+        color: #64748b;
+      }
+
+      .parameter-actions {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 12px;
+      }
+
+      .parameter-action-btn {
+        min-width: 38px;
+      }
+
+      .parameter-matrix-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 16px 22px;
+        border-top: 1px solid rgba(226,232,240,0.86);
+        background: linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(248,250,252,0.94) 100%);
+        font-size: 13px;
+        color: #64748b;
+        font-weight: 700;
+      }
+
+      .kpi-matrix-shell {
+        background:
+          radial-gradient(circle at top center, rgba(37,99,235,0.08), transparent 34%),
+          linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(245,249,255,0.96) 100%);
+        border: 1px solid rgba(148,163,184,0.18);
+        border-radius: 34px;
+        box-shadow: 0 26px 58px rgba(15,23,42,0.10);
+        padding: 18px;
+      }
+
+      .kpi-matrix-hero {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 18px;
+        flex-wrap: wrap;
+        padding: 14px 14px 22px;
+      }
+
+      .kpi-matrix-title h2 {
+        font-size: 28px;
+        font-weight: 900;
+        color: #0f172a;
+        letter-spacing: -0.04em;
+      }
+
+      .kpi-matrix-title p {
+        margin-top: 10px;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #64748b;
+        max-width: 640px;
+      }
+
+      .kpi-matrix-add-btn {
+        min-width: 170px;
+        justify-content: center;
+      }
+
+      .kpi-matrix-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 0 14px 18px;
+      }
+
+      .kpi-matrix-search {
+        flex: 1;
+        min-width: 280px;
+        max-width: 440px;
+      }
+
+      .kpi-results-meta {
+        font-size: 13px;
+        font-weight: 800;
+        color: #64748b;
+      }
+
+      .kpi-matrix-table-shell {
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(148,163,184,0.18);
+        border-radius: 28px;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.92), 0 16px 34px rgba(15,23,42,0.08);
+        overflow: hidden;
+      }
+
+      .kpi-matrix-table-wrap {
+        overflow-x: auto;
+      }
+
+      .kpi-matrix-table {
+        width: 100%;
+        min-width: 1220px;
+        border-collapse: separate;
+        border-spacing: 0;
+      }
+
+      .kpi-matrix-table thead tr {
+        background:
+          radial-gradient(circle at top center, rgba(37,99,235,0.05), transparent 38%),
+          linear-gradient(180deg, #fbfdff 0%, #eef5ff 100%);
+      }
+
+      .kpi-matrix-table th {
+        padding: 18px 22px;
+        text-align: left;
+        font-size: 11px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: #64748b;
+        border-bottom: 1px solid rgba(226,232,240,0.95);
+        white-space: nowrap;
+      }
+
+      .kpi-matrix-table td {
+        padding: 22px;
+        border-bottom: 1px solid rgba(226,232,240,0.92);
+        background: rgba(255,255,255,0.98);
+        vertical-align: middle;
+        color: #0f172a;
+      }
+
+      .kpi-matrix-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+
+      .kpi-matrix-table tbody tr:hover td {
+        background: #f8fbff;
+      }
+
+      .kpi-matrix-kpi-title {
+        font-size: 15px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.4;
+      }
+
+      .kpi-matrix-kpi-path {
+        margin-top: 8px;
+        font-size: 13px;
+        color: #64748b;
+        line-height: 1.65;
+      }
+
+      .kpi-matrix-cell-main {
+        font-size: 14px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.5;
+      }
+
+      .kpi-matrix-cell-sub {
+        margin-top: 7px;
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.55;
+      }
+
+      .kpi-matrix-target-main {
+        font-size: 16px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .kpi-matrix-target-sub {
+        margin-top: 7px;
+        font-size: 12px;
+        color: #64748b;
+      }
+
+      .kpi-matrix-owner {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .kpi-matrix-owner-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, rgba(191,219,254,0.92), rgba(196,181,253,0.88));
+        color: #1d4ed8;
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0.02em;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+      }
+
+      .kpi-matrix-owner-name {
+        font-size: 14px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.4;
+      }
+
+      .kpi-matrix-owner-sub {
+        margin-top: 4px;
+        font-size: 12px;
+        color: #64748b;
+      }
+
+      .kpi-matrix-actions {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 12px;
+      }
+
+      .kpi-matrix-table .parameter-table-actions {
+        width: 176px;
+      }
+
+      .kpi-matrix-action-btn {
+        min-width: 38px;
+      }
+
+      .kpi-matrix-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 16px 22px;
+        border-top: 1px solid rgba(226,232,240,0.86);
+        background: linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(248,250,252,0.94) 100%);
+        font-size: 13px;
+        color: #64748b;
+        font-weight: 700;
+      }
+
+      .parameter-modal .modal-overview {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .readonly-field {
+        background: #f8fafc !important;
+        color: #475569 !important;
+        border-color: #dbe4f0 !important;
       }
 
       .action-btn {
-        border: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 38px;
+        height: 38px;
+        padding: 0;
         border-radius: 12px;
-        padding: 10px 13px;
-        font-size: 12px;
-        font-weight: 800;
+        background: #ffffff;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.08);
         cursor: pointer;
-        transition: 0.18s ease;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+      }
+
+      .action-btn svg {
+        width: 18px;
+        height: 18px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.9;
+        stroke-linecap: round;
+        stroke-linejoin: round;
       }
 
       .action-btn:hover {
         transform: translateY(-1px);
+        box-shadow: 0 14px 30px rgba(15,23,42,0.12);
+      }
+
+      .action-btn:focus-visible {
+        outline: 2px solid rgba(37,99,235,0.20);
+        outline-offset: 3px;
       }
 
       .edit-btn {
-        background: rgba(37,99,235,0.08);
-        color: #1d4ed8;
-        border: 1px solid rgba(37,99,235,0.10);
+        background: #ffffff;
+        color: #2563eb;
+        border: 1px solid rgba(37,99,235,0.18);
       }
 
       .delete-btn {
-        background: rgba(239,68,68,0.08);
-        color: #dc2626;
-        border: 1px solid rgba(239,68,68,0.10);
+        background: #ffffff;
+        color: #ef4444;
+        border: 1px solid rgba(239,68,68,0.18);
+      }
+
+      .kpi-view-btn {
+        background: linear-gradient(135deg, rgba(14,165,233,0.12), rgba(6,182,212,0.10));
+        color: #0891b2;
+        border: 1px solid rgba(8,145,178,0.18);
+      }
+
+      .action-btn:disabled {
+        cursor: not-allowed;
+        opacity: 0.4;
+        box-shadow: none;
+        transform: none;
+        background: #f8fafc;
+      }
+
+      .action-btn:disabled:hover {
+        transform: none;
+        box-shadow: none;
+      }
+
+      #kpiDetailsModalBackdrop {
+        align-items: center;
+        padding: 12px;
+        overflow: auto;
+      }
+
+    
+
+      .kpi-details-hero {
+        padding: 24px 26px 20px;
+        border-bottom: 1px solid rgba(226,232,240,0.9);
+      }
+
+      .kpi-details-kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px;
+        border-radius: 999px;
+        background: rgba(37,99,235,0.08);
+        color: #2563eb;
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kpi-details-title-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 18px;
+        margin-top: 16px;
+        flex-wrap: wrap;
+      }
+
+      .kpi-details-main-title {
+        font-size: 34px;
+        font-weight: 900;
+        letter-spacing: -0.04em;
+        color: #0f172a;
+        line-height: 1.05;
+      }
+
+      .kpi-details-main-subject {
+        margin-top: 10px;
+        font-size: 14px;
+        line-height: 1.7;
+        color: #64748b;
+        max-width: 760px;
+      }
+
+      .kpi-details-badges {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 16px;
+      }
+
+      .kpi-details-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 9px 13px;
+        border-radius: 999px;
+        border: 1px solid rgba(148,163,184,0.18);
+        background: rgba(255,255,255,0.82);
+        color: #334155;
+        font-size: 12px;
+        font-weight: 800;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.9);
+      }
+
+      .kpi-details-pill--consult {
+        background: rgba(245,158,11,0.12);
+        color: #b45309;
+        border-color: rgba(245,158,11,0.16);
+      }
+
+      .kpi-details-side-card {
+        min-width: 240px;
+        max-width: 320px;
+        padding: 16px 18px;
+        border-radius: 22px;
+        background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(30,41,59,0.94));
+        color: #f8fafc;
+        box-shadow: 0 20px 42px rgba(15,23,42,0.20);
+      }
+
+      .kpi-details-side-card-label {
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(255,255,255,0.62);
+      }
+
+      .kpi-details-side-card-value {
+        margin-top: 8px;
+        font-size: 18px;
+        font-weight: 900;
+        line-height: 1.3;
+      }
+
+      .kpi-details-side-card-sub {
+        margin-top: 8px;
+        font-size: 12px;
+        line-height: 1.6;
+        color: rgba(255,255,255,0.72);
+      }
+
+      .kpi-details-metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+        padding: 0 26px 22px;
+      }
+
+      .kpi-detail-metric {
+        position: relative;
+        overflow: hidden;
+        padding: 16px 18px;
+        border-radius: 22px;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid rgba(148,163,184,0.16);
+        box-shadow: 0 14px 30px rgba(15,23,42,0.07);
+      }
+
+      .kpi-detail-metric::before {
+        content: "";
+        position: absolute;
+        width: 110px;
+        height: 110px;
+        right: -38px;
+        top: -48px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(37,99,235,0.10), transparent 72%);
+      }
+
+      .kpi-detail-metric-label {
+        position: relative;
+        z-index: 1;
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #94a3b8;
+      }
+
+      .kpi-detail-metric-value {
+        position: relative;
+        z-index: 1;
+        margin-top: 8px;
+        font-size: 22px;
+        font-weight: 900;
+        letter-spacing: -0.04em;
+        color: #0f172a;
+        line-height: 1.15;
+      }
+
+      .kpi-detail-metric-sub {
+        position: relative;
+        z-index: 1;
+        margin-top: 8px;
+        font-size: 12px;
+        line-height: 1.55;
+        color: #64748b;
+      }
+
+      .kpi-details-sections {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        padding: 0 26px 26px;
+      }
+
+      .kpi-detail-panel {
+        background: rgba(255,255,255,0.94);
+        border: 1px solid rgba(148,163,184,0.16);
+        border-radius: 24px;
+        box-shadow: 0 14px 30px rgba(15,23,42,0.07);
+        padding: 18px 18px 16px;
+      }
+
+      .kpi-detail-panel.full {
+        grid-column: 1 / -1;
+      }
+
+      .kpi-detail-panel-title {
+        font-size: 17px;
+        font-weight: 900;
+        color: #0f172a;
+        letter-spacing: -0.02em;
+      }
+
+      .kpi-detail-panel-subtitle {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.55;
+      }
+
+      .kpi-detail-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      .kpi-detail-item {
+        padding: 13px 14px;
+        border-radius: 16px;
+        background: linear-gradient(180deg, rgba(248,250,252,0.98) 0%, rgba(255,255,255,0.98) 100%);
+        border: 1px solid rgba(226,232,240,0.95);
+      }
+
+      .kpi-detail-item-label {
+        font-size: 10px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: #94a3b8;
+      }
+
+      .kpi-detail-item-value {
+        margin-top: 7px;
+        font-size: 14px;
+        font-weight: 800;
+        line-height: 1.55;
+        color: #0f172a;
+        word-break: break-word;
+      }
+
+      .kpi-detail-definition {
+        margin-top: 16px;
+        padding: 18px;
+        border-radius: 18px;
+        background: linear-gradient(135deg, rgba(239,246,255,0.9), rgba(255,255,255,0.98));
+        border: 1px solid rgba(186,230,253,0.9);
+        color: #1e293b;
+        font-size: 14px;
+        line-height: 1.8;
+        white-space: pre-wrap;
+      }
+
+     #kpiDetailsModalBackdrop {
+  align-items: center;
+  padding: 8px;
+  overflow: auto;
+}
+
+.kpi-details-modal {
+  width: min(1860px, calc(100vw - 32px));
+  max-height: calc(100vh - 16px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-radius: 32px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border: 1px solid rgba(255,255,255,0.9);
+  box-shadow: 0 40px 100px rgba(15,23,42,0.28);
+}
+
+.kpi-details-modal .modal-header {
+  padding: 20px 28px 16px;
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 34%),
+    linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(240,249,255,0.98) 100%);
+  border-bottom: 1px solid rgba(148,163,184,0.16);
+}
+
+.kpi-details-modal .modal-header h2 {
+  font-size: 26px;
+  font-weight: 950;
+  letter-spacing: -0.05em;
+  color: #0f172a;
+}
+
+.kpi-details-modal .modal-subtitle {
+  font-size: 13px;
+  color: #64748b;
+  margin-top: 5px;
+  line-height: 1.5;
+}
+
+.kpi-details-modal .modal-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 14px 20px 16px;
+  background:
+    radial-gradient(circle at top left,  rgba(37,99,235,0.05), transparent 28%),
+    radial-gradient(circle at top right, rgba(6,182,212,0.06),  transparent 24%),
+    linear-gradient(180deg, #fbfdff 0%, #f4f8fd 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kpi-details-modal .modal-footer {
+  padding: 14px 28px;
+  background: rgba(255,255,255,0.97);
+  border-top: 1px solid rgba(148,163,184,0.16);
+  backdrop-filter: blur(12px);
+}
+
+/* ── Section label ── */
+.kdr-section-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: #94a3b8;
+  padding: 0 4px 2px;
+}
+
+.kdr-section-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(148,163,184,0.25), transparent);
+  border-radius: 999px;
+}
+
+/* ── Row card ── */
+.kpi-detail-row {
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.05), transparent 40%),
+    linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(248,251,255,0.96) 100%);
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 22px;
+  padding: 14px 18px;
+  display: grid;
+  gap: 0;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.92),
+    0 8px 24px rgba(15,23,42,0.05);
+  transition: box-shadow 0.2s ease;
+}
+
+.kpi-detail-row:hover {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.92),
+    0 14px 32px rgba(15,23,42,0.09);
+}
+
+.kpi-detail-row.row-cols-2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.kpi-detail-row.row-cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.kpi-detail-row.row-cols-4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.kpi-detail-row.row-cols-5 { grid-template-columns: repeat(5, minmax(0,1fr)); }
+.kpi-detail-row.row-cols-6 { grid-template-columns: repeat(6, minmax(0,1fr)); }
+
+/* ── Dividers between cells ── */
+.kpi-detail-row .kdr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 4px 16px 4px 0;
+  border-right: 1px solid rgba(148,163,184,0.14);
+  margin-right: 16px;
+}
+
+.kpi-detail-row .kdr-field:last-child {
+  border-right: none;
+  padding-right: 0;
+  margin-right: 0;
+}
+
+/* ── Field label ── */
+.kdr-field .kdr-label {
+  font-size: 9px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: #94a3b8;
+  line-height: 1.2;
+}
+
+/* ── Field value ── */
+.kdr-field .kdr-value {
+  font-size: 14px;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.kdr-field .kdr-value.kdr-muted {
+  color: #64748b;
+  font-weight: 700;
+}
+
+/* ── Definition row ── */
+.kpi-detail-row.row-def {
+  grid-template-columns: 1fr;
+  background:
+    radial-gradient(circle at top right, rgba(6,182,212,0.07), transparent 38%),
+    linear-gradient(135deg, rgba(239,246,255,0.92), rgba(255,255,255,0.98));
+  border-color: rgba(186,230,253,0.85);
+}
+
+.kdr-field .kdr-value.kdr-definition {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.75;
+  color: #1e293b;
+  white-space: pre-wrap;
+}
+
+/* ── Status badge inline ── */
+.kdr-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 900;
+  border: 1px solid transparent;
+}
+
+.kdr-status-pill::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+}
+
+.kdr-status-active   { background: rgba(16,185,129,0.12); color: #059669; border-color: rgba(16,185,129,0.18); }
+.kdr-status-draft    { background: rgba(245,158,11,0.12); color: #d97706; border-color: rgba(245,158,11,0.18); }
+.kdr-status-approved { background: rgba(37,99,235,0.12);  color: #2563eb; border-color: rgba(37,99,235,0.18); }
+.kdr-status-closed   { background: rgba(148,163,184,0.16); color: #475569; border-color: rgba(148,163,184,0.22); }
+.kdr-section-label {
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: #94a3b8;
+  padding: 0 2px 4px;
+}
+
+.kdr-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.kdr-status-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+      .kpi-detail-tolerance-note {
+        margin-top: 14px;
+        padding: 13px 14px;
+        border-radius: 16px;
+        background: rgba(37,99,235,0.07);
+        border: 1px solid rgba(37,99,235,0.12);
+        color: #1d4ed8;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.6;
+      }
+
+      @media (max-width: 960px) {
+        .kpi-details-metrics {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .kpi-details-sections {
+          grid-template-columns: 1fr;
+        }
+      }
+
+     
+
+        .kpi-details-hero,
+        .kpi-details-metrics,
+        .kpi-details-sections {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+
+        .kpi-details-metrics {
+          grid-template-columns: 1fr;
+        }
+
+        .kpi-detail-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .kpi-details-main-title {
+          font-size: 28px;
+        }
       }
 
       .empty {
@@ -2865,10 +8151,11 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         background: rgba(15,23,42,0.34);
         backdrop-filter: blur(8px);
         display: none;
-        align-items: center;
+        align-items: flex-start;
         justify-content: center;
         padding: 20px;
         z-index: 999;
+        overflow: auto;
       }
 
       .modal-backdrop.open {
@@ -2876,17 +8163,33 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       }
 
       .modal {
-        width: 100%;
-        max-width: 980px;
-        max-height: 92vh;
-        overflow: hidden;
+        width: min(1360px, calc(100vw - 24px));
+        max-width: none;
+        max-height: none;
+        overflow: visible;
         background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
         border-radius: 30px;
         box-shadow: 0 32px 90px rgba(15, 23, 42, 0.20);
         border: 1px solid rgba(255,255,255,0.9);
         display: flex;
         flex-direction: column;
+        margin: auto;
       }
+
+   #modalBackdrop {
+     align-items: center;
+     padding: 8px;
+     overflow: auto;
+    }
+
+
+.kpi-attributes-modal {
+  width: min(1900px, calc(100vw - 12px));
+  height: calc(100vh - 12px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
 
       .modal-header {
         padding: 22px 24px 18px;
@@ -2922,27 +8225,30 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         max-width: 700px;
       }
 
-      .modal-body {
-        padding: 22px 24px 132px;
-        overflow: auto;
+    .modal-body {
+        padding: 8px 20px 6px;
+        overflow: visible;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
         background:
           radial-gradient(circle at top right, rgba(37,99,235,0.04), transparent 22%),
           linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
       }
 
-      .modal-overview {
+     .modal-overview {
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-        margin-bottom: 18px;
+        gap: 8px;
+        margin-bottom: 0;
+        flex-shrink: 0;
       }
 
       .overview-card {
-        background: rgba(255,255,255,0.92);
-        border: 1px solid rgba(15,23,42,0.06);
-        border-radius: 18px;
-        padding: 13px 14px;
-        box-shadow: 0 8px 18px rgba(15,23,42,0.04);
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 8px 12px;
       }
 
       .overview-card .label {
@@ -2960,80 +8266,81 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         color: #0f172a;
       }
 
-      .form-section {
-        background: rgba(255,255,255,0.90);
-        border: 1px solid rgba(15,23,42,0.06);
-        border-radius: 22px;
-        padding: 18px;
-        box-shadow: 0 10px 24px rgba(15,23,42,0.05);
-        margin-bottom: 16px;
+     .form-section {
+        background: #fafbfc;
+        border: 1px solid #e5e9f0;
+        border-radius: 14px;
+        padding: 10px 14px 11px;
+        margin-bottom: 0;
+        flex-shrink: 0;
       }
 
-      .section-title {
-        margin: 0 0 4px;
-        font-size: 12px;
-        font-weight: 900;
-        color: #4f46e5;
-        text-transform: uppercase;
-        letter-spacing: 0.14em;
-      }
+   .section-title {
+  margin: 0 0 8px;
+  font-size: 10px;
+  font-weight: 900;
+  color: #000;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
 
       .section-subtitle {
-        margin-bottom: 16px;
-        font-size: 13px;
+        font-size: 11px;
         color: #64748b;
-        line-height: 1.5;
+        margin-bottom: 10px;
       }
 
       .form-grid {
         display: grid;
-        grid-template-columns: repeat(12, minmax(0, 1fr));
-        gap: 14px;
+        grid-template-columns: repeat(18, minmax(0, 1fr));
+        gap: 8px;
+        align-items: end;
       }
 
       .field {
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 4px;
       }
 
+      .field.col-2 { grid-column: span 2; }
       .field.col-3 { grid-column: span 3; }
       .field.col-4 { grid-column: span 4; }
+      .field.col-5 { grid-column: span 5; }
       .field.col-6 { grid-column: span 6; }
+      .field.col-7 { grid-column: span 7; }
       .field.col-8 { grid-column: span 8; }
       .field.col-12 { grid-column: 1 / -1; }
 
-      .field label {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        font-size: 12px;
-        font-weight: 800;
-        color: #334155;
-      }
+ .section-title,
+.field label {
+  background: transparent !important;
+  color: #000 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}
 
       .field .hint {
-        font-size: 11px;
+        font-size: 9px;
         font-weight: 700;
         color: #94a3b8;
       }
 
-      .field input,
-      .field textarea,
-      .field select {
-        width: 100%;
-        border: 1px solid rgba(148,163,184,0.24);
-        background: #ffffff;
-        color: #0f172a;
-        border-radius: 16px;
-        padding: 13px 14px;
-        font-size: 14px;
-        font-family: inherit;
-        outline: none;
-        transition: all 0.18s ease;
-        box-shadow: 0 2px 6px rgba(15,23,42,0.03);
-      }
+ .field input,
+.field textarea,
+.field select {
+  width: 100%;
+  border: 1px solid rgba(148,163,184,0.28);
+  background: transparent;
+  color: #000;
+  border-radius: 0;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: all 0.15s ease;
+  box-shadow: none;
+}
 
       .field input::placeholder,
       .field textarea::placeholder,
@@ -3049,14 +8356,585 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       }
 
       .field textarea {
-        min-height: 110px;
-        resize: vertical;
+        min-height: 56px;
+        resize: none;
+        line-height: 1.45;
       }
 
+      .field.is-hidden {
+        display: none;
+      }
+
+      .is-hidden {
+        display: none !important;
+      }
+
+      .tree-select {
+        position: relative;
+        width: 100%;
+      }
+
+      .tree-select-trigger {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        border: 1px solid rgba(148,163,184,0.28);
+        background: #ffffff;
+        color: #0f172a;
+        border-radius: 10px;
+        padding: 9px 10px;
+        font-size: 13px;
+        font-family: inherit;
+        text-align: left;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .hierarchy-tree-field {
+        grid-column: 1 / -1;
+      }
+
+      .hierarchy-tree-field .tree-select-trigger {
+        min-height: 78px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        background:
+          radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 32%),
+          linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+        box-shadow: 0 12px 28px rgba(15,23,42,0.06);
+      }
+
+      .hierarchy-tree-field .tree-select-panel {
+        margin-top: 14px;
+      }
+
+      .hierarchy-tree-field .tree-select-chevron {
+        display: inline-flex;
+      }
+
+      .tree-select-trigger:hover,
+      .tree-select.open .tree-select-trigger {
+        border-color: rgba(37,99,235,0.34);
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+      }
+
+      .tree-select-value {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .tree-select-label {
+        font-size: 13px;
+        font-weight: 700;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .tree-select-meta {
+        font-size: 11px;
+        color: #94a3b8;
+        line-height: 1.35;
+      }
+
+      .tree-select-meta:empty {
+        display: none;
+      }
+
+      .tree-select-chevron {
+        font-size: 12px;
+        color: #64748b;
+        flex-shrink: 0;
+      }
+
+      .tree-select-panel {
+        display: none;
+        margin-top: 8px;
+        border: 1px solid rgba(148,163,184,0.22);
+        border-radius: 18px;
+        background:
+          radial-gradient(circle at top right, rgba(37,99,235,0.08), transparent 30%),
+          linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+        box-shadow: 0 22px 48px rgba(15,23,42,0.12);
+        overflow: hidden;
+      }
+
+      .tree-select.open .tree-select-panel {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .tree-select-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 12px 14px;
+        border-bottom: 1px solid rgba(148,163,184,0.16);
+        background: rgba(248,250,252,0.96);
+      }
+
+      .tree-select-toolbar-copy {
+        min-width: min(100%, 620px);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .field,
+.field-wrap,
+.form-group,
+.select-wrapper {
+  background: transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+      .tree-select-help {
+        font-size: 11px;
+        color: #64748b;
+        line-height: 1.45;
+      }
+
+      .tree-select-current-path {
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid rgba(148,163,184,0.18);
+        background: rgba(255,255,255,0.92);
+        color: #0f172a;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.5;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+      }
+
+      .tree-select-fit {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(37,99,235,0.08);
+        color: #2563eb;
+        font-size: 10px;
+        font-weight: 900;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+    .tree-list {
+         height: auto;
+         max-height: 60vh;
+        overflow: auto;
+        padding: 10px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(248,251,255,0.99) 100%);
+     }
+
+    .tree-list:active {
+      cursor: grabbing;
+     }
+
+    .tree-list::-webkit-scrollbar {
+         width: 5px;
+     } 
+
+    .tree-list::-webkit-scrollbar-track {
+     background: transparent;
+    }
+
+ .tree-list::-webkit-scrollbar-thumb {
+    background: rgba(148,163,184,0.35);
+    border-radius: 99px;
+ }
+
+ .v-tree-node {
+  display: flex;
+  flex-direction: column;
+}
+
+.v-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-height: 38px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.14s ease;
+  position: relative;
+  margin-bottom: 2px;
+}
+
+.v-tree-row:hover {
+  background: rgba(37,99,235,0.06);
+}
+
+.v-tree-row.selected {
+  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(6,182,212,0.08));
+  border: 1px solid rgba(37,99,235,0.18);
+}
+
+.v-tree-indent {
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.v-tree-indent-segment {
+  width: 20px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.v-tree-indent-segment.has-line::before {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(148,163,184,0.28);
+}
+
+.v-tree-toggle-btn {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border: none;
+  background: rgba(37,99,235,0.08);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: #2563eb;
+  font-size: 10px;
+  transition: all 0.15s ease;
+  margin-right: 6px;
+}
+
+.v-tree-toggle-btn:hover {
+  background: rgba(37,99,235,0.16);
+}
+
+.v-tree-toggle-placeholder {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  margin-right: 6px;
+}
+
+.v-tree-icon {
+  font-size: 13px;
+  margin-right: 7px;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.v-tree-content {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px 6px 0;
+}
+
+.v-tree-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.v-tree-row.selected .v-tree-name {
+  color: #1d4ed8;
+}
+
+.v-tree-path {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.v-tree-level-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 99px;
+  margin-right: 8px;
+  background: rgba(148,163,184,0.12);
+  color: #94a3b8;
+}
+
+.v-tree-level-badge.l0 { background: rgba(79,70,229,0.10); color: #4338ca; }
+.v-tree-level-badge.l1 { background: rgba(37,99,235,0.10); color: #1d4ed8; }
+.v-tree-level-badge.l2 { background: rgba(6,182,212,0.10); color: #0891b2; }
+.v-tree-level-badge.l3 { background: rgba(16,185,129,0.10); color: #047857; }
+
+.v-tree-children {
+  display: flex;
+  flex-direction: column;
+}
+
+.v-tree-children.collapsed {
+  display: none;
+}
+
+.v-tree-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(148,163,184,0.14);
+}
+
+.v-tree-search input {
+  flex: 1;
+  border: 1px solid rgba(148,163,184,0.24);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #0f172a;
+  outline: none;
+  background: #fff;
+}
+
+.v-tree-search input:focus {
+  border-color: rgba(37,99,235,0.34);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.10);
+}
+
+.v-tree-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.v-tree-action-btn {
+  border: none;
+  background: rgba(37,99,235,0.08);
+  color: #2563eb;
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s;
+}
+
+.v-tree-action-btn:hover {
+  background: rgba(37,99,235,0.16);
+}
+
+.v-tree-empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+
+.tree-zoom-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(37,99,235,0.08);
+  padding: 6px;
+  border-radius: 999px;
+}
+
+.tree-zoom-actions button {
+  border: none;
+  background: #fff;
+  color: #2563eb;
+  font-weight: 900;
+  border-radius: 999px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.tree-zoom-actions span {
+  min-width: 46px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 900;
+  color: #2563eb;
+}
+
+.subject-tree-stage {
+  min-width: max-content;
+  min-height: max-content;
+}
+
+.subject-tree-scale-layer {
+  transform: scale(var(--subject-tree-scale, 1));
+  transform-origin: top left;
+  width: max-content;
+}
+
+.subject-tree-root,
+.subject-tree-children {
+  list-style: none;
+  padding-left: 28px;
+  margin: 0;
+  position: relative;
+}
+
+.subject-tree-root {
+  padding-left: 0;
+}
+
+.subject-tree-item {
+  position: relative;
+  padding: 8px 0 8px 28px;
+}
+
+.subject-tree-item::before {
+  content: "";
+  position: absolute;
+  top: 28px;
+  left: 0;
+  width: 24px;
+  height: 1px;
+  background: rgba(37,99,235,0.28);
+}
+
+.subject-tree-children::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 12px;
+  bottom: 18px;
+  width: 1px;
+  background: rgba(37,99,235,0.22);
+}
+
+.subject-tree-node-shell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.subject-tree-node-btn {
+  min-width: 220px;
+  max-width: 320px;
+  border: 1px solid rgba(148,163,184,0.25);
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border-radius: 16px;
+  padding: 12px 14px;
+  text-align: left;
+  box-shadow: 0 10px 24px rgba(15,23,42,0.06);
+  cursor: pointer;
+}
+
+.subject-tree-node-btn:hover {
+  border-color: rgba(37,99,235,0.35);
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.10);
+}
+
+.subject-tree-node-btn.selected {
+  border-color: rgba(37,99,235,0.45);
+  background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(6,182,212,0.08));
+}
+
+.subject-tree-node-kicker {
+  display: inline-flex;
+  font-size: 9px;
+  font-weight: 900;
+  color: #2563eb;
+  background: rgba(37,99,235,0.08);
+  padding: 3px 7px;
+  border-radius: 999px;
+  margin-bottom: 6px;
+}
+
+.subject-tree-node-name {
+  display: block;
+  font-size: 13px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.subject-tree-node-path {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.subject-tree-toggle {
+  border: none;
+  background: rgba(37,99,235,0.08);
+  color: #2563eb;
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 10px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+    .subject-tree-toggle.placeholder {
+        background: rgba(148,163,184,0.10);
+       color: #94a3b8;
+       }
       .field-help {
         font-size: 12px;
         color: #64748b;
         line-height: 1.45;
+      }
+
+      .parameter-kpi-summary {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        padding: 12px 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(148,163,184,0.2);
+        background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+      }
+
+      .parameter-kpi-summary-item {
+        min-width: 0;
+      }
+
+      .parameter-kpi-summary-label {
+        font-size: 10px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #94a3b8;
+      }
+
+      .parameter-kpi-summary-value {
+        margin-top: 6px;
+        font-size: 13px;
+        font-weight: 800;
+        color: #0f172a;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+
+      .ratio-mode-help {
+        min-height: 100%;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(37,99,235,0.12);
+        background: linear-gradient(135deg, rgba(37,99,235,0.06), rgba(255,255,255,0.96));
+      }
+
+      .ratio-mode-help strong {
+        color: #0f172a;
       }
 
       .readonly-input {
@@ -3067,12 +8945,11 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       }
 
       .modal-footer {
-        position: sticky;
-        bottom: 0;
+        flex-shrink: 0;
         display: flex;
         justify-content: space-between;
         gap: 12px;
-        padding: 18px 24px;
+        padding: 14px 20px;
         border-top: 1px solid rgba(15,23,42,0.06);
         background: rgba(255,255,255,0.97);
         backdrop-filter: blur(12px);
@@ -3159,6 +9036,16 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         height: 320px;
       }
 
+      .kpi-inline-row {
+      display: flex;
+   
+     }
+
+.kpi-inline-row .field {
+  flex: 1;
+  min-width: 120px; /* adjust */
+}
+
       @media (max-width: 1250px) {
         .layout {
           grid-template-columns: 90px 1fr;
@@ -3190,6 +9077,26 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
 
         .modal-overview {
           grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .form-grid {
+          grid-template-columns: repeat(12, minmax(0, 1fr));
+        }
+
+        .parameter-kpi-summary {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .parameter-matrix-hero,
+        .parameter-matrix-toolbar {
+          padding-left: 8px;
+          padding-right: 8px;
+        }
+
+        .kpi-matrix-hero,
+        .kpi-matrix-toolbar {
+          padding-left: 8px;
+          padding-right: 8px;
         }
       }
 
@@ -3226,9 +9133,44 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
           grid-template-columns: 1fr;
         }
 
+        .parameter-kpi-summary {
+          grid-template-columns: 1fr;
+        }
+
+        .parameter-matrix-hero {
+          padding: 4px 4px 18px;
+        }
+
+        .parameter-matrix-toolbar {
+          padding: 0 4px 16px;
+        }
+
+        .parameter-matrix-add-btn,
+        .parameter-matrix-search {
+          width: 100%;
+          max-width: none;
+        }
+
+        .kpi-matrix-hero {
+          padding: 4px 4px 18px;
+        }
+
+        .kpi-matrix-toolbar {
+          padding: 0 4px 16px;
+        }
+
+        .kpi-matrix-add-btn,
+        .kpi-matrix-search {
+          width: 100%;
+          max-width: none;
+        }
+
+        .field.col-2,
         .field.col-3,
         .field.col-4,
+        .field.col-5,
         .field.col-6,
+        .field.col-7,
         .field.col-8,
         .field.col-12 {
           grid-column: auto;
@@ -3239,7 +9181,7 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         }
 
         .modal-body {
-          padding: 18px 16px 130px;
+          padding: 14px 14px 10px;
         }
 
         .modal-header,
@@ -3248,7 +9190,1933 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
           padding-right: 16px;
         }
       }
-    </style>
+
+
+ .sf-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  min-width: max-content;
+}
+
+.sf-column {
+  width: 210px;
+  flex: 0 0 210px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid rgba(148,163,184,0.14);
+  background: #ffffff;
+  animation: sfColIn 0.2s cubic-bezier(0.22,1,0.36,1);
+}
+
+.sf-column:last-child {
+  border-right: none;
+}
+
+@keyframes sfColIn {
+  from { opacity: 0; transform: translateX(14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.sf-col-head {
+  padding: 10px 13px 9px;
+  border-bottom: 1px solid rgba(148,163,184,0.11);
+  background: linear-gradient(180deg, #f8fbff 0%, #f2f6fd 100%);
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.sf-col-level {
+  display: block;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: #94a3b8;
+  margin-bottom: 2px;
+}
+
+.sf-col-title {
+  display: block;
+  font-size: 11px;
+  font-weight: 900;
+  color: #4338ca;
+  letter-spacing: -0.01em;
+}
+
+.sf-col-count {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.sf-col-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.sf-col-body::-webkit-scrollbar { width: 3px; }
+.sf-col-body::-webkit-scrollbar-track { background: transparent; }
+.sf-col-body::-webkit-scrollbar-thumb {
+  background: rgba(148,163,184,0.28);
+  border-radius: 99px;
+}
+
+.sf-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  transition: background 0.13s ease, border-color 0.13s ease, box-shadow 0.13s ease;
+  margin-bottom: 2px;
+  position: relative;
+}
+
+.sf-item:hover {
+  background: rgba(37,99,235,0.05);
+  border-color: rgba(37,99,235,0.10);
+}
+
+.sf-item.sf-selected {
+  background: linear-gradient(135deg, rgba(37,99,235,0.11), rgba(79,70,229,0.07));
+  border-color: rgba(37,99,235,0.22);
+  box-shadow: 0 2px 10px rgba(37,99,235,0.10);
+}
+
+.sf-badge {
+  flex-shrink: 0;
+  font-size: 8px;
+  font-weight: 900;
+  padding: 2px 5px;
+  border-radius: 99px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sf-badge-l0 { background: rgba(79,70,229,0.10); color: #4338ca; }
+.sf-badge-l1 { background: rgba(37,99,235,0.10); color: #1d4ed8; }
+.sf-badge-l2 { background: rgba(6,182,212,0.10);  color: #0891b2; }
+.sf-badge-l3 { background: rgba(16,185,129,0.10); color: #047857; }
+.sf-badge-lx { background: rgba(148,163,184,0.12); color: #64748b; }
+
+.sf-selected .sf-badge {
+  background: rgba(37,99,235,0.16) !important;
+  color: #1d4ed8 !important;
+}
+
+.sf-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.sf-item-name {
+  display: block;
+  font-size: 12px;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sf-selected .sf-item-name {
+  color: #1d4ed8;
+}
+
+.sf-item-meta {
+  display: block;
+  font-size: 10px;
+  color: #94a3b8;
+  margin-top: 1px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.sf-arrow {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: #cbd5e1;
+  transition: color 0.14s, transform 0.14s;
+  margin-left: auto;
+}
+
+.sf-selected .sf-arrow {
+  color: #2563eb;
+  transform: translateX(2px);
+}
+
+.sf-arrow-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sf-divider {
+  flex-shrink: 0;
+  width: 1px;
+  background: rgba(148,163,184,0.14);
+  align-self: stretch;
+}
+
+.subject-flow-column:first-child .subject-flow-column-title {
+  align-self: flex-start;
+}
+
+ .subject-flow-column:first-child .subject-flow-card {
+  margin-top: auto;
+  margin-bottom: auto;
+  }
+
+      .kpi-attributes-modal .modal-header {
+        padding: 16px 20px 12px;
+      }
+
+      .kpi-attributes-modal .modal-header h2 {
+        font-size: 24px;
+      }
+
+      .kpi-attributes-modal .modal-subtitle {
+        font-size: 13px;
+      }
+
+.kpi-attributes-modal .modal-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+       .kpi-attributes-modal .form-section:first-of-type {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kpi-attributes-modal .hierarchy-tree-field,
+.kpi-attributes-modal .tree-select,
+.kpi-attributes-modal .tree-select-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kpi-attributes-modal .tree-list {
+  flex: 1;
+  height: auto !important;
+  max-height: none !important;
+  min-height: 360px;
+  overflow: auto;
+}
+
+      .kpi-attributes-modal .modal-overview {
+        gap: 6px;
+      }
+
+      .kpi-attributes-modal .overview-card {
+        padding: 7px 10px;
+      }
+
+      .kpi-attributes-modal .form-section {
+        margin: 0 !important;
+        padding: 6px 10px !important;
+      }
+
+      .kpi-attributes-modal .form-grid {
+        gap: 6px;
+      }
+
+      .kpi-attributes-modal .field {
+        gap: 3px;
+      }
+
+      .kpi-attributes-modal .field label {
+        font-size: 9px;
+      }
+
+      .kpi-attributes-modal .field .hint {
+        font-size: 8px;
+      }
+
+      .kpi-attributes-modal .field input,
+      .kpi-attributes-modal .field textarea,
+      .kpi-attributes-modal .field select {
+        padding: 6px 8px;
+        font-size: 12px;
+        border-radius: 9px;
+      }
+
+      .kpi-attributes-modal .field textarea {
+        min-height: 42px;
+      }
+
+      .kpi-attributes-modal .hierarchy-tree-field .tree-select-trigger {
+        min-height: 62px;
+        padding: 10px 14px;
+      }
+
+      .kpi-attributes-modal .tree-select-toolbar {
+        padding: 8px 10px;
+      }
+
+      .kpi-attributes-modal .tree-select-current-path {
+        padding: 8px 10px;
+        font-size: 11px;
+      }
+
+     .kpi-attributes-modal .tree-list {
+        height: auto;
+        max-height: 260px;
+       }
+      .kpi-attributes-modal .subject-flow {
+        gap: 16px;
+      }
+
+      .kpi-attributes-modal .subject-flow-column {
+        width: 220px;
+        flex: 0 0 220px;
+      }
+
+      .kpi-attributes-modal .subject-flow-column-title {
+        margin-bottom: 8px;
+        padding: 6px 10px;
+        font-size: 9px;
+      }
+
+      .kpi-attributes-modal .subject-flow-card {
+        margin-bottom: 8px;
+        padding: 10px 11px;
+        border-radius: 14px;
+      }
+
+      .kpi-attributes-modal .subject-flow-kicker {
+        margin-bottom: 4px;
+        font-size: 8px;
+      }
+
+      .kpi-attributes-modal .subject-flow-name {
+        font-size: 12px;
+      }
+
+      .kpi-attributes-modal .subject-flow-path {
+        margin-top: 3px;
+        font-size: 10px;
+      }
+
+.kpi-attributes-modal .modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  position: relative;
+  bottom: auto;
+  padding: 14px 60px 14px 20px;
+  border-top: 1px solid rgba(15,23,42,0.06);
+  background: rgba(255,255,255,0.97);
+}
+
+
+.kpi-attributes-modal .footer-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.kpi-attributes-modal #deleteBtn {
+  display: none;
+}
+
+.parameter-modal #parameterDeleteBtn {
+  display: none;
+}
+/* ===============================
+   PREMIUM ADD / EDIT KPI MODAL
+   Keeps tree always visible
+================================ */
+
+.modal-backdrop {
+  background: rgba(15, 23, 42, 0.52) !important;
+  backdrop-filter: blur(14px) saturate(140%) !important;
+}
+
+.modal-backdrop.open .kpi-attributes-modal {
+  animation: modalSlideUp 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.kpi-attributes-modal {
+  width: min(1860px, calc(100vw - 48px)) !important;
+  max-height: calc(100vh - 32px) !important;
+  height: auto !important;
+  border-radius: 32px !important;
+  overflow: hidden !important;
+  background:
+    radial-gradient(circle at top right, rgba(37, 99, 235, 0.12), transparent 34%),
+    linear-gradient(180deg, #ffffff 0%, #f8fbff 100%) !important;
+  border: 1px solid rgba(255,255,255,0.9) !important;
+  box-shadow: 0 40px 100px rgba(15, 23, 42, 0.32) !important;
+}
+
+.kpi-attributes-modal .modal-header {
+  padding: 16px 22px 12px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-bottom: 1px solid rgba(148,163,184,0.18) !important;
+}
+
+.kpi-attributes-modal .modal-header h2 {
+  font-size: 24px !important;
+  font-weight: 950 !important;
+  letter-spacing: -0.05em !important;
+  color: #0f172a !important;
+}
+
+.kpi-attributes-modal .modal-subtitle {
+  margin-top: 4px !important;
+  color: #64748b !important;
+  font-size: 12px !important;
+  line-height: 1.45 !important;
+}
+
+.kpi-attributes-modal .modal-body {
+  display: block !important;
+  max-height: calc(100vh - 190px) !important;
+  overflow-y: auto !important;
+  padding: 12px 20px 14px !important;
+  background: linear-gradient(180deg, #fbfdff 0%, #f4f8fd 100%) !important;
+}
+
+.kpi-attributes-modal .form-section {
+  margin: 0 0 10px 0 !important;
+  padding: 12px !important;
+  border-radius: 22px !important;
+  background: rgba(255,255,255,0.9) !important;
+  border: 1px solid rgba(148,163,184,0.20) !important;
+  box-shadow: 0 14px 32px rgba(15,23,42,0.06) !important;
+}
+
+/* Keep tree clear and visible */
+.kpi-attributes-modal .form-section:first-of-type {
+  padding: 14px !important;
+}
+
+.kpi-attributes-modal .tree-select-panel {
+  display: none !important;
+  flex-direction: column !important;
+  border-radius: 22px !important;
+  overflow: hidden !important;
+  background: #ffffff !important;
+  border: 1px solid rgba(148,163,184,0.20) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9) !important;
+}
+
+.kpi-attributes-modal .tree-select.open .tree-select-panel {
+  display: flex !important;
+}
+
+.kpi-attributes-modal .tree-list {
+  height: 345px !important;
+  min-height: 345px !important;
+  max-height: 345px !important;
+  overflow: auto !important;
+  padding: 10px !important;
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.05), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, #f8fbff 100%) !important;
+}
+
+/* Tree column layout */
+.kpi-attributes-modal .sf-flow {
+  display: flex !important;
+  align-items: stretch !important;
+  gap: 0 !important;
+  min-width: max-content !important;
+}
+
+.kpi-attributes-modal .sf-column {
+  width: 245px !important;
+  flex: 0 0 245px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-right: 1px solid rgba(148,163,184,0.16) !important;
+  box-shadow: 8px 0 20px rgba(15,23,42,0.025) !important;
+}
+
+.kpi-attributes-modal .sf-col-head {
+  padding: 14px 16px !important;
+  background: linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%) !important;
+  border-bottom: 1px solid rgba(148,163,184,0.16) !important;
+}
+
+.kpi-attributes-modal .sf-col-level {
+  font-size: 10px !important;
+  font-weight: 950 !important;
+  color: #94a3b8 !important;
+  letter-spacing: 0.12em !important;
+}
+
+.kpi-attributes-modal .sf-col-title {
+  margin-top: 3px !important;
+  font-size: 12px !important;
+  font-weight: 950 !important;
+  color: #1d4ed8 !important;
+}
+
+.kpi-attributes-modal .sf-col-count {
+  margin-top: 4px !important;
+  font-size: 11px !important;
+  color: #64748b !important;
+}
+
+/* Tree items */
+.kpi-attributes-modal .sf-item {
+  margin-bottom: 6px !important;
+  padding: 11px 12px !important;
+  border-radius: 14px !important;
+  border: 1px solid transparent !important;
+  transition: all 0.2s ease !important;
+}
+
+.kpi-attributes-modal .sf-item:hover {
+  background: rgba(37,99,235,0.07) !important;
+  border-color: rgba(37,99,235,0.16) !important;
+  transform: translateX(4px) !important;
+}
+
+.kpi-attributes-modal .sf-selected {
+  background: linear-gradient(135deg, rgba(37,99,235,0.16), rgba(6,182,212,0.10)) !important;
+  border-color: rgba(37,99,235,0.35) !important;
+  box-shadow: 0 10px 24px rgba(37,99,235,0.16) !important;
+}
+
+.kpi-attributes-modal .sf-badge {
+  border-radius: 999px !important;
+  padding: 3px 7px !important;
+  font-size: 9px !important;
+}
+
+.kpi-attributes-modal .sf-item-name {
+  font-size: 13px !important;
+  font-weight: 900 !important;
+  color: #0f172a !important;
+}
+
+.kpi-attributes-modal .sf-item-meta {
+  margin-top: 2px !important;
+  font-size: 11px !important;
+  color: #94a3b8 !important;
+}
+
+.kpi-attributes-modal .sf-arrow {
+  color: #94a3b8 !important;
+  font-size: 11px !important;
+}
+
+/* Inputs */
+.kpi-attributes-modal .field input,
+.kpi-attributes-modal .field select,
+.kpi-attributes-modal .field textarea {
+  min-height: 40px !important;
+  border-radius: 13px !important;
+  border: 1px solid rgba(148,163,184,0.28) !important;
+  background: #ffffff !important;
+  padding: 9px 11px !important;
+  font-size: 13px !important;
+  transition: all 0.2s ease !important;
+}
+
+.kpi-attributes-modal .field input:focus,
+.kpi-attributes-modal .field select:focus,
+.kpi-attributes-modal .field textarea:focus {
+  border-color: rgba(37,99,235,0.55) !important;
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.12) !important;
+  transform: translateY(-1px) !important;
+}
+
+/* Footer */
+.kpi-attributes-modal .modal-footer {
+  padding: 18px 24px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-top: 1px solid rgba(148,163,184,0.18) !important;
+}
+
+.kpi-attributes-modal .btn {
+  border-radius: 16px !important;
+  padding: 13px 20px !important;
+  font-weight: 900 !important;
+}
+
+.kpi-attributes-modal .btn-primary {
+  background: linear-gradient(135deg, #4f46e5, #2563eb, #06b6d4) !important;
+  box-shadow: 0 16px 32px rgba(37,99,235,0.28) !important;
+}
+
+@keyframes modalSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(26px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Keep the KPI modal polished, compact, and content-driven */
+.kpi-attributes-modal {
+  width: min(1860px, calc(100vw - 32px)) !important;
+  height: auto !important;
+  max-height: calc(100vh - 2px) !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.kpi-attributes-modal .modal-body {
+  flex: 0 1 auto !important;
+  display: grid !important;
+  align-content: start !important;
+  gap: 6px !important;
+  max-height: calc(100vh - 108px) !important;
+  height: auto !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  padding: 6px 10px 4px !important;
+}
+
+/* Keep the subject dropdown usable without taking over the whole modal */
+.kpi-attributes-modal .tree-list {
+  height: auto !important;
+  min-height: 320px !important;
+  max-height: min(42vh, 420px) !important;
+  overflow: auto !important;
+}
+
+/* Show all tree columns/items clearly */
+.kpi-attributes-modal .sf-flow {
+  height: auto !important;
+  min-height: auto !important;
+  overflow: visible !important;
+}
+
+.kpi-attributes-modal .sf-column {
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+.kpi-attributes-modal .sf-col-body {
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+/* Make sections compact so everything fits */
+.kpi-attributes-modal .form-section {
+  margin: 0 !important;
+  padding: 7px 10px !important;
+  border-radius: 18px !important;
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.05) !important;
+}
+
+.kpi-attributes-modal .tree-select-panel {
+  max-height: min(52vh, 520px) !important;
+  overflow: hidden !important;
+}
+
+.kpi-attributes-modal .form-grid {
+  gap: 6px !important;
+}
+
+.kpi-attributes-modal .form-grid + .form-grid {
+  margin-top: 8px !important;
+}
+
+.kpi-attributes-modal .hierarchy-tree-field .tree-select-trigger {
+  min-height: 44px !important;
+  padding: 8px 10px !important;
+  border-radius: 14px !important;
+}
+
+.kpi-attributes-modal .kpi-inline-row {
+  display: grid !important;
+  grid-template-columns:
+    minmax(340px, 2.15fr)
+    minmax(120px, 0.85fr)
+    minmax(180px, 1.1fr)
+    minmax(150px, 0.95fr) !important;
+  gap: 10px !important;
+  align-items: end !important;
+}
+
+.kpi-attributes-modal .kpi-inline-row .field {
+  min-width: 0 !important;
+  grid-column: auto !important;
+}
+
+.kpi-attributes-modal .kpi-logic-row {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)) !important;
+  gap: 14px !important;
+  align-items: end !important;
+}
+
+.kpi-attributes-modal .kpi-logic-row .field {
+  min-width: 0 !important;
+  grid-column: auto !important;
+}
+
+.kpi-attributes-modal .kpi-logic-row #wrap_reference_kpi_id {
+  min-width: 280px !important;
+}
+
+.kpi-attributes-modal .kpi-details-row {
+  display: grid !important;
+  grid-template-columns:
+    minmax(128px, 0.7fr)
+    minmax(128px, 0.7fr)
+    minmax(220px, 1fr)
+    minmax(560px, 3fr) !important;
+  gap: 16px !important;
+  align-items: end !important;
+}
+
+.kpi-attributes-modal .kpi-details-row .field {
+  min-width: 0 !important;
+  grid-column: auto !important;
+}
+
+.kpi-attributes-modal .kpi-details-row .field:last-child {
+  grid-column: 4 / 5 !important;
+}
+
+.kpi-attributes-modal .kpi-details-row .field:last-child textarea {
+  min-height: 84px !important;
+  overflow-y: hidden !important;
+}
+
+.kpi-attributes-modal .kpi-tolerance-row {
+  gap: 14px !important;
+}
+
+.kpi-attributes-modal .field input,
+.kpi-attributes-modal .field select,
+.kpi-attributes-modal .field textarea {
+  min-height: 34px !important;
+  padding: 6px 9px !important;
+  border-radius: 11px !important;
+}
+
+.kpi-attributes-modal .field textarea {
+  min-height: 42px !important;
+  line-height: 1.5 !important;
+}
+
+.kpi-attributes-modal .modal-footer {
+  padding: 6px 12px 8px !important;
+  margin-top: 0 !important;
+}
+
+@media (max-width: 1280px) {
+  .kpi-attributes-modal .kpi-inline-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .kpi-attributes-modal .kpi-logic-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .kpi-attributes-modal .kpi-details-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .kpi-attributes-modal .kpi-details-row .field:last-child {
+    grid-column: auto !important;
+  }
+}
+
+@media (max-width: 960px) {
+  .kpi-attributes-modal .kpi-inline-row {
+    grid-template-columns: 1fr !important;
+  }
+
+  .kpi-attributes-modal .kpi-logic-row {
+    grid-template-columns: 1fr !important;
+  }
+
+  .kpi-attributes-modal .kpi-details-row {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+
+/* ===============================
+   MODERN KPI TARGET ALLOCATION MODAL
+================================ */
+
+#parameterModalBackdrop {
+  background: rgba(15, 23, 42, 0.55) !important;
+  backdrop-filter: blur(14px) saturate(140%) !important;
+}
+
+#parameterModalBackdrop.open .parameter-modal {
+  animation: parameterModalIn 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.parameter-modal {
+  width: min(1500px, calc(100vw - 42px)) !important;
+  height: calc(100vh - 42px) !important;
+  max-height: calc(100vh - 42px) !important;
+  overflow: hidden !important;
+  border-radius: 34px !important;
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.14), transparent 34%),
+    radial-gradient(circle at bottom left, rgba(6,182,212,0.12), transparent 30%),
+    linear-gradient(180deg, #ffffff 0%, #f8fbff 100%) !important;
+  border: 1px solid rgba(255,255,255,0.88) !important;
+  box-shadow: 0 40px 100px rgba(15,23,42,0.30) !important;
+}
+
+.parameter-modal .modal-header {
+  padding: 26px 32px 20px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-bottom: 1px solid rgba(148,163,184,0.18) !important;
+}
+
+.parameter-modal .modal-header h2 {
+  font-size: 30px !important;
+  font-weight: 950 !important;
+  letter-spacing: -0.05em !important;
+  color: #0f172a !important;
+}
+
+.parameter-modal .modal-subtitle {
+  margin-top: 6px !important;
+  color: #64748b !important;
+  font-size: 14px !important;
+}
+
+.parameter-modal .modal-body {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+  padding: 18px 22px !important;
+  max-height: none !important;
+  overflow-y: auto !important;
+  background: linear-gradient(180deg, #fbfdff 0%, #f4f8fd 100%) !important;
+}
+
+.parameter-modal .form-section {
+  margin-bottom: 16px !important;
+  padding: 18px !important;
+  border-radius: 24px !important;
+  background: rgba(255,255,255,0.9) !important;
+  border: 1px solid rgba(148,163,184,0.20) !important;
+  box-shadow: 0 16px 34px rgba(15,23,42,0.06) !important;
+}
+
+.parameter-modal .form-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 24px;
+  column-gap: 36px; /* more horizontal space */
+  row-gap: 20px;
+  align-items: end;
+}
+
+.parameter-modal #parameterAllocationFieldsSection.is-individual-layout .form-grid {
+  grid-template-columns: repeat(21, minmax(0, 1fr)) !important;
+}
+
+.parameter-modal .field label {
+  font-size: 10px !important;
+  font-weight: 900 !important;
+  color: #334155 !important;
+}
+
+.parameter-modal .field .hint {
+  font-size: 9px !important;
+  color: #94a3b8 !important;
+}
+
+.parameter-modal .field input,
+.parameter-modal .field select,
+.parameter-modal .field textarea {
+  min-height: 42px !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(148,163,184,0.28) !important;
+  background: #ffffff !important;
+  padding: 10px 12px !important;
+  font-size: 13px !important;
+  color: #0f172a !important;
+  transition: all 0.2s ease !important;
+}
+
+.parameter-modal .field textarea {
+  min-height: 80px !important;
+  resize: vertical !important;
+}
+
+.parameter-modal .field input:focus,
+.parameter-modal .field select:focus,
+.parameter-modal .field textarea:focus {
+  border-color: rgba(37,99,235,0.55) !important;
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.12) !important;
+  transform: translateY(-1px) !important;
+}
+
+.parameter-role-select {
+  position: relative;
+}
+
+.parameter-role-native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.parameter-role-trigger {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(148,163,184,0.28);
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 10px 12px;
+  color: #0f172a;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.parameter-role-trigger:hover,
+.parameter-role-select.is-open .parameter-role-trigger {
+  border-color: rgba(37,99,235,0.55);
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.12);
+}
+
+.parameter-role-trigger:disabled {
+  cursor: not-allowed;
+  color: #94a3b8;
+  background: #f8fafc;
+  box-shadow: none;
+}
+
+.parameter-role-trigger-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parameter-role-trigger.is-placeholder .parameter-role-trigger-label {
+  color: #64748b;
+}
+
+.parameter-role-trigger-chevron {
+  flex-shrink: 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.parameter-role-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  max-height: min(420px, calc(100vh - 240px));
+  border: 1px solid rgba(148,163,184,0.22);
+  border-radius: 18px;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+  box-shadow: 0 22px 48px rgba(15,23,42,0.14);
+  overflow: hidden;
+}
+
+.parameter-role-menu[hidden] {
+  display: none !important;
+}
+
+.parameter-role-search {
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid rgba(148,163,184,0.16);
+  background: rgba(255,255,255,0.96);
+}
+
+.parameter-role-search input {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid rgba(148,163,184,0.24);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 8px 10px;
+  color: #0f172a;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+
+.parameter-role-search input:focus {
+  border-color: rgba(37,99,235,0.55);
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.12);
+}
+
+.parameter-role-options {
+  max-height: min(340px, calc(100vh - 300px));
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.parameter-role-option {
+  width: 100%;
+  display: block;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  padding: 10px 12px;
+  color: #0f172a;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.parameter-role-option:hover {
+  background: rgba(37,99,235,0.08);
+}
+
+.parameter-role-option.is-selected {
+  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(6,182,212,0.10));
+  color: #1d4ed8;
+  font-weight: 800;
+}
+
+.parameter-role-option.is-placeholder {
+  color: #64748b;
+}
+
+.parameter-role-empty {
+  padding: 16px 14px;
+  color: #94a3b8;
+  font-size: 12px;
+  text-align: center;
+}
+
+.parameter-modal .modal-footer {
+  padding: 18px 24px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-top: 1px solid rgba(148,163,184,0.18) !important;
+  display: flex !important;
+  justify-content: flex-end !important;
+  align-items: center !important;
+}
+
+.parameter-modal .footer-actions {
+  display: flex !important;
+  justify-content: flex-end !important;
+  gap: 10px !important;
+  margin-left: auto !important;
+}
+
+.parameter-modal .btn {
+  border-radius: 16px !important;
+  padding: 13px 20px !important;
+  font-weight: 900 !important;
+}
+
+.parameter-modal .btn-primary {
+  background: linear-gradient(135deg, #4f46e5, #2563eb, #06b6d4) !important;
+  box-shadow: 0 16px 32px rgba(37,99,235,0.28) !important;
+}
+
+.parameter-modal #parameterCloseBtn:disabled,
+.parameter-modal #parameterCancelBtn:disabled,
+.parameter-modal #parameterSaveBtn:disabled {
+  opacity: 0.72 !important;
+  cursor: not-allowed !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.parameter-modal #parameterSaveBtn {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 10px !important;
+  min-width: 220px;
+}
+
+.parameter-modal #parameterSaveBtn.is-loading {
+  cursor: wait !important;
+}
+
+.parameter-modal .parameter-save-spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.38);
+  border-top-color: #ffffff;
+  display: none;
+  animation: parameterButtonSpin 0.75s linear infinite;
+  flex-shrink: 0;
+}
+
+.parameter-modal #parameterSaveBtn.is-loading .parameter-save-spinner {
+  display: inline-block;
+}
+
+.parameter-modal .btn-danger {
+  background: linear-gradient(135deg, #fb7185, #ef4444) !important;
+  color: white !important;
+  box-shadow: 0 14px 28px rgba(239,68,68,0.22) !important;
+}
+
+.parameter-modal .multisite-matrix-field {
+  gap: 18px;
+}
+
+.parameter-modal .multisite-matrix-shell {
+  border: 1px solid rgba(148,163,184,0.16);
+  border-radius: 28px;
+  padding: 18px;
+  background:
+    radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 26%),
+    radial-gradient(circle at bottom right, rgba(6,182,212,0.10), transparent 28%),
+    linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(244,248,255,0.98) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.92),
+    0 24px 46px rgba(15,23,42,0.08);
+}
+
+.parameter-modal .multisite-matrix-intro {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+  padding: 2px 2px 12px;
+  border-bottom: 1px solid rgba(226,232,240,0.82);
+}
+
+.parameter-modal .multisite-matrix-copy {
+  font-size: 13px;
+  line-height: 1.72;
+  color: #475569;
+  max-width: 760px;
+}
+
+.parameter-modal .multisite-matrix-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(6,182,212,0.12));
+  border: 1px solid rgba(37,99,235,0.14);
+  color: #1d4ed8;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  box-shadow: 0 10px 18px rgba(37,99,235,0.08);
+}
+
+.parameter-modal .multisite-unit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px;
+}
+
+.parameter-modal .multisite-unit-card {
+  border: 1px solid rgba(191,219,254,0.72);
+  border-radius: 20px;
+  padding: 14px;
+  background: rgba(255,255,255,0.96);
+  box-shadow: 0 12px 28px rgba(15,23,42,0.05);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.parameter-modal .multisite-unit-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(96,165,250,0.85);
+  box-shadow: 0 18px 34px rgba(37,99,235,0.12);
+}
+
+.parameter-modal .multisite-unit-card.is-selected {
+  border-color: rgba(37,99,235,0.85);
+  background:
+    radial-gradient(circle at top right, rgba(59,130,246,0.14), transparent 36%),
+    linear-gradient(180deg, rgba(239,246,255,0.98) 0%, rgba(255,255,255,0.98) 100%);
+  box-shadow: 0 20px 38px rgba(37,99,235,0.16);
+}
+
+.parameter-modal .multisite-unit-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.parameter-modal .multisite-unit-kicker {
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+
+.parameter-modal .multisite-unit-name {
+  margin-top: 6px;
+  font-size: 16px;
+  font-weight: 900;
+  color: #0f172a;
+  line-height: 1.35;
+}
+
+.parameter-modal .multisite-unit-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.55;
+}
+
+.parameter-modal .multisite-unit-select-btn {
+  border: none;
+  border-radius: 14px;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.12));
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 900;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.parameter-modal .multisite-unit-select-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 18px rgba(37,99,235,0.12);
+}
+
+.parameter-modal .multisite-unit-card.is-selected .multisite-unit-select-btn {
+  background: linear-gradient(135deg, #1d4ed8, #2563eb);
+  color: #ffffff;
+}
+
+.parameter-modal .multisite-unit-people {
+  display: grid;
+  gap: 10px;
+}
+
+.parameter-modal .multisite-person-chip {
+  width: 100%;
+  text-align: left;
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 16px;
+  padding: 12px 14px;
+  background: rgba(248,250,252,0.92);
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.parameter-modal .multisite-person-chip:hover {
+  transform: translateX(2px);
+  border-color: rgba(96,165,250,0.65);
+  background: rgba(239,246,255,0.96);
+}
+
+.parameter-modal .multisite-person-chip.is-selected {
+  border-color: rgba(37,99,235,0.72);
+  background: linear-gradient(135deg, rgba(219,234,254,0.98), rgba(224,242,254,0.98));
+  box-shadow: 0 10px 24px rgba(37,99,235,0.14);
+}
+
+.parameter-modal .multisite-person-name {
+  display: block;
+  font-size: 13px;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1.4;
+}
+
+.parameter-modal .multisite-person-role {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: #64748b;
+  line-height: 1.5;
+}
+
+.parameter-modal .multisite-person-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.parameter-modal .multisite-primary-badge,
+.parameter-modal .multisite-selected-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.parameter-modal .multisite-primary-badge {
+  background: rgba(16,185,129,0.12);
+  color: #047857;
+}
+
+.parameter-modal .multisite-selected-badge {
+  background: rgba(37,99,235,0.12);
+  color: #1d4ed8;
+}
+
+
+.multisite-table-wrap {
+  overflow: auto;
+  padding: 10px;
+  border-radius: 28px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.08), transparent 28%),
+    radial-gradient(circle at bottom left, rgba(6,182,212,0.08), transparent 24%),
+    linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(245,249,255,0.98) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.92),
+    0 20px 40px rgba(15, 23, 42, 0.08);
+}
+
+.multisite-table {
+  width: 100%;
+  min-width: 1290px;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.multisite-table textarea {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid rgba(148,163,184,0.24);
+  border-radius: 16px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  background: rgba(255,255,255,0.98);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+}
+
+.multisite-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  padding: 18px 16px;
+  background:
+    linear-gradient(180deg, #fdfefe 0%, #edf4ff 100%);
+  color: #475569;
+  font-size: 10px;
+  font-weight: 950;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  border-bottom: 1px solid rgba(226,232,240,0.95);
+  box-shadow: inset 0 -1px 0 rgba(226,232,240,0.95);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.multisite-table tbody tr {
+  transition: background 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.multisite-table tbody tr:nth-child(even) td {
+  background: linear-gradient(180deg, rgba(249,251,255,0.98) 0%, rgba(246,249,255,0.98) 100%);
+}
+
+.multisite-table tbody tr:hover td {
+  background: linear-gradient(180deg, #fbfdff 0%, #eef6ff 100%);
+}
+
+.multisite-table td {
+  padding: 18px 16px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(252,253,255,0.98) 100%);
+  border-top: 1px solid rgba(226,232,240,0.88);
+  border-bottom: 1px solid rgba(226,232,240,0.88);
+  color: #0f172a;
+  font-size: 13px;
+  vertical-align: top;
+}
+
+.multisite-table tbody tr td:first-child {
+  border-left: 1px solid rgba(226,232,240,0.88);
+  border-top-left-radius: 18px;
+  border-bottom-left-radius: 18px;
+}
+
+.multisite-table tbody tr td:last-child {
+  border-right: 1px solid rgba(226,232,240,0.88);
+  border-top-right-radius: 18px;
+  border-bottom-right-radius: 18px;
+}
+
+.multisite-table td:first-child {
+  font-weight: 850;
+  color: #0f172a;
+  min-width: 220px;
+}
+
+.multisite-table input,
+.multisite-table select {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid rgba(148,163,184,0.24);
+  border-radius: 16px;
+  background: rgba(255,255,255,0.98);
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #0f172a;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease, background 0.18s ease;
+}
+
+.multisite-table .readonly-input {
+  background: linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%);
+  color: #334155;
+  border-color: #d9e4f2;
+  cursor: default;
+  font-weight: 800;
+}
+
+.multisite-table .parameter-unit-responsible-input {
+  min-width: 210px;
+}
+
+.multisite-table .parameter-unit-responsible-input.is-empty {
+  color: #94a3b8;
+  border-style: dashed;
+  background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.98);
+}
+
+.multisite-table .readonly-input:focus {
+  border-color: #d9e4f2;
+  box-shadow: none;
+  transform: none;
+}
+
+.multisite-table input:focus,
+.multisite-table select:focus {
+  border-color: rgba(37,99,235,0.55);
+  box-shadow: 0 0 0 4px rgba(37,99,235,0.12);
+  transform: translateY(-1px);
+}
+
+.role-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 180px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(6,182,212,0.10));
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.role-empty {
+  background: rgba(148,163,184,0.14);
+  color: #64748b;
+}
+
+.parameter-unit-name {
+  font-size: 15px;
+  font-weight: 900;
+  color: #0f172a;
+  line-height: 1.35;
+}
+
+.parameter-unit-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #64748b;
+}
+
+.parameter-unit-cell-note {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(148,163,184,0.16);
+  background: rgba(248,250,252,0.88);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.82);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #64748b;
+}
+
+.parameter-unit-cell-note.is-linked {
+  border-color: rgba(37,99,235,0.14);
+  background: linear-gradient(135deg, rgba(219,234,254,0.50), rgba(236,253,245,0.58));
+  color: #476178;
+}
+
+.parameter-unit-cell-note.is-warning {
+  border-color: rgba(245,158,11,0.18);
+  background: linear-gradient(135deg, rgba(255,247,237,0.95), rgba(248,250,252,0.96));
+  color: #8a5a12;
+}
+
+.parameter-kpi-unit-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(255,255,255,0.92), rgba(236,243,255,0.95));
+  border: 1px solid rgba(148,163,184,0.20);
+  color: #0f172a;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9);
+}
+
+.parameter-table-empty {
+  padding: 34px 26px;
+  border-radius: 24px;
+  border: 1px dashed rgba(148,163,184,0.28);
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 34%),
+    radial-gradient(circle at bottom left, rgba(6,182,212,0.08), transparent 28%),
+    rgba(248,250,252,0.97);
+  color: #64748b;
+  font-size: 14px;
+  line-height: 1.8;
+  text-align: center;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.88),
+    0 16px 30px rgba(15,23,42,0.05);
+}
+
+@keyframes parameterModalIn {
+  from {
+    opacity: 0;
+    transform: translateY(26px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes parameterButtonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── New KPI modal layout ── */
+.kpi-main-row {
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+}
+.kpi-main-row .field { display: flex; flex-direction: column; gap: 4px; }
+.kpi-main-row .field.f-name { flex: 2.5; min-width: 160px; }
+.kpi-main-row .field.f-unit { flex: 0.9; min-width: 80px; }
+.kpi-main-row .field.f-freq { flex: 1.2; min-width: 110px; }
+.kpi-main-row .field.f-dir  { flex: 0.9; min-width: 85px; }
+.kpi-main-row .field.f-min  { flex: 0.85; min-width: 80px; }
+.kpi-main-row .field.f-minv { flex: 0.85; min-width: 80px; }
+.kpi-main-row .field.f-max  { flex: 0.85; min-width: 80px; }
+.kpi-main-row .field.f-maxv { flex: 0.85; min-width: 80px; }
+.kpi-main-row .field.f-def  { flex: 2.5; min-width: 180px; }
+.kpi-attributes-modal .field > label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kpi-attributes-modal .field > label > span:first-child {
+  color: #000 !important;
+  background: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+}
+
+.field label span,
+.field-title span,
+.form-label span {
+  background: transparent !important;
+  color: #000 !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+}
+
+.kpi-attributes-modal .hierarchy-tree-field > label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.kpi-attributes-modal .hierarchy-tree-field > label > span:first-child {
+  display: inline;
+  padding: 0 !important;
+  margin: 0;
+  border: none !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: #0f172a !important;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.2;
+}
+
+.kpi-attributes-modal .hierarchy-tree-field > label > .hint {
+  font-size: 9px;
+  font-weight: 700;
+  color: #94a3b8 !important;
+}
+
+.kpi-main-row .field label {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 10px; font-weight: 800; color: #334155;
+}
+.kpi-main-row .field .hint { font-size: 9px; font-weight: 700; color: #94a3b8; }
+.kpi-main-row .field input,
+.kpi-main-row .field select,
+.kpi-main-row .field textarea {
+  width: 100%; border: 1px solid rgba(148,163,184,0.28);
+  background: #fff; color: #0f172a; border-radius: 10px;
+  padding: 7px 10px; font-size: 13px; font-family: inherit; outline: none;
+}
+.kpi-main-row .field textarea { min-height: 56px; resize: none; line-height: 1.45; }
+
+.calc-section-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.calc-logic-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-height: auto;
+  padding: 9px 11px;
+  border-radius: 16px;
+  border: 1px solid rgba(191,219,254,0.7);
+  background:
+    radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 42%),
+    linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,251,255,0.98) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.88),
+    0 16px 28px rgba(15,23,42,0.06);
+}
+
+.calc-logic-row.is-split {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto minmax(260px, 1fr);
+  gap: 6px 10px;
+  align-items: end;
+}
+
+.calc-logic-row .clr-label {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #0f172a;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.2;
+  box-shadow: none;
+}
+
+.calc-logic-row.is-split .clr-label {
+  grid-column: 1 / -1;
+}
+
+.calc-logic-row .field {
+  min-width: 0;
+  flex: none;
+  max-width: none;
+}
+
+.calc-logic-row.is-split > .field:not(.cond-field) {
+  grid-column: 1 / 2;
+}
+
+.calc-logic-row .field.cond-field {
+  min-width: 0;
+  flex: none;
+  max-width: none;
+}
+
+.calc-logic-row.is-split > .field.cond-field {
+  grid-column: 3 / 4;
+}
+
+.calc-logic-row .field label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+  font-size: 8px;
+  font-weight: 800;
+  color: #334155;
+}
+
+.calc-logic-row .field .hint {
+  font-size: 7px;
+  font-weight: 700;
+  color: #94a3b8;
+}
+
+.calc-logic-row .field input,
+.calc-logic-row .field select {
+  width: 100%;
+  min-height: 32px;
+  border: 1px solid rgba(148,163,184,0.28);
+  background: rgba(255,255,255,0.96);
+  color: #0f172a;
+  border-radius: 10px;
+  padding: 5px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+}
+
+.calc-logic-arrow {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(79,70,229,0.08);
+  color: #4f46e5;
+  font-size: 10px;
+  font-weight: 900;
+  flex-shrink: 0;
+}
+
+.calc-logic-row.is-split .calc-logic-arrow {
+  grid-column: 2 / 3;
+  align-self: end;
+  justify-self: center;
+}
+
+.calc-section-rows > .f-def {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(191,219,254,0.7);
+  background:
+    radial-gradient(circle at top right, rgba(6,182,212,0.08), transparent 38%),
+    linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(246,250,255,0.98) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.9),
+    0 18px 32px rgba(15,23,42,0.06);
+}
+
+.calc-section-rows > .f-def label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 9px;
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.calc-section-rows > .f-def .hint {
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+
+.calc-section-rows > .f-def textarea {
+  min-height: 62px;
+  border: 1px solid rgba(148,163,184,0.24);
+  border-radius: 14px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.96);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+}
+
+@media (max-width: 1180px) {
+  .calc-logic-row {
+    min-height: auto;
+  }
+
+  .calc-logic-row.is-split {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+}
+
+.tolerance-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+
+.tolerance-option-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.tolerance-type-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.tol-type-label {
+  min-width: 88px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+
+  padding: 0;
+  border-radius: 0;
+
+  background: transparent;
+
+  height: auto;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+
+  color: #000;
+
+  box-shadow: none;
+}
+
+.tolerance-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+
+
+.tol-radio-label {
+  width: 96px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  color: #334155;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1.5px solid rgba(148,163,184,0.28);
+  background: #fff;
+}
+
+
+.tol-radio-label:has(input:checked) {
+  background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(79,70,229,0.07));
+  border-color: rgba(37,99,235,0.40); color: #1d4ed8;
+  box-shadow: 0 6px 18px rgba(37,99,235,0.12);
+}
+.tol-radio-label input[type="radio"] {
+  width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer; margin: 0;
+}
+
+.tolerance-fields-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.tolerance-fields-row .field {
+  flex: 1; min-width: 120px; max-width: 200px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.tolerance-fields-row .field label {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 8px; font-weight: 800; color: #334155;
+}
+.tolerance-fields-row .field .hint { font-size: 7px; font-weight: 700; color: #94a3b8; }
+.tolerance-fields-row .field input {
+  width: 100%; border: 1px solid rgba(148,163,184,0.28);
+  background: #fff; color: #0f172a; border-radius: 10px;
+  padding: 5px 8px; font-size: 11px; font-family: inherit; outline: none; min-height: 32px;
+}
+
+
+.parameter-modal .field {
+  min-width: 0 !important;
+}
+ </style>
   </head>
 
   <body>
@@ -3265,19 +11133,25 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         <div>
           <div class="sidebar-section-title">Navigation</div>
           <nav class="nav">
-            <a href="#" class="nav-item active" id="navDashboard" onclick="showDashboard(); return false;">
-              <div class="nav-icon">📊</div>
-              <span>Dashboard</span>
-            </a>
-
-            <a href="#" class="nav-item" id="navMyKpis" onclick="showMyKpis(); return false;">
-              <div class="nav-icon">🎯</div>
-              <span>My KPIs</span>
-            </a>
+        
 
             <a href="#" class="nav-item" onclick="openCreateModal(); return false;">
               <div class="nav-icon">➕</div>
               <span>Create KPI</span>
+            </a>
+              <a href="#" class="nav-item active" id="navDashboard" onclick="showDashboard(); return false;">
+              <div class="nav-icon">📊</div>
+              <span>Consult KPI</span>
+            </a>
+
+            <a href="#" class="nav-item" onclick="openCreateParameterModal(); return false;">
+              <div class="nav-icon">🧭</div>
+              <span>Create KPI TARGET ALLOCATION</span>
+            </a>
+
+            <a href="#" class="nav-item" id="navConsultAllocations" onclick="showConsultTargetAllocations(); return false;">
+              <div class="nav-icon">📁</div>
+              <span>Consult Target Allocation</span>
             </a>
           </nav>
         </div>
@@ -3285,7 +11159,7 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         <div class="sidebar-footer">
           <h4>Responsible Workspace</h4>
           <p>
-            Manage KPI settings, update targets and keep your performance indicators organized in one modern dashboard.
+            Manage KPI definitions, update targets and keep your performance indicators organized in one modern dashboard.
           </p>
         </div>
       </aside>
@@ -3293,70 +11167,33 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       <main class="content">
         <div class="topbar">
           <div class="topbar-left">
-            <h1>Responsible KPI Dashboard</h1>
-            <p>Modern KPI workspace for responsible management and tracking.</p>
+              <h1>Responsible KPI Dashboard</h1>
+            <p>Modern KPI workspace for ${escapeHtml(responsibleName)}. KPI creation and target allocation are locked to this responsible.</p>
           </div>
 
-          <div class="topbar-right">
-            <button class="btn btn-soft" onclick="refreshKpis()">Refresh</button>
-            <button class="btn btn-primary" onclick="openCreateModal()">+ Add New KPI</button>
-          </div>
         </div>
 
         <section id="dashboardSection">
           <div class="hero-panel">
-            <div class="hero-row">
-              <div class="hero-meta">
-                <h3>Executive KPI Management</h3>
-                <div class="responsible-chip">👤 ${responsibleName}</div>
-                <p>
-                  Track, maintain and optimize your KPI portfolio with a cleaner and more professional interface.
-                </p>
+        
+          <div class="kpi-matrix-shell">
+            <div class="kpi-matrix-hero">
+              <div class="kpi-matrix-title">
+                <h2>KPI Matrix</h2>
+                <p>View and manage all KPI definitions with direct visibility on KPI subject, KPI name, KPI code, unit, direction, and actions.</p>
               </div>
+              <button class="btn btn-primary kpi-matrix-add-btn" type="button" onclick="openCreateModal()">+ Add KPI</button>
+            </div>
 
-              <div class="hero-badge">
-                <span>Responsible</span>
-                <strong>#${responsibleId}</strong>
+            <div class="kpi-matrix-toolbar">
+              <div class="search-wrap kpi-matrix-search">
+                <input id="search" class="search" placeholder="Search KPI by subject, name, code, unit or direction..." />
               </div>
+              <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
             </div>
+
+            <div id="grid"></div>
           </div>
-
-          <div class="stats-grid">
-            <div class="stat-card">
-              <div class="stat-label">Total KPIs</div>
-              <div class="stat-value" id="statTotal">0</div>
-            </div>
-
-            <div class="stat-card">
-              <div class="stat-label">Monthly KPIs</div>
-              <div class="stat-value" id="statMonthly">0</div>
-            </div>
-
-            <div class="stat-card">
-              <div class="stat-label">With Target</div>
-              <div class="stat-value" id="statTarget">0</div>
-            </div>
-
-            <div class="stat-card">
-              <div class="stat-label">Tolerance Rules</div>
-              <div class="stat-value" id="statTolerance">0</div>
-            </div>
-          </div>
-
-          <div class="toolbar">
-            <div class="search-wrap">
-              <input id="search" class="search" placeholder="Search KPI by title, frequency..." />
-            </div>
-          </div>
-
-          <div class="section-head">
-            <div>
-              <h2>KPI Portfolio</h2>
-              <p>Smaller, cleaner KPI cards with full information display.</p>
-            </div>
-          </div>
-
-          <div id="grid" class="grid"></div>
         </section>
 
         <section id="myKpisSection" style="display:none;">
@@ -3369,159 +11206,546 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
 
           <div id="chartsGrid" class="grid"></div>
         </section>
+
+        <section id="consultTargetAllocationsSection" style="display:none;">
+          <div class="parameter-section-shell">
+            <div class="parameter-matrix-hero">
+              <div class="parameter-matrix-title">
+                <h2>KPI Matrix</h2>
+                <p>View and manage all KPI target allocations with direct visibility on KPI name, KPI type, role, KPI frequency, responsible, target status, and target value.</p>
+              </div>
+              <button class="btn btn-primary parameter-matrix-add-btn" type="button" onclick="openCreateParameterModal()">+ Add Target Allocation</button>
+            </div>
+
+            <div class="parameter-matrix-toolbar">
+              <div class="search-wrap parameter-matrix-search">
+                <input id="parameterSearch" class="search" placeholder="Search KPI name, KPI type, role, frequency, responsible, target status or target value..." />
+              </div>
+              <div class="parameter-results-meta" id="parameterResultsMeta">0 allocations</div>
+            </div>
+
+            <div id="parameterGrid"></div>
+          </div>
+        </section>
       </main>
     </div>
 
     <div id="modalBackdrop" class="modal-backdrop">
-      <div class="modal">
+      <div class="modal kpi-attributes-modal">
         <div class="modal-header">
           <div class="modal-title-wrap">
-            <h2 id="modalTitle">Edit KPI</h2>
+            <h2 id="modalTitle">Edit KPI Attributes</h2>
             <div class="modal-subtitle" id="modalSubtitle">
               Update KPI information, targets, calculation rules and thresholds in a cleaner professional form.
             </div>
           </div>
 
-          <button class="btn btn-soft" onclick="closeModal()">Close</button>
+        <button class="btn btn-soft" onclick="dismissKpiModal()" style="width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:12px;font-size:20px;line-height:1;color:#64748b;">&times;</button>
+        </div>
+
+      <div class="modal-body">
+          <input type="hidden" id="kpi_id" />
+          <input type="hidden" id="indicator_title" />
+          <input type="hidden" id="subject_path_display" />
+          <input type="hidden" id="kpi_code" />
+          <input type="hidden" id="kpi_formula" />
+          <input type="hidden" id="status" value="Active" />
+          <input type="hidden" id="comments" />
+          <input type="hidden" id="target" />
+
+          <div class="form-section">
+            <div class="kpi-main-row">
+              <div class="field f-name">
+                <label><span>KPI Name</span></label>
+                <input id="indicator_sub_title" placeholder="Type or adjust the KPI name" required />
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="form-grid">
+            <div class="field col-12 hierarchy-field hierarchy-tree-field">
+              <label><span>Subject</span><span class="hint">Excel hierarchy tree</span></label>
+              <input type="hidden" id="subject" />
+              <input type="hidden" id="subject_node_id" />
+              <div class="tree-select" id="subjectTreeSelect">
+                <button type="button" class="tree-select-trigger" id="subjectTreeTrigger" onclick="toggleSubjectTree()">
+                  <span class="tree-select-value">
+                    <span class="tree-select-label" id="subjectTreeLabel">Selectdv subject from tree</span>
+                    <span class="tree-select-meta" id="subjectTreeMeta">Open the visual hierarchy to choose a subject and follow its branch.</span>
+                  </span>
+                  <span class="tree-select-chevron" id="subjectTreeChevron">▾</span>
+                </button>
+                <div class="tree-select-panel" id="subjectTreePanel">
+           <div class="tree-select-toolbar">
+           <div class="vtree-search-row">
+            <input
+            type="text"
+            class="vtree-search-input"
+            id="subjectTreeSearch"
+            placeholder="Filter subjects..."
+            oninput="onSubjectTreeSearch(this.value)"
+            autocomplete="off"
+            />
+            <div class="vtree-toolbar-actions">
+             <button type="button" class="v-tree-action-btn" onclick="resetSubjectFlow()">&#10006; Reset</button>
+            </div>
+           </div>
+           </div>
+                  <div class="tree-list" id="subjectTreeList"></div>
+                </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="kpi-main-row">
+              <div class="field f-unit">
+                <label><span>Unit</span></label>
+                <select id="unit" required>
+                  <option value="kCur">kCur</option>
+                  <option value="%">%</option>
+                  <option value="EA">EA</option>
+                  <option value="PPM">PPM</option>
+                  <option value="Number">Number</option>
+                </select>
+              </div>
+              <div class="field f-freq">
+                <label><span>Frequency</span></label>
+                <select id="frequency" required>
+                  <option value="Daily">Daily</option>
+                  <option value="Weekly">Weekly</option>
+                  <option value="By Weekly">By Weekly</option>
+                  <option value="Monthly">Monthly</option>
+                  <option value="By Monthly">By Monthly</option>
+                  <option value="Yearly">Yearly</option>
+                  <option value="By Yearly">By Yearly</option>
+                </select>
+              </div>
+              <div class="field f-dir">
+                <label><span>Direction</span></label>
+                <select id="direction" required>
+                  <option value="Up">Up</option>
+                  <option value="Down">Down</option>
+                </select>
+              </div>
+              <div class="field f-min">
+                <label><span>Min</span></label>
+                <select id="min_type" onchange="handleMinTypeChange()" required>
+                  <option value="Null">Null</option>
+                  <option value="0">0</option>
+                  <option value="Valeur a entrer">Value</option>
+                </select>
+              </div>
+              <div class="field f-minv" id="wrap_min_value" style="display:none;">
+                <label><span>Min Value</span><span class="hint">Enter</span></label>
+                <input id="min" placeholder="Min value" />
+              </div>
+              <div class="field f-max">
+                <label><span>Max</span></label>
+                <select id="max_type" onchange="handleMaxTypeChange()" required>
+                  <option value="Null">Null</option>
+                  <option value="0">0</option>
+                  <option value="Valeur a entrer">Value</option>
+                </select>
+              </div>
+              <div class="field f-maxv" id="wrap_max_value" style="display:none;">
+                <label><span>Max Value</span><span class="hint">Enter</span></label>
+                <input id="max" placeholder="Max value" />
+              </div>
+            </div>
+          </div>
+
+          <!-- SECTION 3: Calculation logic stacked rows -->
+          <div class="form-section">
+            <div class="calc-section-rows">
+              <div class="calc-logic-row">
+                <span class="clr-label">Calculation On</span>
+                <div class="field">
+                  <select id="calculation_on" onchange="handleCalculationOnChange()" required>
+                   <option value="" selected>Select Calculation On</option>
+                    <option value="Value">Value</option>
+                    <option value="Average">Average</option>
+                  </select>
+                </div>
+                <span class="calc-logic-arrow" id="calc_on_arrow" style="display:none;">→</span>
+                <div class="field cond-field" id="wrap_nombre_periode" style="display:none;">
+                  <label><span>Number of Periods</span><span class="hint">Period count</span></label>
+                  <select id="nombre_periode" required>
+                    <option value="1 week">1 week</option>
+                    <option value="2 weeks">2 weeks</option>
+                    <option value="3 weeks">3 weeks</option>
+                    <option value="4 weeks">4 weeks</option>
+                  </select>
+                </div>
+              </div>
+              <div class="calc-logic-row">
+                <span class="clr-label">Calculation Mode</span>
+                <div class="field">
+                  <select id="calculation_mode" onchange="handleCalculationModeChange()" required>
+                    <option value="" selected>Select calculation mode</option>
+                    <option value="Direct">Direct</option>
+                    <option value="Ratio">Ratio</option>
+                  </select>
+                </div>
+                <span class="calc-logic-arrow" id="calc_mode_arrow" style="display:none;">→</span>
+                <div class="field cond-field" id="wrap_reference_kpi_id" style="display:none;">
+                  <label><span>Reference KPI</span><span class="hint">Required for ratio</span></label>
+                  <select id="reference_kpi_id" onchange="updateDisplayedKpiPreview()">
+                    <option value="">Select reference KPI</option>
+                  </select>
+                </div>
+              </div>
+              <div class="calc-logic-row">
+                <span class="clr-label">Display Trend</span>
+                <div class="field">
+                  <select id="display_trend" onchange="handleDisplayTrendChange()" required>
+                    <option value="" selected>Select display trend</option>
+                    <option value="No">No</option>
+                    <option value="Yes">Yes</option>
+                  </select>
+                </div>
+                <span class="calc-logic-arrow" id="disp_trend_arrow" style="display:none;">→</span>
+                <div class="field cond-field" id="wrap_regression" style="display:none;">
+                  <label><span> Periods of Regression</span><span class="hint">Weeks</span></label>
+                  <select id="regression">
+                    <option value="1 week">1 week</option>
+                    <option value="2 weeks">2 weeks</option>
+                    <option value="3 weeks">3 weeks</option>
+                    <option value="4 weeks">4 weeks</option>
+                  </select>
+                </div>
+              </div>
+              <div class="calc-logic-row">
+                <span class="clr-label">Target Auto Adjust</span>
+                <div class="field">
+                  <select id="target_auto_adjustment" required>
+                    <option value="Yes">Yes</option>
+                    <option value="No">No</option>
+                  </select>
+                </div>
+              </div>
+
+               <div class="field f-def">
+                <label><span>Definition</span><span class="hint">Explain clearly</span></label>
+                <textarea id="definition" placeholder="Write a clear KPI definition..." required></textarea>
+              </div>
+            </div>
+          </div>
+
+<div class="form-section">
+
+  <div class="tolerance-wrap">
+
+    <!-- LEFT TITLE -->
+    <span class="tol-type-label">Tolerance</span>
+
+    <!-- RIGHT CONTENT -->
+    <div class="tolerance-options">
+
+      <!-- ABSOLUTE -->
+      <div class="tolerance-option-row">
+
+        <label class="tol-radio-label">
+          <input type="radio"
+                 name="tolerance_type_radio"
+                 value="Absolute"
+                 onchange="setToleranceTypeFromRadio('Absolute')">
+          Absolute
+        </label>
+
+        <div class="tolerance-fields-row">
+
+          <div class="field" id="wrap_high_limit" style="display:none;">
+            <label>
+              <span>High Limit</span>
+            </label>
+            <input id="high_limit"
+                   type="number"
+                   step="any"
+                   placeholder="e.g. 544.5" />
+          </div>
+
+          <div class="field" id="wrap_low_limit" style="display:none;">
+            <label>
+              <span>Low Limit</span>
+            </label>
+            <input id="low_limit"
+                   type="number"
+                   step="any"
+                   placeholder="e.g. 445.5" />
+          </div>
+
+        </div>
+      </div>
+
+      <!-- RELATIVE -->
+      <div class="tolerance-option-row">
+
+        <label class="tol-radio-label">
+          <input type="radio"
+                 name="tolerance_type_radio"
+                 value="Relative"
+                 onchange="setToleranceTypeFromRadio('Relative')">
+          Relative
+        </label>
+
+        <div class="tolerance-fields-row">
+
+          <div class="field" id="wrap_up_tolerance" style="display:none;">
+            <label>
+              <span>Up Tolerance</span>
+            </label>
+            <input id="up_tolerance"
+                   placeholder="+10%"
+                   oninput="recalculateLimits(this)" />
+          </div>
+
+          <div class="field" id="wrap_low_tolerance" style="display:none;">
+            <label>
+              <span>Low Tolerance</span>
+            </label>
+            <input id="low_tolerance"
+                   placeholder="-10%"
+                   oninput="recalculateLimits(this)" />
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+
+    <!-- HIDDEN SELECT -->
+    <select id="tolerance_type"
+            style="display:none;"
+            onchange="handleToleranceTypeChange(this)">
+      <option value="" selected></option>
+      <option value="Absolute">Absolute</option>
+      <option value="Relative">Relative</option>
+    </select>
+
+  </div>
+
+</div>
+
+       <div class="modal-footer">
+      <div class="footer-actions">
+      <button id="deleteBtn" class="btn btn-danger" onclick="deleteCurrentKpi()">Delete KPI</button>
+     <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
+     <button class="btn btn-soft" onclick="dismissKpiModal()">Cancel</button>
+      </div>
+      </div>
+        </div>
+
+    
+      </div>
+    </div>
+
+    <div id="kpiDetailsModalBackdrop" class="modal-backdrop">
+      <div class="modal kpi-details-modal">
+        <div class="modal-header">
+          <div class="modal-title-wrap">
+            <h2>KPI Details</h2>
+            <div class="modal-subtitle">
+              Consult the full KPI definition, thresholds, and calculation logic in a focused read-only view.
+            </div>
+          </div>
+
+          <button class="btn btn-soft" onclick="dismissKpiDetailsModal()" style="width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:12px;font-size:20px;line-height:1;color:#64748b;" type="button">&times;</button>
         </div>
 
         <div class="modal-body">
-          <input type="hidden" id="kpi_id" />
+          <div id="kpiDetailsModalContent"></div>
+        </div>
 
-          <div class="modal-overview">
-            <div class="overview-card">
-              <div class="label">Mode</div>
-              <div class="value" id="modalModeBadge">Edit KPI</div>
-            </div>
-            <div class="overview-card">
-              <div class="label">Frequency</div>
-              <div class="value" id="overviewFrequency">Not set</div>
-            </div>
-            <div class="overview-card">
-              <div class="label">Unit</div>
-              <div class="value" id="overviewUnit">Not set</div>
-            </div>
-            <div class="overview-card">
-              <div class="label">Target</div>
-              <div class="value" id="overviewTarget">Not set</div>
+        <div class="modal-footer">
+          <div></div>
+          <div class="footer-actions">
+            <button class="btn btn-soft" type="button" onclick="dismissKpiDetailsModal()">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="parameterModalBackdrop" class="modal-backdrop">
+      <div class="modal parameter-modal">
+        <div class="modal-header">
+          <div class="modal-title-wrap">
+            <h2 id="parameterModalTitle">Create KPI Target Allocation</h2>
+            <div class="modal-subtitle" id="parameterModalSubtitle">
+              Create a KPI target allocation with scope, target dates and approval details.
             </div>
           </div>
 
-          <div class="form-section">
-            <div class="section-title">Identity</div>
-            <div class="section-subtitle">Basic KPI naming and structure.</div>
+          <button id="parameterCloseBtn" class="btn btn-soft" style="width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:12px;font-size:20px;line-height:1;color:#64748b;" type="button" onclick="dismissParameterModal()">&times;</button>
+        </div>
 
+        <div class="modal-body">
+          <input type="hidden" id="parameter_object_id" />
+          <div class="form-section">
             <div class="form-grid">
               <div class="field col-6">
-                <label>
-                  <span>Category</span>
-                  <span class="hint">Main KPI group</span>
-                </label>
-                <input id="indicator_title" placeholder="Example: Finance / Operations / Quality" />
+                <label><span>KPI Name</span></label>
+                <select id="parameter_kpi_id"></select>
               </div>
-
-              <div class="field col-6">
-                <label>
-                  <span>KPI Name</span>
-                  <span class="hint">Displayed label</span>
-                </label>
-                <input id="indicator_sub_title" placeholder="Example: Action plan milestone respected" />
-              </div>
-
-              <div class="field col-4">
-                <label>
-                  <span>Unit</span>
-                  <span class="hint">%, days, qty</span>
-                </label>
-                <input id="unit" placeholder="%" />
-              </div>
-
-              <div class="field col-4">
-                <label>
-                  <span>Frequency</span>
-                  <span class="hint">Update rhythm</span>
-                </label>
-                <input id="frequency" placeholder="Monthly" />
-              </div>
-
-            </div>
-          </div>
-
-          <div class="form-section">
-            <div class="section-title">Target & Calculation</div>
-            <div class="section-subtitle">Performance objective and measurement logic.</div>
-
-            <div class="form-grid">
-              <div class="field col-4">
-                <label><span>Target</span><span class="hint">Expected result</span></label>
-                <input id="target" placeholder="145" />
-              </div>
-
-              <div class="field col-4">
-                <label><span>Calculation On</span><span class="hint">Scope or basis</span></label>
-                <input id="calculation_on" placeholder="Monthly average" />
-              </div>
-
-              <div class="field col-4">
-                <label><span>Target Auto Adjustment</span><span class="hint">Optional</span></label>
-                <input id="target_auto_adjustment" placeholder="Optional rule" />
-              </div>
-
-              <div class="field col-4">
-                <label><span>Max</span><span class="hint">Optional</span></label>
-                <input id="max" placeholder="Maximum value" />
-              </div>
-
-              <div class="field col-4">
-                <label><span>Min</span><span class="hint">Optional</span></label>
-                <input id="min" placeholder="Minimum value" />
-              </div>
-
-              <div class="field col-4">
-                <label><span>Tolerance Type</span><span class="hint">Relative / Absolute</span></label>
-                <select id="tolerance_type">
-                  <option value="">Select tolerance type</option>
-                  <option value="Relative">Relative</option>
-                  <option value="Absolute">Absolute</option>
+              <div class="field col-2">
+                <label><span>KPI Type</span></label>
+                <select id="parameter_kpi_type">
+                  <option value="">Select KPI Type</option>
+                  <option value="Multisite">Multisite</option>
+                  <option value="Individual">Individual</option>
+                  <option value="Zone">Zone</option>
                 </select>
               </div>
+              <div class="field col-2" id="parameter_unit_type_field">
+                <label><span>Unit Type</span></label>
+                <select id="parameter_unit_type_id"></select>
+              </div>
+              <div class="field col-2" id="parameter_role_field">
+                <label><span id="parameter_role_label">Role</span><span class="hint" id="parameter_role_hint">Loaded from role table</span></label>
+                <div class="parameter-role-select" id="parameterRoleSelectShell">
+                  <button
+                    type="button"
+                    class="parameter-role-trigger is-placeholder"
+                    id="parameterRoleTrigger"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                  >
+                    <span class="parameter-role-trigger-label" id="parameterRoleTriggerLabel">Select role</span>
+                    <span class="parameter-role-trigger-chevron">▾</span>
+                  </button>
+                  <div class="parameter-role-menu" id="parameterRoleMenu" hidden>
+                    <div class="parameter-role-search">
+                      <input
+                        id="parameterRoleSearch"
+                        type="text"
+                        placeholder="Type to filter roles..."
+                        autocomplete="off"
+                      />
+                    </div>
+                    <div class="parameter-role-options" id="parameterRoleOptions" role="listbox" aria-label="Role options"></div>
+                  </div>
+                  <select id="parameter_role_id" class="parameter-role-native" tabindex="-1" aria-hidden="true"></select>
+                </div>
+              </div>
+
+              <div class="field col-3 is-hidden" id="parameter_zone_unit_field">
+                <label><span>Unit</span><span class="hint">Select unit first</span></label>
+                <select id="parameter_zone_unit_id">
+                  <option value="">Select unit</option>
+                </select>
+              </div>
+
+              <div class="field col-3 is-hidden" id="parameter_zone_product_field">
+                <label><span>Product</span><span class="hint">Then select product</span></label>
+                <select id="parameter_zone_product_id">
+                  <option value="">Select product</option>
+                </select>
+              </div>
+
+              <div class="field col-3 is-hidden" id="parameter_zone_resolved_field">
+                <label><span>Matched Zone</span><span class="hint">Resolved automatically</span></label>
+                <input id="parameter_zone_resolved_display" class="readonly-input" readonly placeholder="Select unit and product first" />
+              </div>
+
+           
+              <div class="field col-4 is-hidden" id="parameter_plant_field">
+                <label><span>Unit</span><span class="hint">Filtered by selected unit type</span></label>
+                <select id="parameter_plant_id"></select>
+              </div>
+              <div class="field col-12 multisite-matrix-field" id="parameter_multisite_matrix_field">
+                
+                <div class="multisite-matrix-shell">
+                  <div class="multisite-matrix-intro">
+                    <div class="multisite-matrix-badge" id="parameter_scope_table_badge">Unit Type View</div>
+                  </div>
+                  <div id="parameterMultisiteMatrix"></div>
+                </div>
+              </div>
+              <div class="field col-4 is-hidden" id="parameter_zone_field">
+                <label><span>Zone</span><span class="hint">Optional zone scope</span></label>
+                <select id="parameter_zone_id"></select>
+              </div>
+              <div class="field col-4 is-hidden" id="parameter_function_field">
+                <label><span id="parameter_function_label">Function</span><span class="hint" id="parameter_function_hint">Optional business function</span></label>
+                <input id="parameter_function" placeholder="Manufacturing, Finance, Quality..." />
+              </div>
+           
             </div>
+
           </div>
 
-          <div class="form-section">
-            <div class="section-title">Thresholds & Tolerances</div>
-            <div class="section-subtitle">High and low limits are displayed for visibility and are read-only.</div>
-
+          <div class="form-section is-hidden" id="parameterAllocationFieldsSection">
             <div class="form-grid">
               <div class="field col-3">
-                <label><span>Up Tolerance</span><span class="hint">Upper variance</span></label>
-                <input id="up_tolerance" placeholder="10%" />
+                <label><span>Target Value <span style="color:#ef4444;">*</span></span></label>
+                <input id="parameter_target_value" type="number" step="any" placeholder="Enter target value" required />
               </div>
-
               <div class="field col-3">
-                <label><span>Low Tolerance</span><span class="hint">Lower variance</span></label>
-                <input id="low_tolerance" placeholder="10%" />
+                <label><span>Setup Date</span></label>
+                <input id="parameter_target_setup_date" type="date" />
               </div>
-
               <div class="field col-3">
-                <label><span>High Limit</span><span class="hint">Read only</span></label>
-                <input id="high_limit" class="readonly-input" type="number" step="any" placeholder="159.5" readonly />
+                <label><span>KPI Unit</span></label>
+                <input id="parameter_target_unit" class="readonly-input" readonly />
               </div>
-
               <div class="field col-3">
-                <label><span>Low Limit</span><span class="hint">Read only</span></label>
-                <input id="low_limit" class="readonly-input" type="number" step="any" placeholder="130.5" readonly />
+                <label><span>Sell Currency</span></label>
+                <input id="parameter_local_currency" class="readonly-input" readonly />
+              </div>
+          
+              <div class="field col-3" id="parameter_previous_target_field">
+                <label><span>Previous Target</span></label>
+                <input id="parameter_previous_target_value" type="number" step="any" placeholder="Optional previous target" />
+              </div>
+              <div class="field col-3">
+                <label><span id="parameter_set_by_people_label">Responsible</span></label>
+                <select id="parameter_set_by_people_id"></select>
+              </div>
+              <div class="field col-3">
+                <label><span>Approved By</span></label>
+                <select id="parameter_approved_by_people_id"></select>
+              </div>
+              <div class="field col-3" id="parameter_target_start_date_field">
+                <label><span>Target Start Date</span><span class="hint">Optional start</span></label>
+                <input id="parameter_target_start_date" type="date" />
+              </div>
+              <div class="field col-3" id="parameter_target_end_date_field">
+                <label><span>Target End Date</span><span class="hint">Optional end</span></label>
+                <input id="parameter_target_end_date" type="date" />
+              </div>
+              <div class="field col-3" id="parameter_target_status_field">
+                <label><span>Target Status</span><span class="hint">Lifecycle status</span></label>
+                <select id="parameter_target_status">
+                  <option value="Draft">Draft</option>
+                  <option value="Active">Active</option>
+                  <option value="Approved">Approved</option>
+                  <option value="Closed">Closed</option>
+                </select>
+              </div>
+              <div class="field col-12" id="parameter_comments_field">
+                <label><span>Comments</span><span class="hint">Optional note</span></label>
+                <textarea id="parameter_comments" placeholder="Add context, assumptions, or approval notes..."></textarea>
               </div>
             </div>
           </div>
         </div>
 
         <div class="modal-footer">
-          <button class="btn btn-danger" id="deleteBtn" onclick="deleteCurrentKpi()">Delete KPI</button>
-
+      
           <div class="footer-actions">
-            <button class="btn btn-soft" onclick="closeModal()">Cancel</button>
-            <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
+            <button
+              id="parameterSaveBtn"
+              class="btn btn-primary"
+              type="button"
+              data-default-label="Save Target Allocation"
+              onclick="saveParameterKpi()"
+            >
+              <span class="parameter-save-spinner" aria-hidden="true"></span>
+              <span class="parameter-save-label">Save Target Allocation</span>
+            </button>
+            <button id="parameterCancelBtn" class="btn btn-soft" type="button" onclick="dismissParameterModal()">Cancel</button>
           </div>
         </div>
       </div>
@@ -3530,10 +11754,59 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
     <div id="toast" class="toast"></div>
 
     <script>
-      const responsibleId = "${responsibleId}";
+      const responsibleId = ${JSON.stringify(String(dashboardResponsibleId || ""))};
+      const responsibleName = ${JSON.stringify(responsibleName)};
+      const kpiSubjectHierarchy = ${JSON.stringify(kpiSubjectHierarchy)};
+      const roleOptions = ${JSON.stringify(roleOptions)};
+      const allocationLookups = ${JSON.stringify(allocationLookups)};
       let currentRows = [];
+      let referenceKpiRows = [];
+      let currentParameterRows = [];
+      let parameterSourceRows = [];
+      let parameterKpiCatalog = [];
+      let parameterUnitTargetState = {};
+      let parameterLockedUnitId = "";
+      let parameterLockedZoneId = "";
+      let parameterLockedZoneIds = [];
+      let parameterResolvedZoneId = "";
+      let parameterZoneLookupPending = false;
+      let parameterSavePending = false;
+      let parameterEditMode = false;
+      let kpiCreateDraft = null;
+      let parameterCreateDraft = null;
       let chartsLoaded = false;
       let chartInstances = [];
+      const PARAMETER_ZONE_ALL_ROLE_VALUE = "__zone_all_roles__";
+      const PARAMETER_MODAL_FIELD_IDS = [
+        "parameter_object_id",
+        "parameter_kpi_id",
+        "parameter_kpi_type",
+        "parameter_unit_type_id",
+        "parameter_role_id",
+        "parameter_target_status",
+        "parameter_plant_id",
+        "parameter_zone_unit_id",
+        "parameter_zone_product_id",
+        "parameter_zone_resolved_display",
+        "parameter_zone_id",
+        "parameter_unit_id",
+        "parameter_function",
+        "parameter_product_line_id",
+        "parameter_product_id",
+        "parameter_market_id",
+        "parameter_customer_id",
+        "parameter_target_value",
+        "parameter_target_unit",
+        "parameter_local_currency",
+        "parameter_last_best_target",
+        "parameter_previous_target_value",
+        "parameter_target_setup_date",
+        "parameter_target_start_date",
+        "parameter_target_end_date",
+        "parameter_set_by_people_id",
+        "parameter_approved_by_people_id",
+        "parameter_comments"
+      ];
 
       function showToast(message) {
         const toast = document.getElementById("toast");
@@ -3542,6 +11815,342 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         setTimeout(() => {
           toast.style.display = "none";
         }, 2400);
+      }
+
+      function buildParameterKpiOptionLabel(kpi) {
+        return String(kpi.indicator_sub_title || "").trim() || "Untitled KPI";
+      }
+
+      function getParameterKpiGroupLabel(subjectPath) {
+        const pathText = String(subjectPath || "").trim();
+        if (!pathText) return "Other KPIs";
+
+        const parts = pathText
+          .split("/")
+          .map((part) => String(part || "").trim())
+          .filter(Boolean);
+
+        return parts.length ? parts[parts.length - 1] : pathText;
+      }
+
+      function ensureParameterTargetUnitOption(unitValue) {
+        const targetUnitSelect = document.getElementById("parameter_target_unit");
+        const normalizedUnitValue = String(unitValue || "").trim();
+        if (!targetUnitSelect || !normalizedUnitValue) return;
+
+        if (String(targetUnitSelect.tagName || "").toUpperCase() !== "SELECT") {
+          if (!String(targetUnitSelect.value || "").trim()) {
+            targetUnitSelect.value = normalizedUnitValue;
+          }
+          return;
+        }
+
+        const alreadyExists = Array.from(targetUnitSelect.options).some(
+          (option) => String(option.value || "").trim() === normalizedUnitValue
+        );
+
+        if (!alreadyExists) {
+          targetUnitSelect.insertAdjacentHTML(
+            "beforeend",
+            '<option value="' + escapeHtml(normalizedUnitValue) + '">' +
+            escapeHtml(normalizedUnitValue) +
+            '</option>'
+          );
+        }
+      }
+
+      function getParameterKpiById(kpiId) {
+        return (parameterKpiCatalog || []).find(kpi => String(kpi.kpi_id) === String(kpiId)) || null;
+      }
+
+      function getParameterAllocationUnits() {
+        const assignmentUnits = Array.isArray(allocationLookups.multisiteAssignments)
+          ? allocationLookups.multisiteAssignments
+          : [];
+
+        if (assignmentUnits.length) {
+          return assignmentUnits;
+        }
+
+        const plainUnits = Array.isArray(allocationLookups.units)
+          ? allocationLookups.units
+          : [];
+
+        return plainUnits.map((unitEntry) => ({
+          value: unitEntry.value,
+          label: unitEntry.label,
+          unit_type_id: unitEntry.unit_type_id ?? null,
+          unit_type_name: unitEntry.unit_type_name || "",
+          selling_currency: unitEntry.selling_currency || "",
+          operating_currency: unitEntry.operating_currency || "",
+          responsibles: []
+        }));
+      }
+
+      function getParameterUnitById(unitId) {
+        const normalizedUnitId = String(unitId || "").trim();
+        if (!normalizedUnitId) return null;
+
+        return getParameterAllocationUnits().find(
+          (unitEntry) => String(unitEntry.value || "") === normalizedUnitId
+        ) || null;
+      }
+
+      function getParameterSelectedKpiUnit() {
+        return String(getParameterKpiById(getParameterFieldValue("parameter_kpi_id"))?.unit || "").trim();
+      }
+
+      function getParameterRoleLabel(roleId) {
+        const normalizedRoleId = String(roleId || "").trim();
+        if (!normalizedRoleId) return "";
+        if (normalizedRoleId === PARAMETER_ZONE_ALL_ROLE_VALUE) return "All roles";
+
+        const matchedRole = (roleOptions || []).find(
+          (option) => String(option.value || "") === normalizedRoleId
+        );
+
+        return String(matchedRole?.label || "").split(" · ")[0].trim();
+      }
+
+     function getNormalizedParameterRoleId(roleId = getParameterFieldValue("parameter_role_id")) {
+      const normalizedRoleId = String(roleId || "").trim();
+
+      if (
+        normalizedRoleId === PARAMETER_ZONE_ALL_ROLE_VALUE ||
+        normalizedRoleId === "__all_roles__"
+      ) {
+        return "";
+      }
+
+      return normalizedRoleId;
+    }
+
+  // AFTER — replace with this:
+function populateParameterRoleScopeOptions(selectedValue = "") {
+  const scopeKind = getParameterScopeKind();
+  const normalizedSelectedValue = String(selectedValue || "").trim();
+
+  if (scopeKind === "zone") {
+
+    const zoneRoles = Array.from(
+      new Set(
+        (allocationLookups.zones || [])
+          .map(z => String(z.role || "").trim())
+          .filter(Boolean)
+      )
+    )
+      .sort((a, b) => a.localeCompare(b));
+
+    const roleOptionsForZone = [
+      {
+        value: "__all_roles__",
+        label: "All roles"
+      },
+      ...zoneRoles.map(role => ({
+        value: role,
+        label: role
+      }))
+    ];
+
+    setLookupSelectOptions(
+      "parameter_role_id",
+      roleOptionsForZone,
+      "Select role",
+      normalizedSelectedValue || "__all_roles__"
+    );
+
+    return;
+  }
+
+  setLookupSelectOptions(
+    "parameter_role_id",
+    roleOptions,
+    "Select role",
+    getNormalizedParameterRoleId(normalizedSelectedValue)
+  );
+}
+
+      function getParameterSelectedUnitTypeLabel() {
+        const selectedUnitTypeId = String(getParameterFieldValue("parameter_unit_type_id") || "").trim();
+        if (!selectedUnitTypeId) return "";
+
+        const matchedUnitType = (allocationLookups.unitTypes || []).find(
+          (option) => String(option.value || "") === selectedUnitTypeId
+        );
+
+        return String(
+          matchedUnitType?.label ||
+          matchedUnitType?.unit_type_name ||
+          ""
+        ).trim();
+      }
+
+      function getParameterZoneUnitOptions() {
+        const hiddenZoneUnits = new Set([
+          "avocarbon group",
+          "france",
+          "china",
+          "tunisia",
+          "germany",
+          "europe",
+          "americas",
+          "asia"
+        ]);
+
+        const rawOptions = allocationLookups.units || allocationLookups.plants || [];
+
+        return rawOptions.filter((option) => {
+          const normalizedLabel = String(option?.label || "")
+            .trim()
+            .toLowerCase();
+
+          return normalizedLabel && !hiddenZoneUnits.has(normalizedLabel);
+        });
+      }
+
+      function isIndividualParameterScope() {
+        return String(getParameterFieldValue("parameter_kpi_type") || "").trim().toLowerCase() === "individual";
+      }
+
+      function syncParameterPlantOptions(preferredValue = "") {
+        const plantSelect = document.getElementById("parameter_plant_id");
+        if (!plantSelect) return;
+
+        const unitOptions = getParameterVisibleUnitRows()
+          .filter((entry) => String(entry.row_kind || "unit") === "unit")
+          .map((entry) => ({
+            value: String(entry.value || ""),
+            label: entry.label || "",
+            unit_type_id: entry.unit_type_id ?? null,
+            unit_type_name: entry.unit_type_name || "",
+            selling_currency: entry.selling_currency || "",
+            operating_currency: entry.operating_currency || ""
+          }));
+
+        const selectedValue =
+          preferredValue ||
+          parameterLockedUnitId ||
+          String(plantSelect.value || "").trim();
+
+        setLookupSelectOptions("parameter_plant_id", unitOptions, "Select unit", selectedValue);
+      }
+
+      function getParameterScopeKind() {
+        return String(getParameterFieldValue("parameter_kpi_type") || "").trim().toLowerCase() === "zone"
+          ? "zone"
+          : "unit";
+      }
+
+      function getParameterRowStateKey(scopeType, scopeId) {
+        const normalizedScopeType = String(scopeType || "unit").trim().toLowerCase() || "unit";
+        const normalizedScopeId = String(scopeId || "").trim();
+        if (!normalizedScopeId) return "";
+
+        return normalizedScopeType + ":" + normalizedScopeId;
+      }
+
+      function getParameterUnitState(scopeType, scopeId) {
+        const key = scopeId === undefined
+          ? String(scopeType || "").trim()
+          : getParameterRowStateKey(scopeType, scopeId);
+
+        return parameterUnitTargetState[key] || {};
+      }
+
+      function setParameterUnitState(scopeType, scopeId, patch = {}) {
+        const key = scopeId === undefined
+          ? getParameterRowStateKey("unit", scopeType)
+          : getParameterRowStateKey(scopeType, scopeId);
+
+        if (!key) return;
+
+        parameterUnitTargetState[key] = {
+          ...parameterUnitTargetState[key],
+          ...patch
+        };
+      }
+
+      function resetParameterUnitTargetState() {
+        parameterUnitTargetState = {};
+      }
+
+      function initializeParameterUnitTargetState(rows = []) {
+        resetParameterUnitTargetState();
+
+        (Array.isArray(rows) ? rows : []).forEach((row) => {
+          const scopeType = row?.zone_id ? "zone" : "unit";
+          const scopeId = row?.zone_id ?? row?.plant_id ?? row?.unit_id;
+          if (!scopeId) return;
+
+          setParameterUnitState(scopeType, scopeId, {
+            kpi_target_allocation_id: row.kpi_target_allocation_id ?? "",
+            target_value: row.target_value ?? "",
+            local_currency: row.local_currency ?? "",
+            target_setup_date: normalizeParameterDateValue(row?.target_setup_date) || getLocalDateInputValue(),
+            set_by_people_id: row.set_by_people_id ?? "",
+            responsible_id: row.set_by_people_id ?? "",
+            last_best_target: row.last_best_target ?? "",
+            approved_by_id: row.approved_by_people_id ?? ""
+          });
+        });
+      }
+
+      function updateParameterKpiSummary() {
+        const selectedKpi = getParameterKpiById(getParameterFieldValue("parameter_kpi_id"));
+        const targetUnitInput = document.getElementById("parameter_target_unit");
+        if (selectedKpi && targetUnitInput) {
+          ensureParameterTargetUnitOption(selectedKpi.unit || "");
+          targetUnitInput.value = selectedKpi.unit || "";
+        }
+        if (isIndividualParameterScope()) {
+          syncIndividualParameterFields();
+          return;
+        }
+        renderMultisiteUnitMatrix();
+      }
+
+      async function loadKpiNames(selectedValue = "") {
+        const select = document.getElementById("parameter_kpi_id");
+        if (!select) return;
+
+        const res = await fetch(
+          "/api/responsibles/" + responsibleId + "/kpis?include_all=1&_ts=" + Date.now(),
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+        parameterKpiCatalog = Array.isArray(data) ? data : [];
+
+        const grouped = parameterKpiCatalog.reduce((acc, kpi) => {
+          const subjectPath = String(kpi.subject || "Other KPIs").trim() || "Other KPIs";
+          if (!acc[subjectPath]) acc[subjectPath] = [];
+          acc[subjectPath].push(kpi);
+          return acc;
+        }, {});
+
+        const groupMarkup = Object.keys(grouped)
+          .sort((a, b) => a.localeCompare(b))
+          .map(subjectPath => {
+            const options = grouped[subjectPath]
+              .sort((a, b) => {
+                const nameCompare = buildParameterKpiOptionLabel(a).localeCompare(buildParameterKpiOptionLabel(b));
+                if (nameCompare !== 0) return nameCompare;
+                return String(a.indicator_title || "").localeCompare(String(b.indicator_title || ""));
+              })
+              .map(kpi =>
+                '<option value="' + escapeHtml(kpi.kpi_id) + '">' +
+                escapeHtml(buildParameterKpiOptionLabel(kpi)) +
+                '</option>'
+              ).join("");
+
+            return '<optgroup label="' + escapeHtml(getParameterKpiGroupLabel(subjectPath)) + '">' + options + '</optgroup>';
+          }).join("");
+
+        select.innerHTML =
+          '<option value="">Select KPI Name</option>' +
+          groupMarkup;
+
+        select.value = selectedValue || "";
+        updateParameterKpiSummary();
       }
 
       function escapeHtml(value) {
@@ -3553,26 +12162,2139 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
           .replace(/'/g, "&#39;");
       }
 
-      function setActiveNav(target) {
-        document.getElementById("navDashboard").classList.remove("active");
-        document.getElementById("navMyKpis").classList.remove("active");
-        document.getElementById(target).classList.add("active");
+const KPI_MODAL_FIELD_IDS = new Set([
+  "kpi_id",
+  "indicator_title",
+  "indicator_sub_title",
+  "subject",
+  "subject_node_id",
+  "subject_path_display",
+  "kpi_code",
+  "kpi_formula",
+  "unit",
+  "definition",
+  "frequency",
+  "target",
+  "tolerance_type",
+  "up_tolerance",
+  "low_tolerance",
+  "max",
+  "min",
+  "calculation_on",
+  "target_auto_adjustment",
+  "high_limit",
+  "low_limit",
+  "direction",
+  "nombre_periode",
+  "calculation_mode",
+  "reference_kpi_id",
+  "display_trend",
+  "regression",
+  "min_type",
+  "max_type",
+  "status",
+  "comments",
+  "owner_role_id"
+]);
+
+function getKpiFieldElement(id) {
+  if (!id) return null;
+
+  if (!KPI_MODAL_FIELD_IDS.has(id)) {
+    return document.getElementById(id);
+  }
+
+  const modalRoot = document.getElementById("modalBackdrop");
+  return modalRoot?.querySelector("#" + id) || document.getElementById(id);
+}
+
+function cloneDraftSnapshot(value) {
+  if (value === null || value === undefined) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+  function splitMultiValue(value) {
+  return String(value || "")
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+function getSelectedValues(selectId) {
+  const el = document.getElementById(selectId);
+  if (!el) return [];
+  return Array.from(el.selectedOptions).map(o => o.value).filter(Boolean);
+}
+
+function setToleranceTypeFromRadio(type) {
+  const toleranceTypeInput = document.getElementById("tolerance_type");
+  if (!toleranceTypeInput) return;
+
+  toleranceTypeInput.value = type;
+  handleToleranceTypeChange(toleranceTypeInput);
+}
+
+function setSelectOptions(selectId, options, placeholder, selectedValue = "") {
+  const selectEl = document.getElementById(selectId);
+  if (!selectEl) return;
+
+  const uniqueOptions = Array.from(new Set((options || []).filter(Boolean)));
+
+  selectEl.innerHTML =
+    '<option value="">' + escapeHtml(placeholder) + '</option>' +
+    uniqueOptions.map(option =>
+      '<option value="' + escapeHtml(option) + '">' + escapeHtml(option) + '</option>'
+    ).join("");
+
+  selectEl.value = selectedValue || "";
+  selectEl.disabled = uniqueOptions.length === 0;
+}
+
+
+
+
+function cleanLookupLabel(option, { stripTrailingNumericSuffix = false } = {}) {
+  let label =
+    option.unit_name ||
+    option.plant_name ||
+    option.zone_name ||
+    option.product_line_name ||
+    option.product_name ||
+    option.market_name ||
+    option.customer_name ||
+    option.display_name ||
+    option.name ||
+    option.label ||
+    option.value ||
+    "";
+
+  label = String(label).trim();
+
+  if (stripTrailingNumericSuffix) {
+    label = label.replace(/\s*[-:·•]\s*\d+\s*$/g, "").trim();
+  }
+
+  return label;
+}
+
+function dedupeLookupOptionsByLabel(options, selectedValue = "", cleanLabelOptions = {}) {
+  const selectedText = selectedValue === null || selectedValue === undefined
+    ? ""
+    : String(selectedValue);
+  const seenByLabel = new Map();
+
+  (Array.isArray(options) ? options : []).forEach((option) => {
+    if (!option || option.value === undefined || option.value === null) return;
+
+    const label = cleanLookupLabel(option, cleanLabelOptions);
+    const valueText = String(option.value);
+    const existingOption = seenByLabel.get(label);
+
+    if (!existingOption) {
+      seenByLabel.set(label, option);
+      return;
+    }
+
+    const existingValueText = String(existingOption.value);
+    if (valueText === selectedText && existingValueText !== selectedText) {
+      seenByLabel.set(label, option);
+    }
+  });
+
+  return Array.from(seenByLabel.values());
+}
+
+function setLookupSelectOptions(selectId, options, placeholder, selectedValue = "") {
+  const selectEl = getKpiFieldElement(selectId);
+  if (!selectEl) return;
+
+  const baseOptions = Array.isArray(options)
+    ? options.filter(option => option && option.value !== undefined && option.value !== null)
+    : [];
+
+  const selectedText = selectedValue === null || selectedValue === undefined ? "" : String(selectedValue);
+  const shouldStripTrailingNumericSuffix =
+    selectId === "parameter_plant_id" || selectId === "parameter_unit_id";
+  const normalizedOptions = selectId === "parameter_zone_id"
+    ? dedupeLookupOptionsByLabel(baseOptions, selectedText, {
+      stripTrailingNumericSuffix: false
+    })
+    : baseOptions;
+
+  selectEl.innerHTML =
+    '<option value="">' + escapeHtml(placeholder) + '</option>' +
+    normalizedOptions.map(option => {
+      const label = cleanLookupLabel(option, {
+        stripTrailingNumericSuffix: shouldStripTrailingNumericSuffix
+      });
+
+      return '<option value="' + escapeHtml(option.value) + '">' +
+        escapeHtml(label) +
+        '</option>';
+    }).join("");
+
+  if (selectedText && !normalizedOptions.some(option => String(option.value) === selectedText)) {
+    selectEl.insertAdjacentHTML(
+      "beforeend",
+      '<option value="' + escapeHtml(selectedText) + '">' +
+        escapeHtml(
+          shouldStripTrailingNumericSuffix
+            ? cleanLookupLabel({ label: selectedText }, { stripTrailingNumericSuffix: true })
+            : selectedText
+        ) +
+      '</option>'
+    );
+  }
+
+  selectEl.value = selectedText;
+  selectEl.disabled = normalizedOptions.length === 0;
+
+  if (selectId === "parameter_role_id") {
+    syncParameterRoleDropdown();
+  }
+}
+
+function getParameterRoleDropdownElements() {
+  return {
+    shell: document.getElementById("parameterRoleSelectShell"),
+    trigger: document.getElementById("parameterRoleTrigger"),
+    triggerLabel: document.getElementById("parameterRoleTriggerLabel"),
+    menu: document.getElementById("parameterRoleMenu"),
+    search: document.getElementById("parameterRoleSearch"),
+    options: document.getElementById("parameterRoleOptions"),
+    select: document.getElementById("parameter_role_id")
+  };
+}
+
+function closeParameterRoleDropdown({ restoreFocus = false } = {}) {
+  const { shell, trigger, menu, search } = getParameterRoleDropdownElements();
+  if (!shell || !trigger || !menu) return;
+
+  shell.classList.remove("is-open");
+  menu.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  if (search) {
+    search.value = "";
+  }
+
+  if (restoreFocus) {
+    trigger.focus();
+  }
+}
+
+function renderParameterRoleDropdownOptions(filterText = "") {
+  const { options, select } = getParameterRoleDropdownElements();
+  if (!options || !select) return;
+
+  const nativeOptions = Array.from(select.options || []);
+  const selectedValue = String(select.value || "");
+  const normalizedFilter = String(filterText || "").trim().toLowerCase();
+  const visibleOptions = nativeOptions.filter((option, index) => {
+    const value = String(option.value || "");
+    const label = String(option.text || option.label || value || "Select role");
+
+    if (!normalizedFilter) return true;
+    if (index === 0 && value === "") return false;
+
+    return label.toLowerCase().includes(normalizedFilter);
+  });
+
+  if (!visibleOptions.length) {
+    options.innerHTML = '<div class="parameter-role-empty">No roles match your search</div>';
+    return;
+  }
+
+  options.innerHTML = visibleOptions.map((option) => {
+    const value = String(option.value || "");
+    const label = String(option.text || option.label || value || "Select role");
+    const isSelected = value === selectedValue;
+    const isPlaceholder = value === "";
+
+    return '<button type="button" class="parameter-role-option' +
+      (isSelected ? ' is-selected' : '') +
+      (isPlaceholder ? ' is-placeholder' : '') +
+      '" role="option" aria-selected="' + (isSelected ? "true" : "false") +
+      '" data-value="' + escapeHtml(value) + '">' +
+      escapeHtml(label) +
+      '</button>';
+  }).join("");
+}
+
+function syncParameterRoleDropdown() {
+  const {
+    trigger,
+    triggerLabel,
+    search,
+    options,
+    select
+  } = getParameterRoleDropdownElements();
+
+  if (!trigger || !triggerLabel || !options || !select) return;
+
+  const nativeOptions = Array.from(select.options || []);
+  const selectedValue = String(select.value || "");
+  const selectedOption = nativeOptions.find(
+    (option) => String(option.value || "") === selectedValue
+  );
+  const placeholderText = nativeOptions[0]?.text || "Select role";
+
+  triggerLabel.textContent = selectedOption?.text || placeholderText;
+  trigger.disabled = Boolean(select.disabled);
+  trigger.classList.toggle("is-placeholder", !selectedValue);
+  if (search) {
+    search.disabled = Boolean(select.disabled);
+  }
+
+  if (!nativeOptions.length || (nativeOptions.length === 1 && String(nativeOptions[0].value || "") === "")) {
+    options.innerHTML = '<div class="parameter-role-empty">No roles available</div>';
+    closeParameterRoleDropdown();
+    return;
+  }
+
+  renderParameterRoleDropdownOptions("");
+  closeParameterRoleDropdown();
+}
+
+function ensureParameterRoleDropdownSpace() {
+  const { shell, menu, options } = getParameterRoleDropdownElements();
+  const modalBody = shell?.closest(".modal-body");
+  if (!shell || !menu || !options || !modalBody) return;
+
+  const shellRect = shell.getBoundingClientRect();
+  const bodyRect = modalBody.getBoundingClientRect();
+  const desiredHeight = Math.min((menu.scrollHeight || options.scrollHeight || 320), 420);
+  const overflow = shellRect.bottom + desiredHeight + 16 - bodyRect.bottom;
+
+  if (overflow > 0) {
+    modalBody.scrollTop += overflow;
+  }
+}
+
+function toggleParameterRoleDropdown(forceOpen) {
+  const { shell, trigger, menu, search, select } = getParameterRoleDropdownElements();
+  if (!shell || !trigger || !menu || !select || trigger.disabled || select.disabled) return;
+
+  const shouldOpen = typeof forceOpen === "boolean"
+    ? forceOpen
+    : menu.hidden;
+
+  if (!shouldOpen) {
+    closeParameterRoleDropdown();
+    return;
+  }
+
+  shell.classList.add("is-open");
+  menu.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  renderParameterRoleDropdownOptions("");
+  ensureParameterRoleDropdownSpace();
+
+  if (search) {
+    search.value = "";
+    setTimeout(() => {
+      search.focus();
+      search.select();
+    }, 0);
+  }
+}
+
+function applyParameterRoleDropdownValue(nextValue = "") {
+  const { select } = getParameterRoleDropdownElements();
+  if (!select) return;
+
+  const normalizedValue = String(nextValue || "");
+  if (String(select.value || "") === normalizedValue) {
+    closeParameterRoleDropdown({ restoreFocus: true });
+    return;
+  }
+
+  select.value = normalizedValue;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  syncParameterRoleDropdown();
+  closeParameterRoleDropdown({ restoreFocus: true });
+}
+
+function populateRoleOptions(selectedValue = "") {
+  setLookupSelectOptions("owner_role_id", roleOptions, "Select owner role", selectedValue);
+}
+
+function toggleScopedParameterField(fieldId, shouldShow, { clearOnHide = true } = {}) {
+  const field = document.getElementById(fieldId);
+  if (!field) return;
+
+  field.classList.toggle("is-hidden", !shouldShow);
+
+  const input = fieldId === "parameter_role_field"
+    ? document.getElementById("parameter_role_id")
+    : field.querySelector("input, select, textarea");
+  if (!input) return;
+
+  input.disabled = !shouldShow;
+  if (!shouldShow && clearOnHide) {
+    input.value = "";
+  }
+
+  if (fieldId === "parameter_role_field") {
+    syncParameterRoleDropdown();
+  }
+}
+
+function updateMultisiteResponsibleHint(unitEntry, responsibleEntry = null) {
+  const setByHint = document.getElementById("parameter_set_by_people_hint");
+  if (!setByHint) return;
+
+  const normalizedKpiType = getParameterFieldValue("parameter_kpi_type").toLowerCase();
+  if (normalizedKpiType !== "multisite") {
+    syncDashboardResponsibleAssignment();
+    return;
+  }
+
+  if (!unitEntry) {
+    setByHint.textContent = "Choose a unit card to assign its related responsible.";
+    return;
+  }
+
+  if (responsibleEntry) {
+    setByHint.textContent =
+      "Linked to " + unitEntry.label + ": " + responsibleEntry.label +
+      (responsibleEntry.role_name ? " · " + responsibleEntry.role_name : "") + ".";
+    return;
+  }
+
+  if (Array.isArray(unitEntry.responsibles) && unitEntry.responsibles.length) {
+    setByHint.textContent = "Select one of the related responsibles for " + unitEntry.label + ".";
+    return;
+  }
+
+  setByHint.textContent = "No related responsible is mapped to " + unitEntry.label + " yet.";
+}
+
+function selectMultisiteResponsible(unitId, peopleId = "") {
+  const unitEntry = getMultisiteUnitAssignment(unitId);
+  const plantSelect = document.getElementById("parameter_plant_id");
+  const setBySelect = document.getElementById("parameter_set_by_people_id");
+
+  if (plantSelect) {
+    plantSelect.value = unitEntry ? String(unitEntry.value || "") : "";
+  }
+
+  let responsibleEntry = peopleId
+    ? getMultisiteResponsibleEntry(unitEntry, peopleId)
+    : getMultisiteResponsibleEntry(unitEntry, getParameterFieldValue("parameter_set_by_people_id"));
+
+  if (!responsibleEntry) {
+    responsibleEntry = getDefaultMultisiteResponsible(unitEntry);
+  }
+
+  if (setBySelect) {
+    setBySelect.value = responsibleEntry ? String(responsibleEntry.people_id || "") : "";
+  }
+
+  renderMultisiteUnitMatrix();
+  if (typeof updateParameterOverview === "function") {
+    updateParameterOverview();
+  }
+}
+
+function selectMultisiteUnitCard(unitId) {
+  const unitEntry = getMultisiteUnitAssignment(unitId);
+  const plantSelect = document.getElementById("parameter_plant_id");
+  const setBySelect = document.getElementById("parameter_set_by_people_id");
+
+  if (plantSelect) {
+    plantSelect.value = unitEntry ? String(unitEntry.value || "") : "";
+  }
+
+  if (setBySelect) {
+    const currentResponsible = getMultisiteResponsibleEntry(unitEntry, setBySelect.value);
+    if (!currentResponsible) {
+      setBySelect.value = "";
+    }
+  }
+
+  renderMultisiteUnitMatrix();
+  if (typeof updateParameterOverview === "function") {
+    updateParameterOverview();
+  }
+}
+
+function renderMultisiteUnitMatrix() {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl) return;
+ 
+  const scopeKind       = getParameterScopeKind();
+  const selectedKpiId   = getParameterFieldValue("parameter_kpi_id");
+  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+  const selectedKpiUnit = getParameterSelectedKpiUnit();
+  const scopeLabel      = scopeKind === "zone" ? "Zone" : "Unit";
+ 
+  if (!selectedKpiId) {
+    renderParameterTableEmptyState("Select a KPI name to load the KPI unit and available target rows.");
+    return;
+  }
+ 
+  if (scopeKind !== "zone" && !selectedUnitTypeId && !parameterLockedUnitId) {
+    renderParameterTableEmptyState("Select a unit type to display the units that should receive targets.");
+    return;
+  }
+ 
+  const visibleRows = getParameterVisibleUnitRows();
+  if (!visibleRows.length) {
+    renderParameterTableEmptyState(
+      scopeKind === "zone"
+        ? "No zones were found in the zone table."
+        : "No units were found for the selected unit type."
+    );
+    return;
+  }
+ 
+  /* Build people <option> list once, reused for Responsible + Approved By */
+  const peopleOptions =
+    '<option value="">Select…</option>' +
+    (allocationLookups.people || [])
+      .map(p =>
+        '<option value="' + escapeHtml(p.value) + '">' +
+        escapeHtml(p.label) +
+        '</option>'
+      )
+      .join('');
+ 
+  matrixEl.innerHTML =
+    '<div class="multisite-table-wrap">' +
+      '<table class="multisite-table">' +
+        '<thead>' +
+          '<tr>' +
+            '<th>' + escapeHtml(scopeLabel) + '</th>' +
+            '<th>Sell Currency</th>' +
+            '<th>Target Value</th>' +
+            '<th>Setup Date</th>' +
+            '<th>KPI Unit</th>' +
+            '<th>Responsible</th>' +
+          '</tr>' +
+        '</thead>' +
+        '<tbody>' +
+          visibleRows.map(function(scopeEntry) {
+            const scopeId       = String(scopeEntry.value || "");
+            const scopeEntryKind = scopeEntry.row_kind || "unit";
+            const state         = getParameterUnitState(scopeEntryKind, scopeId);
+            const dk            = escapeHtml(scopeEntryKind);
+            const ds            = escapeHtml(scopeId);
+ 
+            return '' +
+              '<tr>' +
+                /* ── Unit / Zone name ── */
+                '<td>' +
+                  '<div class="parameter-unit-name">' + escapeHtml(scopeEntry.label || "") + '</div>' +
+                  '<div class="parameter-unit-meta">' + escapeHtml(getParameterUnitMetaText(scopeEntry) || (scopeLabel + " target row")) + '</div>' +
+                '</td>' +
+ 
+                /* ── Sell Currency (read-only pill) ── */
+                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>' +
+ 
+                /* ── Target Value ── */
+                '<td>' +
+                  '<input class="parameter-unit-target-input"' +
+                    ' data-scope-kind="' + dk + '" data-scope-id="' + ds + '"' +
+                    ' type="number" step="any" placeholder="Enter target value"' +
+                    ' value="' + escapeHtml(state.target_value ?? "") + '" />' +
+                '</td>' +
+ 
+                /* ── Setup Date ── */
+                '<td>' +
+                  '<input class="parameter-unit-setup-date-input"' +
+                    ' data-scope-kind="' + dk + '" data-scope-id="' + ds + '"' +
+                    ' type="date"' +
+                    ' value="' + escapeHtml(
+                      normalizeParameterDateValue(
+                        state.target_setup_date ?? getParameterFieldValue("parameter_target_setup_date")
+                      ) || getLocalDateInputValue()
+                    ) + '" />' +
+                '</td>' +
+ 
+                /* ── KPI Unit (read-only pill) ── */
+                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
+ 
+                /* ── Responsible ── */
+                '<td>' +
+                  '<select class="parameter-unit-responsible-select"' +
+                    ' data-scope-kind="' + dk + '" data-scope-id="' + ds + '">' +
+                    peopleOptions +
+                  '</select>' +
+                '</td>' +
+ 
+              
+ 
+              '</tr>';
+          }).join("") +
+        '</tbody>' +
+      '</table>' +
+    '</div>';
+ 
+  /* ── Restore select values saved in state (must happen after innerHTML) ── */
+  visibleRows.forEach(function(scopeEntry) {
+    const scopeId        = String(scopeEntry.value || "");
+    const scopeEntryKind = scopeEntry.row_kind || "unit";
+    const state          = getParameterUnitState(scopeEntryKind, scopeId);
+ 
+    const respSel = matrixEl.querySelector(
+      '.parameter-unit-responsible-select[data-scope-id="' + scopeId + '"]'
+    );
+    if (respSel && state.responsible_id)    respSel.value = state.responsible_id;
+ 
+    const appSel = matrixEl.querySelector(
+      '.parameter-unit-approved-by-select[data-scope-id="' + scopeId + '"]'
+    );
+    if (appSel && state.approved_by_id)     appSel.value = state.approved_by_id;
+  });
+ 
+  /* ── Event listeners ── */
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach(function(input) {
+    input.addEventListener("input", function(event) {
+      const sk = event.target.getAttribute("data-scope-kind");
+      const si = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(sk, si, { target_value: event.target.value });
+      syncPrimaryParameterFieldsFromTable();
+    });
+  });
+ 
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-setup-date-input")).forEach(function(input) {
+    input.addEventListener("change", function(event) {
+      const sk = event.target.getAttribute("data-scope-kind");
+      const si = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(sk, si, { target_setup_date: event.target.value });
+      syncPrimaryParameterFieldsFromTable();
+    });
+  });
+ 
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-responsible-select")).forEach(function(sel) {
+    sel.addEventListener("change", function(event) {
+      const sk = event.target.getAttribute("data-scope-kind");
+      const si = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(sk, si, { responsible_id: event.target.value });
+    });
+  });
+ 
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-approved-by-select")).forEach(function(sel) {
+    sel.addEventListener("change", function(event) {
+      const sk = event.target.getAttribute("data-scope-kind");
+      const si = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(sk, si, { approved_by_id: event.target.value });
+    });
+  });
+ 
+  syncPrimaryParameterFieldsFromTable();
+}
+
+function autoFillSetByFromUnit() {
+  const normalizedKpiType = getParameterFieldValue("parameter_kpi_type").toLowerCase();
+  if (normalizedKpiType !== "multisite") return;
+
+  const selectedUnitId = getParameterFieldValue("parameter_plant_id");
+  if (!selectedUnitId) {
+    renderMultisiteUnitMatrix();
+    return;
+  }
+
+  selectMultisiteUnitCard(selectedUnitId);
+}
+
+function syncDashboardResponsibleAssignment() {
+  const setBySelect = document.getElementById("parameter_set_by_people_id");
+  const setByHint = document.getElementById("parameter_set_by_people_hint");
+  if (!setBySelect) return;
+
+  setBySelect.dataset.lockedResponsible = "false";
+  setBySelect.disabled = false;
+
+  if (setByHint) {
+    setByHint.textContent = "Responsible is resolved automatically from the selected unit and role.";
+  }
+}
+
+function populateAllocationLookupOptions(values = {}) {
+  setLookupSelectOptions("parameter_plant_id", allocationLookups.plants, "Select unit", values.parameter_plant_id || values.plant_id || "");
+  setLookupSelectOptions("parameter_zone_id", allocationLookups.zones, "Select zone", values.parameter_zone_id || values.zone_id || "");
+
+  setLookupSelectOptions(
+    "parameter_zone_unit_id",
+    getParameterZoneUnitOptions(),
+    "Select unit",
+    values.parameter_zone_unit_id || values.unit_id || values.plant_id || ""
+  );
+
+  setLookupSelectOptions(
+    "parameter_zone_product_id",
+    allocationLookups.products,
+    "Select product",
+    values.parameter_zone_product_id || values.product_id || ""
+  );
+
+  setLookupSelectOptions("parameter_unit_id", allocationLookups.units, "Select unit", values.parameter_unit_id || values.unit_id || "");
+  setLookupSelectOptions("parameter_unit_type_id", allocationLookups.unitTypes, "Select unit type", values.parameter_unit_type_id || values.unit_type_id || "");
+  populateParameterRoleScopeOptions(values.parameter_role_id || values.role_id || "");
+  setLookupSelectOptions("parameter_product_line_id", allocationLookups.productLines, "Select product line", values.parameter_product_line_id || values.product_line_id || "");
+  setLookupSelectOptions("parameter_product_id", allocationLookups.products, "Select product", values.parameter_product_id || values.product_id || "");
+  setLookupSelectOptions("parameter_market_id", allocationLookups.markets, "Select market", values.parameter_market_id || values.market_id || "");
+  setLookupSelectOptions("parameter_customer_id", allocationLookups.customers, "Select customer", values.parameter_customer_id || values.customer_id || "");
+  setLookupSelectOptions("parameter_set_by_people_id", allocationLookups.people, "Select person", values.parameter_set_by_people_id || values.set_by_people_id || "");
+  setLookupSelectOptions("parameter_approved_by_people_id", allocationLookups.people, "Select approver", values.parameter_approved_by_people_id || values.approved_by_people_id || "");
+
+  ensureParameterTargetUnitOption(values.parameter_target_unit || values.target_unit || "");
+
+  syncDashboardResponsibleAssignment();
+  syncParameterScopePresentation();
+  syncParameterPlantOptions(values.parameter_plant_id || values.plant_id || "");
+  syncIndividualParameterFields();
+  renderMultisiteUnitMatrix();
+}
+
+function getParameterVisibleUnitRows() {
+  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+  const selectedUnitTypeLabel = getParameterSelectedUnitTypeLabel().toLowerCase();
+  const filteredUnits = getParameterAllocationUnits()
+    .filter((unitEntry) => String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group")
+    .filter((unitEntry) => {
+      if (!selectedUnitTypeId) return true;
+
+      const entryTypeId = String(unitEntry.unit_type_id || "").trim();
+      const entryTypeName = String(unitEntry.unit_type_name || "").trim().toLowerCase();
+
+      return (
+        entryTypeId === String(selectedUnitTypeId) ||
+        (selectedUnitTypeLabel && entryTypeName === selectedUnitTypeLabel)
+      );
+    });
+
+  if (parameterLockedUnitId) {
+    return filteredUnits.filter(
+      (unitEntry) => String(unitEntry.value || "") === String(parameterLockedUnitId)
+    );
+  }
+
+  if (parameterEditMode) {
+    const savedScopeKeys = new Set(Object.keys(parameterUnitTargetState || {}));
+    const scopedEditedUnits = filteredUnits.filter((unitEntry) =>
+      savedScopeKeys.has(getParameterRowStateKey("unit", unitEntry.value))
+    );
+
+    if (scopedEditedUnits.length) {
+      return scopedEditedUnits;
+    }
+  }
+
+  return filteredUnits;
+}
+
+function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
+  if (!unitEntry || !Array.isArray(unitEntry.responsibles)) return null;
+
+  const normalizedRoleId = String(roleId || "").trim();
+  const responsibles = unitEntry.responsibles
+    .filter((entry) => entry && entry.people_id)
+    .sort((left, right) => Number(Boolean(right.is_primary)) - Number(Boolean(left.is_primary)));
+
+  if (!normalizedRoleId) {
+    return responsibles[0] || null;
+  }
+
+  return responsibles.find(
+    (entry) => String(entry.role_id || "") === normalizedRoleId
+  ) || null;
+}
+
+function getParameterUnitMetaText(unitEntry) {
+  if (!unitEntry) return "";
+
+  const parts = [];
+  const roleId = getParameterFieldValue("parameter_role_id");
+  const roleLabel = getParameterRoleLabel(roleId);
+  const matchedResponsible = getParameterMatchedResponsible(unitEntry, roleId);
+  const localCurrency = unitEntry.selling_currency || unitEntry.operating_currency || "";
+
+  if (unitEntry.unit_type_name) {
+    parts.push(unitEntry.unit_type_name);
+  }
+
+  if (localCurrency) {
+    parts.push(localCurrency + " currency");
+  }
+
+  if (matchedResponsible) {
+    parts.push((roleLabel || matchedResponsible.role_name || "Role") + ": " + matchedResponsible.label);
+  } else if (roleLabel) {
+    parts.push("No active " + roleLabel + " assigned");
+  }
+
+  return parts.filter(Boolean).join(" • ");
+}
+
+function getParameterUnitAllocationRows() {
+  const kpiUnit             = getParameterSelectedKpiUnit();
+  const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || responsibleId || "";
+  const sharedRoleId        = getParameterFieldValue("parameter_role_id");
+  const sharedUnitTypeId    = getParameterFieldValue("parameter_unit_type_id");
+  const fallbackSetupDate   =
+    getParameterFieldValue("parameter_target_setup_date") ||
+    getLocalDateInputValue();
+ 
+  return getParameterVisibleUnitRows()
+    .map(function(scopeEntry) {
+      const scopeKind  = scopeEntry.row_kind || "unit";
+      const scopeId    = String(scopeEntry.value || "").trim();
+      const state      = getParameterUnitState(scopeKind, scopeId);
+      const targetValue      = String(state.target_value ?? "").trim();
+      const targetSetupDate  = String(state.target_setup_date ?? "").trim() || fallbackSetupDate;
+ 
+      if (!targetValue) return null;
+ 
+      /* Per-row responsible falls back to the shared dashboard responsible */
+      const rowResponsibleId =
+        String(state.responsible_id || "").trim() || sharedSetByPeopleId;
+ 
+      return {
+        plant_id:            scopeKind === "unit" ? scopeId : null,
+        zone_id:             scopeKind === "zone" ? scopeId : null,
+        unit_type_id:        scopeKind === "unit"
+                               ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
+                               : null,
+        role_id:             scopeKind === "unit" ? sharedRoleId : null,
+        target_value:        targetValue,
+        target_setup_date:   targetSetupDate,
+        target_unit:         kpiUnit,
+        local_currency:      scopeKind === "unit" ? (scopeEntry.local_currency || "") : "",
+        set_by_people_id:    rowResponsibleId,
+        last_best_target:    String(state.last_best_target ?? "").trim() || null,
+        approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
+      };
+    })
+    .filter(Boolean);
+}
+
+function syncPrimaryParameterFieldsFromTable() {
+  const allocationRows = getParameterUnitAllocationRows();
+  const primaryRow = allocationRows[0] || null;
+
+  const plantInput = document.getElementById("parameter_plant_id");
+  const targetValueInput = document.getElementById("parameter_target_value");
+  const targetUnitInput = document.getElementById("parameter_target_unit");
+  const localCurrencyInput = document.getElementById("parameter_local_currency");
+
+  if (plantInput) {
+    plantInput.value = primaryRow?.plant_id || parameterLockedUnitId || "";
+  }
+
+  if (targetValueInput) {
+    targetValueInput.value = primaryRow?.target_value || "";
+  }
+
+  if (targetUnitInput) {
+    const kpiUnit = getParameterSelectedKpiUnit();
+    ensureParameterTargetUnitOption(primaryRow?.target_unit || kpiUnit);
+    targetUnitInput.value = primaryRow?.target_unit || kpiUnit || "";
+  }
+
+  if (localCurrencyInput) {
+    localCurrencyInput.value = primaryRow?.local_currency || "";
+  }
+}
+
+function renderParameterTableEmptyState(message) {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl) return;
+
+  matrixEl.innerHTML = '<div class="parameter-table-empty">' + escapeHtml(message) + '</div>';
+}
+
+function handleParameterKpiTypeChange() {
+  renderMultisiteUnitMatrix();
+}
+
+
+function autoFillSetByFromUnit() {
+  if (isIndividualParameterScope()) {
+    syncIndividualParameterFields();
+    return;
+  }
+
+  renderMultisiteUnitMatrix();
+}
+
+
+function getParameterVisibleUnitRows() {
+  const scopeKind = getParameterScopeKind();
+
+// AFTER — filter zones by the selected role:
+if (scopeKind === "zone") {
+
+  const selectedRole = String(
+    getParameterFieldValue("parameter_role_id") || "__all_roles__"
+  ).trim();
+
+  return (allocationLookups.zones || [])
+    .filter(zoneEntry => {
+
+      if (selectedRole === "__all_roles__") {
+        return true;
+      }
+
+      return (
+        String(zoneEntry.role || "").trim() === selectedRole
+      );
+    })
+    .map(zoneEntry => ({
+      row_kind: "zone",
+
+      value: String(
+        zoneEntry.value || zoneEntry.zone_id || ""
+      ),
+
+      label:
+        zoneEntry.label ||
+        zoneEntry.zone_name ||
+        "",
+
+      local_currency: "",
+
+      responsable_zone:
+        zoneEntry.responsable_zone || "",
+ 
+      role:
+        String(zoneEntry.role || "").trim()
+    }));
+}
+
+  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+  const selectedUnitTypeLabel = getParameterSelectedUnitTypeLabel().toLowerCase();
+  const filteredUnits = getParameterAllocationUnits()
+    .filter((unitEntry) => String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group")
+    .filter((unitEntry) => {
+      if (!selectedUnitTypeId) return true;
+
+      const entryTypeId = String(unitEntry.unit_type_id || "").trim();
+      const entryTypeName = String(unitEntry.unit_type_name || "").trim().toLowerCase();
+
+      return (
+        entryTypeId === String(selectedUnitTypeId) ||
+        (selectedUnitTypeLabel && entryTypeName === selectedUnitTypeLabel)
+      );
+    })
+    .map((unitEntry) => ({
+      ...unitEntry,
+      row_kind: "unit",
+      local_currency: unitEntry.selling_currency || unitEntry.operating_currency || ""
+    }));
+
+  if (parameterLockedUnitId) {
+    return filteredUnits.filter(
+      (unitEntry) => String(unitEntry.value || "") === String(parameterLockedUnitId)
+    );
+  }
+
+  if (parameterEditMode) {
+    const savedScopeKeys = new Set(Object.keys(parameterUnitTargetState || {}));
+    const scopedEditedUnits = filteredUnits.filter((unitEntry) =>
+      savedScopeKeys.has(getParameterRowStateKey("unit", unitEntry.value))
+    );
+
+    if (scopedEditedUnits.length) {
+      return scopedEditedUnits;
+    }
+  }
+
+  return filteredUnits;
+}
+
+function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
+  if (!unitEntry || unitEntry.row_kind === "zone" || !Array.isArray(unitEntry.responsibles)) return null;
+
+  const normalizedRoleId = String(roleId || "").trim();
+  const responsibles = unitEntry.responsibles
+    .filter((entry) => entry && entry.people_id)
+    .sort((left, right) => Number(Boolean(right.is_primary)) - Number(Boolean(left.is_primary)));
+
+  if (!normalizedRoleId) {
+    return null;
+  }
+
+  return responsibles.find(
+    (entry) => String(entry.role_id || "") === normalizedRoleId
+  ) || null;
+}
+
+function getParameterPeopleLabel(peopleId) {
+  const normalizedPeopleId = String(peopleId || "").trim();
+  if (!normalizedPeopleId) return "";
+
+  const matchedPerson = (allocationLookups.people || []).find(
+    (option) => String(option.value || "") === normalizedPeopleId
+  );
+
+  return String(matchedPerson?.label || ("Person " + normalizedPeopleId)).trim();
+}
+
+function resolveParameterResponsibleEntry(scopeEntry, state = null) {
+  if (!scopeEntry) return null;
+
+  const scopeKind = scopeEntry.row_kind || "unit";
+  const scopeId = String(scopeEntry.value || "").trim();
+  const roleId = getParameterFieldValue("parameter_role_id");
+  const rowState = state || getParameterUnitState(scopeKind, scopeId);
+  const matchedResponsible = getParameterMatchedResponsible(scopeEntry, roleId);
+
+  if (matchedResponsible?.people_id) {
+    return {
+      ...matchedResponsible,
+      people_id: String(matchedResponsible.people_id),
+      label:
+        matchedResponsible.label ||
+        getParameterPeopleLabel(matchedResponsible.people_id) ||
+        ("Person " + matchedResponsible.people_id),
+      source: "role"
+    };
+  }
+
+  if (scopeKind === "zone") {
+    const zoneResponsibleLabel = String(
+      scopeEntry.responsable_zone ||
+      rowState?.responsable_zone ||
+      ""
+    ).trim();
+
+    if (zoneResponsibleLabel) {
+      return {
+        people_id: "",
+        label: zoneResponsibleLabel,
+        source: "zone-table"
+      };
+    }
+
+    const explicitPeopleId = String(
+      rowState?.set_by_people_id ||
+      rowState?.responsible_id ||
+      ""
+    ).trim();
+
+    if (!explicitPeopleId) {
+      return null;
+    }
+
+    return {
+      people_id: explicitPeopleId,
+      label: getParameterPeopleLabel(explicitPeopleId) || ("Person " + explicitPeopleId),
+      source: "zone-explicit"
+    };
+  }
+
+  return null;
+}
+
+function getParameterResponsibleCellNote(scopeEntry, responsibleEntry) {
+  const roleLabel = getParameterRoleLabel(getParameterFieldValue("parameter_role_id"));
+
+  if (scopeEntry?.row_kind === "zone") {
+    return "";
+  }
+
+  if (!roleLabel) {
+    return "Enter the role please.";
+  }
+
+  if (responsibleEntry?.source === "role") {
+    return isIndividualParameterScope()
+      ? roleLabel + " matched automatically from the selected unit."
+      : "";
+  }
+
+  return "";
+}
+
+function syncIndividualParameterFields() {
+  const setBySelect = document.getElementById("parameter_set_by_people_id");
+  const setByHint = document.getElementById("parameter_set_by_people_hint");
+  const targetUnitInput = document.getElementById("parameter_target_unit");
+  const setupDateInput = document.getElementById("parameter_target_setup_date");
+
+  if (!isIndividualParameterScope()) {
+    if (setBySelect) {
+      setBySelect.disabled = false;
+      setBySelect.classList.remove("readonly-input");
+    }
+    return;
+  }
+
+  const kpiUnit = getParameterSelectedKpiUnit();
+
+  if (targetUnitInput) {
+    ensureParameterTargetUnitOption(kpiUnit);
+    targetUnitInput.value = getParameterFieldValue("parameter_target_unit") || kpiUnit || "";
+  }
+
+  if (setupDateInput && !String(setupDateInput.value || "").trim()) {
+    setupDateInput.value = getLocalDateInputValue();
+  }
+
+  if (setBySelect) {
+    setBySelect.disabled = false;
+    setBySelect.classList.remove("readonly-input");
+    setBySelect.dataset.autoResolved = "false";
+  }
+
+  if (setByHint) {
+    setByHint.textContent = "Select the responsible person for this individual target.";
+  }
+}
+
+function getParameterUnitMetaText(unitEntry) {
+  if (!unitEntry) return "";
+  return "";
+
+  if (unitEntry.row_kind === "zone") {
+    return "Zone from zone table";
+  }
+
+  const parts = [];
+  const roleId = getParameterFieldValue("parameter_role_id");
+  const roleLabel = getParameterRoleLabel(roleId);
+  const matchedResponsible = getParameterMatchedResponsible(unitEntry, roleId);
+  const localCurrency = unitEntry.selling_currency || unitEntry.operating_currency || "";
+
+  if (unitEntry.unit_type_name) {
+    parts.push(unitEntry.unit_type_name);
+  }
+
+  if (localCurrency) {
+    parts.push(localCurrency + " currency");
+  }
+
+  if (matchedResponsible) {
+    parts.push((roleLabel || matchedResponsible.role_name || "Role") + ": " + matchedResponsible.label);
+  } else if (roleLabel) {
+    parts.push("No active " + roleLabel + " assigned");
+  }
+
+  return parts.filter(Boolean).join(" • ");
+}
+
+function getParameterUnitAllocationRows() {
+  const kpiUnit = getParameterSelectedKpiUnit();
+  const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || "";
+  const sharedRoleId = getNormalizedParameterRoleId();
+  const sharedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+  const fallbackSetupDate = getParameterFieldValue("parameter_target_setup_date") || getLocalDateInputValue();
+
+  if (isIndividualParameterScope()) {
+    const plantId = String(getParameterFieldValue("parameter_plant_id") || parameterLockedUnitId || "").trim();
+    const unitEntry = getParameterUnitById(plantId);
+    const existingState = plantId ? getParameterUnitState("unit", plantId) : {};
+    const targetValue = String(getParameterFieldValue("parameter_target_value") || "").trim();
+    const selectedResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
+
+    if (!targetValue) return [];
+
+    return [{
+      kpi_target_allocation_id:
+        String(
+          existingState.kpi_target_allocation_id ||
+          getParameterFieldValue("parameter_object_id") ||
+          ""
+        ).trim() || null,
+      plant_id: plantId || null,
+      zone_id: null,
+      unit_type_id: sharedUnitTypeId || String(unitEntry?.unit_type_id || "").trim() || null,
+      role_id: sharedRoleId || null,
+      target_value: targetValue,
+      target_setup_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_setup_date")) || fallbackSetupDate,
+      target_unit: getParameterFieldValue("parameter_target_unit") || kpiUnit,
+      local_currency: getParameterFieldValue("parameter_local_currency") || unitEntry?.selling_currency || unitEntry?.operating_currency || "",
+      set_by_people_id: selectedResponsibleId || null,
+      last_best_target: getParameterFieldValue("parameter_last_best_target") || null,
+      approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id") || null
+      }];
+     }
+
+  return getParameterVisibleUnitRows()
+    .map((scopeEntry) => {
+      const scopeKind = scopeEntry.row_kind || "unit";
+      const scopeId = String(scopeEntry.value || "").trim();
+      const state = getParameterUnitState(scopeKind, scopeId);
+      const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
+      const rowResponsibleId = String(
+        scopeKind === "zone"
+          ? (resolvedResponsible?.people_id || "")
+          : (resolvedResponsible?.people_id || sharedSetByPeopleId || "")
+      ).trim();
+      const targetValue = String(state.target_value ?? "").trim();
+      const targetSetupDate = normalizeParameterDateValue(state.target_setup_date) || fallbackSetupDate;
+      if (!targetValue) return null;
+
+      return {
+      kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
+      plant_id: scopeKind === "unit" ? scopeId : null,
+      zone_id: scopeKind === "zone" ? scopeId : null,
+
+     unit_id: null,
+     product_id: scopeKind === "zone" ? null : getParameterFieldValue("parameter_product_id"),
+        unit_type_id: scopeKind === "unit" ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || "")) : null,
+        role_id: scopeKind === "zone" ? null : (sharedRoleId || null),
+        target_value: targetValue,
+        target_setup_date: targetSetupDate,
+        target_unit: kpiUnit,
+        local_currency: scopeKind === "unit" ? (scopeEntry.local_currency || "") : "",
+        set_by_people_id: rowResponsibleId,
+        last_best_target: String(state.last_best_target ?? "").trim(),
+        approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
+      };
+    })
+    .filter(Boolean);
+}
+
+function syncPrimaryParameterFieldsFromTable() {
+  if (isIndividualParameterScope()) {
+    syncIndividualParameterFields();
+    return;
+  }
+
+  const allocationRows = getParameterUnitAllocationRows();
+  const primaryRow = allocationRows[0] || null;
+
+  const plantInput = document.getElementById("parameter_plant_id");
+  const zoneInput = document.getElementById("parameter_zone_id");
+  const targetValueInput = document.getElementById("parameter_target_value");
+  const targetUnitInput = document.getElementById("parameter_target_unit");
+  const localCurrencyInput = document.getElementById("parameter_local_currency");
+  const lastBestTargetInput = document.getElementById("parameter_last_best_target");
+  const targetSetupDateInput = document.getElementById("parameter_target_setup_date");
+  const setByInput = document.getElementById("parameter_set_by_people_id");
+  const approvedByInput = document.getElementById("parameter_approved_by_people_id");
+
+  if (plantInput) {
+    plantInput.value = primaryRow?.plant_id || parameterLockedUnitId || "";
+  }
+
+  if (zoneInput) {
+    zoneInput.value = primaryRow?.zone_id || parameterLockedZoneId || "";
+  }
+
+  if (targetValueInput) {
+    targetValueInput.value = primaryRow?.target_value || "";
+  }
+
+  if (targetUnitInput) {
+    const kpiUnit = getParameterSelectedKpiUnit();
+    ensureParameterTargetUnitOption(primaryRow?.target_unit || kpiUnit);
+    targetUnitInput.value = primaryRow?.target_unit || kpiUnit || "";
+  }
+
+  if (localCurrencyInput) {
+    localCurrencyInput.value = primaryRow?.local_currency || "";
+  }
+
+  if (lastBestTargetInput) {
+    lastBestTargetInput.value = primaryRow?.last_best_target ?? "";
+  }
+
+  if (targetSetupDateInput) {
+    targetSetupDateInput.value =
+      normalizeParameterDateValue(primaryRow?.target_setup_date) ||
+      normalizeParameterDateValue(targetSetupDateInput.value) ||
+      getLocalDateInputValue();
+  }
+
+  if (setByInput) {
+    setByInput.value = primaryRow?.set_by_people_id || setByInput.value || "";
+  }
+
+  if (approvedByInput) {
+    approvedByInput.value = primaryRow?.approved_by_people_id ?? "";
+  }
+}
+
+function renderParameterTableEmptyState(message) {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl) return;
+
+  matrixEl.innerHTML = '<div class="parameter-table-empty">' + escapeHtml(message) + '</div>';
+}
+
+async function lookupZoneFromManufacturingStrategy() {
+  const unitId   = getParameterFieldValue("parameter_zone_unit_id");
+  const productId = getParameterFieldValue("parameter_zone_product_id");
+  const displayEl = document.getElementById("parameter_zone_resolved_display");
+
+  parameterZoneLookupPending = false;
+  parameterResolvedZoneId = "";
+  parameterLockedZoneId   = "";
+
+  if (!unitId || !productId) {
+    if (displayEl) {
+      displayEl.value = "";
+      displayEl.placeholder = unitId
+        ? "Now select a product..."
+        : "Select unit & product first...";
+    }
+    renderMultisiteUnitMatrix();
+    return;
+  }
+
+  if (displayEl) {
+    displayEl.value = "";
+    displayEl.placeholder = "Looking up zone...";
+  }
+
+  parameterZoneLookupPending = true;
+
+  try {
+    const res  = await fetch(
+      "/api/manufacturing-strategy/zone?unit_id=" +
+      encodeURIComponent(unitId) + "&product_id=" + encodeURIComponent(productId)
+    );
+    const data = await res.json();
+
+ const zones = Array.isArray(data.zones) ? data.zones : [];
+
+  if (zones.length) {
+   parameterLockedZoneIds = zones.map((z) => String(z.zone_id));
+   parameterResolvedZoneId = parameterLockedZoneIds[0] || "";
+   parameterLockedZoneId = parameterResolvedZoneId;
+
+      /* Resolve zone name from already-loaded allocationLookups.zones */
+    const firstZone = zones[0] || {};
+    const zoneEntry = (allocationLookups.zones || []).find(
+     z => String(z.value) === String(firstZone.zone_id)
+     );
+    const zoneName = zoneEntry?.label || firstZone.zone_name || ("Zone #" + firstZone.zone_id);
+
+      if (displayEl) {
+        displayEl.value       = zoneName;
+        displayEl.placeholder = "";
+      }
+    } else {
+      parameterResolvedZoneId = "";
+      parameterLockedZoneId   = "";
+
+      if (displayEl) {
+        displayEl.value       = "";
+        displayEl.placeholder = "No zone found for this unit + product";
+      }
+    }
+  } catch (err) {
+    parameterResolvedZoneId = "";
+    parameterLockedZoneId   = "";
+    if (displayEl) {
+      displayEl.value       = "";
+      displayEl.placeholder = "Error looking up zone";
+    }
+  }
+
+  parameterZoneLookupPending = false;
+  renderMultisiteUnitMatrix();
+}
+
+
+function syncParameterScopePresentation() {
+  const scopeKind   = getParameterScopeKind();
+  const isZoneScope = scopeKind === "zone";
+ 
+  const kpiType      = getParameterFieldValue("parameter_kpi_type").toLowerCase();
+  const hasKpiType   = Boolean(String(getParameterFieldValue("parameter_kpi_type") || "").trim());
+  const isIndividual = kpiType === "individual";
+  const shouldRequireRole = hasKpiType && !isZoneScope;
+ 
+  const tableLabel = document.getElementById("parameter_scope_table_label");
+  const tableHint  = document.getElementById("parameter_scope_table_hint");
+  const tableCopy  = document.getElementById("parameter_scope_table_copy");
+  const tableBadge = document.getElementById("parameter_scope_table_badge");
+  const zoneDisplayEl = document.getElementById("parameter_zone_resolved_display");
+  const roleLabelEl = document.getElementById("parameter_role_label");
+  const roleHintEl = document.getElementById("parameter_role_hint");
+ 
+  /* ── bottom section: only for Individual ── */
+  const allocSection = document.getElementById("parameterAllocationFieldsSection");
+  if (allocSection) {
+    allocSection.classList.toggle("is-hidden", !isIndividual);
+    allocSection.classList.toggle("is-individual-layout", isIndividual);
+    allocSection.setAttribute("aria-hidden", String(!isIndividual));
+    Array.from(allocSection.querySelectorAll("input, select, textarea")).forEach((field) => {
+      field.disabled = !isIndividual;
+    });
+  }
+ 
+  /* ── matrix table: hidden for Individual, shown for Multisite / Zone ── */
+  toggleScopedParameterField("parameter_multisite_matrix_field", !isIndividual);
+ 
+  /* ── scope fields: Multisite only in the latest Individual layout ── */
+  toggleScopedParameterField("parameter_unit_type_field", !isZoneScope && !isIndividual, { clearOnHide: false });
+  toggleScopedParameterField("parameter_role_field",      hasKpiType && !isZoneScope, { clearOnHide: false });
+  toggleScopedParameterField("parameter_plant_field",     false, { clearOnHide: false });
+  toggleScopedParameterField("parameter_previous_target_field", !isIndividual, { clearOnHide: false });
+  toggleScopedParameterField("parameter_target_start_date_field", !isIndividual, { clearOnHide: false });
+  toggleScopedParameterField("parameter_target_end_date_field", !isIndividual, { clearOnHide: false });
+  toggleScopedParameterField("parameter_target_status_field", !isIndividual, { clearOnHide: false });
+  toggleScopedParameterField("parameter_comments_field", !isIndividual, { clearOnHide: false });
+ 
+/* ── always-hidden dropdowns ── */
+toggleScopedParameterField("parameter_zone_field", false, { clearOnHide: false });
+toggleScopedParameterField("parameter_function_field", false);
+toggleScopedParameterField("parameter_zone_unit_field", false, { clearOnHide: false });
+toggleScopedParameterField("parameter_zone_product_field", false, { clearOnHide: false });
+toggleScopedParameterField("parameter_zone_resolved_field", false, { clearOnHide: false });
+
+  if (roleLabelEl) {
+    roleLabelEl.innerHTML = shouldRequireRole
+      ? 'Role <span style="color:#ef4444;">*</span>'
+      : "Role";
+  }
+  if (roleHintEl) {
+    roleHintEl.textContent = isZoneScope
+      ? "Filter zones by role or keep All roles"
+      : "Loaded from role table";
+  }
+  populateParameterRoleScopeOptions(getParameterFieldValue("parameter_role_id"));
+
+  if (!isZoneScope) {
+    parameterZoneLookupPending = false;
+    parameterResolvedZoneId = "";
+    parameterLockedZoneId   = "";
+    parameterLockedZoneIds = [];
+    if (zoneDisplayEl) {
+      zoneDisplayEl.value = "";
+      zoneDisplayEl.placeholder = "Select unit and product first";
+    }
+  }
+ 
+  if (isIndividual) {
+    parameterLockedUnitId  = "";
+    parameterLockedZoneId  = "";
+    syncParameterPlantOptions();
+    syncIndividualParameterFields();
+    return;
+  }
+ 
+if (isZoneScope) {
+    parameterLockedUnitId = "";
+    parameterZoneLookupPending = false;
+    parameterResolvedZoneId = "";
+    parameterLockedZoneId = "";
+    parameterLockedZoneIds = [];
+
+    /* Show zone role only; the zones themselves come directly from the zone table */
+    toggleScopedParameterField("parameter_unit_type_field", false);
+    toggleScopedParameterField("parameter_role_field", true, { clearOnHide: false });
+    toggleScopedParameterField("parameter_zone_unit_field", false);
+    toggleScopedParameterField("parameter_zone_product_field", false);
+    toggleScopedParameterField("parameter_zone_resolved_field", false);
+
+    if (tableLabel) tableLabel.textContent = "Zone Target Table";
+    if (tableHint)  tableHint.textContent  = "Enter a target for each zone. The responsible is loaded automatically from the zone table.";
+    if (tableCopy)  tableCopy.textContent  =
+      "Choose a KPI and set the KPI type to Zone. The table below will list the zones from the zone table, then you can enter a target for each zone while keeping the responsible synced from the zone table.";
+    if (tableBadge) tableBadge.textContent = "Zone View";
+    return;
+  }
+ 
+  parameterLockedZoneId = "";
+  if (tableLabel) tableLabel.textContent = "Unit Target Table";
+  if (tableHint)  tableHint.textContent  = "Enter a target for each unit. Responsible is linked automatically from the selected role.";
+  if (tableCopy)  tableCopy.textContent  =
+    "Choose a KPI, KPI type, unit type and role. The table below will list matching units, resolve the related responsible automatically, and keep the KPI unit from the selected KPI.";
+  if (tableBadge) tableBadge.textContent = "Unit Type View";
+}
+
+function handleParameterKpiTypeChange() {
+  syncParameterScopePresentation();
+  syncParameterPlantOptions();
+  syncIndividualParameterFields();
+
+  if (!isIndividualParameterScope()) {
+    renderMultisiteUnitMatrix();
+  }
+}
+
+function renderMultisiteUnitMatrix() {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl) return;
+
+  const scopeKind = getParameterScopeKind();
+  const selectedKpiId = getParameterFieldValue("parameter_kpi_id");
+  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+  const selectedRoleId = getParameterFieldValue("parameter_role_id");
+  const selectedKpiUnit = getParameterSelectedKpiUnit();
+  const scopeLabel = scopeKind === "zone" ? "Zone" : "Unit";
+
+  if (!selectedKpiId) {
+    renderParameterTableEmptyState("Select a KPI name to load the KPI unit and available target rows.");
+    return;
+  }
+
+  if (scopeKind !== "zone" && !selectedUnitTypeId && !parameterLockedUnitId) {
+    renderParameterTableEmptyState("Select a unit type to display the units that should receive targets.");
+    return;
+  }
+
+  if (scopeKind !== "zone" && !selectedRoleId) {
+    renderParameterTableEmptyState("Enter the role please to load the target table and resolve the related responsible for each unit.");
+    return;
+  }
+
+  const visibleRows = getParameterVisibleUnitRows();
+  if (!visibleRows.length) {
+    renderParameterTableEmptyState(
+      scopeKind === "zone"
+        ? "No zones were found in the zone table."
+        : "No units were found for the selected unit type."
+    );
+    return;
+  }
+
+  matrixEl.innerHTML =
+    '<div class="multisite-table-wrap">' +
+      '<table class="multisite-table">' +
+        '<thead>' +
+          '<tr>' +
+            '<th>' + escapeHtml(scopeLabel) + '</th>' +
+            '<th>Sell Currency</th>' +
+            '<th>KPI Unit</th>' +
+            '<th>Target Value</th>' +
+            '<th>Setup Date</th>' +
+            '<th>Responsible</th>' +
+          '</tr>' +
+        '</thead>' +
+        '<tbody>' +
+          visibleRows.map((scopeEntry) => {
+            const scopeId = String(scopeEntry.value || "");
+            const scopeEntryKind = scopeEntry.row_kind || "unit";
+            const state = getParameterUnitState(scopeEntryKind, scopeId);
+            const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
+            const responsibleLabel = resolvedResponsible?.label || "";
+            const responsibleNote = getParameterResponsibleCellNote(scopeEntry, resolvedResponsible);
+            const responsiblePlaceholder = scopeKind === "zone"
+              ? "No responsible assigned"
+              : (selectedRoleId ? "No responsible assigned" : "Enter the role please");
+            const responsibleInputClass =
+              "readonly-input parameter-unit-responsible-input" +
+              (responsibleLabel ? "" : " is-empty");
+            const responsibleNoteClass =
+              "parameter-unit-cell-note" +
+              (resolvedResponsible ? " is-linked" : " is-warning");
+            const responsibleNoteMarkup = responsibleNote
+              ? '<div class="' + responsibleNoteClass + '">' + escapeHtml(responsibleNote) + '</div>'
+              : "";
+            return '' +
+              '<tr>' +
+                '<td>' +
+                  '<div class="parameter-unit-name">' + escapeHtml(scopeEntry.label || "") + '</div>' +
+                  (getParameterUnitMetaText(scopeEntry)
+                    ? '<div class="parameter-unit-meta">' + escapeHtml(getParameterUnitMetaText(scopeEntry)) + '</div>'
+                    : '') +
+                '</td>' +
+                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>' +
+                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
+                '<td>' +
+                  '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(state.target_value ?? "") + '" />' +
+                '</td>' +
+                '<td>' +
+                  '<input class="parameter-unit-setup-date-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="date" value="' + escapeHtml(normalizeParameterDateValue(state.target_setup_date ?? getParameterFieldValue("parameter_target_setup_date")) || getLocalDateInputValue()) + '" />' +
+                '</td>' +
+                '<td>' +
+                  '<input class="' + responsibleInputClass + '" type="text" readonly tabindex="-1" value="' + escapeHtml(responsibleLabel) + '" placeholder="' + escapeHtml(responsiblePlaceholder) + '" />' +
+                  responsibleNoteMarkup +
+                '</td>' +
+              '</tr>';
+          }).join("") +
+        '</tbody>' +
+      '</table>' +
+    '</div>';
+
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((input) => {
+    input.addEventListener("input", (event) => {
+      const scopeKind = event.target.getAttribute("data-scope-kind");
+      const scopeId = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(scopeKind, scopeId, { target_value: event.target.value });
+      syncPrimaryParameterFieldsFromTable();
+    });
+  });
+
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-setup-date-input")).forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const scopeKind = event.target.getAttribute("data-scope-kind");
+      const scopeId = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(scopeKind, scopeId, { target_setup_date: event.target.value });
+      syncPrimaryParameterFieldsFromTable();
+    });
+  });
+
+  Array.from(matrixEl.querySelectorAll(".parameter-unit-approved-by-select")).forEach((select) => {
+    select.addEventListener("change", (event) => {
+      const scopeKind = event.target.getAttribute("data-scope-kind");
+      const scopeId = event.target.getAttribute("data-scope-id");
+      setParameterUnitState(scopeKind, scopeId, { approved_by_id: event.target.value });
+      syncPrimaryParameterFieldsFromTable();
+    });
+  });
+
+  syncPrimaryParameterFieldsFromTable();
+}
+
+function autoFillSetByFromUnit() {
+  if (isIndividualParameterScope()) {
+    syncIndividualParameterFields();
+    return;
+  }
+
+  renderMultisiteUnitMatrix();
+}
+
+function getFieldValue(id) {
+  const el = document.getElementById(id);
+  return el ? String(el.value || "").trim() : "";
+}
+
+const subjectTreeNodeLookup = new Map();
+let subjectTreeExpandedIds = new Set();
+let subjectTreeSelectedFlow = [];
+const SUBJECT_TREE_MAX_LEVELS = 4;
+
+function getAllSubjectTreeIds(nodes = getSubjectTreeRoots(), target = new Set()) {
+  (Array.isArray(nodes) ? nodes : []).forEach((node) => {
+    if (!node || !node.id) return;
+    target.add(String(node.id));
+    getAllSubjectTreeIds(Array.isArray(node.children) ? node.children : [], target);
+  });
+  return target;
+}
+
+function registerSubjectTreeNodes(nodes = []) {
+  nodes.forEach((node) => {
+    if (!node || !node.id) return;
+
+    subjectTreeNodeLookup.set(String(node.id), node);
+    registerSubjectTreeNodes(Array.isArray(node.children) ? node.children : []);
+  });
+}
+
+registerSubjectTreeNodes(Array.isArray(kpiSubjectHierarchy) ? kpiSubjectHierarchy : []);
+
+function getSubjectTreeRoots() {
+  return Array.isArray(kpiSubjectHierarchy) ? kpiSubjectHierarchy : [];
+}
+
+function getSubjectNode(nodeId) {
+  return nodeId ? subjectTreeNodeLookup.get(String(nodeId)) || null : null;
+}
+
+function getSubjectNodeParent(nodeId) {
+  const node = getSubjectNode(nodeId);
+  return node && node.parent_id ? getSubjectNode(node.parent_id) : null;
+}
+
+function getSubjectNodeAncestors(nodeId) {
+  const ancestors = [];
+  let currentNode = getSubjectNode(nodeId);
+
+  while (currentNode && currentNode.parent_id) {
+    const parentNode = getSubjectNode(currentNode.parent_id);
+    if (!parentNode) break;
+    ancestors.unshift(parentNode);
+    currentNode = parentNode;
+  }
+
+  return ancestors;
+}
+
+function getDefaultSubjectTreeExpandedIds() {
+  return getAllSubjectTreeIds();
+}
+
+function updateSubjectTreeCurrentPath(node = null) {
+  const currentPathEl = document.getElementById("subjectTreeCurrentPath");
+  if (!currentPathEl) return;
+
+  const pathText = node?.full_path || getFieldValue("subject_path_display") || "";
+  currentPathEl.textContent = pathText || "No subject selected yet.";
+}
+
+function updateSubjectTreeTrigger(node = null, fallbackLabel = "") {
+  const labelEl = document.getElementById("subjectTreeLabel");
+  const metaEl = document.getElementById("subjectTreeMeta");
+  const chevronEl = document.getElementById("subjectTreeChevron");
+  const treeSelect = document.getElementById("subjectTreeSelect");
+  const fallbackPath = getFieldValue("subject_path_display") || fallbackLabel || "";
+
+  if (labelEl) {
+    labelEl.textContent = node?.full_path || fallbackPath || "Select subject from tree";
+  }
+
+  if (metaEl) {
+    metaEl.textContent = node?.full_path || fallbackPath ? "" : "Open the visual hierarchy to choose a subject and follow its branch.";
+  }
+
+  updateSubjectTreeCurrentPath(node);
+
+  if (chevronEl && treeSelect) {
+    chevronEl.textContent = treeSelect.classList.contains("open") ? "▴" : "▾";
+  }
+}
+
+function toggleSubjectTree(forceOpen) {
+  const treeSelect = document.getElementById("subjectTreeSelect");
+  if (!treeSelect) return;
+
+  const shouldOpen = typeof forceOpen === "boolean"
+    ? forceOpen
+    : !treeSelect.classList.contains("open");
+
+  treeSelect.classList.toggle("open", shouldOpen);
+  updateSubjectTreeTrigger(getSubjectNode(getFieldValue("subject_node_id")));
+}
+
+function closeSubjectTree() {
+  toggleSubjectTree(false);
+}
+
+function getSubjectFlowColumns() {
+  var roots = getSubjectTreeRoots();
+  var columns = [roots];
+  var currentNodes = roots;
+
+  subjectTreeSelectedFlow.forEach(function(selectedId) {
+    if (columns.length >= SUBJECT_TREE_MAX_LEVELS) {
+      return;
+    }
+    var selectedNode = null;
+    for (var i = 0; i < currentNodes.length; i++) {
+      if (String(currentNodes[i].id) === String(selectedId)) {
+        selectedNode = currentNodes[i];
+        break;
+      }
+    }
+    if (selectedNode && Array.isArray(selectedNode.children) && selectedNode.children.length) {
+      columns.push(selectedNode.children);
+      currentNodes = selectedNode.children;
+    }
+  });
+
+  return columns;
+}
+
+function isSubjectTreeTerminalLevel(level) {
+  return level >= (SUBJECT_TREE_MAX_LEVELS - 1);
+}
+
+function renderSubjectFlowColumn(nodes = [], level = 0) {
+  return ''
+    + '<div class="subject-flow-column' + (subjectTreeSelectedFlow[level] ? ' is-active' : '') + '">'
+    +   '<div class="subject-flow-column-title">'
+    +     ('Level ' + (level + 1) + ' · ' + (level === 0 ? 'Parent subjects' : 'Related subjects'))
+    +   '</div>'
+    +   nodes.map((node) => {
+          const nodeId = String(node.id || '');
+          const isSelected = subjectTreeSelectedFlow[level] === nodeId;
+          const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+          const metaText = hasChildren ? node.children.length + ' children' : 'Leaf';
+
+          return ''
+            + '<button type="button"'
+            + ' class="subject-flow-card' + (isSelected ? ' selected' : '') + '"'
+            + ' onclick="selectSubjectFlowNode(&quot;' + escapeHtml(nodeId) + '&quot;, ' + level + ')">'
+            +   '<span class="subject-flow-kicker">L' + level + ' · ' + escapeHtml(metaText) + '</span>'
+            +   '<span class="subject-flow-name">' + escapeHtml(node.name || '') + '</span>'
+            +   '<span class="subject-flow-path">' + escapeHtml(node.parent_name || node.full_path || '') + '</span>'
+            + '</button>';
+        }).join('')
+    + '</div>';
+}
+   
+let currentTreeSearch = '';
+
+function renderSubjectTree() {
+  var treeList = document.getElementById('subjectTreeList');
+  var statusEl = document.getElementById('subjectTreeFitMeta');
+  if (!treeList) return;
+
+  var columns = getSubjectFlowColumns();
+  var search = (currentTreeSearch || '').toLowerCase().trim();
+
+  var levelTitles = ['Parent subjects', 'Related subjects', 'Sub-category', 'KPI subjects'];
+  var badgeClasses = ['sf-badge-l0', 'sf-badge-l1', 'sf-badge-l2', 'sf-badge-l3'];
+
+  var html = '<div class="sf-flow">';
+
+  columns.forEach(function(nodes, colIndex) {
+    var selectedId = subjectTreeSelectedFlow[colIndex] || '';
+    var levelTitle = levelTitles[colIndex] || ('Level ' + (colIndex + 1));
+    var badgeClass = badgeClasses[colIndex] || 'sf-badge-lx';
+
+    var filteredNodes = search
+      ? nodes.filter(function(n) { return nodeMatchesSearch(n, search); })
+      : nodes;
+    var isTerminalColumn = isSubjectTreeTerminalLevel(colIndex);
+
+    var itemsHtml = filteredNodes.map(function(node) {
+      var nodeId = String(node.id || '');
+      var hasChildren = Array.isArray(node.children) && node.children.length > 0;
+      var isSelected = selectedId === nodeId;
+      var childCount = hasChildren ? node.children.length : 0;
+      var metaText = hasChildren && !isTerminalColumn
+        ? childCount + ' ' + (childCount === 1 ? 'child' : 'children')
+        : 'Leaf · select this';
+
+      return '<button type="button"' +
+        ' class="sf-item' + (isSelected ? ' sf-selected' : '') + '"' +
+        ' onclick="selectSubjectFlowNode(\\'' + escapeHtml(nodeId) + '\\', ' + colIndex + ')">' +
+        '<span class="sf-badge ' + badgeClass + '">L' + colIndex + '</span>' +
+        '<span class="sf-item-body">' +
+          '<span class="sf-item-name">' + (search ? highlightText(node.name || '', currentTreeSearch) : escapeHtml(node.name || '')) + '</span>' +
+          '<span class="sf-item-meta">' + escapeHtml(metaText) + '</span>' +
+        '</span>' +
+        '<span class="sf-arrow' + (hasChildren && !isTerminalColumn ? '' : ' sf-arrow-hidden') + '">&#9654;</span>' +
+      '</button>';
+    }).join('');
+
+    if (!itemsHtml) {
+      itemsHtml = '<div style="padding:14px 10px;font-size:11px;color:#94a3b8;text-align:center;">No matches</div>';
+    }
+
+    html += '<div class="sf-column">' +
+      '<div class="sf-col-head">' +
+        '<span class="sf-col-level">Level ' + (colIndex + 1) + '</span>' +
+        '<span class="sf-col-title">' + escapeHtml(levelTitle) + '</span>' +
+        '<span class="sf-col-count">' + filteredNodes.length + ' items</span>' +
+      '</div>' +
+      '<div class="sf-col-body">' + itemsHtml + '</div>' +
+    '</div>';
+  });
+
+  html += '</div>';
+  treeList.innerHTML = html;
+
+  if (statusEl) {
+    statusEl.textContent = columns.length + ' level' + (columns.length !== 1 ? 's' : '');
+  }
+
+  // Scroll selected item into view
+  setTimeout(function() {
+    var sel = treeList.querySelector('.sf-selected');
+    if (sel) { sel.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+  }, 60);
+}
+
+
+function setSubjectSelectedFlow(nodeId) {
+  var node = getSubjectNode(nodeId);
+  if (!node) return;
+  var ancestorIds = getSubjectNodeAncestors(node.id).map(function(a) { return String(a.id); });
+  subjectTreeSelectedFlow = ancestorIds.concat(String(node.id));
+}
+
+function selectSubjectFlowNode(nodeId, level) {
+  var node = getSubjectNode(nodeId);
+  if (!node) return;
+
+  subjectTreeSelectedFlow = subjectTreeSelectedFlow.slice(0, level);
+  subjectTreeSelectedFlow[level] = String(nodeId);
+
+  var hasChildren = Array.isArray(node.children) && node.children.length > 0;
+  if (hasChildren && !isSubjectTreeTerminalLevel(level)) {
+    updateSubjectTreeTrigger(node);   // ← ADD THIS LINE
+    renderSubjectTree();
+    return;
+  }
+
+  selectSubjectNode(node.id, { keepOpen: false });
+}
+
+function resetSubjectFlow() {
+  subjectTreeSelectedFlow = [];
+  var searchEl = document.getElementById('subjectTreeSearch');
+  if (searchEl) { searchEl.value = ''; }
+  currentTreeSearch = '';
+  renderSubjectTree();
+}
+
+function onSubjectTreeSearch(term) {
+  currentTreeSearch = term.trim();
+  renderSubjectTree();
+}
+
+function expandAllSubjectTree() { renderSubjectTree(); }
+function collapseAllSubjectTree() { renderSubjectTree(); }
+function toggleSubjectTreeNode() { renderSubjectTree(); }
+
+function syncDefinitionTextareaHeight() {
+  const definitionEl = getKpiFieldElement("definition");
+  if (!definitionEl || definitionEl.tagName !== "TEXTAREA") return;
+
+  definitionEl.style.height = "auto";
+  definitionEl.style.overflowY = "hidden";
+  definitionEl.style.height = Math.max(definitionEl.scrollHeight, 62) + "px";
+}
+
+function findSubjectNodeForValues(values = {}) {
+  const subjectNodeId = normalizeNullableFieldValue(values.subject_node_id || values.subject_id);
+  const subjectText = normalizeNullableFieldValue(values.subject);
+  const categoryText = normalizeNullableFieldValue(values.indicator_title);
+  const nameText = normalizeNullableFieldValue(values.indicator_sub_title);
+
+  if (subjectNodeId) {
+    const directNode = getSubjectNode(subjectNodeId);
+    if (directNode) return directNode;
+  }
+
+  if (subjectText) {
+    const directSubjectMatch = Array.from(subjectTreeNodeLookup.values()).find((node) =>
+      String(node.full_path || "") === subjectText || String(node.name || "") === subjectText
+    );
+    if (directSubjectMatch) return directSubjectMatch;
+  }
+
+  if (nameText && categoryText) {
+    const matches = Array.from(subjectTreeNodeLookup.values()).filter((node) => String(node.name || "") === nameText);
+    const parentMatch = matches.find((node) => {
+      const parentNode = getSubjectNodeParent(node.id);
+      return parentNode && (
+        String(parentNode.name || "") === categoryText ||
+        String(parentNode.full_path || "") === categoryText
+      );
+    });
+
+    if (parentMatch) return parentMatch;
+
+    const pathMatch = matches.find((node) => String(node.full_path || "").includes(categoryText));
+    if (pathMatch) return pathMatch;
+  }
+
+  if (nameText) {
+    const nameMatches = Array.from(subjectTreeNodeLookup.values()).filter((node) => String(node.name || "") === nameText);
+    if (nameMatches.length === 1) {
+      return nameMatches[0];
+    }
+  }
+
+  return null;
+}
+
+function selectSubjectNode(nodeId, { preserveName = false, preserveSubtitle = false, preserveDefinition = false, fallbackDefinition = "", keepOpen = true } = {}) {
+  const node = getSubjectNode(nodeId);
+  if (!node) return;
+
+  const parentNode = getSubjectNodeParent(node.id);
+  setSubjectSelectedFlow(node.id);
+
+  const subjectInput = getKpiFieldElement("subject");
+  const subjectNodeInput = getKpiFieldElement("subject_node_id");
+  const categoryInput = getKpiFieldElement("indicator_title");
+  const nameInput = getKpiFieldElement("indicator_sub_title");
+  const pathDisplayInput = getKpiFieldElement("subject_path_display");
+  const definitionEl = getKpiFieldElement("definition");
+
+  if (subjectInput) subjectInput.value = node.full_path || node.name || "";
+  if (subjectNodeInput) subjectNodeInput.value = node.id || "";
+  if (categoryInput && (!preserveSubtitle || !String(categoryInput.value || "").trim())) {
+    categoryInput.value = parentNode ? parentNode.name || "" : node.name || "";
+  }
+  if (pathDisplayInput) pathDisplayInput.value = node.full_path || node.name || "";
+
+
+
+  if (definitionEl) {
+    if (preserveDefinition) {
+      definitionEl.value = fallbackDefinition || "";
+    }
+    syncDefinitionTextareaHeight();
+  }
+
+  updateSubjectTreeTrigger(node);
+  renderSubjectTree();
+  toggleSubjectTree(keepOpen);
+  updateModalOverview();
+}
+
+function selectSubjectTreeNode(nodeId) {
+  const node = getSubjectNode(nodeId);
+  if (!node) return;
+
+  const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+  if (hasChildren) {
+    setSubjectSelectedFlow(node.id);
+    renderSubjectTree();
+    return;
+  }
+
+  selectSubjectNode(node.id, { keepOpen: false });
+}
+
+function initializeKpiHierarchySelectors(values = {}) {
+  subjectTreeSelectedFlow = [];
+
+  const subjectInput = getKpiFieldElement("subject");
+  const subjectNodeInput = getKpiFieldElement("subject_node_id");
+  const categoryInput = getKpiFieldElement("indicator_title");
+  const nameInput = getKpiFieldElement("indicator_sub_title");
+  const pathDisplayInput = getKpiFieldElement("subject_path_display");
+  const definitionEl = getKpiFieldElement("definition");
+
+  if (subjectInput) subjectInput.value = "";
+  if (subjectNodeInput) subjectNodeInput.value = "";
+  if (categoryInput) categoryInput.value = "";
+  if (pathDisplayInput) pathDisplayInput.value = "";
+  if (nameInput) nameInput.value = values.indicator_sub_title || "";
+  if (definitionEl) {
+    definitionEl.value = values.definition || "";
+    syncDefinitionTextareaHeight();
+  }
+
+  const matchedNode = findSubjectNodeForValues(values);
+  if (matchedNode) {
+    selectSubjectNode(matchedNode.id, {
+      preserveName: true,
+      preserveSubtitle: true,
+      preserveDefinition: true,
+      fallbackDefinition: values.definition || "",
+      keepOpen: false
+    });
+  } else {
+    if (subjectInput) subjectInput.value = values.subject || "";
+    if (categoryInput) categoryInput.value = values.indicator_title || "";
+    if (pathDisplayInput) pathDisplayInput.value = values.subject || "";
+    updateSubjectTreeTrigger(null, getLastPathSegment(values.subject || ""));
+    renderSubjectTree();
+    closeSubjectTree();
+  }
+
+  syncDefinitionTextareaHeight();
+}
+
+function formatReferenceKpiLabel(row) {
+  if (!row) return "";
+
+  const kpiName = String(row.indicator_sub_title || "").trim();
+
+  return  (kpiName ? " " + kpiName : "");
+}
+
+function getReferenceKpiCandidates() {
+  const currentKpiId = getFieldValue("kpi_id");
+
+  return (referenceKpiRows || []).filter(row =>
+    row &&
+    row.kpi_id !== undefined &&
+    row.kpi_id !== null &&
+    String(row.kpi_id) !== String(currentKpiId)
+  );
+}
+
+function getReferenceKpiRow(referenceKpiId) {
+  return (referenceKpiRows || []).find(row => String(row.kpi_id) === String(referenceKpiId)) || null;
+}
+
+function populateReferenceKpiOptions(selectedValue = "") {
+  const selectEl = getKpiFieldElement("reference_kpi_id");
+  if (!selectEl) return;
+
+  const selectedText = String(selectedValue || "").trim();
+  const candidates = getReferenceKpiCandidates();
+  const options = candidates.map(row => ({
+    value: String(row.kpi_id),
+    label: formatReferenceKpiLabel(row)
+  }));
+
+  if (selectedText && !options.some(option => option.value === selectedText)) {
+    options.push({
+      value: selectedText,
+      label: "#" + selectedText
+    });
+  }
+
+  selectEl.innerHTML =
+    '<option value="">Select reference KPI</option>' +
+    options.map(option =>
+      '<option value="' + escapeHtml(option.value) + '">' + escapeHtml(option.label) + '</option>'
+    ).join("");
+
+  selectEl.value = selectedText;
+  selectEl.disabled = options.length === 0;
+}
+
+function updateDisplayedKpiPreview() {
+  const previewEl = document.getElementById("displayed_kpi_preview");
+  if (!previewEl) return;
+
+  const referenceKpiId = getFieldValue("reference_kpi_id");
+  const referenceRow = referenceKpiId ? getReferenceKpiRow(referenceKpiId) : null;
+  const referenceLabel = referenceRow
+  ? String(referenceRow.indicator_sub_title || "").trim()
+  : "";
+
+  previewEl.value = referenceLabel
+    ? "Displayed KPI = Raw value / " + referenceLabel + " x 100"
+    : "Displayed KPI = Raw value / Reference KPI x 100";
+}
+
+function handleCalculationModeChange() {
+  const mode = getFieldValue("calculation_mode").toLowerCase();
+  const isRatio = mode === "ratio";
+
+  const referenceWrap = document.getElementById("wrap_reference_kpi_id");
+  const displayedWrap = document.getElementById("wrap_displayed_kpi_preview");
+  const helpWrap = document.getElementById("wrap_ratio_mode_help");
+  const modeRow = referenceWrap ? referenceWrap.closest(".calc-logic-row") : null;
+
+  if (referenceWrap) referenceWrap.style.display = isRatio ? "" : "none";
+  const arrowMode = document.getElementById("calc_mode_arrow");
+  if (arrowMode) arrowMode.style.display = isRatio ? "" : "none";
+  if (modeRow) modeRow.classList.toggle("is-split", isRatio);
+  if (displayedWrap) displayedWrap.style.display = isRatio ? "" : "none";
+  if (helpWrap) helpWrap.style.display = isRatio ? "" : "none";
+
+  if (isRatio) {
+    populateReferenceKpiOptions(getFieldValue("reference_kpi_id"));
+    updateDisplayedKpiPreview();
+  } else {
+    const previewEl = document.getElementById("displayed_kpi_preview");
+    if (previewEl) previewEl.value = "";
+  }
+
+  syncKpiRequiredState();
+}
+
+     function setActiveNav(target) {
+        ["navDashboard", "navMyKpis", "navConsultAllocations"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.classList.remove("active");
+        });
+        const activeEl = document.getElementById(target);
+        if (activeEl) activeEl.classList.add("active");
       }
 
       function showDashboard() {
         document.getElementById("dashboardSection").style.display = "block";
         document.getElementById("myKpisSection").style.display = "none";
+        document.getElementById("consultTargetAllocationsSection").style.display = "none";
         setActiveNav("navDashboard");
       }
 
       async function showMyKpis() {
         document.getElementById("dashboardSection").style.display = "none";
         document.getElementById("myKpisSection").style.display = "block";
+        document.getElementById("consultTargetAllocationsSection").style.display = "none";
         setActiveNav("navMyKpis");
 
         if (!chartsLoaded) {
           await loadKpiCharts();
           chartsLoaded = true;
+        }
+      }
+
+      async function showConsultTargetAllocations() {
+        document.getElementById("dashboardSection").style.display = "none";
+        document.getElementById("myKpisSection").style.display = "none";
+        document.getElementById("consultTargetAllocationsSection").style.display = "block";
+        setActiveNav("navConsultAllocations");
+
+        if (!parameterSourceRows.length) {
+          await loadParameterKpis();
+        } else {
+          applyParameterSearch();
         }
       }
 
@@ -3582,107 +14304,1082 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
         const withTarget = rows.filter(r => r.target !== null && r.target !== undefined && String(r.target).trim() !== "").length;
         const tolerance = rows.filter(r => r.tolerance_type && String(r.tolerance_type).trim() !== "").length;
 
-        document.getElementById("statTotal").textContent = total;
-        document.getElementById("statMonthly").textContent = monthly;
-        document.getElementById("statTarget").textContent = withTarget;
-        document.getElementById("statTolerance").textContent = tolerance;
+        
       }
 
-  function renderKpis(rows) {
-  currentRows = rows || [];
+function getLastPathSegment(pathText) {
+  const normalizedText = String(pathText || "").trim();
+  if (!normalizedText) return "";
+
+  const parts = normalizedText
+    .split("/")
+    .map((part) => String(part || "").trim())
+    .filter(Boolean);
+
+  return parts.length ? parts[parts.length - 1] : normalizedText;
+}
+
+function getKpiCategory(row) {
+  const parts = splitParameterPath(row.full_subject_path || row.subject || row.indicator_title || "");
+  if (parts.length >= 2) return parts[parts.length - 2];
+  if (parts.length === 1) return parts[0];
+  return String(row.indicator_title || "").trim() || "General";
+}
+
+function getKpiStatusClass(status) {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (normalizedStatus === "active") return "parameter-status-active";
+  if (normalizedStatus === "draft") return "parameter-status-draft";
+  if (normalizedStatus === "approved") return "parameter-status-approved";
+  if (normalizedStatus === "closed" || normalizedStatus === "archived") return "parameter-status-closed";
+  if (normalizedStatus === "inactive") return "parameter-status-neutral";
+  return "parameter-status-neutral";
+}
+
+function formatKpiDetailTimestamp(value) {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function formatKpiDetailNumber(value, unit = "") {
+  const formatted = formatParameterDisplayValue(value);
+  if (formatted === "-") return "-";
+  return unit ? formatted + " " + unit : formatted;
+}
+
+function buildKpiDetailItem(label, value) {
+  return (
+    '<div class="kpi-detail-item">' +
+      '<div class="kpi-detail-item-label">' + escapeHtml(label) + '</div>' +
+      '<div class="kpi-detail-item-value">' + escapeHtml(value || "-") + '</div>' +
+    '</div>'
+  );
+}
+
+function renderKpiDetailsModalContent(kpi = {}) {
+  const isOwned = typeof kpi?.is_owned_by_responsible === "boolean"
+    ? kpi.is_owned_by_responsible
+    : String(kpi.created_by_people_id || "") === String(responsibleId || "");
+  const visibilityText = isOwned ? "Owned by this responsible" : "Visible in consult mode";
+
+  function hasValue(v) {
+    if (v === null || v === undefined) return false;
+    const s = String(v).trim();
+    return s !== "" && s !== "-" && s.toLowerCase() !== "null" && s.toLowerCase() !== "undefined";
+  }
+
+  function fmtNum(v, unit) {
+    const r = formatKpiDetailNumber(v, unit || "");
+    return hasValue(r) && r !== "-" ? r : "";
+  }
+
+  function field(label, value) {
+    if (!hasValue(value)) return "";
+    return '<div class="kdr-field">' +
+      '<span class="kdr-label">' + escapeHtml(label) + '</span>' +
+      '<span class="kdr-value">' + escapeHtml(String(value)) + '</span>' +
+    '</div>';
+  }
+
+  function row(sectionLabel, colClass, ...fields) {
+    const rendered = fields.filter(Boolean).join("");
+    if (!rendered) return "";
+    return '<div class="kdr-section-label">' + escapeHtml(sectionLabel) + '</div>' +
+      '<div class="kpi-detail-row ' + colClass + '">' + rendered + '</div>';
+  }
+
+  const unit = kpi.unit || "";
+
+  /* Count filled fields per section to pick the right col class */
+  function colClass(fields) {
+    const filled = fields.filter(hasValue).length;
+    if (filled <= 2) return "row-cols-2";
+    if (filled <= 3) return "row-cols-3";
+    if (filled <= 4) return "row-cols-4";
+    if (filled <= 5) return "row-cols-5";
+    return "row-cols-6";
+  }
+
+/* ── Identity ── */
+const identityFields = [
+  kpi.indicator_sub_title,
+  kpi.full_subject_path || kpi.subject,
+  kpi.kpi_code,
+  kpi.kpi_formula
+];
+const identityHtml = row("Identity", colClass(identityFields),
+  field("KPI Name", kpi.indicator_sub_title),
+  field("Subject",  kpi.full_subject_path || kpi.subject),
+  field("KPI Code", kpi.kpi_code),
+  field("Formula",  kpi.kpi_formula)
+);
+
+  /* ── Measurement ── */
+  const measFields = [
+    kpi.unit,
+    kpi.frequency,
+    kpi.target_direction,
+    fmtNum(kpi.target, unit),
+    kpi.target_auto_adjustment
+  ];
+  const measHtml = row("Measurement", colClass(measFields),
+    field("Unit",               kpi.unit),
+    field("Frequency",          kpi.frequency),
+    field("Direction",          kpi.target_direction),
+    field("Target",             fmtNum(kpi.target, unit)),
+    field("Target Auto Adjust", kpi.target_auto_adjustment)
+  );
+
+  /* ── Calculation ── */
+  const calcFields = [
+    kpi.calculation_on,
+    kpi.calculation_mode,
+    kpi.reference_kpi_id ? "KPI #" + kpi.reference_kpi_id : "",
+    kpi.display_trend,
+    kpi.regression,
+    kpi.nombre_periode
+  ];
+  const calcHtml = row("Calculation", colClass(calcFields),
+    field("Calculation On",   kpi.calculation_on),
+    field("Calculation Mode", kpi.calculation_mode),
+    field("Reference KPI",    kpi.reference_kpi_id ? "KPI #" + kpi.reference_kpi_id : ""),
+    field("Display Trend",    kpi.display_trend),
+    field("Regression",       kpi.regression),
+    field("Periods",          kpi.nombre_periode)
+  );
+
+/* ── Range ── */
+const minTypeRaw = String(kpi.min_type || "").trim().toLowerCase();
+const maxTypeRaw = String(kpi.max_type || "").trim().toLowerCase();
+const showMin = minTypeRaw !== "" && minTypeRaw !== "null";
+const showMax = maxTypeRaw !== "" && maxTypeRaw !== "null";
+
+const minTypeLabel = minTypeRaw === "valeur a entrer" ? "Value" : kpi.min_type;
+const maxTypeLabel = maxTypeRaw === "valeur a entrer" ? "Value" : kpi.max_type;
+
+const rangeFields = [
+  showMin ? kpi.min_type : "",
+  showMin ? fmtNum(kpi.min, unit) : "",
+  showMax ? kpi.max_type : "",
+  showMax ? fmtNum(kpi.max, unit) : ""
+];
+const rangeHtml = row("Range", colClass(rangeFields),
+  showMin ? field("Min Type",  minTypeLabel) : "",
+  showMin ? field("Min Value", fmtNum(kpi.min, unit)) : "",
+  showMax ? field("Max Type",  maxTypeLabel) : "",
+  showMax ? field("Max Value", fmtNum(kpi.max, unit)) : ""
+);
+  /* ── Tolerance ── */
+/* ── Tolerance ── */
+function fmtTolerance(value) {
+  if (!hasValue(value)) return "";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  const pct = Math.abs(num) <= 1 ? num * 100 : num;
+  return parseFloat(pct.toFixed(4)) + "%";
+}
+
+  const toleranceType = String(kpi.tolerance_type || "").trim().toLowerCase();
+  const isRelative = toleranceType === "relative";
+
+  const tolFields = [
+    kpi.tolerance_type,
+    isRelative ? fmtTolerance(kpi.up_tolerance)  : kpi.up_tolerance,
+    isRelative ? fmtTolerance(kpi.low_tolerance) : kpi.low_tolerance,
+    fmtNum(kpi.high_limit, unit),
+    fmtNum(kpi.low_limit,  unit)
+  ];
+  const tolHtml = row("Tolerance", colClass(tolFields),
+    field("Tolerance Type", kpi.tolerance_type),
+    field("Up Tolerance",   isRelative ? fmtTolerance(kpi.up_tolerance)  : fmtNum(kpi.up_tolerance,  unit)),
+    field("Low Tolerance",  isRelative ? fmtTolerance(kpi.low_tolerance) : fmtNum(kpi.low_tolerance, unit)),
+    field("High Limit",     fmtNum(kpi.high_limit, unit)),
+    field("Low Limit",      fmtNum(kpi.low_limit,  unit))
+  );
+
+  /* ── Timeline ── */
+  const timeFields = [
+    formatKpiDetailTimestamp(kpi.created_at),
+    formatKpiDetailTimestamp(kpi.updated_at),
+    kpi.owner_role_id,
+    fmtNum(kpi.target, unit)
+  ];
+  const timeHtml = row("Timeline", colClass(timeFields),
+    field("Created At",    formatKpiDetailTimestamp(kpi.created_at)),
+    field("Updated At",    formatKpiDetailTimestamp(kpi.updated_at)),
+    field("Owner Role ID", kpi.owner_role_id ? String(kpi.owner_role_id) : ""),
+    field("Target",        fmtNum(kpi.target, unit))
+  );
+
+  /* ── Definition ── */
+  const defText = String(kpi.definition || "").trim();
+  const defHtml = !defText ? "" :
+    '<div class="kdr-section-label">Definition</div>' +
+    '<div class="kpi-detail-row row-def">' +
+      '<div class="kdr-field" style="grid-column:1/-1">' +
+        '<span class="kdr-label">Definition</span>' +
+        '<span class="kdr-value kdr-definition">' + escapeHtml(defText) + '</span>' +
+      '</div>' +
+    '</div>';
+
+  const html = identityHtml + measHtml + calcHtml + rangeHtml + tolHtml + timeHtml + defHtml;
+
+  const contentEl = document.getElementById("kpiDetailsModalContent");
+  if (contentEl) contentEl.innerHTML = html || '<div style="padding:20px;color:#64748b;text-align:center;">No KPI data available.</div>';
+}
+
+function updateKpiResultsMeta(visibleCount) {
+  const metaEl = document.getElementById("kpiResultsMeta");
+  if (!metaEl) return;
+
+  const shown = Number.isFinite(visibleCount) ? visibleCount : 0;
+  metaEl.textContent = shown + " KPI" + (shown === 1 ? "" : "s");
+}
+
+function isKpiOwnedByResponsible(kpi = {}) {
+  return typeof kpi?.is_owned_by_responsible === "boolean"
+    ? kpi.is_owned_by_responsible
+    : String(kpi.created_by_people_id || "") === String(responsibleId || "");
+}
+
+function getCurrentKpiRowById(kpiId) {
+  return Array.isArray(currentRows)
+    ? currentRows.find((row) => String(row?.kpi_id || "") === String(kpiId || ""))
+    : null;
+}
+
+      function renderKpis(rows) {
+  const sortedRows = Array.isArray(rows) ? rows.slice() : [];
+  sortedRows.sort((left, right) => {
+    const leftOwned = Boolean(left?.is_owned_by_responsible);
+    const rightOwned = Boolean(right?.is_owned_by_responsible);
+    if (leftOwned !== rightOwned) {
+      return leftOwned ? -1 : 1;
+    }
+    return String(left?.indicator_sub_title || "").localeCompare(String(right?.indicator_sub_title || ""));
+  });
+
+  currentRows = sortedRows;
   updateStats(currentRows);
+  updateKpiResultsMeta(currentRows.length);
 
   const grid = document.getElementById("grid");
 
   if (!currentRows.length) {
-    grid.innerHTML = '<div class="empty">No KPI found for this responsible.</div>';
+    grid.innerHTML = '<div class="empty">No KPI found.</div>';
     return;
   }
 
-  grid.innerHTML = currentRows.map(row => \`
-    <div class="kpi-card">
-      <div class="kpi-head">
-        <div>
-          <div class="kpi-title">\${escapeHtml(row.indicator_title || "Untitled KPI")}</div>
-          <div class="kpi-subtitle">\${escapeHtml(row.indicator_sub_title || "")}</div>
-        </div>
-        <span class="pill pill-blue">KPI #\${escapeHtml(row.kpi_id)}</span>
+  grid.innerHTML = \`
+    <div class="kpi-matrix-table-shell">
+      <div class="kpi-matrix-table-wrap">
+        <table class="kpi-matrix-table">
+          <thead>
+            <tr>
+              <th>KPI Subject</th>
+              <th>KPI Name</th>
+              <th>Unit</th>
+              <th>Direction</th>
+              <th class="parameter-table-actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${currentRows.map(row => {
+              const isOwnedByResponsible = isKpiOwnedByResponsible(row);
+              const ownerActionsHtml = \`
+                <button
+                  type="button"
+                  class="action-btn edit-btn kpi-matrix-action-btn"
+                  onclick="openEditModal(\${row.kpi_id})"
+                  aria-label="Edit KPI"
+                  title="Edit KPI"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
+                    <path d="M13.5 6.5l4 4"></path>
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="action-btn delete-btn kpi-matrix-action-btn"
+                  onclick="deleteKpi(\${row.kpi_id})"
+                  aria-label="Delete KPI"
+                  title="Delete KPI"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 6h18"></path>
+                    <path d="M8 6V4h8v2"></path>
+                    <path d="M19 6l-1 14H6L5 6"></path>
+                    <path d="M10 11v6"></path>
+                    <path d="M14 11v6"></path>
+                  </svg>
+                </button>
+                \`;
+
+              return \`
+              <tr>
+                <td>
+                  <div class="kpi-matrix-kpi-title">\${escapeHtml(getLastPathSegment(row.full_subject_path || row.subject || row.indicator_title) || "No subject")}</div>
+                  <div class="kpi-matrix-kpi-path">\${escapeHtml(row.full_subject_path || row.subject || "No KPI hierarchy attached")}</div>
+                </td>
+                <td>
+                  <div class="kpi-matrix-kpi-title">\${escapeHtml(row.indicator_sub_title || "Untitled KPI")}</div>
+                  <div class="kpi-matrix-cell-sub">\${escapeHtml([
+                    row.status ? "Status: " + row.status : "",
+                    row.frequency ? "Frequency: " + row.frequency : "",
+                    isOwnedByResponsible ? "My KPI" : "",
+                    !isOwnedByResponsible ? "Visible in consult mode" : ""
+                  ].filter(Boolean).join(" • ") || "No KPI details")}</div>
+                </td>
+           
+                <td>
+                  <div class="kpi-matrix-cell-main">\${escapeHtml(row.unit || "-")}</div>
+                  <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target !== null && row.target !== undefined && String(row.target).trim() !== "" ? "Target: " + formatParameterDisplayValue(row.target) : "No unit target")}</div>
+                </td>
+                <td>
+                  <div class="kpi-matrix-cell-main">\${escapeHtml(row.target_direction || "-")}</div>
+                  <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target_auto_adjustment ? "Auto adjust: " + row.target_auto_adjustment : "No direction setting")}</div>
+                </td>
+                <td class="parameter-table-actions">
+                  <div class="kpi-matrix-actions">
+                    <button
+                      type="button"
+                      class="action-btn kpi-view-btn kpi-matrix-action-btn"
+                      onclick="openKpiDetailsModal(\${row.kpi_id})"
+                      aria-label="View KPI details"
+                      title="View KPI details"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M1.5 12s3.8-7 10.5-7 10.5 7 10.5 7-3.8 7-10.5 7S1.5 12 1.5 12z"></path>
+                        <circle cx="12" cy="12" r="3.2"></circle>
+                      </svg>
+                    </button>
+                    \${ownerActionsHtml}
+                  </div>
+                </td>
+              </tr>
+            \`;
+            }).join("")}
+          </tbody>
+        </table>
       </div>
-
-      <div class="meta">
-        <div class="meta-box neutral compact">
-          <div class="label">Unit</div>
-          <div class="value">\${escapeHtml(row.unit || "-")}</div>
-        </div>
-
-        <div class="meta-box neutral compact">
-          <div class="label">Frequency</div>
-          <div class="value">\${escapeHtml(row.frequency || "-")}</div>
-        </div>
-
-        <div class="meta-box primary">
-          <div class="label">Target</div>
-          <div class="value value-number">\${escapeHtml(row.target || "-")}</div>
-        </div>
-
-        <div class="meta-box neutral compact">
-          <div class="label">Tolerance Type</div>
-          <div class="value">\${escapeHtml(row.tolerance_type || "-")}</div>
-        </div>
-
-        <div class="meta-box success">
-          <div class="label">Up Tolerance</div>
-          <div class="value value-number">\${escapeHtml(row.up_tolerance || "-")}</div>
-        </div>
-
-        <div class="meta-box danger">
-          <div class="label">Low Tolerance</div>
-          <div class="value value-number">\${escapeHtml(row.low_tolerance || "-")}</div>
-        </div>
-
-        <div class="meta-box warning">
-          <div class="label">High Limit</div>
-          <div class="value value-number">\${escapeHtml(row.high_limit ?? "-")}</div>
-        </div>
-
-        <div class="meta-box primary">
-          <div class="label">Low Limit</div>
-          <div class="value value-number">\${escapeHtml(row.low_limit ?? "-")}</div>
-        </div>
-
-        <div class="meta-box neutral compact">
-          <div class="label">Calculation On</div>
-          <div class="value">\${escapeHtml(row.calculation_on || "-")}</div>
-        </div>
-
-        <div class="meta-box neutral compact">
-          <div class="label">Max</div>
-          <div class="value value-number">\${escapeHtml(row.max || "-")}</div>
-        </div>
-
-        <div class="meta-box neutral compact">
-          <div class="label">Min</div>
-          <div class="value value-number">\${escapeHtml(row.min || "-")}</div>
-        </div>
-
-      </div>
-
-      <div class="card-actions">
-        <button class="action-btn edit-btn" onclick="openEditModal(\${row.kpi_id})">Edit KPI</button>
-        <button class="action-btn delete-btn" onclick="deleteKpi(\${row.kpi_id})">Delete KPI</button>
+      <div class="kpi-matrix-footer">
+        <span>\${escapeHtml("Showing " + currentRows.length + " KPI" + (currentRows.length === 1 ? "" : "s"))}</span>
+        <span>KPI definition matrix</span>
       </div>
     </div>
-  \`).join("");
+  \`;
 }
+
+      function getParameterSearchValue() {
+        const searchEl = document.getElementById("parameterSearch");
+        return searchEl ? String(searchEl.value || "") : "";
+      }
+
+      function buildParameterAllocationGroupKey(row) {
+        return [
+          row.kpi_id || "",
+          String(row.kpi_type || "").trim().toLowerCase(),
+          row.unit_type_id || "",
+          row.role_id || "",
+          String(row.function || "").trim().toLowerCase(),
+          row.product_id || "",
+          row.product_line_id || "",
+          row.market_id || "",
+          row.customer_id || "",
+          row.created_by_people_id || "",
+          row.created_at || ""
+        ].join("::");
+      }
+
+      function buildParameterAllocationScopeKey(row) {
+        if (!row || typeof row !== "object") return "";
+
+        const zoneId = String(row.zone_id || "").trim();
+        if (zoneId) return "zone:" + zoneId;
+
+        const unitId = String(row.plant_id || row.unit_id || "").trim();
+        if (unitId) return "unit:" + unitId;
+
+        const allocationId = String(row.kpi_target_allocation_id || "").trim();
+        return allocationId ? "allocation:" + allocationId : "";
+      }
+
+      function mergeParameterAllocationCollections(...collections) {
+        const mergedRows = new Map();
+
+        collections
+          .flat()
+          .filter(Boolean)
+          .forEach((row) => {
+            const scopeKey = buildParameterAllocationScopeKey(row);
+            const fallbackKey = "allocation:" + String(row?.kpi_target_allocation_id || "").trim();
+            const key = scopeKey || fallbackKey;
+            if (!key) return;
+
+            const existingRow = mergedRows.get(key) || {};
+            mergedRows.set(key, {
+              ...existingRow,
+              ...row
+            });
+          });
+
+        return Array.from(mergedRows.values()).sort(
+          (left, right) =>
+            Number(left?.kpi_target_allocation_id || 0) - Number(right?.kpi_target_allocation_id || 0)
+        );
+      }
+
+      function getParameterGroupedScopeKindLabel(row, count = 1) {
+        const normalizedType = String(row?.kpi_type || "").trim().toLowerCase();
+        const singularLabel = normalizedType === "zone" ? "zone" : "unit";
+        return count === 1 ? singularLabel : singularLabel + "s";
+      }
+
+      function groupParameterAllocationRows(rows) {
+        const sourceRows = Array.isArray(rows) ? rows : [];
+        const groupedRows = new Map();
+
+        sourceRows.forEach((row) => {
+          const groupKey = buildParameterAllocationGroupKey(row);
+          if (!groupedRows.has(groupKey)) {
+            groupedRows.set(groupKey, []);
+          }
+          groupedRows.get(groupKey).push(row);
+        });
+
+        return Array.from(groupedRows.values())
+          .map((groupRows) => {
+            const sortedGroupRows = groupRows
+              .slice()
+              .sort((left, right) => Number(left.kpi_target_allocation_id) - Number(right.kpi_target_allocation_id));
+            const primaryRow = sortedGroupRows[0] || {};
+            const scopeNames = Array.from(
+              new Set(
+                sortedGroupRows
+                  .map((row) => row.zone_name || row.unit_name || row.plant_name || "")
+                  .filter(Boolean)
+              )
+            );
+            const responsibleNames = Array.from(
+              new Set(
+                sortedGroupRows
+                  .map((row) => row.set_by_people_display_name || "")
+                  .filter(Boolean)
+              )
+            );
+            const currencies = Array.from(
+              new Set(
+                sortedGroupRows
+                  .map((row) => row.local_currency || "")
+                  .filter(Boolean)
+              )
+            );
+            const targetValues = sortedGroupRows
+              .map((row) => row.target_value)
+              .filter((value) => value !== null && value !== undefined && value !== "");
+
+            return {
+              ...primaryRow,
+              related_allocations: sortedGroupRows,
+              group_row_count: sortedGroupRows.length,
+              group_scope_names: scopeNames,
+              group_responsible_names: responsibleNames,
+              group_currencies: currencies,
+              group_target_values: targetValues,
+              local_currency: currencies.length === 1 ? currencies[0] : "",
+              set_by_people_display_name: responsibleNames.length === 1
+                ? responsibleNames[0]
+                : (primaryRow.set_by_people_display_name || "")
+            };
+          })
+          .sort((left, right) => {
+            const leftCreatedAt = new Date(left.created_at || 0).getTime();
+            const rightCreatedAt = new Date(right.created_at || 0).getTime();
+            if (leftCreatedAt !== rightCreatedAt) {
+              return rightCreatedAt - leftCreatedAt;
+            }
+            return Number(right.kpi_target_allocation_id || 0) - Number(left.kpi_target_allocation_id || 0);
+          });
+      }
+
+      function buildParameterSearchIndex(row) {
+        return [
+          row.kpi_name,
+          row.kpi_subject,
+          row.kpi_group,
+          row.kpi_type,
+          row.unit_type_name,
+          row.role_name,
+          row.frequency,
+          row.target_status,
+          row.plant_name,
+          row.zone_name,
+          row.unit_name,
+          row.function,
+          row.product_line_name,
+          row.product_name,
+          row.market_name,
+          row.customer_name,
+          Array.isArray(row.group_scope_names) ? row.group_scope_names.join(" ") : "",
+          Array.isArray(row.group_responsible_names) ? row.group_responsible_names.join(" ") : "",
+          Array.isArray(row.group_target_values)
+            ? row.group_target_values.map((value) => formatParameterDisplayValue(value)).join(" ")
+            : "",
+          row.target_unit,
+          row.local_currency,
+          formatParameterDisplayValue(row.target_value),
+          formatParameterDisplayDate(row.target_setup_date)
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+      }
+
+      function filterParameterRows(rows, search = "") {
+        const sourceRows = Array.isArray(rows) ? rows : [];
+        const query = String(search || "").trim().toLowerCase();
+        if (!query) return sourceRows;
+
+        return sourceRows.filter((row) => buildParameterSearchIndex(row).includes(query));
+      }
+
+      function formatParameterDisplayValue(value) {
+        if (value === null || value === undefined || value === "") return "-";
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) {
+          return numeric.toLocaleString("en-US", {
+            minimumFractionDigits: Math.abs(numeric % 1) > 0.001 ? 2 : 0,
+            maximumFractionDigits: 2
+          });
+        }
+        return String(value);
+      }
+
+      function getLocalDateInputValue(value = new Date()) {
+        const parsed = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(parsed.getTime())) return "";
+        const year = parsed.getFullYear();
+        const month = String(parsed.getMonth() + 1).padStart(2, "0");
+        const day = String(parsed.getDate()).padStart(2, "0");
+        return year + "-" + month + "-" + day;
+      }
+
+      function normalizeParameterDateValue(value) {
+        if (!value) return "";
+        if (value instanceof Date) {
+          return getLocalDateInputValue(value);
+        }
+
+        const text = String(value).trim();
+        if (!text) return "";
+
+        const dateOnlyMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (dateOnlyMatch) {
+          return dateOnlyMatch[1] + "-" + dateOnlyMatch[2] + "-" + dateOnlyMatch[3];
+        }
+
+        const parsed = new Date(text);
+        return Number.isNaN(parsed.getTime()) ? text : getLocalDateInputValue(parsed);
+      }
+
+      function formatParameterDisplayDate(value) {
+        if (!value) return "-";
+        const normalizedValue = normalizeParameterDateValue(value);
+        const dateOnlyMatch = normalizedValue.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        const parsed = dateOnlyMatch
+          ? new Date(
+              Number(dateOnlyMatch[1]),
+              Number(dateOnlyMatch[2]) - 1,
+              Number(dateOnlyMatch[3])
+            )
+          : new Date(normalizedValue);
+        if (Number.isNaN(parsed.getTime())) return escapeHtml(value);
+        return parsed.toLocaleDateString("en-GB", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric"
+        });
+      }
+
+      function splitParameterPath(pathText) {
+        return String(pathText || "")
+          .split("/")
+          .map((part) => String(part || "").trim())
+          .filter(Boolean);
+      }
+
+      function getParameterCategory(row) {
+        const parts = splitParameterPath(row.kpi_subject || row.kpi_group || row.kpi_name || "");
+        if (parts.length >= 2) return parts[parts.length - 2];
+        if (parts.length === 1) return parts[0];
+        return "General";
+      }
+
+      function buildParameterScopeSummary(row) {
+        const groupedRowCount = Number(
+          row.group_row_count ||
+          (Array.isArray(row.related_allocations) ? row.related_allocations.length : 0)
+        );
+
+        if (groupedRowCount > 1) {
+          const scopeNames = Array.isArray(row.group_scope_names) ? row.group_scope_names : [];
+          const scopePreview = scopeNames.length > 3
+            ? scopeNames.slice(0, 3).join(", ") + " +" + (scopeNames.length - 3)
+            : scopeNames.join(", ");
+
+          return [
+            row.unit_type_name,
+            row.role_name,
+            scopePreview || (groupedRowCount + " " + getParameterGroupedScopeKindLabel(row, groupedRowCount))
+          ]
+            .filter(Boolean)
+            .join(" / ");
+        }
+
+        return [
+          row.unit_type_name,
+          row.role_name,
+          row.plant_name,
+          row.zone_name,
+          row.unit_name,
+          row.function,
+          row.product_line_name,
+          row.product_name,
+          row.market_name,
+          row.customer_name
+        ]
+          .filter(Boolean)
+          .join(" / ");
+      }
+
+      function getParameterStatusClass(status) {
+        const normalizedStatus = String(status || "").trim().toLowerCase();
+        if (normalizedStatus === "draft") return "parameter-status-draft";
+        if (normalizedStatus === "active") return "parameter-status-active";
+        if (normalizedStatus === "approved") return "parameter-status-approved";
+        if (normalizedStatus === "closed") return "parameter-status-closed";
+        return "parameter-status-neutral";
+      }
+
+      function getParameterPersonInitials(nameText) {
+        const parts = String(nameText || "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .slice(0, 2);
+
+        if (!parts.length) return "NA";
+        return parts.map((part) => part.charAt(0).toUpperCase()).join("");
+      }
+
+      function updateParameterResultsMeta(visibleCount, totalCount = visibleCount) {
+        const metaEl = document.getElementById("parameterResultsMeta");
+        if (!metaEl) return;
+
+        const shown = Number.isFinite(visibleCount) ? visibleCount : 0;
+        const total = Number.isFinite(totalCount) ? totalCount : shown;
+
+        if (!shown) {
+          metaEl.textContent = total > 0 ? "No matching allocations" : "0 allocations";
+          return;
+        }
+
+        metaEl.textContent = shown === total
+          ? shown + " allocation" + (shown === 1 ? "" : "s")
+          : shown + " of " + total + " allocations";
+      }
+
+      function renderParameterKpis(rows) {
+        currentParameterRows = rows || [];
+        const parameterGrid = document.getElementById("parameterGrid");
+        if (!parameterGrid) return;
+        updateParameterResultsMeta(
+          currentParameterRows.length,
+          Array.isArray(parameterSourceRows) ? parameterSourceRows.length : currentParameterRows.length
+        );
+
+        if (!currentParameterRows.length) {
+          parameterGrid.innerHTML = '<div class="empty">No KPI target allocation found for the current search.</div>';
+          return;
+        }
+
+        const visibleCount = currentParameterRows.length;
+        const totalCount = Array.isArray(parameterSourceRows) ? parameterSourceRows.length : visibleCount;
+        const footerText = visibleCount === totalCount
+          ? 'Showing ' + visibleCount + ' allocation' + (visibleCount === 1 ? '' : 's')
+          : 'Showing ' + visibleCount + ' of ' + totalCount + ' allocations';
+
+        parameterGrid.innerHTML = \`
+          <div class="parameter-matrix-table-shell">
+            <div class="parameter-matrix-table-wrap">
+              <table class="parameter-matrix-table">
+                <thead>
+                  <tr>
+                    <th>KPI Name</th>
+                    <th>Type</th>
+                    <th>Role</th>
+                    <th>Frequency</th>
+                    <th>Target Value</th>
+                    <th class="parameter-table-actions">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  \${currentParameterRows.map(row => \`
+                    <tr>
+                      <td>
+                        <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_name || row.kpi_group || "Linked KPI")}</div>
+                        <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_subject || row.kpi_group || "No KPI hierarchy attached")}</div>
+                      </td>
+                      <td>
+                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.kpi_type || "Not Set")}</div>
+                        <div class="parameter-matrix-cell-sub">\${escapeHtml([
+                          buildParameterScopeSummary(row),
+                          row.local_currency
+                        ].filter(Boolean).join(" • ") || "No KPI type context")}</div>
+                      </td>
+                      <td>
+                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.role_name || "Not Set")}</div>
+                        <div class="parameter-matrix-cell-sub">\${escapeHtml([
+                          row.unit_type_name,
+                          row.function
+                        ].filter(Boolean).join(" • ") || "No role linked")}</div>
+                      </td>
+                      <td>
+                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.frequency || "-")}</div>
+                        <div class="parameter-matrix-cell-sub">\${escapeHtml(row.frequency ? "Frequency from selected KPI" : "No frequency linked")}</div>
+                      </td>
+                      <td>
+                        <div class="parameter-matrix-target-main">\${escapeHtml(Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " " + getParameterGroupedScopeKindLabel(row, 1) + " targets" : (formatParameterDisplayValue(row.target_value) + (row.target_unit ? " " + row.target_unit : "")))}</div>
+                        <div class="parameter-matrix-target-sub">\${escapeHtml([
+                          row.kpi_type,
+                          Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " linked rows" : '',
+                          row.target_setup_date ? 'Setup ' + formatParameterDisplayDate(row.target_setup_date) : '',
+                          row.target_start_date ? 'Start ' + formatParameterDisplayDate(row.target_start_date) : '',
+                          row.target_end_date ? 'End ' + formatParameterDisplayDate(row.target_end_date) : ''
+                        ].filter(Boolean).join(" • ") || "Target allocation")}</div>
+                      </td>
+                      <td class="parameter-table-actions">
+                        <div class="parameter-actions">
+                          <button
+                            type="button"
+                            class="action-btn edit-btn parameter-action-btn"
+                            onclick="openEditParameterModal(\${row.kpi_target_allocation_id})"
+                            aria-label="Edit allocation"
+                            title="Edit allocation"
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
+                              <path d="M13.5 6.5l4 4"></path>
+                            </svg>
+                          </button>
+                          <button
+                            type="button"
+                            class="action-btn delete-btn parameter-action-btn"
+                            onclick="deleteParameterKpi(\${row.kpi_target_allocation_id})"
+                            aria-label="Delete allocation"
+                            title="Delete allocation"
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M3 6h18"></path>
+                              <path d="M8 6V4h8v2"></path>
+                              <path d="M19 6l-1 14H6L5 6"></path>
+                              <path d="M10 11v6"></path>
+                              <path d="M14 11v6"></path>
+                            </svg>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  \`).join("")}
+                </tbody>
+              </table>
+            </div>
+            <div class="parameter-matrix-footer">
+              <span>\${escapeHtml(footerText)}</span>
+              <span>Target allocation matrix</span>
+            </div>
+          </div>
+        \`;
+      }
+
+      function applyParameterSearch(search = getParameterSearchValue()) {
+        renderParameterKpis(filterParameterRows(parameterSourceRows, search));
+      }
+
+      function doesParameterRowMatchAllocationIds(row, allocationIds = []) {
+        const normalizedAllocationIds = new Set(
+          (Array.isArray(allocationIds) ? allocationIds : [allocationIds])
+            .map((allocationId) => String(allocationId || "").trim())
+            .filter(Boolean)
+        );
+        if (!normalizedAllocationIds.size || !row) return false;
+
+        if (normalizedAllocationIds.has(String(row.kpi_target_allocation_id || "").trim())) {
+          return true;
+        }
+
+        return Array.isArray(row.related_allocations) && row.related_allocations.some((allocationRow) =>
+          normalizedAllocationIds.has(String(allocationRow?.kpi_target_allocation_id || "").trim())
+        );
+      }
+
+      function removeParameterAllocationsFromUi(allocationIds) {
+        parameterSourceRows = (Array.isArray(parameterSourceRows) ? parameterSourceRows : []).filter(
+          (row) => !doesParameterRowMatchAllocationIds(row, allocationIds)
+        );
+
+        applyParameterSearch(getParameterSearchValue());
+      }
+
+      function getParameterAllocationIdsForUiRemoval(parameterObjectId, responseData = null) {
+        const responseIds = Array.isArray(responseData?.deleted_ids)
+          ? responseData.deleted_ids
+              .map((allocationId) => String(allocationId || "").trim())
+              .filter(Boolean)
+          : [];
+
+        if (responseIds.length) {
+          return responseIds;
+        }
+
+        const matchedGroupedRow = (Array.isArray(parameterSourceRows) ? parameterSourceRows : []).find(
+          (row) => String(row?.kpi_target_allocation_id || "").trim() === String(parameterObjectId || "").trim()
+        );
+
+        if (Array.isArray(matchedGroupedRow?.related_allocations) && matchedGroupedRow.related_allocations.length) {
+          const relatedIds = matchedGroupedRow.related_allocations
+            .map((row) => String(row?.kpi_target_allocation_id || "").trim())
+            .filter(Boolean);
+
+          if (relatedIds.length) {
+            return relatedIds;
+          }
+        }
+
+        return [String(parameterObjectId || "").trim()].filter(Boolean);
+      }
+
+      async function loadParameterKpis(search = getParameterSearchValue()) {
+        const parameterGrid = document.getElementById("parameterGrid");
+
+        try {
+          const res = await fetch(
+            '/api/responsibles/' + responsibleId + '/kpi-objects?_ts=' + Date.now(),
+            { cache: "no-store" }
+          );
+          const data = await res.json();
+
+          if (!res.ok) {
+            throw new Error(data?.error || "Failed to load KPI target allocations");
+          }
+
+          parameterSourceRows = groupParameterAllocationRows(Array.isArray(data) ? data : []);
+          applyParameterSearch(search);
+        } catch (error) {
+          parameterSourceRows = [];
+          updateParameterResultsMeta(0, 0);
+          if (parameterGrid) {
+            parameterGrid.innerHTML = '<div class="empty">Failed to load KPI target allocations.</div>';
+          }
+        }
+      }
+
+      function normalizeChartLimitValue(value) {
+        if (value === null || value === undefined || value === "") return null;
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : null;
+      }
+
+      function normalizeChartDirection(direction) {
+        const normalizedDirection = String(direction || "").trim().toLowerCase();
+        return normalizedDirection === "down" ? "down" : "up";
+      }
+
+      function getChartValueBandColor(value, lowLimit, highLimit, direction) {
+        const numericValue = normalizeChartLimitValue(value);
+        const low = normalizeChartLimitValue(lowLimit);
+        const high = normalizeChartLimitValue(highLimit);
+        const resolvedDirection = normalizeChartDirection(direction);
+
+        if (numericValue === null) return "rgba(148, 163, 184, 0.85)";
+
+        const lowerBound = low !== null && high !== null ? Math.min(low, high) : low;
+        const upperBound = low !== null && high !== null ? Math.max(low, high) : high;
+
+        if (resolvedDirection === "down") {
+          return upperBound !== null && numericValue > upperBound
+            ? "rgba(239, 68, 68, 0.88)"
+            : "rgba(74, 222, 128, 0.88)";
+        }
+
+        return lowerBound !== null && numericValue < lowerBound
+          ? "rgba(239, 68, 68, 0.88)"
+          : "rgba(74, 222, 128, 0.88)";
+      }
+
+      function getChartValueBorderColor(value, lowLimit, highLimit, direction) {
+        const color = getChartValueBandColor(value, lowLimit, highLimit, direction);
+        if (color.includes("239, 68, 68")) return "rgba(220, 38, 38, 1)";
+        return "rgba(22, 163, 74, 1)";
+      }
+
+      const kpiThresholdBandsPlugin = {
+        id: "kpiThresholdBands",
+        beforeDatasetsDraw(chart, args, pluginOptions) {
+          const low = normalizeChartLimitValue(pluginOptions?.lowLimit);
+          const high = normalizeChartLimitValue(pluginOptions?.highLimit);
+          const direction = normalizeChartDirection(pluginOptions?.direction);
+          const yScale = chart.scales?.y;
+          const area = chart.chartArea;
+
+          if (!yScale || !area || (low === null && high === null)) return;
+
+          const lowerBound = low !== null && high !== null ? Math.min(low, high) : low;
+          const upperBound = low !== null && high !== null ? Math.max(low, high) : high;
+
+          const drawBand = (fromValue, toValue, fillStyle) => {
+            if (fromValue === null || toValue === null) return;
+            const startY = yScale.getPixelForValue(fromValue);
+            const endY = yScale.getPixelForValue(toValue);
+            if (!Number.isFinite(startY) || !Number.isFinite(endY)) return;
+
+            const top = Math.min(startY, endY);
+            const height = Math.abs(endY - startY);
+            if (!height) return;
+
+            chart.ctx.fillStyle = fillStyle;
+            chart.ctx.fillRect(area.left, top, area.right - area.left, height);
+          };
+
+          const fillWholeArea = (fillStyle) => {
+            chart.ctx.fillStyle = fillStyle;
+            chart.ctx.fillRect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+          };
+
+          chart.ctx.save();
+          chart.ctx.beginPath();
+          chart.ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+          chart.ctx.clip();
+
+          if (direction === "down") {
+            if (upperBound !== null) {
+              drawBand(yScale.max, upperBound, "rgba(254, 226, 226, 0.55)");
+              drawBand(upperBound, yScale.min, "rgba(220, 252, 231, 0.55)");
+            } else {
+              fillWholeArea("rgba(220, 252, 231, 0.55)");
+            }
+          } else if (lowerBound !== null) {
+            drawBand(yScale.max, lowerBound, "rgba(220, 252, 231, 0.55)");
+            drawBand(lowerBound, yScale.min, "rgba(254, 226, 226, 0.55)");
+          } else {
+            fillWholeArea("rgba(220, 252, 231, 0.55)");
+          }
+
+          chart.ctx.restore();
+        }
+      };
+
+      const kpiFlowLinePlugin = {
+        id: "kpiFlowLine",
+        afterDatasetsDraw(chart, args, pluginOptions) {
+          const datasetIndex = Number.isInteger(pluginOptions?.datasetIndex)
+            ? pluginOptions.datasetIndex
+            : 0;
+          const meta = chart.getDatasetMeta(datasetIndex);
+          const area = chart.chartArea;
+
+          if (!meta?.data?.length || !area) return;
+
+          const offset = Number.isFinite(pluginOptions?.offset) ? pluginOptions.offset : 12;
+          const pointRadius = Number.isFinite(pluginOptions?.pointRadius) ? pluginOptions.pointRadius : 3.5;
+          const points = [];
+
+          meta.data.forEach((barElement, index) => {
+            const rawValue = chart.data?.datasets?.[datasetIndex]?.data?.[index];
+            const numericValue = Number(rawValue);
+
+            if (!Number.isFinite(numericValue) || !Number.isFinite(barElement?.x) || !Number.isFinite(barElement?.y)) {
+              return;
+            }
+
+            points.push({
+              x: barElement.x,
+              y: Math.max(barElement.y - offset, area.top + 8)
+            });
+          });
+
+          if (points.length < 2) return;
+
+          const ctx = chart.ctx;
+          const strokeStyle = pluginOptions?.color || "rgba(15, 23, 42, 0.92)";
+          const pointFill = pluginOptions?.pointFill || "rgba(15, 23, 42, 0.96)";
+          const pointStroke = pluginOptions?.pointStroke || "rgba(255, 255, 255, 0.98)";
+          const lineWidth = Number.isFinite(pluginOptions?.lineWidth) ? pluginOptions.lineWidth : 3;
+
+          ctx.save();
+          ctx.lineWidth = lineWidth;
+          ctx.strokeStyle = strokeStyle;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.beginPath();
+          ctx.moveTo(points[0].x, points[0].y);
+
+          for (let index = 1; index < points.length; index += 1) {
+            const previousPoint = points[index - 1];
+            const currentPoint = points[index];
+            const midX = (previousPoint.x + currentPoint.x) / 2;
+            const midY = (previousPoint.y + currentPoint.y) / 2;
+            ctx.quadraticCurveTo(previousPoint.x, previousPoint.y, midX, midY);
+          }
+
+          const lastPoint = points[points.length - 1];
+          ctx.lineTo(lastPoint.x, lastPoint.y);
+          ctx.stroke();
+
+          points.forEach((point) => {
+            ctx.beginPath();
+            ctx.fillStyle = pointFill;
+            ctx.arc(point.x, point.y, pointRadius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = pointStroke;
+            ctx.stroke();
+            ctx.lineWidth = lineWidth;
+            ctx.strokeStyle = strokeStyle;
+          });
+
+          ctx.restore();
+        }
+      };
 
       async function loadKpis(search = "") {
         try {
-          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?search=' + encodeURIComponent(search));
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?include_all=1&search=' + encodeURIComponent(search));
           const data = await res.json();
           renderKpis(data);
         } catch (error) {
+          updateKpiResultsMeta(0);
           document.getElementById("grid").innerHTML =
             '<div class="empty">Failed to load KPIs.</div>';
+        }
+      }
+
+      async function loadReferenceKpis() {
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?include_all=1&search=');
+          const data = await res.json();
+          referenceKpiRows = Array.isArray(data) ? data : [];
+        } catch (error) {
+          referenceKpiRows = Array.isArray(currentRows) ? currentRows.slice() : [];
         }
       }
 
@@ -3721,17 +15418,25 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
           rows.forEach((row, index) => {
             const canvas = document.getElementById('chart_' + index);
             const ctx = canvas.getContext('2d');
+            const sourceLabels = Array.isArray(row.labels) ? row.labels : [];
+            const periodLabels = sourceLabels.map((_, labelIndex) => 'Period ' + (labelIndex + 1));
 
-            const targetSeries = Array.isArray(row.labels)
-              ? row.labels.map(() => row.targetValue ?? null)
+            const targetSeries = Array.isArray(sourceLabels)
+              ? sourceLabels.map(() => row.targetValue ?? null)
               : [];
 
-            const highLimitSeries = Array.isArray(row.labels)
-              ? row.labels.map(() => row.highLimitValue ?? null)
+            const highLimitSeries = Array.isArray(sourceLabels)
+              ? sourceLabels.map(() => row.highLimitValue ?? null)
               : [];
 
-            const lowLimitSeries = Array.isArray(row.labels)
-              ? row.labels.map(() => row.lowLimitValue ?? null)
+            const lowLimitSeries = Array.isArray(sourceLabels)
+              ? sourceLabels.map(() => row.lowLimitValue ?? null)
+              : [];
+            const barColors = Array.isArray(row.values)
+              ? row.values.map(value => getChartValueBandColor(value, row.lowLimitValue, row.highLimitValue, row.targetDirection))
+              : [];
+            const barBorderColors = Array.isArray(row.values)
+              ? row.values.map(value => getChartValueBorderColor(value, row.lowLimitValue, row.highLimitValue, row.targetDirection))
               : [];
             const axisValues = [
               ...(Array.isArray(row.values) ? row.values : []),
@@ -3762,15 +15467,17 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
 
             const chart = new Chart(ctx, {
               data: {
-                labels: row.labels,
+                labels: periodLabels,
                 datasets: [
                   {
                     type: 'bar',
                     label: 'Actual Value',
                     data: row.values,
-                    borderWidth: 0,
-                    backgroundColor: 'rgba(34, 197, 94, 0.85)',
+                    borderWidth: 1,
+                    borderColor: barBorderColors,
+                    backgroundColor: barColors,
                     borderRadius: 6,
+                    borderSkipped: false,
                     barThickness: 26
                   },
                   {
@@ -3818,12 +15525,33 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
                 responsive: true,
                 maintainAspectRatio: false,
                 plugins: {
+                  kpiThresholdBands: {
+                    lowLimit: row.lowLimitValue,
+                    highLimit: row.highLimitValue,
+                    direction: row.targetDirection
+                  },
+                  kpiFlowLine: {
+                    datasetIndex: 0,
+                    offset: 12,
+                    lineWidth: 3,
+                    pointRadius: 3.5
+                  },
                   legend: {
                     display: false
                   },
                   tooltip: {
                     mode: 'index',
-                    intersect: false
+                    intersect: false,
+                    callbacks: {
+                      title(items) {
+                        const indexValue = items?.[0]?.dataIndex ?? 0;
+                        return periodLabels[indexValue] || '';
+                      },
+                      footer(items) {
+                        const indexValue = items?.[0]?.dataIndex ?? 0;
+                        return sourceLabels[indexValue] ? 'Source: ' + sourceLabels[indexValue] : '';
+                      }
+                    }
                   }
                 },
                 interaction: {
@@ -3833,6 +15561,15 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
                 },
                 scales: {
                   x: {
+                    title: {
+                      display: true,
+                      text: 'Period',
+                      color: '#0f172a',
+                      font: {
+                        size: 13,
+                        weight: '700'
+                      }
+                    },
                     grid: {
                       display: false
                     },
@@ -3844,6 +15581,15 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
                     beginAtZero: false,
                     min: axisMin,
                     max: axisMax,
+                    title: {
+                      display: true,
+                      text: 'Value',
+                      color: '#0f172a',
+                      font: {
+                        size: 13,
+                        weight: '700'
+                      }
+                    },
                     ticks: {
                       color: '#64748b'
                     },
@@ -3852,7 +15598,8 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
                     }
                   }
                 }
-              }
+              },
+              plugins: [kpiThresholdBandsPlugin, kpiFlowLinePlugin]
             });
 
             chartInstances.push(chart);
@@ -3865,260 +15612,1085 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
 
       async function refreshKpis() {
         await loadKpis(document.getElementById("search").value || "");
+        await loadParameterKpis();
         showToast("Dashboard refreshed");
       }
 
       function openModal() {
         document.getElementById("modalBackdrop").classList.add("open");
+        requestAnimationFrame(() => {
+          syncDefinitionTextareaHeight();
+        });
       }
 
       function closeModal() {
         document.getElementById("modalBackdrop").classList.remove("open");
       }
 
-      function updateModalOverview() {
-        const isEdit = !!document.getElementById("kpi_id").value;
-        document.getElementById("modalModeBadge").textContent = isEdit ? "Edit KPI" : "Create KPI";
-        document.getElementById("overviewFrequency").textContent =
-          document.getElementById("frequency").value.trim() || "Not set";
-        document.getElementById("overviewUnit").textContent =
-          document.getElementById("unit").value.trim() || "Not set";
-        document.getElementById("overviewTarget").textContent =
-          document.getElementById("target").value.trim() || "Not set";
+      function openKpiDetailsModalShell() {
+        document.getElementById("kpiDetailsModalBackdrop").classList.add("open");
       }
 
-      function normalizeNumericInput(value, { allowPercent = false } = {}) {
-        const text = String(value ?? "").trim();
-        if (!text) return null;
+      function closeKpiDetailsModal() {
+        document.getElementById("kpiDetailsModalBackdrop").classList.remove("open");
+      }
 
-        let normalized = text.replace(/\s+/g, "").replace(/,/g, ".");
+      function dismissKpiDetailsModal() {
+        closeKpiDetailsModal();
+      }
+
+      function openParameterModal() {
+        setParameterSaveLoading(parameterSavePending);
+        syncParameterRoleDropdown();
+        document.getElementById("parameterModalBackdrop").classList.add("open");
+      }
+
+      function closeParameterModal(force = false) {
+        if (parameterSavePending && !force) return;
+        closeParameterRoleDropdown();
+        document.getElementById("parameterModalBackdrop").classList.remove("open");
+      }
+
+      function setParameterSaveLoading(isLoading) {
+        const saveBtn = document.getElementById("parameterSaveBtn");
+        const closeBtn = document.getElementById("parameterCloseBtn");
+        const cancelBtn = document.getElementById("parameterCancelBtn");
+        const labelEl = saveBtn ? saveBtn.querySelector(".parameter-save-label") : null;
+        const defaultLabel = saveBtn?.dataset?.defaultLabel || "Save Target Allocation";
+
+        if (saveBtn) {
+          saveBtn.disabled = Boolean(isLoading);
+          saveBtn.classList.toggle("is-loading", Boolean(isLoading));
+          saveBtn.setAttribute("aria-busy", isLoading ? "true" : "false");
+        }
+
+        [closeBtn, cancelBtn].forEach((btn) => {
+          if (btn) {
+            btn.disabled = Boolean(isLoading);
+          }
+        });
+
+        if (labelEl) {
+          labelEl.textContent = isLoading ? "Saving..." : defaultLabel;
+        }
+      }
+
+      function getParameterFieldValue(id) {
+        const element = document.getElementById(id);
+        return element ? String(element.value || "").trim() : "";
+      }
+
+      function updateParameterOverview() {
+   
+      }
+
+      function getFieldValue(id) {
+        const element = getKpiFieldElement(id);
+        return element ? String(element.value || "").trim() : "";
+      }
+
+      function captureKpiCreateDraft() {
+        if (getFieldValue("kpi_id")) return null;
+
+        const draft = {};
+        KPI_MODAL_FIELD_IDS.forEach((id) => {
+          if (id === "kpi_id") return;
+
+          const field = getKpiFieldElement(id);
+          if (field) {
+            draft[id] = field.value ?? "";
+          }
+        });
+
+        return draft;
+      }
+
+      function restoreKpiCreateDraft(draft = null) {
+        resetForm();
+        if (!draft || typeof draft !== "object") return;
+
+        initializeKpiHierarchySelectors({
+          subject_node_id: draft.subject_node_id || "",
+          subject: draft.subject || "",
+          indicator_title: draft.indicator_title || "",
+          indicator_sub_title: draft.indicator_sub_title || "",
+          definition: draft.definition || ""
+        });
+
+        populateReferenceKpiOptions(draft.reference_kpi_id || "");
+        populateRoleOptions(draft.owner_role_id || "");
+
+        const draftFieldSkipList = new Set([
+          "subject",
+          "subject_node_id",
+          "indicator_title",
+          "indicator_sub_title",
+          "subject_path_display",
+          "definition"
+        ]);
+
+        Object.keys(draft).forEach((id) => {
+          if (draftFieldSkipList.has(id)) return;
+          setFieldValue(id, draft[id]);
+        });
+
+        handleCalculationOnChange();
+        handleDisplayTrendChange();
+        handleMinTypeChange();
+        handleMaxTypeChange();
+        handleCalculationModeChange();
+        syncKpiRequiredState();
+        syncToleranceInputs();
+        recalculateLimits();
+        updateModalOverview();
+      }
+
+      function dismissKpiModal() {
+        const isCreateMode = !getFieldValue("kpi_id");
+        if (isCreateMode) {
+          kpiCreateDraft = captureKpiCreateDraft();
+        }
+
+        closeModal();
+      }
+
+      function captureParameterCreateDraft() {
+        if (parameterEditMode || getParameterFieldValue("parameter_object_id")) return null;
+
+        const fields = {};
+        PARAMETER_MODAL_FIELD_IDS.forEach((id) => {
+          const field = document.getElementById(id);
+          if (field) {
+            fields[id] = field.value ?? "";
+          }
+        });
+
+        return {
+          fields,
+          unitTargetState: cloneDraftSnapshot(parameterUnitTargetState || {}) || {},
+          lockedUnitId: parameterLockedUnitId || "",
+          lockedZoneId: parameterLockedZoneId || "",
+          lockedZoneIds: Array.isArray(parameterLockedZoneIds) ? parameterLockedZoneIds.slice() : [],
+          resolvedZoneId: parameterResolvedZoneId || "",
+          zoneLookupPending: Boolean(parameterZoneLookupPending)
+        };
+      }
+
+      async function restoreParameterCreateDraft(draft = null) {
+        resetParameterForm();
+        if (!draft || typeof draft !== "object") return;
+
+        const fields = draft.fields && typeof draft.fields === "object"
+          ? draft.fields
+          : {};
+
+        parameterEditMode = false;
+        parameterLockedUnitId = draft.lockedUnitId || "";
+        parameterLockedZoneId = draft.lockedZoneId || "";
+        parameterLockedZoneIds = Array.isArray(draft.lockedZoneIds) ? draft.lockedZoneIds.slice() : [];
+        parameterResolvedZoneId = draft.resolvedZoneId || "";
+        parameterZoneLookupPending = Boolean(draft.zoneLookupPending);
+        parameterUnitTargetState = cloneDraftSnapshot(draft.unitTargetState || {}) || {};
+
+        await loadKpiNames(fields.parameter_kpi_id || "");
+        populateAllocationLookupOptions(fields);
+
+        Object.keys(fields).forEach((id) => {
+          const field = document.getElementById(id);
+          if (field) {
+            field.value = fields[id] ?? "";
+          }
+        });
+
+        const unitTypeSelect = document.getElementById("parameter_unit_type_id");
+        if (unitTypeSelect) {
+          unitTypeSelect.disabled = Boolean(parameterLockedUnitId) || Boolean(parameterLockedZoneId);
+        }
+
+        syncParameterRoleDropdown();
+        handleParameterKpiTypeChange();
+        updateParameterOverview();
+        updateParameterKpiSummary();
+      }
+
+      function dismissParameterModal() {
+        if (parameterSavePending) return;
+
+        const isCreateMode = !parameterEditMode && !getParameterFieldValue("parameter_object_id");
+        if (isCreateMode) {
+          parameterCreateDraft = captureParameterCreateDraft();
+        }
+
+        closeParameterModal();
+      }
+
+      function updateModalOverview() {
+        const isEdit = !!getFieldValue("kpi_id");
+  
+      }
+
+      function normalizeLimitInput(value, allowPercent = false) {
+        if (value === null || value === undefined) return null;
+        let normalized = String(value).trim();
+        if (!normalized) return null;
+
+        normalized = normalized.replace(/\\s+/g, "").replace(/,/g, ".");
         if (allowPercent && normalized.endsWith("%")) {
           normalized = normalized.slice(0, -1);
         }
 
-        return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized) ? Number(normalized) : null;
+        return /^[+-]?(?:\\d+\\.?\\d*|\\.\\d+)$/.test(normalized) ? normalized : null;
       }
 
-      function formatDerivedLimit(value) {
-        return Number.isFinite(value) ? String(Number(value.toFixed(6))) : "";
+      function parseLimitNumber(value, allowPercent = false) {
+        const normalized = normalizeLimitInput(value, allowPercent);
+        return normalized === null ? null : Number(normalized);
       }
 
-      function updateDerivedLimits({ clearWhenUnavailable = true } = {}) {
-        const target = normalizeNumericInput(document.getElementById("target").value);
-        const upTolerance = normalizeNumericInput(document.getElementById("up_tolerance").value, { allowPercent: true });
-        const lowTolerance = normalizeNumericInput(document.getElementById("low_tolerance").value, { allowPercent: true });
-        const toleranceType = String(document.getElementById("tolerance_type").value || "").trim().toLowerCase();
-
-        let highLimit = null;
-        let lowLimit = null;
-
-        if (
-          target !== null &&
-          upTolerance !== null &&
-          lowTolerance !== null &&
-          toleranceType
-        ) {
-          if (toleranceType === "relative") {
-            highLimit = target * (1 + (upTolerance / 100));
-            lowLimit = target * (1 + (lowTolerance / 100));
-          } else if (toleranceType === "absolute") {
-            highLimit = target + upTolerance;
-            lowLimit = target + lowTolerance;
-          }
-        }
-
-        if (highLimit !== null && lowLimit !== null) {
-          document.getElementById("high_limit").value = formatDerivedLimit(highLimit);
-          document.getElementById("low_limit").value = formatDerivedLimit(lowLimit);
-          return;
-        }
-
-        if (clearWhenUnavailable) {
-          document.getElementById("high_limit").value = "";
-          document.getElementById("low_limit").value = "";
-        }
+      function formatCalculatedLimit(value) {
+        if (!Number.isFinite(value)) return "";
+        return value.toFixed(10).replace(/\\.?0+$/, "");
       }
+
+      function isRelativeToleranceType(toleranceType) {
+        return String(toleranceType || "").trim().toLowerCase() === "relative";
+      }
+
+      function parseToleranceInputValue(value) {
+        if (value === null || value === undefined) {
+          return { text: "", numeric: null, hasPercent: false };
+        }
+
+        const text = String(value).trim();
+        if (!text) {
+          return { text: "", numeric: null, hasPercent: false };
+        }
+
+        const normalized = normalizeLimitInput(text, true);
+        return {
+          text,
+          numeric: normalized === null ? null : Number(normalized),
+          hasPercent: text.includes("%")
+        };
+      }
+
+      function parseToleranceDelta(value, toleranceType, direction = "up") {
+        const { numeric, hasPercent } = parseToleranceInputValue(value);
+        if (!Number.isFinite(numeric)) return null;
+
+        let delta = numeric;
+
+        if (isRelativeToleranceType(toleranceType)) {
+          delta = hasPercent || Math.abs(delta) > 1 ? delta / 100 : delta;
+        }
+
+        if (direction === "up") {
+          return Math.abs(delta);
+        }
+
+        return delta > 0 ? -delta : delta;
+      }
+
+      function formatToleranceForInput(value, toleranceType, direction = "up") {
+        const parsed = parseToleranceInputValue(value);
+        if (!parsed.text) return "";
+        if (!Number.isFinite(parsed.numeric)) return parsed.text;
+
+        let displayValue = parsed.numeric;
+
+        if (isRelativeToleranceType(toleranceType)) {
+          displayValue = parsed.hasPercent || Math.abs(displayValue) > 1
+            ? displayValue
+            : displayValue * 100;
+        }
+
+        if (direction === "up") {
+          displayValue = Math.abs(displayValue);
+        } else if (displayValue > 0) {
+          displayValue = -displayValue;
+        }
+
+        const suffix = isRelativeToleranceType(toleranceType) ? "%" : "";
+        return formatCalculatedLimit(displayValue) + suffix;
+      }
+
+      function formatToleranceForDisplay(value, toleranceType, direction = "up") {
+        return formatToleranceForInput(value, toleranceType, direction);
+      }
+
+      function serializeToleranceForPayload(value, toleranceType, direction = "up") {
+        const parsed = parseToleranceInputValue(value);
+        if (!parsed.text) return "";
+
+        const delta = parseToleranceDelta(value, toleranceType, direction);
+        return Number.isFinite(delta) ? formatCalculatedLimit(delta) : parsed.text;
+      }
+
+      function getLimitFields(source = null) {
+        const root = source && typeof source.closest === "function"
+          ? source.closest("#modalBackdrop") || source.closest(".modal") || document
+          : document.getElementById("modalBackdrop") || document;
+
+        return {
+          targetInput: root.querySelector("#target") || getKpiFieldElement("target"),
+          toleranceTypeInput: root.querySelector("#tolerance_type") || getKpiFieldElement("tolerance_type"),
+          upToleranceInput: root.querySelector("#up_tolerance") || getKpiFieldElement("up_tolerance"),
+          lowToleranceInput: root.querySelector("#low_tolerance") || getKpiFieldElement("low_tolerance"),
+          highLimitInput: root.querySelector("#high_limit") || getKpiFieldElement("high_limit"),
+          lowLimitInput: root.querySelector("#low_limit") || getKpiFieldElement("low_limit")
+        };
+      }
+
+function syncToleranceInputs(source = null) {
+    const {
+      toleranceTypeInput,
+      upToleranceInput,
+      lowToleranceInput,
+      highLimitInput,
+      lowLimitInput
+    } = getLimitFields(source);
+
+    if (!toleranceTypeInput) return;
+
+    const toleranceType = String(toleranceTypeInput.value || "").trim().toLowerCase();
+    const isAbsolute = toleranceType === "absolute";
+    const isRelative = toleranceType === "relative";
+
+    const wrapUp   = document.getElementById("wrap_up_tolerance");
+    const wrapLow  = document.getElementById("wrap_low_tolerance");
+    const wrapHigh = document.getElementById("wrap_high_limit");
+    const wrapLowL = document.getElementById("wrap_low_limit");
+
+    if (wrapUp)   wrapUp.style.display   = isRelative ? "" : "none";
+    if (wrapLow)  wrapLow.style.display  = isRelative ? "" : "none";
+    if (wrapHigh) wrapHigh.style.display = isAbsolute ? "" : "none";
+    if (wrapLowL) wrapLowL.style.display = isAbsolute ? "" : "none";
+
+    // Clear hidden fields so stale values aren't submitted
+    if (isAbsolute && upToleranceInput)  upToleranceInput.value  = "";
+    if (isAbsolute && lowToleranceInput) lowToleranceInput.value = "";
+    if (isRelative && highLimitInput)    highLimitInput.value    = "";
+    if (isRelative && lowLimitInput)     lowLimitInput.value     = "";
+
+    // Format tolerance display for Relative
+    if (isRelative) {
+      if (upToleranceInput && String(upToleranceInput.value || "").trim()) {
+        upToleranceInput.value = formatToleranceForInput(upToleranceInput.value, toleranceType, "up");
+      }
+      if (lowToleranceInput && String(lowToleranceInput.value || "").trim()) {
+        lowToleranceInput.value = formatToleranceForInput(lowToleranceInput.value, toleranceType, "low");
+      }
+    }
+    // add as last line inside syncToleranceInputs():
+    if (typeof syncToleranceRadioButtons === "function") syncToleranceRadioButtons();
+  }
+
+      function handleToleranceTypeChange(source) {
+        syncToleranceInputs(source);
+        recalculateLimits(source);
+        syncKpiRequiredState();
+      }
+
+function recalculateLimits(sourceOrOptions = {}, maybeOptions = {}) {
+  const source = sourceOrOptions && typeof sourceOrOptions.closest === "function"
+    ? sourceOrOptions
+    : null;
+
+  const {
+    targetInput,
+    toleranceTypeInput,
+    upToleranceInput,
+    lowToleranceInput,
+    highLimitInput,
+    lowLimitInput
+  } = getLimitFields(source);
+
+  const toleranceType = String(toleranceTypeInput?.value || "").trim().toLowerCase();
+
+  // Absolute = DO NOTHING
+  if (toleranceType === "absolute") {
+    return;
+  }
+
+  // Only Relative can calculate
+  if (toleranceType !== "relative") {
+    return;
+  }
+
+  const targetValue = parseLimitNumber(targetInput?.value);
+  const upToleranceValue = parseToleranceDelta(upToleranceInput?.value, toleranceType, "up");
+  const lowToleranceValue = parseToleranceDelta(lowToleranceInput?.value, toleranceType, "low");
+
+  if (
+    !Number.isFinite(targetValue) ||
+    !Number.isFinite(upToleranceValue) ||
+    !Number.isFinite(lowToleranceValue)
+  ) {
+    return;
+  }
+
+  highLimitInput.value = formatCalculatedLimit(targetValue * (1 + upToleranceValue));
+  lowLimitInput.value = formatCalculatedLimit(targetValue * (1 + lowToleranceValue));
+}
 
       function bindOverviewListeners() {
         ["frequency", "unit", "target"].forEach(id => {
-          const el = document.getElementById(id);
+          const el = getKpiFieldElement(id);
           if (el) {
             el.addEventListener("input", updateModalOverview);
+            el.addEventListener("change", updateModalOverview);
           }
         });
+      }
 
+
+      function bindHierarchyListeners() {
+  const nameEl = getKpiFieldElement("indicator_sub_title");
+  const definitionEl = getKpiFieldElement("definition");
+  const treeTrigger = document.getElementById("subjectTreeTrigger");
+
+  if (treeTrigger) {
+    treeTrigger.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeSubjectTree();
+      }
+    });
+  }
+
+  if (nameEl) {
+    ["input", "change"].forEach((eventName) => {
+      nameEl.addEventListener(eventName, () => {
+        updateModalOverview();
+      });
+    });
+  }
+
+  if (definitionEl) {
+    ["input", "change"].forEach((eventName) => {
+      definitionEl.addEventListener(eventName, () => {
+        syncDefinitionTextareaHeight();
+        updateModalOverview();
+      });
+    });
+  }
+
+document.addEventListener("click", (event) => {
+  const treeSelect = document.getElementById("subjectTreeSelect");
+  if (!treeSelect) return;
+
+  const path = event.composedPath ? event.composedPath() : [];
+  const clickedInsideTree = path.includes(treeSelect) || treeSelect.contains(event.target);
+
+  if (!clickedInsideTree) {
+    closeSubjectTree();
+  }
+});
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeSubjectTree();
+      updateModalOverview();
+    }
+  });
+}
+      function bindLimitListeners() {
         ["target", "up_tolerance", "low_tolerance"].forEach(id => {
-          const el = document.getElementById(id);
+          const el = getKpiFieldElement(id);
           if (el) {
-            el.addEventListener("input", () => updateDerivedLimits());
+            el.addEventListener("input", (event) => recalculateLimits(event.target));
           }
         });
 
-        ["up_tolerance", "low_tolerance"].forEach(id => {
-          const el = document.getElementById(id);
-          if (el) {
-            el.addEventListener("blur", () => syncToleranceInputsWithType());
-          }
-        });
-
-        const toleranceTypeField = document.getElementById("tolerance_type");
-        if (toleranceTypeField) {
-          toleranceTypeField.addEventListener("change", () => {
-            syncToleranceInputsWithType();
-            updateDerivedLimits();
-          });
+        const toleranceType = getKpiFieldElement("tolerance_type");
+        if (toleranceType) {
+          toleranceType.addEventListener("change", (event) => handleToleranceTypeChange(event.target));
         }
       }
 
-      function resetForm() {
-        [
-          "kpi_id",
-          "indicator_title",
-          "indicator_sub_title",
-          "unit",
-          "frequency",
-          "target",
-          "tolerance_type",
-          "up_tolerance",
-          "low_tolerance",
-          "max",
-          "min",
-          "calculation_on",
-          "target_auto_adjustment",
-          "high_limit",
-          "low_limit"
-        ].forEach(id => {
-          const el = document.getElementById(id);
-          if (el) el.value = "";
-        });
+function handleCalculationOnChange() {
+  const value = getKpiFieldElement("calculation_on")?.value;
+  const wrap = document.getElementById("wrap_nombre_periode");
+  const select = getKpiFieldElement("nombre_periode");
+  const shouldShowNombrePeriode = value === "Average";
+  const calcOnRow = wrap ? wrap.closest(".calc-logic-row") : null;
 
-        document.getElementById("tolerance_type").value = "";
-        syncToleranceInputsWithType();
-        updateModalOverview();
-      }
+  if (wrap) wrap.style.display = shouldShowNombrePeriode ? "" : "none";
+  const arrowOn = document.getElementById("calc_on_arrow");
+  if (arrowOn) arrowOn.style.display = shouldShowNombrePeriode ? "" : "none";
+  if (calcOnRow) calcOnRow.classList.toggle("is-split", shouldShowNombrePeriode);
+  if (select) {
+    select.disabled = !shouldShowNombrePeriode;
+    if (!select.value) select.value = "1 week";
+  }
 
-      function formatToleranceForInput(value, toleranceType) {
-        if (value === null || value === undefined || value === "") return "";
-        const normalizedValue = normalizeNumericInput(value, { allowPercent: true });
-        if (normalizedValue === null) {
-          const text = String(value).trim();
-          if (!text) return "";
-          return String(toleranceType || "").trim().toLowerCase() === "relative"
-            ? text.replace(/%+$/g, "") + "%"
-            : text.replace(/%+$/g, "");
+  syncKpiRequiredState();
+}
+
+function handleDisplayTrendChange() {
+  const value = getKpiFieldElement("display_trend")?.value;
+  const wrap = document.getElementById("wrap_regression");
+  const arrowTrend = document.getElementById("disp_trend_arrow");
+  const trendRow = wrap ? wrap.closest(".calc-logic-row") : null;
+  if (wrap) wrap.style.display = value === "Yes" ? "" : "none";
+  if (arrowTrend) arrowTrend.style.display = value === "Yes" ? "" : "none";
+  if (trendRow) trendRow.classList.toggle("is-split", value === "Yes");
+  syncKpiRequiredState();
+}
+
+function normalizeNullableFieldValue(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+
+  const lowered = text.toLowerCase();
+  if (lowered === "none" || lowered === "null" || lowered === "undefined" || lowered === "nan") {
+    return "";
+  }
+
+  return text;
+}
+
+function inferValueType(value) {
+  const text = normalizeNullableFieldValue(value);
+  if (!text) return "Null";
+  if (!Number.isNaN(Number(text)) && Number(text) === 0) return "0";
+  return "Valeur a entrer";
+}
+
+function handleMinTypeChange() {
+  const value = getKpiFieldElement("min_type")?.value;
+  const wrap = document.getElementById("wrap_min_value");
+  const input = getKpiFieldElement("min");
+
+  if (wrap) wrap.style.display = value === "Valeur a entrer" ? "" : "none";
+  if (!input) return;
+
+  if (value === "Null") input.value = "";
+  if (value === "0") input.value = "0";
+  if (value === "Valeur a entrer" && input.value === "0") input.value = "";
+  syncKpiRequiredState();
+}
+
+function handleMaxTypeChange() {
+  const value = getKpiFieldElement("max_type")?.value;
+  const wrap = document.getElementById("wrap_max_value");
+  const input = getKpiFieldElement("max");
+
+  if (wrap) wrap.style.display = value === "Valeur a entrer" ? "" : "none";
+  if (!input) return;
+
+  if (value === "Null") input.value = "";
+  if (value === "0") input.value = "0";
+  if (value === "Valeur a entrer" && input.value === "0") input.value = "";
+  syncKpiRequiredState();
+}
+
+function setKpiFieldRequired(id, isRequired) {
+  const field = getKpiFieldElement(id);
+  if (!field) return;
+
+  if (isRequired) {
+    field.setAttribute("required", "required");
+    return;
+  }
+
+  field.removeAttribute("required");
+}
+
+function syncKpiRequiredState() {
+  const toleranceType = getFieldValue("tolerance_type");
+  const calculationOn = getFieldValue("calculation_on");
+  const calculationMode = getFieldValue("calculation_mode");
+  const displayTrend = getFieldValue("display_trend");
+  const minType = getFieldValue("min_type");
+  const maxType = getFieldValue("max_type");
+  const isRelative = String(toleranceType || "").toLowerCase() !== "absolute";
+
+  setKpiFieldRequired("nombre_periode", calculationOn === "Average");
+  setKpiFieldRequired("reference_kpi_id", calculationMode === "Ratio");
+  setKpiFieldRequired("regression", displayTrend === "Yes");
+  setKpiFieldRequired("min", minType === "Valeur a entrer");
+  setKpiFieldRequired("max", maxType === "Valeur a entrer");
+  setKpiFieldRequired("up_tolerance", isRelative);
+  setKpiFieldRequired("low_tolerance", isRelative);
+  setKpiFieldRequired("high_limit", !isRelative);
+  setKpiFieldRequired("low_limit", !isRelative);
+}
+
+function focusKpiField(id) {
+  const field = id === "subject_node_id"
+    ? document.getElementById("subjectTreeTrigger")
+    : getKpiFieldElement(id);
+
+  if (field && typeof field.focus === "function") {
+    field.focus();
+  }
+}
+
+function validateKpiForm() {
+  syncKpiRequiredState();
+
+  const validations = [
+    {
+      id: "subject_node_id",
+      valid: Boolean(getFieldValue("subject_node_id")),
+      message: "Select the final subject from the tree."
+    },
+    {
+      id: "indicator_sub_title",
+      valid: Boolean(getFieldValue("indicator_sub_title")),
+      message: "KPI Name is required."
+    },
+    {
+      id: "unit",
+      valid: Boolean(getFieldValue("unit")),
+      message: "Unit is required."
+    },
+    {
+      id: "frequency",
+      valid: Boolean(getFieldValue("frequency")),
+      message: "Frequency is required."
+    },
+    {
+      id: "direction",
+      valid: Boolean(getFieldValue("direction")),
+      message: "Direction is required."
+    },
+    {
+      id: "calculation_on",
+      valid: Boolean(getFieldValue("calculation_on")),
+      message: "Calculation On is required."
+    },
+    {
+      id: "calculation_mode",
+      valid: Boolean(getFieldValue("calculation_mode")),
+      message: "Calculation Mode is required."
+    },
+    {
+      id: "display_trend",
+      valid: Boolean(getFieldValue("display_trend")),
+      message: "Display Trend is required."
+    },
+    {
+      id: "min_type",
+      valid: Boolean(getFieldValue("min_type")),
+      message: "Min is required."
+    },
+    {
+      id: "max_type",
+      valid: Boolean(getFieldValue("max_type")),
+      message: "Max is required."
+    },
+    {
+      id: "target_auto_adjustment",
+      valid: Boolean(getFieldValue("target_auto_adjustment")),
+      message: "Target Auto Adjust is required."
+    },
+    {
+      id: "definition",
+      valid: Boolean(getFieldValue("definition")),
+      message: "Definition is required."
+    },
+    {
+      id: "tolerance_type",
+      valid: Boolean(getFieldValue("tolerance_type")),
+      message: "Tolerance Type is required."
+    }
+  ];
+
+  const calculationOn = getFieldValue("calculation_on");
+  const calculationMode = getFieldValue("calculation_mode");
+  const displayTrend = getFieldValue("display_trend");
+  const minType = getFieldValue("min_type");
+  const maxType = getFieldValue("max_type");
+  const toleranceType = getFieldValue("tolerance_type");
+
+  if (calculationOn === "Average") {
+    validations.push({
+      id: "nombre_periode",
+      valid: Boolean(getFieldValue("nombre_periode")),
+      message: "Nombre periode is required."
+    });
+  }
+
+  if (calculationMode === "Ratio") {
+    validations.push({
+      id: "reference_kpi_id",
+      valid: Boolean(getFieldValue("reference_kpi_id")),
+      message: "Reference KPI is required for Ratio mode."
+    });
+  }
+
+  if (displayTrend === "Yes") {
+    validations.push({
+      id: "regression",
+      valid: Boolean(getFieldValue("regression")),
+      message: "Regression is required when Display Trend is Yes."
+    });
+  }
+
+  if (minType === "Valeur a entrer") {
+    const minValue = getFieldValue("min");
+    validations.push({
+      id: "min",
+      valid: Boolean(minValue),
+      message: "Min Value is required."
+    });
+    validations.push({
+      id: "min",
+      valid: !minValue || normalizeLimitInput(minValue) !== null,
+      message: "Min Value must be numeric."
+    });
+  }
+
+  if (maxType === "Valeur a entrer") {
+    const maxValue = getFieldValue("max");
+    validations.push({
+      id: "max",
+      valid: Boolean(maxValue),
+      message: "Max Value is required."
+    });
+    validations.push({
+      id: "max",
+      valid: !maxValue || normalizeLimitInput(maxValue) !== null,
+      message: "Max Value must be numeric."
+    });
+  }
+
+  if (String(toleranceType || "").toLowerCase() === "absolute") {
+    const highLimitValue = getFieldValue("high_limit");
+    const lowLimitValue = getFieldValue("low_limit");
+    validations.push({
+      id: "high_limit",
+      valid: Boolean(highLimitValue),
+      message: "High Limit is required."
+    });
+    validations.push({
+      id: "high_limit",
+      valid: !highLimitValue || normalizeLimitInput(highLimitValue) !== null,
+      message: "High Limit must be numeric."
+    });
+    validations.push({
+      id: "low_limit",
+      valid: Boolean(lowLimitValue),
+      message: "Low Limit is required."
+    });
+    validations.push({
+      id: "low_limit",
+      valid: !lowLimitValue || normalizeLimitInput(lowLimitValue) !== null,
+      message: "Low Limit must be numeric."
+    });
+  } else {
+    const upToleranceValue = getFieldValue("up_tolerance");
+    const lowToleranceValue = getFieldValue("low_tolerance");
+    validations.push({
+      id: "up_tolerance",
+      valid: Boolean(upToleranceValue),
+      message: "Up Tolerance is required."
+    });
+    validations.push({
+      id: "up_tolerance",
+      valid: !upToleranceValue || normalizeLimitInput(upToleranceValue, true) !== null,
+      message: "Up Tolerance must be numeric."
+    });
+    validations.push({
+      id: "low_tolerance",
+      valid: Boolean(lowToleranceValue),
+      message: "Low Tolerance is required."
+    });
+    validations.push({
+      id: "low_tolerance",
+      valid: !lowToleranceValue || normalizeLimitInput(lowToleranceValue, true) !== null,
+      message: "Low Tolerance must be numeric."
+    });
+  }
+
+  const firstFailure = validations.find((entry) => !entry.valid);
+  if (!firstFailure) {
+    return true;
+  }
+
+  showToast(firstFailure.message);
+  focusKpiField(firstFailure.id);
+  return false;
+}
+
+
+function resetForm() {
+  [
+    "kpi_id",
+    "kpi_code",
+    "kpi_formula",
+    "unit",
+    "definition",
+    "frequency",
+    "target",
+    "tolerance_type",
+    "up_tolerance",
+    "low_tolerance",
+    "max",
+    "min",
+    "calculation_on",
+    "target_auto_adjustment",
+    "high_limit",
+    "low_limit",
+    "direction",
+    "nombre_periode",
+    "calculation_mode",
+    "reference_kpi_id",
+    "display_trend",
+    "regression",
+    "min_type",
+    "max_type",
+    "status",
+    "comments",
+    "owner_role_id"
+  ].forEach(id => {
+    const el = getKpiFieldElement(id);
+    if (el) el.value = "";
+  });
+
+  const toleranceTypeEl = getKpiFieldElement("tolerance_type");
+  if (toleranceTypeEl) toleranceTypeEl.value = "";
+
+  const displayTrendEl = getKpiFieldElement("display_trend");
+  if (displayTrendEl) displayTrendEl.value = "";
+
+  const calculationModeEl = getKpiFieldElement("calculation_mode");
+  if (calculationModeEl) calculationModeEl.value = "";
+  setFieldValue("target_auto_adjustment", "Yes");
+  const minTypeEl = getKpiFieldElement("min_type");
+  if (minTypeEl) minTypeEl.value = "Null";
+
+  const maxTypeEl = getKpiFieldElement("max_type");
+  if (maxTypeEl) maxTypeEl.value = "0";
+
+  const statusEl = getKpiFieldElement("status");
+  if (statusEl) statusEl.value = "Active";
+
+  handleCalculationOnChange();
+  handleDisplayTrendChange();
+  handleMinTypeChange();
+  handleMaxTypeChange();
+  populateReferenceKpiOptions("");
+  populateRoleOptions("");
+  handleCalculationModeChange();
+  syncKpiRequiredState();
+
+  initializeKpiHierarchySelectors({
+    subject: "",
+    indicator_title: "",
+    indicator_sub_title: "",
+    definition: ""
+  });
+  updateModalOverview();
+  syncToleranceInputs();
+  recalculateLimits();
+}
+
+function setFieldValue(id, value) {
+  const el = getKpiFieldElement(id);
+  if (!el) return;
+
+  const finalValue = value ?? "";
+
+  if (el.tagName === "SELECT" && finalValue !== "") {
+    const exists = Array.from(el.options).some(opt => opt.value === String(finalValue));
+    if (!exists) {
+      el.insertAdjacentHTML(
+        "beforeend",
+        '<option value="' + escapeHtml(finalValue) + '">' + escapeHtml(finalValue) + '</option>'
+      );
+    }
+  }
+
+  el.value = finalValue;
+
+  if (id === "definition") {
+    syncDefinitionTextareaHeight();
+  }
+}
+
+
+function fillForm(data) {
+  setFieldValue("kpi_id", data.kpi_id);
+
+  initializeKpiHierarchySelectors({
+    subject_node_id: data.subject_node_id || "",
+    subject: data.subject || "",
+    indicator_title: data.indicator_title || "",
+    indicator_sub_title: data.indicator_sub_title || "",
+    definition: data.definition || ""
+  });
+
+  setFieldValue("kpi_code", data.kpi_code);
+  setFieldValue("kpi_formula", data.kpi_formula);
+  setFieldValue("unit", data.unit);
+  setFieldValue("definition", data.definition);
+  setFieldValue("frequency", data.frequency);
+  setFieldValue("direction", data.target_direction);
+  setFieldValue("status", data.status || "Active");
+  setFieldValue("comments", data.comments || "");
+
+  setFieldValue("calculation_on", data.calculation_on);
+  setFieldValue("nombre_periode", data.nombre_periode);
+  setFieldValue("calculation_mode", data.calculation_mode || "Direct");
+  populateReferenceKpiOptions(data.reference_kpi_id);
+  populateRoleOptions(data.owner_role_id);
+  setFieldValue("reference_kpi_id", data.reference_kpi_id);
+  setFieldValue("owner_role_id", data.owner_role_id);
+  setFieldValue("display_trend", data.display_trend);
+  setFieldValue("regression", data.regression);
+
+  setFieldValue("target", data.target);
+  setFieldValue("target_auto_adjustment", data.target_auto_adjustment);
+
+  setFieldValue("min_type", data.min_type || inferValueType(data.min));
+  setFieldValue("max_type", data.max_type || inferValueType(data.max));
+  setFieldValue("min", normalizeNullableFieldValue(data.min));
+  setFieldValue("max", normalizeNullableFieldValue(data.max));
+
+  setFieldValue("tolerance_type", data.tolerance_type || "");
+  setFieldValue("up_tolerance", formatToleranceForInput(data.up_tolerance, data.tolerance_type, "up"));
+  setFieldValue("low_tolerance", formatToleranceForInput(data.low_tolerance, data.tolerance_type, "low"));
+  setFieldValue("high_limit", data.high_limit);
+  setFieldValue("low_limit", data.low_limit);
+
+  handleCalculationOnChange();
+  handleDisplayTrendChange();
+  handleMinTypeChange();
+  handleMaxTypeChange();
+  handleCalculationModeChange();
+  syncToleranceInputs();
+  updateModalOverview();
+}
+
+      async function openCreateModal() {
+        await loadReferenceKpis();
+        if (kpiCreateDraft) {
+          restoreKpiCreateDraft(kpiCreateDraft);
+        } else {
+          resetForm();
         }
-
-        const text = String(Number(normalizedValue.toFixed(6)));
-        return String(toleranceType || "").trim().toLowerCase() === "relative"
-          ? text + "%"
-          : text;
-      }
-
-      function syncToleranceInputsWithType() {
-        const toleranceType = document.getElementById("tolerance_type")?.value || "";
-        const isRelative = String(toleranceType || "").trim().toLowerCase() === "relative";
-
-        ["up_tolerance", "low_tolerance"].forEach((id) => {
-          const field = document.getElementById(id);
-          if (!field) return;
-          field.value = formatToleranceForInput(field.value, toleranceType);
-        });
-
-        const upToleranceField = document.getElementById("up_tolerance");
-        const lowToleranceField = document.getElementById("low_tolerance");
-
-        if (upToleranceField) {
-          upToleranceField.placeholder = isRelative ? "10%" : "10";
-        }
-
-        if (lowToleranceField) {
-          lowToleranceField.placeholder = isRelative ? "-10%" : "-10";
-        }
-      }
-
-      function fillForm(data) {
-        [
-          "kpi_id",
-          "indicator_title",
-          "indicator_sub_title",
-          "unit",
-          "frequency",
-          "target",
-          "max",
-          "min",
-          "calculation_on",
-          "target_auto_adjustment",
-          "high_limit",
-          "low_limit"
-        ].forEach(id => {
-          const el = document.getElementById(id);
-          if (el) el.value = data[id] ?? "";
-        });
-
-        document.getElementById("tolerance_type").value = data.tolerance_type || "";
-        document.getElementById("up_tolerance").value = data.up_tolerance ?? "";
-        document.getElementById("low_tolerance").value = data.low_tolerance ?? "";
-
-        syncToleranceInputsWithType();
-        updateDerivedLimits({ clearWhenUnavailable: false });
-        updateModalOverview();
-      }
-
-      function openCreateModal() {
-        resetForm();
         document.getElementById("modalTitle").textContent = "Add New KPI";
         document.getElementById("modalSubtitle").textContent =
-          "Create a new KPI with clear identity, target logic and threshold visibility.";
-        document.getElementById("deleteBtn").style.display = "none";
+          "Create a new KPI with clear identity, target logic and threshold visibility. It will be linked to " + (responsibleName || "this responsible") + " when you save its target allocation.";
+        const deleteBtn = document.getElementById("deleteBtn");
+        if (deleteBtn) {
+         deleteBtn.style.display = "none";
+        }
         updateModalOverview();
         openModal();
       }
 
+      async function openKpiDetailsModal(kpiId) {
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId + '?include_all=1');
+          if (!res.ok) throw new Error("Failed to load KPI details");
+
+          const data = await res.json();
+          renderKpiDetailsModalContent(data);
+          openKpiDetailsModalShell();
+        } catch (error) {
+          console.error("OPEN KPI DETAILS ERROR:", error);
+          showToast("Unable to load KPI details: " + error.message);
+        }
+      }
+
       async function openEditModal(kpiId) {
         try {
-          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId);
+          await loadReferenceKpis();
+          const res = await fetch('/api/kpis/' + kpiId);
           if (!res.ok) throw new Error("Failed to load KPI");
 
           const data = await res.json();
           fillForm(data);
+          handleCalculationOnChange();
+          handleDisplayTrendChange();
+          handleMinTypeChange();
+          handleMaxTypeChange();
 
-          document.getElementById("modalTitle").textContent = "Edit KPI";
+          document.getElementById("modalTitle").textContent = "Edit KPI Attributes";
           document.getElementById("modalSubtitle").textContent =
-            "Review and update KPI details, targets, rules and displayed thresholds.";
-          document.getElementById("deleteBtn").style.display = "inline-flex";
+            "";
+          const deleteBtn = document.getElementById("deleteBtn");
+          if (deleteBtn) {
+           deleteBtn.style.display = "inline-flex";
+          }
 
           updateModalOverview();
           openModal();
         } catch (error) {
-          showToast("Unable to load KPI");
-        }
+        console.error("OPEN EDIT MODAL ERROR:", error);
+        showToast("Unable to load KPI: " + error.message);
+         } 
       }
 
+
+        function getSafeValue(id, options = {}) {
+      const optional = Boolean(options && options.optional);
+      const el = getKpiFieldElement(id);
+     if (!el) {
+      if (!optional) {
+        console.error("Missing field:", id);
+      }
+    return "";
+     }
+     return el.value || "";
+    }
+
       function buildPayload() {
+        const toleranceType = getSafeValue("tolerance_type");
+        const minType = getSafeValue("min_type") || "Null";
+        const maxType = getSafeValue("max_type") || "Null";
+        const minValue = normalizeNullableFieldValue(getSafeValue("min", { optional: true }));
+        const maxValue = normalizeNullableFieldValue(getSafeValue("max", { optional: true }));
         return {
-          indicator_title: document.getElementById("indicator_title").value,
-          indicator_sub_title: document.getElementById("indicator_sub_title").value,
-          unit: document.getElementById("unit").value,
-          frequency: document.getElementById("frequency").value,
-          target: document.getElementById("target").value,
-          tolerance_type: document.getElementById("tolerance_type").value,
-          up_tolerance: document.getElementById("up_tolerance").value,
-          low_tolerance: document.getElementById("low_tolerance").value,
-          max: document.getElementById("max").value,
-          min: document.getElementById("min").value,
-          calculation_on: document.getElementById("calculation_on").value,
-          target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
-          high_limit: document.getElementById("high_limit").value || null,
-          low_limit: document.getElementById("low_limit").value || null
+          indicator_title: getSafeValue("subject"),              // use subject as title
+          indicator_sub_title: getSafeValue("indicator_sub_title"), // manual KPI name
+          subject_node_id: getSafeValue("subject_node_id"),
+          kpi_code: getSafeValue("kpi_code"),
+          kpi_formula: getSafeValue("kpi_formula"),
+          unit: getSafeValue("unit"),
+          subject: getSafeValue("subject"),
+          definition: getSafeValue("definition"),
+          frequency: getSafeValue("frequency"),
+          target: getSafeValue("target", { optional: true }),
+          tolerance_type: toleranceType,
+          up_tolerance: serializeToleranceForPayload(getSafeValue("up_tolerance", { optional: true }), toleranceType, "up"),
+          low_tolerance: serializeToleranceForPayload(getSafeValue("low_tolerance", { optional: true }), toleranceType, "low"),
+          max: maxType === "Null" ? "" : maxType === "0" ? "0" : maxValue,
+          min: minType === "Null" ? "" : minType === "0" ? "0" : minValue,
+          calculation_on: getSafeValue("calculation_on"),
+          target_auto_adjustment: getSafeValue("target_auto_adjustment"),
+          target_direction: getSafeValue("direction"),
+          nombre_periode: getSafeValue("nombre_periode"),
+          calculation_mode: getSafeValue("calculation_mode"),
+          reference_kpi_id: getSafeValue("calculation_mode") === "Ratio"
+            ? (getSafeValue("reference_kpi_id", { optional: true }) || null)
+            : null,
+          display_trend: getSafeValue("display_trend"),
+          regression: getSafeValue("regression", { optional: true }),
+          min_type: getSafeValue("min_type"),
+          max_type: getSafeValue("max_type"),
+          owner_role_id: getSafeValue("owner_role_id", { optional: true }) || null,
+          status: getSafeValue("status", { optional: true }),
+          comments: getSafeValue("comments", { optional: true }),
+          high_limit: getSafeValue("high_limit", { optional: true }) || null,
+          low_limit: getSafeValue("low_limit", { optional: true }) || null
         };
       }
 
       async function saveKpi() {
-        const kpiId = document.getElementById("kpi_id").value;
+        if (!validateKpiForm()) {
+          return;
+        }
+
+        const kpiId = getSafeValue("kpi_id", { optional: true });
+        const isCreateMode = !kpiId;
         const method = kpiId ? "PUT" : "POST";
-        const url = kpiId
-          ? '/api/responsibles/' + responsibleId + '/kpis/' + kpiId
-          : '/api/responsibles/' + responsibleId + '/kpis';
+       const url = kpiId
+        ? '/api/kpis/' + kpiId
+        : '/api/responsibles/' + responsibleId + '/kpis';
 
         try {
           const res = await fetch(url, {
@@ -4127,47 +16699,507 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
             body: JSON.stringify(buildPayload())
           });
 
+          const savedKpi = await res.json().catch(() => null);
+
           if (!res.ok) {
-            const errorData = await res.json().catch(() => null);
-            showToast(errorData?.error || "Save failed");
+            showToast(savedKpi?.error || "Save failed");
             return;
           }
 
-          closeModal();
-          await loadKpis(document.getElementById("search").value || "");
-          showToast(kpiId ? "KPI updated successfully" : "KPI created successfully");
+       if (isCreateMode) {
+         kpiCreateDraft = null;
+       }
+       closeModal();
+       if (isCreateMode) {
+         resetForm();
+       }
+       await loadKpis(document.getElementById("search").value || "");
+       if (isCreateMode && savedKpi?.kpi_id) {
+          showDashboard();
+          showToast("KPI created successfully");
+          return;
+        }
+        showToast(kpiId ? "KPI updated successfully" : "KPI created successfully"); 
         } catch (error) {
-          showToast("Save failed");
+          console.error("SAVE KPI ERROR:", error);
+          showToast("Save failed: " + error.message);
         }
       }
 
       async function deleteCurrentKpi() {
-        const kpiId = document.getElementById("kpi_id").value;
+        const kpiId = getSafeValue("kpi_id", { optional: true });
         if (!kpiId) return;
-
-        const ok = confirm("Delete this KPI?");
-        if (!ok) return;
 
         await deleteKpi(kpiId, true);
       }
 
       async function deleteKpi(kpiId, fromModal = false) {
-        const ok = fromModal ? true : confirm("Delete this KPI?");
+        if (!kpiId) return;
+        const ok = confirm("Delete this KPI? This will also delete linked target allocations, KPI results, and assistant conversations.");
         if (!ok) return;
 
         try {
-          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId, {
+          const res = await fetch('/api/kpis/' + kpiId, {
             method: "DELETE"
           });
 
           if (!res.ok) {
-            showToast("Delete failed");
+            const errorData = await res.json().catch(() => null);
+            showToast(errorData?.error || "Delete failed");
             return;
           }
 
-          if (fromModal) closeModal();
+          if (String(getSafeValue("kpi_id", { optional: true })) === String(kpiId)) {
+            resetForm();
+            closeModal();
+          } else if (fromModal) {
+            closeModal();
+          }
+
           await loadKpis(document.getElementById("search").value || "");
           showToast("KPI deleted");
+        } catch (error) {
+          showToast("Delete failed");
+        }
+      }
+
+      function formatParameterDateForInput(value) {
+        return normalizeParameterDateValue(value);
+      }
+
+      function resetParameterForm() {
+        PARAMETER_MODAL_FIELD_IDS.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = "";
+        });
+
+        parameterLockedUnitId = "";
+        parameterLockedZoneId = "";
+        parameterLockedZoneIds = [];
+        parameterResolvedZoneId = "";
+        parameterZoneLookupPending = false;
+        parameterEditMode = false;
+        resetParameterUnitTargetState();
+        populateAllocationLookupOptions({});
+
+        const setupDateInput = document.getElementById("parameter_target_setup_date");
+        if (setupDateInput) {
+          setupDateInput.value = getLocalDateInputValue();
+        }
+
+        const statusInput = document.getElementById("parameter_target_status");
+        if (statusInput) {
+          statusInput.value = "Draft";
+        }
+
+        const unitTypeSelect = document.getElementById("parameter_unit_type_id");
+        if (unitTypeSelect) {
+          unitTypeSelect.disabled = false;
+        }
+
+        const parameterDeleteBtn = document.getElementById("parameterDeleteBtn");
+        if (parameterDeleteBtn) {
+          parameterDeleteBtn.style.display = "none";
+        }
+        const allocSection = document.getElementById("parameterAllocationFieldsSection");
+        if (allocSection) allocSection.classList.add("is-hidden");
+     handleParameterKpiTypeChange();
+
+
+
+updateParameterOverview();
+updateParameterKpiSummary();
+      }
+
+      function fillParameterForm(data) {
+        const relatedAllocations = Array.isArray(data?.related_allocations) && data.related_allocations.length
+          ? data.related_allocations
+          : [data];
+        const primaryRow =
+          relatedAllocations.find(
+            (row) => String(row?.kpi_target_allocation_id || "") === String(data?.kpi_target_allocation_id || "")
+          ) || relatedAllocations[0] || data;
+        const normalizedKpiType = String(primaryRow?.kpi_type || "").trim().toLowerCase();
+        const isGroupedScope = normalizedKpiType === "multisite" || normalizedKpiType === "zone";
+
+        const mappings = {
+          parameter_object_id: primaryRow.kpi_target_allocation_id,
+          parameter_kpi_id: primaryRow.kpi_id,
+          parameter_kpi_type: primaryRow.kpi_type,
+          parameter_unit_type_id: primaryRow.unit_type_id,
+          parameter_role_id: primaryRow.role_id,
+          parameter_target_status: primaryRow.target_status,
+          parameter_plant_id: primaryRow.plant_id,
+          parameter_zone_id: primaryRow.zone_id,
+          parameter_unit_id: primaryRow.unit_id,
+          parameter_function: primaryRow.function,
+          parameter_product_line_id: primaryRow.product_line_id,
+          parameter_product_id: primaryRow.product_id,
+          parameter_market_id: primaryRow.market_id,
+          parameter_customer_id: primaryRow.customer_id,
+          parameter_target_value: primaryRow.target_value ?? "",
+          parameter_target_unit: primaryRow.target_unit ?? "",
+          parameter_local_currency: primaryRow.local_currency,
+          parameter_last_best_target: primaryRow.last_best_target ?? "",
+          parameter_previous_target_value: primaryRow.previous_target_value ?? "",
+          parameter_target_setup_date: formatParameterDateForInput(primaryRow.target_setup_date),
+          parameter_target_start_date: formatParameterDateForInput(primaryRow.target_start_date),
+          parameter_target_end_date: formatParameterDateForInput(primaryRow.target_end_date),
+          parameter_set_by_people_id: primaryRow.set_by_people_id,
+          parameter_zone_unit_id: primaryRow.unit_id,
+          parameter_zone_product_id: primaryRow.product_id,
+          parameter_approved_by_people_id: primaryRow.approved_by_people_id,
+          parameter_comments: primaryRow.comments ?? ""
+        };
+
+        parameterEditMode = true;
+        parameterLockedUnitId = isGroupedScope
+          ? ""
+          : String(primaryRow.plant_id || primaryRow.unit_id || "").trim();
+    if (normalizedKpiType === "zone") {
+    parameterLockedZoneIds = relatedAllocations
+      .map((row) => String(row.zone_id || "").trim())
+      .filter(Boolean);
+
+     parameterLockedZoneId = parameterLockedZoneIds[0] || "";
+     parameterResolvedZoneId = parameterLockedZoneId;
+     } else {
+      parameterLockedZoneIds = [];
+      parameterLockedZoneId = "";
+      parameterResolvedZoneId = "";
+     }
+      initializeParameterUnitTargetState(relatedAllocations);
+       populateAllocationLookupOptions(mappings);
+
+     if (normalizedKpiType === "zone") {
+      setLookupSelectOptions(
+       "parameter_zone_unit_id",
+       getParameterZoneUnitOptions(),
+       "Select unit",
+       primaryRow.unit_id || primaryRow.plant_id || ""
+    );
+
+    setLookupSelectOptions(
+      "parameter_zone_product_id",
+      allocationLookups.products,
+      "Select product",
+      primaryRow.product_id || ""
+    );
+   }
+
+Object.keys(mappings).forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = mappings[id] ?? "";
+        });
+
+        const unitTypeSelect = document.getElementById("parameter_unit_type_id");
+        if (unitTypeSelect) {
+          unitTypeSelect.disabled = Boolean(parameterLockedUnitId) || Boolean(parameterLockedZoneId) || isGroupedScope;
+        }
+
+    handleParameterKpiTypeChange();
+
+if (normalizedKpiType === "zone") {
+  const zoneUnitEl = document.getElementById("parameter_zone_unit_id");
+  const zoneProductEl = document.getElementById("parameter_zone_product_id");
+
+  if (zoneUnitEl) {
+    zoneUnitEl.value = String(primaryRow.unit_id || primaryRow.plant_id || "");
+  }
+
+  if (zoneProductEl) {
+    zoneProductEl.value = String(primaryRow.product_id || "");
+  }
+
+  parameterLockedZoneIds = relatedAllocations
+    .map(row => String(row.zone_id || "").trim())
+    .filter(Boolean);
+
+  parameterLockedZoneId = parameterLockedZoneIds[0] || "";
+  parameterResolvedZoneId = parameterLockedZoneId;
+
+  renderMultisiteUnitMatrix();
+}
+
+updateParameterOverview();
+updateParameterKpiSummary();
+      }
+
+      async function openCreateParameterModal(defaults = {}) {
+        if (parameterCreateDraft) {
+          await restoreParameterCreateDraft(parameterCreateDraft);
+        } else {
+          await loadKpiNames(defaults.kpi_id || "");
+          resetParameterForm();
+          const parameterDefaults = {
+            parameter_kpi_id: defaults.kpi_id || "",
+            parameter_target_value: defaults.target_value ?? "",
+            parameter_target_unit: defaults.target_unit || "",
+            parameter_set_by_people_id: defaults.set_by_people_id || responsibleId || ""
+          };
+          populateAllocationLookupOptions(parameterDefaults);
+          Object.keys(parameterDefaults).forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) {
+              el.value = parameterDefaults[id] ?? "";
+            }
+          });
+          syncDashboardResponsibleAssignment();
+          updateParameterOverview();
+          updateParameterKpiSummary();
+        }
+        document.getElementById("parameterModalTitle").textContent = "Create KPI Target Allocation";
+        document.getElementById("parameterModalSubtitle").textContent =
+          "Create KPI target allocations by KPI, KPI type, unit type and role, then enter one target value per unit.";
+        openParameterModal();
+      }
+
+      async function openEditParameterModal(parameterObjectId) {
+        try {
+          const groupedAllocationRow = (currentParameterRows || []).find(
+            (row) => String(row?.kpi_target_allocation_id || "") === String(parameterObjectId || "")
+          );
+          const groupedAllocations = Array.isArray(groupedAllocationRow?.related_allocations)
+            ? groupedAllocationRow.related_allocations
+            : [];
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId);
+          const data = await res.json();
+
+          if (!res.ok) {
+            throw new Error(data?.error || "Failed to load KPI target allocation");
+          }
+
+          const apiRelatedAllocations = Array.isArray(data?.related_allocations)
+            ? data.related_allocations
+            : [];
+          const mergedRelatedAllocations = mergeParameterAllocationCollections(
+            groupedAllocations,
+            apiRelatedAllocations.length ? apiRelatedAllocations : [data]
+          );
+          const mergedAllocationData = {
+            ...data,
+            related_allocations: mergedRelatedAllocations.length
+              ? mergedRelatedAllocations
+              : (apiRelatedAllocations.length ? apiRelatedAllocations : groupedAllocations)
+          };
+
+          await loadKpiNames(data.kpi_id);
+          fillParameterForm(mergedAllocationData);
+          document.getElementById("parameterModalTitle").textContent = "Edit KPI Target Allocation";
+          document.getElementById("parameterModalSubtitle").textContent =
+            "Update the selected unit target allocation and keep the KPI unit synced from the chosen KPI.";
+          const parameterDeleteBtn = document.getElementById("parameterDeleteBtn");
+          if (parameterDeleteBtn) {
+            parameterDeleteBtn.style.display = "inline-flex";
+          }
+          openParameterModal();
+        } catch (error) {
+          console.error("OPEN KPI OBJECT MODAL ERROR:", error);
+          showToast("Unable to load KPI target allocation: " + error.message);
+        }
+      }
+
+function buildParameterPayload() {
+  const scopeKind = getParameterScopeKind();
+  const unitAllocations = getParameterUnitAllocationRows();
+  const primaryAllocation = unitAllocations[0] || null;
+
+ const roleId = scopeKind === "zone" ? "" : getNormalizedParameterRoleId();
+
+   return {
+     kpi_target_allocation_id: getParameterFieldValue("parameter_object_id") || "",
+     kpi_id: getParameterFieldValue("parameter_kpi_id"),
+     kpi_type: getParameterFieldValue("parameter_kpi_type"),
+     unit_type_id: scopeKind === "zone" ? null : getParameterFieldValue("parameter_unit_type_id"),
+    role_id: roleId,
+    target_status: getParameterFieldValue("parameter_target_status"),
+    plant_id: primaryAllocation?.plant_id || getParameterFieldValue("parameter_plant_id"),
+    zone_id: primaryAllocation?.zone_id || getParameterFieldValue("parameter_zone_id"),
+    function: getParameterFieldValue("parameter_function"),
+    product_line_id: getParameterFieldValue("parameter_product_line_id"),
+    unit_id: scopeKind === "zone"
+   ? null
+   : getParameterFieldValue("parameter_unit_id"),
+
+   product_id: scopeKind === "zone"
+   ? null
+   : getParameterFieldValue("parameter_product_id"),
+    market_id: getParameterFieldValue("parameter_market_id"),
+    customer_id: getParameterFieldValue("parameter_customer_id"),
+   target_value: primaryAllocation?.target_value || getParameterFieldValue("parameter_target_value"),
+    target_unit: primaryAllocation?.target_unit || getParameterFieldValue("parameter_target_unit"),
+    local_currency: primaryAllocation?.local_currency || getParameterFieldValue("parameter_local_currency"),
+    last_best_target: getParameterFieldValue("parameter_last_best_target"),
+    previous_target_value: getParameterFieldValue("parameter_previous_target_value"),
+    target_setup_date: normalizeParameterDateValue(primaryAllocation?.target_setup_date || getParameterFieldValue("parameter_target_setup_date")),
+    target_start_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_start_date")),
+    target_end_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_end_date")),
+    set_by_people_id: getParameterFieldValue("parameter_set_by_people_id"),
+    approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id"),
+    comments: getParameterFieldValue("parameter_comments"),
+    unit_allocations: unitAllocations
+  };
+  }
+
+   async function saveParameterKpi() {
+  if (parameterSavePending) {
+    return;
+  }
+
+  const parameterObjectId = getParameterFieldValue("parameter_object_id");
+  const method = parameterObjectId ? "PUT" : "POST";
+  const scopeKind = getParameterScopeKind();
+
+  const url = parameterObjectId
+    ? '/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId
+    : '/api/responsibles/' + responsibleId + '/kpi-objects';
+
+  try {
+    if (!getParameterFieldValue("parameter_kpi_id")) {
+      showToast("Select a KPI name first");
+      return;
+    }
+
+    if (!getParameterFieldValue("parameter_kpi_type")) {
+      showToast("Select a KPI type");
+      return;
+    }
+
+     if (!isIndividualParameterScope() && scopeKind !== "zone" && !getParameterFieldValue("parameter_unit_type_id") && !parameterLockedUnitId) {
+      showToast("Select a unit type");
+      return;
+    }
+
+    if (scopeKind !== "zone" && !getNormalizedParameterRoleId()) {
+      showToast("Select the role first");
+      const roleTrigger = document.getElementById("parameterRoleTrigger");
+      if (roleTrigger) roleTrigger.focus();
+      return;
+    }
+
+  if (isIndividualParameterScope()) {
+  const targetVal = getParameterFieldValue("parameter_target_value");
+  if (!targetVal || isNaN(Number(targetVal))) {
+    showToast("Target Value is required.");
+    const tvInput = document.getElementById("parameter_target_value");
+    if (tvInput) tvInput.focus();
+    return;
+  }
+   } else {
+const visibleRows = getParameterVisibleUnitRows();
+
+if (!visibleRows.length) {
+  showToast(
+    scopeKind === "zone"
+      ? "No zones are available from the zone table."
+      : "No units are available for the selected unit type."
+  );
+  return;
+}
+
+const missingRow = visibleRows.find((row) => {
+  const state = getParameterUnitState(row.row_kind || "unit", row.value);
+  return !String(state.target_value ?? "").trim();
+});
+
+if (missingRow) {
+  showToast(
+    scopeKind === "zone"
+      ? "Target Value is required for every zone."
+      : "Target Value is required for every unit."
+  );
+
+  const input = document.querySelector(
+    '.parameter-unit-target-input[data-scope-id="' + CSS.escape(String(missingRow.value)) + '"], ' +
+    '.parameter-unit-target-input[data-unit-id="' + CSS.escape(String(missingRow.value)) + '"]'
+  );
+
+  if (input) {
+    input.focus();
+    input.reportValidity();
+  }
+
+  return;
+}
+    }
+
+    const payload = buildParameterPayload();
+    parameterSavePending = true;
+    setParameterSaveLoading(true);
+
+    const res = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => null);
+      console.error("SAVE KPI OBJECT API ERROR:", errorData);
+      showToast(errorData?.error || "Failed to save KPI target allocation");
+      return;
+    }
+
+    if (!parameterObjectId) {
+      parameterCreateDraft = null;
+    }
+    closeParameterModal(true);
+    if (!parameterObjectId) {
+      resetParameterForm();
+    }
+    await loadParameterKpis();
+
+    if (parameterObjectId) {
+      showToast("KPI target allocation updated");
+      return;
+    }
+
+    showToast("KPI target allocation created");
+    await showConsultTargetAllocations();
+  } catch (error) {
+    console.error("SAVE KPI OBJECT ERROR:", error);
+    showToast("Failed to save: " + error.message);
+  } finally {
+    parameterSavePending = false;
+    setParameterSaveLoading(false);
+  }
+}
+
+      async function deleteCurrentParameterKpi() {
+        const parameterObjectId = getParameterFieldValue("parameter_object_id");
+        if (!parameterObjectId) return;
+
+        const ok = confirm("Delete this KPI target allocation?");
+        if (!ok) return;
+
+        await deleteParameterKpi(parameterObjectId, true);
+      }
+
+      async function deleteParameterKpi(parameterObjectId, fromModal = false) {
+        const ok = fromModal ? true : confirm("Delete this KPI target allocation?");
+        if (!ok) return;
+
+        try {
+          const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId, {
+            method: "DELETE"
+          });
+          const responseData = await res.json().catch(() => null);
+
+          if (!res.ok) {
+            showToast(responseData?.error || "Delete failed");
+            return;
+          }
+
+          removeParameterAllocationsFromUi(
+            getParameterAllocationIdsForUiRemoval(parameterObjectId, responseData)
+          );
+          if (fromModal) closeParameterModal();
+          showToast("KPI target allocation deleted");
+          window.setTimeout(() => {
+            loadParameterKpis().catch((error) => {
+              console.error("BACKGROUND KPI TARGET ALLOCATION RELOAD ERROR:", error);
+            });
+          }, 300);
         } catch (error) {
           showToast("Delete failed");
         }
@@ -4178,355 +17210,243 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
       });
 
       document.getElementById("modalBackdrop").addEventListener("click", (e) => {
-        if (e.target.id === "modalBackdrop") closeModal();
+        if (e.target.id === "modalBackdrop") {
+          e.preventDefault();
+        }
       });
 
-      bindOverviewListeners();
-      loadKpis();
+      document.getElementById("kpiDetailsModalBackdrop").addEventListener("click", (e) => {
+        if (e.target.id === "kpiDetailsModalBackdrop") {
+          e.preventDefault();
+        }
+      });
+
+      document.getElementById("parameterModalBackdrop").addEventListener("click", (e) => {
+        if (e.target.id === "parameterModalBackdrop") {
+          e.preventDefault();
+        }
+      });
+
+      [
+        "parameter_kpi_id",
+        "parameter_kpi_type",
+        "parameter_unit_type_id",
+        "parameter_role_id",
+        "parameter_target_status",
+        "parameter_plant_id",
+        "parameter_zone_id",
+        "parameter_unit_id",
+        "parameter_function",
+        "parameter_product_line_id",
+        "parameter_product_id",
+        "parameter_market_id",
+        "parameter_customer_id",
+        "parameter_target_value",
+        "parameter_target_unit",
+        "parameter_local_currency",
+        "parameter_last_best_target",
+        "parameter_previous_target_value",
+        "parameter_target_setup_date",
+        "parameter_target_start_date",
+        "parameter_target_end_date",
+        "parameter_set_by_people_id",
+        "parameter_approved_by_people_id",
+        "parameter_comments"
+      ].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.addEventListener("input", updateParameterOverview);
+          el.addEventListener("change", updateParameterOverview);
+        }
+      });
+
+      const parameterKpiSelect = document.getElementById("parameter_kpi_id");
+      if (parameterKpiSelect) {
+        parameterKpiSelect.addEventListener("change", updateParameterKpiSummary);
+      }
+
+    const parameterKpiTypeSelect = document.getElementById("parameter_kpi_type");
+     if (parameterKpiTypeSelect) {
+     parameterKpiTypeSelect.addEventListener("change", () => {
+     handleParameterKpiTypeChange();
+    autoFillSetByFromUnit();
+    });
+    }
+
+    const parameterUnitTypeSelect = document.getElementById("parameter_unit_type_id");
+    if (parameterUnitTypeSelect) {
+      parameterUnitTypeSelect.addEventListener("change", () => {
+        if (!parameterEditMode) {
+          resetParameterUnitTargetState();
+        }
+        syncParameterPlantOptions();
+        if (isIndividualParameterScope()) {
+          syncIndividualParameterFields();
+          return;
+        }
+        renderMultisiteUnitMatrix();
+      });
+    }
+
+   const parameterRoleSelect = document.getElementById("parameter_role_id");
+if (parameterRoleSelect) {
+  parameterRoleSelect.addEventListener("change", () => {
+    syncParameterRoleDropdown();
+    if (isIndividualParameterScope()) {
+      syncIndividualParameterFields();
+      return;
+    }
+    // For Zone scope: re-filter zones by the newly selected role,
+    // then reset any previously entered targets so stale rows are cleared
+    if (getParameterScopeKind() === "zone") {
+      resetParameterUnitTargetState();
+    }
+    renderMultisiteUnitMatrix();
+  });
+
+  syncParameterRoleDropdown();
+}
+
+const parameterRoleTrigger = document.getElementById("parameterRoleTrigger");
+if (parameterRoleTrigger) {
+  parameterRoleTrigger.addEventListener("click", (event) => {
+    event.preventDefault();
+    toggleParameterRoleDropdown();
+  });
+}
+
+const parameterRoleOptionsHost = document.getElementById("parameterRoleOptions");
+if (parameterRoleOptionsHost) {
+  parameterRoleOptionsHost.addEventListener("click", (event) => {
+    const optionButton = event.target.closest(".parameter-role-option");
+    if (!optionButton) return;
+    applyParameterRoleDropdownValue(optionButton.getAttribute("data-value") || "");
+  });
+}
+
+const parameterRoleSearch = document.getElementById("parameterRoleSearch");
+if (parameterRoleSearch) {
+  parameterRoleSearch.addEventListener("input", (event) => {
+    renderParameterRoleDropdownOptions(event.target.value || "");
+  });
+
+  parameterRoleSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const firstVisibleOption = document.querySelector("#parameterRoleOptions .parameter-role-option:not(.is-placeholder)");
+      if (firstVisibleOption) {
+        applyParameterRoleDropdownValue(firstVisibleOption.getAttribute("data-value") || "");
+      }
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeParameterRoleDropdown({ restoreFocus: true });
+    }
+  });
+}
+
+document.addEventListener("click", (event) => {
+  const { shell } = getParameterRoleDropdownElements();
+  if (!shell || shell.contains(event.target)) return;
+  closeParameterRoleDropdown();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeParameterRoleDropdown();
+  }
+});
+
+    const parameterPlantSelect = document.getElementById("parameter_plant_id");
+     if (parameterPlantSelect) {
+    parameterPlantSelect.addEventListener("change", autoFillSetByFromUnit);
+    }
+
+    const parameterZoneUnitSelect = document.getElementById("parameter_zone_unit_id");
+    if (parameterZoneUnitSelect) {
+      parameterZoneUnitSelect.addEventListener("change", () => {
+        /* Reset product and resolved zone when unit changes */
+        const productSel = document.getElementById("parameter_zone_product_id");
+        if (productSel) productSel.value = "";
+        parameterResolvedZoneId = "";
+        parameterLockedZoneId   = "";
+        resetParameterUnitTargetState();
+        lookupZoneFromManufacturingStrategy();
+      });
+    }
+
+    const parameterZoneProductSelect = document.getElementById("parameter_zone_product_id");
+    if (parameterZoneProductSelect) {
+      parameterZoneProductSelect.addEventListener("change", () => {
+        resetParameterUnitTargetState();
+        lookupZoneFromManufacturingStrategy();
+      });
+    }
+
+    const parameterSetBySelect = document.getElementById("parameter_set_by_people_id");
+    if (parameterSetBySelect) {
+      parameterSetBySelect.addEventListener("change", () => {
+        if (isIndividualParameterScope()) {
+          syncIndividualParameterFields();
+          return;
+        }
+        renderMultisiteUnitMatrix();
+      });
+    }
+       
+      
+
+      window.addEventListener("resize", () => {
+      requestAnimationFrame(renderSubjectTree);
+     });
+
+     bindOverviewListeners();
+     bindHierarchyListeners();
+     bindLimitListeners();
+     populateRoleOptions("");
+     populateAllocationLookupOptions({});
+     resetParameterForm();
+     updateSubjectTreeCurrentPath();
+
+     (async () => {
+       await loadKpis();
+       await loadParameterKpis();
+
+       const currentUrl = new URL(window.location.href);
+       const editKpiId = currentUrl.searchParams.get("editKpi");
+
+       if (editKpiId) {
+         await openEditModal(editKpiId);
+         currentUrl.searchParams.delete("editKpi");
+         window.history.replaceState({}, "", currentUrl.pathname + currentUrl.search);
+       }
+     })();
+     function setToleranceTypeFromRadio(value) {
+  const selectEl = getKpiFieldElement("tolerance_type");
+  if (selectEl) selectEl.value = value;
+  handleToleranceTypeChange(selectEl);
+}
+
+function syncToleranceRadioButtons() {
+  const toleranceType = getFieldValue("tolerance_type") || "";
+
+  document.querySelectorAll('input[name="tolerance_type_radio"]').forEach(radio => {
+    radio.checked = radio.value === toleranceType;
+  });
+}
     </script>
   </body>
   </html>
   `);
 });
 
+
+
 app.get("/responsible/:responsibleId/kpis/:kpiId/edit", async (req, res) => {
   const { responsibleId, kpiId } = req.params;
-
-  res.send(`
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Edit KPI</title>
-    <style>
-      body {
-        font-family: Inter, Arial, sans-serif;
-        margin: 0;
-        background: #f6f8fc;
-        padding: 24px;
-      }
-      .card {
-        max-width: 900px;
-        margin: 0 auto;
-        background: white;
-        border-radius: 22px;
-        padding: 24px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.06);
-      }
-      h1 { margin-top: 0; }
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0,1fr));
-        gap: 14px;
-      }
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-      .full { grid-column: 1 / -1; }
-      label { font-weight: 700; font-size: 13px; }
-      input, textarea {
-        width: 100%;
-        padding: 12px 14px;
-        border-radius: 12px;
-        border: 1px solid #dbe3ee;
-      }
-      textarea {
-        min-height: 110px;
-        resize: vertical;
-      }
-      .actions {
-        display: flex;
-        gap: 12px;
-        margin-top: 20px;
-      }
-      button {
-        border: none;
-        border-radius: 12px;
-        padding: 12px 16px;
-        font-weight: 700;
-        cursor: pointer;
-      }
-      .primary {
-        background: #2563eb;
-        color: white;
-      }
-      .soft {
-        background: #e2e8f0;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>Edit KPI</h1>
-
-      <div class="grid">
-        <div class="field">
-          <label>Category</label>
-          <input id="indicator_title" />
-        </div>
-
-        <div class="field">
-          <label>KPI</label>
-          <input id="indicator_sub_title" />
-        </div>
-
-        <div class="field">
-          <label>Unit</label>
-          <input id="unit" />
-        </div>
-
-        <div class="field">
-          <label>Frequency</label>
-          <input id="frequency" />
-        </div>
-
-        <div class="field">
-          <label>Target</label>
-          <input id="target" />
-        </div>
-
-        <div class="field">
-          <label>Tolerance Type</label>
-          <input id="tolerance_type" />
-        </div>
-
-        <div class="field">
-          <label>Up Tolerance</label>
-          <input id="up_tolerance" />
-        </div>
-
-        <div class="field">
-          <label>Low Tolerance</label>
-          <input id="low_tolerance" />
-        </div>
-
-        <div class="field">
-          <label>Max</label>
-          <input id="max" />
-        </div>
-
-        <div class="field">
-          <label>Min</label>
-          <input id="min" />
-        </div>
-
-        <div class="field">
-          <label>Calculation On</label>
-          <input id="calculation_on" />
-        </div>
-
-        <div class="field">
-          <label>Target Auto Adjustment</label>
-          <input id="target_auto_adjustment" />
-        </div>
-
-        <div class="field">
-          <label>High Limit</label>
-          <input id="high_limit" type="number" step="any" />
-        </div>
-
-        <div class="field">
-          <label>Low Limit</label>
-          <input id="low_limit" type="number" step="any" />
-        </div>
-      </div>
-
-      <div class="actions">
-        <button class="soft" onclick="goBack()">Back</button>
-        <button class="primary" onclick="saveKpi()">Save KPI</button>
-      </div>
-    </div>
-
-    <script>
-      const responsibleId = "${responsibleId}";
-      const kpiId = "${kpiId}";
-
-      function formatToleranceForInput(value, toleranceType) {
-        if (value === null || value === undefined || value === "") return "";
-        const normalizedValue = normalizeNumericInput(value, { allowPercent: true });
-        if (normalizedValue === null) {
-          const text = String(value).trim();
-          if (!text) return "";
-          return String(toleranceType || "").trim().toLowerCase() === "relative"
-            ? text.replace(/%+$/g, "") + "%"
-            : text.replace(/%+$/g, "");
-        }
-
-        const text = String(Number(normalizedValue.toFixed(6)));
-        return String(toleranceType || "").trim().toLowerCase() === "relative"
-          ? text + "%"
-          : text;
-      }
-
-      function normalizeNumericInput(value, { allowPercent = false } = {}) {
-        const text = String(value ?? "").trim();
-        if (!text) return null;
-
-        let normalized = text.replace(/\s+/g, "").replace(/,/g, ".");
-        if (allowPercent && normalized.endsWith("%")) {
-          normalized = normalized.slice(0, -1);
-        }
-
-        return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(normalized) ? Number(normalized) : null;
-      }
-
-      function formatDerivedLimit(value) {
-        return Number.isFinite(value) ? String(Number(value.toFixed(6))) : "";
-      }
-
-      function syncToleranceInputsWithType() {
-        const toleranceType = document.getElementById("tolerance_type")?.value || "";
-        const isRelative = String(toleranceType || "").trim().toLowerCase() === "relative";
-
-        ["up_tolerance", "low_tolerance"].forEach((id) => {
-          const field = document.getElementById(id);
-          if (!field) return;
-          field.value = formatToleranceForInput(field.value, toleranceType);
-        });
-
-        const upToleranceField = document.getElementById("up_tolerance");
-        const lowToleranceField = document.getElementById("low_tolerance");
-
-        if (upToleranceField) {
-          upToleranceField.placeholder = isRelative ? "10%" : "10";
-        }
-
-        if (lowToleranceField) {
-          lowToleranceField.placeholder = isRelative ? "-10%" : "-10";
-        }
-      }
-
-      function updateDerivedLimits({ clearWhenUnavailable = true } = {}) {
-        const target = normalizeNumericInput(document.getElementById("target").value);
-        const upTolerance = normalizeNumericInput(document.getElementById("up_tolerance").value, { allowPercent: true });
-        const lowTolerance = normalizeNumericInput(document.getElementById("low_tolerance").value, { allowPercent: true });
-        const toleranceType = String(document.getElementById("tolerance_type").value || "").trim().toLowerCase();
-
-        let highLimit = null;
-        let lowLimit = null;
-
-        if (
-          target !== null &&
-          upTolerance !== null &&
-          lowTolerance !== null &&
-          toleranceType
-        ) {
-          if (toleranceType === "relative") {
-            highLimit = target * (1 + (upTolerance / 100));
-            lowLimit = target * (1 + (lowTolerance / 100));
-          } else if (toleranceType === "absolute") {
-            highLimit = target + upTolerance;
-            lowLimit = target + lowTolerance;
-          }
-        }
-
-        if (highLimit !== null && lowLimit !== null) {
-          document.getElementById("high_limit").value = formatDerivedLimit(highLimit);
-          document.getElementById("low_limit").value = formatDerivedLimit(lowLimit);
-          return;
-        }
-
-        if (clearWhenUnavailable) {
-          document.getElementById("high_limit").value = "";
-          document.getElementById("low_limit").value = "";
-        }
-      }
-
-      function bindDerivedLimitListeners() {
-        ["target", "up_tolerance", "low_tolerance"].forEach(id => {
-          const el = document.getElementById(id);
-          if (el) {
-            el.addEventListener("input", () => updateDerivedLimits());
-          }
-        });
-
-        ["up_tolerance", "low_tolerance"].forEach(id => {
-          const el = document.getElementById(id);
-          if (el) {
-            el.addEventListener("blur", () => syncToleranceInputsWithType());
-          }
-        });
-
-        const toleranceTypeField = document.getElementById("tolerance_type");
-        if (toleranceTypeField) {
-          toleranceTypeField.addEventListener("input", () => {
-            syncToleranceInputsWithType();
-            updateDerivedLimits();
-          });
-          toleranceTypeField.addEventListener("change", () => {
-            syncToleranceInputsWithType();
-            updateDerivedLimits();
-          });
-        }
-      }
-
-      async function loadKpi() {
-        const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId);
-        const data = await res.json();
-
-        document.getElementById("indicator_title").value = data.indicator_title || "";
-        document.getElementById("indicator_sub_title").value = data.indicator_sub_title || "";
-        document.getElementById("unit").value = data.unit || "";
-        document.getElementById("frequency").value = data.frequency || "";
-        document.getElementById("target").value = data.target || "";
-        document.getElementById("tolerance_type").value = data.tolerance_type || "";
-        document.getElementById("up_tolerance").value = data.up_tolerance ?? "";
-        document.getElementById("low_tolerance").value = data.low_tolerance ?? "";
-        document.getElementById("max").value = data.max || "";
-        document.getElementById("min").value = data.min || "";
-        document.getElementById("calculation_on").value = data.calculation_on || "";
-        document.getElementById("target_auto_adjustment").value = data.target_auto_adjustment || "";
-        document.getElementById("high_limit").value = data.high_limit || "";
-        document.getElementById("low_limit").value = data.low_limit || "";
-        syncToleranceInputsWithType();
-        updateDerivedLimits({ clearWhenUnavailable: false });
-      }
-
-      async function saveKpi() {
-        const payload = {
-          indicator_title: document.getElementById("indicator_title").value,
-          indicator_sub_title: document.getElementById("indicator_sub_title").value,
-          unit: document.getElementById("unit").value,
-          frequency: document.getElementById("frequency").value,
-          target: document.getElementById("target").value,
-          tolerance_type: document.getElementById("tolerance_type").value,
-          up_tolerance: document.getElementById("up_tolerance").value,
-          low_tolerance: document.getElementById("low_tolerance").value,
-          max: document.getElementById("max").value,
-          min: document.getElementById("min").value,
-          calculation_on: document.getElementById("calculation_on").value,
-          target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
-          high_limit: document.getElementById("high_limit").value || null,
-          low_limit: document.getElementById("low_limit").value || null
-        };
-
-        const res = await fetch('/api/responsibles/' + responsibleId + '/kpis/' + kpiId, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        if (res.ok) {
-          window.location.href = '/responsible/' + responsibleId + '/dashboard';
-        } else {
-          const errorData = await res.json().catch(() => null);
-          alert(errorData?.error || "Save failed");
-        }
-      }
-
-      function goBack() {
-        window.location.href = '/responsible/' + responsibleId + '/dashboard';
-      }
-
-      bindDerivedLimitListeners();
-      loadKpi();
-    </script>
-  </body>
-  </html>
-  `);
+  res.redirect(`/responsible/${encodeURIComponent(responsibleId)}/dashboard?editKpi=${encodeURIComponent(kpiId)}`);
 });
 
 
@@ -4794,7 +17714,7 @@ const inferKpiDirection = (kpi = {}) => {
   }
 
   const searchableText = [
-    kpi.indicator_title,
+    kpi.subject,
     kpi.title,
     kpi.indicator_sub_title,
     kpi.subtitle
@@ -4894,10 +17814,11 @@ const acquireJobLock = async (lockId, ttlMinutes = 9) => {
   }
 };
 
-const releaseJobLock = async (lockId, lockHash) => {
+const releaseJobLock = async (lockId, lockHashOrInstanceId, maybeLockHash) => {
+  const resolvedLockHash = maybeLockHash ?? lockHashOrInstanceId;
   try {
-    if (lockHash) {
-      await pool.query('SELECT pg_advisory_unlock($1)', [lockHash]);
+    if (resolvedLockHash) {
+      await pool.query('SELECT pg_advisory_unlock($1)', [resolvedLockHash]);
     }
   } catch (error) {
     console.error(`âš ï¸ Could not release lock ${lockId}:`, error.message);
@@ -4916,11 +17837,33 @@ const createTransporter = () =>
     },
   });
 
+const getOpenAIClient = () => {
+  if (!process.env.SECRET_KEY) {
+    throw new Error("OpenAI API key is not configured");
+  }
+
+  const OpenAI = require("openai");
+  return new OpenAI({
+    apiKey: process.env.SECRET_KEY,
+  });
+};
+
 const formatInputDate = (dateValue) => {
   if (!dateValue) return "";
   const d = new Date(dateValue);
   if (isNaN(d.getTime())) return "";
   return d.toISOString().split("T")[0];
+};
+
+const formatDisplayDate = (
+  dateValue,
+  locale = "en-GB",
+  options = { day: "2-digit", month: "short", year: "numeric" }
+) => {
+  if (!dateValue) return "N/A";
+  const d = new Date(dateValue);
+  if (isNaN(d.getTime())) return "N/A";
+  return d.toLocaleDateString(locale, options);
 };
 
 const normalizeText = (value) => {
@@ -4933,6 +17876,44 @@ const CORRECTIVE_ACTION_STATUS_OPTIONS = [
   "Waiting for validation",
   "Completed",
   "Closed"
+];
+
+const OPEN_CORRECTIVE_ACTION_STATUS = "Open";
+const CLOSED_CORRECTIVE_ACTION_STATUS = "Closed";
+
+const CORRECTIVE_ACTION_ESCALATION_STAGES = [
+  {
+    key: "due_day_3_responsible_reminder",
+    minOverdueDays: 3,
+    audience: "responsible",
+    label: "First reminder",
+    intro:
+      "This corrective action is now 3 days overdue. Please review it and update the status as soon as possible."
+  },
+  {
+    key: "due_day_4_responsible_reminder",
+    minOverdueDays: 4,
+    audience: "responsible",
+    label: "Second reminder",
+    intro:
+      "This is a second reminder because the corrective action is still open 4 days after the due date."
+  },
+  {
+    key: "due_day_5_responsible_reminder",
+    minOverdueDays: 5,
+    audience: "responsible",
+    label: "Third reminder",
+    intro:
+      "This is a third reminder because the corrective action is still open 5 days after the due date."
+  },
+  {
+    key: "due_day_6_plant_manager_escalation",
+    minOverdueDays: 6,
+    audience: "manager",
+    label: "Plant manager escalation",
+    intro:
+      "This corrective action is still open 6 days after the due date and has now been escalated to the plant manager."
+  }
 ];
 
 const normalizeCorrectiveActionStatus = (value, fallback = null) => {
@@ -4953,6 +17934,315 @@ const escapeHtml = (value) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+
+const buildAbsoluteAppUrl = (req, relativePath = "/") => {
+  const normalizedPath = String(relativePath || "/").startsWith("/")
+    ? String(relativePath || "/")
+    : `/${String(relativePath || "")}`;
+  const forwardedProto = normalizeOptionalTextInput(req?.headers?.["x-forwarded-proto"]);
+  const protocol = forwardedProto || req?.protocol || "http";
+  const host = normalizeOptionalTextInput(req?.get?.("host")) || `localhost:${port}`;
+  return `${protocol}://${host}${normalizedPath}`;
+};
+
+const formatKpiTargetAllocationScopeSummary = (row = {}) => {
+  const parts = [
+    normalizeOptionalTextInput(row.kpi_type) ? `Type: ${row.kpi_type}` : null,
+    normalizeOptionalTextInput(row.plant_name) ? `Plant: ${row.plant_name}` : null,
+    normalizeOptionalTextInput(row.zone_name) ? `Zone: ${row.zone_name}` : null,
+    normalizeOptionalTextInput(row.unit_name) ? `Unit: ${row.unit_name}` : null,
+    normalizeOptionalTextInput(row.unit_type_name) ? `Unit Type: ${row.unit_type_name}` : null,
+    normalizeOptionalTextInput(row.role_name) ? `Role: ${row.role_name}` : null,
+    normalizeOptionalTextInput(row.product_name) ? `Product: ${row.product_name}` : null,
+    normalizeOptionalTextInput(row.product_line_name) ? `Product Line: ${row.product_line_name}` : null,
+    normalizeOptionalTextInput(row.market_name) ? `Market: ${row.market_name}` : null,
+    normalizeOptionalTextInput(row.customer_name) ? `Customer: ${row.customer_name}` : null
+  ].filter(Boolean);
+
+  return parts.join(" | ");
+};
+
+const loadKpiTargetAllocationNotificationRows = async (allocationIds = []) => {
+  const normalizedIds = Array.from(
+    new Set(
+      (Array.isArray(allocationIds) ? allocationIds : [allocationIds])
+        .map((value) => normalizeOptionalIntegerInput(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+  if (!normalizedIds.length) {
+    return [];
+  }
+
+  const subjectHierarchy = await loadSubjectHierarchyData();
+  const result = await pool.query(
+    `
+    SELECT
+      a.kpi_target_allocation_id,
+      a.kpi_id,
+      a.kpi_type,
+      a.target_value,
+      a.target_unit,
+      a.local_currency,
+      TO_CHAR(a.target_setup_date, 'YYYY-MM-DD') AS target_setup_date,
+      TO_CHAR(a.target_start_date, 'YYYY-MM-DD') AS target_start_date,
+      TO_CHAR(a.target_end_date, 'YYYY-MM-DD') AS target_end_date,
+      a.set_by_people_id,
+      assigned_people.email AS assigned_email,
+      assigned_people.name AS assigned_name,
+      assigned_people.first_name AS assigned_first_name,
+      plant.unit_name AS plant_name,
+      zone.zone_name,
+      unit_scope.unit_name AS unit_name,
+      unit_type.unit_type_name,
+      role.role_name,
+      product.product_name,
+      product_line.product_line_name,
+      market.market_name,
+      customer.customer_name,
+      k.kpi_name,
+      k.kpi_sub_title,
+      k.kpi_code,
+      primary_subject.subject_id
+    FROM public.kpi_target_allocation a
+    LEFT JOIN public.kpi k
+      ON k.kpi_id = a.kpi_id
+    LEFT JOIN public.people assigned_people
+      ON assigned_people.people_id = a.set_by_people_id
+    LEFT JOIN public.unit plant
+      ON plant.unit_id = a.plant_id
+    LEFT JOIN public.zone zone
+      ON zone.zone_id = a.zone_id
+    LEFT JOIN public.unit unit_scope
+      ON unit_scope.unit_id = a.unit_id
+    LEFT JOIN public.unit_type unit_type
+      ON unit_type.unit_type_id = a.unit_type_id
+    LEFT JOIN public.role role
+      ON role.role_id = a.role_id
+    LEFT JOIN public.product product
+      ON product.product_id = a.product_id
+    LEFT JOIN public.product_line product_line
+      ON product_line.product_line_id = a.product_line_id
+    LEFT JOIN public.market market
+      ON market.market_id = a.market_id
+    LEFT JOIN public.customer customer
+      ON customer.customer_id = a.customer_id
+    LEFT JOIN LATERAL (
+      SELECT sk.subject_id
+      FROM public.subject_kpi sk
+      WHERE sk.kpi_id = a.kpi_id
+      ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+      LIMIT 1
+    ) primary_subject ON TRUE
+    WHERE a.kpi_target_allocation_id = ANY($1::int[])
+    ORDER BY a.kpi_target_allocation_id ASC
+    `,
+    [normalizedIds]
+  );
+
+  return result.rows.map((row) => {
+    const subjectId = normalizeOptionalIntegerInput(row.subject_id);
+    const subjectPath = subjectId
+      ? subjectHierarchy.pathById.get(String(subjectId)) || ""
+      : "";
+
+    return {
+      ...row,
+      subject_path: subjectPath,
+      assigned_display_name: getPeopleDisplayName({
+        name: row.assigned_name,
+        first_name: row.assigned_first_name
+      }) || "",
+      scope_summary: formatKpiTargetAllocationScopeSummary(row)
+    };
+  });
+};
+
+const buildKpiTargetAllocationAssignedEmailHtml = ({
+  recipientName,
+  allocatorName,
+  allocations = [],
+  dashboardUrl
+}) => {
+  const normalizedAllocations = Array.isArray(allocations) ? allocations : [];
+  const primaryAllocation = normalizedAllocations[0] || {};
+  const recipientDisplayName = normalizeOptionalTextInput(recipientName) || "Responsible owner";
+  const kpiTitle =
+    normalizeOptionalTextInput(primaryAllocation.kpi_name) ||
+    normalizeOptionalTextInput(primaryAllocation.kpi_sub_title) ||
+    "Untitled KPI";
+  const kpiType = normalizeOptionalTextInput(primaryAllocation.kpi_type) || "Not specified";
+  const subjectPath =
+    normalizeOptionalTextInput(primaryAllocation.subject_path) || "No KPI hierarchy attached";
+  const scopeRows = normalizedAllocations.length
+    ? normalizedAllocations.map((row) => {
+      const targetValue = row.target_value !== null && row.target_value !== undefined
+        ? String(row.target_value).trim()
+        : "";
+      const targetUnit = normalizeOptionalTextInput(row.target_unit);
+      const formattedTarget = [targetValue, targetUnit].filter(Boolean).join(" ") || "N/A";
+      const formattedSetupDate = normalizeOptionalTextInput(row.target_setup_date)
+        ? formatDisplayDate(row.target_setup_date)
+        : "N/A";
+
+      return `
+        <tr>
+          <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#0f172a;vertical-align:top;">
+            ${escapeHtml(formattedTarget)}
+          </td>
+          <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#0f172a;vertical-align:top;">
+            ${escapeHtml(formattedSetupDate)}
+          </td>
+        </tr>
+      `;
+    }).join("")
+    : `
+      <tr>
+        <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#64748b;" colspan="3">
+          No target allocation details available.
+        </td>
+      </tr>
+    `;
+
+
+
+  return `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+      <title>KPI Target Allocation Assigned</title>
+    </head>
+    <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,'Segoe UI',sans-serif;color:#0f172a;">
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;background:#f4f6f8;">
+        <tr>
+          <td align="center" style="padding:24px 16px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:760px;width:100%;border-collapse:collapse;background:#ffffff;border:1px solid #e1e6eb;">
+              <tr>
+                <td style="padding:28px 32px 24px;font-size:15px;line-height:1.65;color:#0f172a;">
+                  <p style="margin:0 0 14px;">Hello ${escapeHtml(recipientDisplayName)},</p>
+                  <p style="margin:0 0 22px;">You have been assigned to a KPI target allocation.</p>
+
+                  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;margin-bottom:16px;">
+                    <tr>
+                      <td style="width:120px;padding:12px 14px;border:1px solid #dbe2ea;background:#f2f5f8;font-size:14px;font-weight:700;color:#0f172a;">KPI</td>
+                      <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#0f172a;">${escapeHtml(kpiTitle)}</td>
+                    </tr>
+                    <tr>
+                      <td style="width:120px;padding:12px 14px;border:1px solid #dbe2ea;background:#f2f5f8;font-size:14px;font-weight:700;color:#0f172a;">KPI Type</td>
+                      <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#0f172a;">${escapeHtml(kpiType)}</td>
+                    </tr>
+                    <tr>
+                      <td style="width:120px;padding:12px 14px;border:1px solid #dbe2ea;background:#f2f5f8;font-size:14px;font-weight:700;color:#0f172a;">Subject</td>
+                      <td style="padding:12px 14px;border:1px solid #dbe2ea;font-size:14px;color:#0f172a;">${escapeHtml(subjectPath)}</td>
+                    </tr>
+                  </table>
+
+                  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;margin-bottom:16px;">
+                    <tr>
+                      <th align="left" style="padding:12px 14px;border:1px solid #dbe2ea;background:#f2f5f8;font-size:14px;font-weight:700;color:#0f172a;">Target</th>
+                      <th align="left" style="padding:12px 14px;border:1px solid #dbe2ea;background:#f2f5f8;font-size:14px;font-weight:700;color:#0f172a;">Setup Date</th>
+                    </tr>
+                    ${scopeRows}
+                  </table>
+
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:0 32px 24px;font-size:13px;line-height:1.7;color:#64748b;">
+                  <div style="padding-top:18px;border-top:1px solid #e2e8f0;">
+                    This notification was sent automatically by the AVOCarbon KPI System.
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>`;
+};
+
+const sendKpiTargetAllocationAssignmentNotifications = async ({
+  req,
+  actorResponsibleId,
+  allocationIds = []
+}) => {
+  const allocationRows = await loadKpiTargetAllocationNotificationRows(allocationIds);
+  if (!allocationRows.length) {
+    return { sent: 0, skipped: 0 };
+  }
+
+  const actorContext = await loadFormResponsibleContext(actorResponsibleId);
+  const allocatorName = normalizeOptionalTextInput(actorContext?.name) || "KPI Workspace";
+  const groupedByRecipient = new Map();
+  let skippedCount = 0;
+
+  allocationRows.forEach((row) => {
+    const assignedPeopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
+    const assignedEmail = normalizeOptionalTextInput(row.assigned_email);
+
+    if (!assignedPeopleId || !assignedEmail) {
+      skippedCount += 1;
+      return;
+    }
+
+    const recipientKey = String(assignedPeopleId);
+    if (!groupedByRecipient.has(recipientKey)) {
+      groupedByRecipient.set(recipientKey, {
+        peopleId: assignedPeopleId,
+        email: assignedEmail,
+        name: normalizeOptionalTextInput(row.assigned_display_name) || `Person #${assignedPeopleId}`,
+        allocations: []
+      });
+    }
+
+    groupedByRecipient.get(recipientKey).allocations.push(row);
+  });
+
+  if (!groupedByRecipient.size) {
+    return { sent: 0, skipped: skippedCount };
+  }
+
+  const transporter = createTransporter();
+  let sentCount = 0;
+
+  for (const recipient of groupedByRecipient.values()) {
+    const firstAllocation = recipient.allocations[0] || {};
+    const firstTitle =
+      normalizeOptionalTextInput(firstAllocation.kpi_sub_title) ||
+      normalizeOptionalTextInput(firstAllocation.kpi_name) ||
+      `Allocation #${firstAllocation.kpi_target_allocation_id || ""}`;
+    const subject =
+      recipient.allocations.length === 1
+        ? `KPI target allocation assigned: ${firstTitle}`
+        : `${recipient.allocations.length} KPI target allocations assigned to you`;
+    const dashboardUrl = buildAbsoluteAppUrl(
+      req,
+      `/responsible/${encodeURIComponent(String(recipient.peopleId))}/dashboard`
+    );
+
+    await transporter.sendMail({
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      to: recipient.email,
+      subject,
+      html: buildKpiTargetAllocationAssignedEmailHtml({
+        recipientName: recipient.name,
+        allocatorName,
+        allocations: recipient.allocations,
+        dashboardUrl
+      })
+    });
+
+    sentCount += 1;
+  }
+
+  return {
+    sent: sentCount,
+    skipped: skippedCount
+  };
+};
 
 const toArray = (value) => {
   if (Array.isArray(value)) return value;
@@ -5032,6 +18322,423 @@ const getSubmittedCorrectiveActions = (formData, kpiValuesId, defaultResponsible
     status: normalizeText(statuses[index]) || "Open"
   }));
 };
+
+let correctiveActionEscalationSchemaPromise = null;
+
+const ensureCorrectiveActionEscalationSchema = async () => {
+  if (!correctiveActionEscalationSchemaPromise) {
+    correctiveActionEscalationSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.corrective_action_escalation_log (
+          escalation_id BIGSERIAL PRIMARY KEY,
+          corrective_action_id BIGINT NOT NULL,
+          escalation_stage TEXT NOT NULL,
+          sent_to_email TEXT,
+          sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          CONSTRAINT corrective_action_escalation_log_unique
+            UNIQUE (corrective_action_id, escalation_stage)
+        )
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_corrective_action_escalation_log_action
+        ON public.corrective_action_escalation_log (corrective_action_id)
+      `);
+    })().catch((error) => {
+      correctiveActionEscalationSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return correctiveActionEscalationSchemaPromise;
+};
+
+const getCorrectiveActionOverdueDays = (dateValue, now = new Date()) => {
+  if (!dateValue) return 0;
+
+  const dueDate = new Date(dateValue);
+  if (isNaN(dueDate.getTime())) return 0;
+
+  const currentDay = new Date(now);
+  currentDay.setHours(0, 0, 0, 0);
+
+  const dueDay = new Date(dueDate);
+  dueDay.setHours(0, 0, 0, 0);
+
+  const diffMs = currentDay.getTime() - dueDay.getTime();
+  if (!Number.isFinite(diffMs) || diffMs < 0) return 0;
+
+  return Math.floor(diffMs / 86400000);
+};
+
+const buildCorrectiveActionEscalationEmailHtml = ({ action, stage, overdueDays }) => {
+  const actionTitle = [action.kpi_subject, action.indicator_sub_title]
+    .filter(Boolean)
+    .join(" - ");
+  const responsibleName = action.responsible_name || "Responsible owner";
+  const managerName = action.manager || "Plant manager";
+  const createdOn = formatDisplayDate(action.created_date);
+  const dueOn = action.due_date ? formatDisplayDate(action.due_date) : "Not set";
+  const isManagerAudience = stage.audience === "manager";
+  const theme = isManagerAudience
+    ? {
+      heroBase: "#7f1d1d",
+      heroStart: "#991b1b",
+      heroEnd: "#dc2626",
+      soft: "#fff1f2",
+      softBorder: "#fecaca",
+      muted: "#7f1d1d",
+      statSurface: "#fff7f7",
+      shadow: "rgba(220,38,38,0.14)"
+    }
+    : {
+      heroBase: "#1d4ed8",
+      heroStart: "#1d4ed8",
+      heroEnd: "#0f766e",
+      soft: "#eff6ff",
+      softBorder: "#bfdbfe",
+      muted: "#1e3a8a",
+      statSurface: "#f8fbff",
+      shadow: "rgba(37,99,235,0.14)"
+    };
+  const recipientIntro =
+    isManagerAudience
+      ? `${escapeHtml(responsibleName)} still has an open corrective action that is overdue by ${overdueDays} day${overdueDays === 1 ? "" : "s"}.`
+      : `Your corrective action is overdue by ${overdueDays} day${overdueDays === 1 ? "" : "s"} after the due date.`;
+  const statusValue = action.status || OPEN_CORRECTIVE_ACTION_STATUS;
+  const normalizedStatus = statusValue.toLowerCase();
+  const statusTheme =
+    normalizedStatus === "completed" || normalizedStatus === "closed"
+      ? {
+        bg: "#ecfdf5",
+        border: "#a7f3d0",
+        color: "#047857"
+      }
+      : normalizedStatus === "waiting for validation"
+        ? {
+          bg: "#fff7ed",
+          border: "#fed7aa",
+          color: "#c2410c"
+        }
+        : {
+          bg: "#fef2f2",
+          border: "#fecaca",
+          color: "#b91c1c"
+        };
+  const rootCauseBlock = normalizeText(action.root_cause)
+    ? `
+      <div style="margin-top:18px;padding:22px 24px;background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;box-shadow:0 10px 24px rgba(15,23,42,0.05);">
+        <div style="font-size:12px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:#64748b;margin-bottom:10px;">Root Cause</div>
+        <div style="font-size:15px;line-height:1.8;color:#1e293b;">${escapeHtml(action.root_cause)}</div>
+      </div>`
+    : "";
+  const solutionBlock = normalizeText(action.implemented_solution)
+    ? `
+      <div style="margin-top:18px;padding:22px 24px;background:${theme.statSurface};border:1px solid ${theme.softBorder};border-radius:20px;box-shadow:0 10px 24px ${theme.shadow};">
+        <div style="font-size:12px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:${theme.muted};margin-bottom:10px;">Corrective Action</div>
+        <div style="font-size:15px;line-height:1.8;color:#1e293b;">${escapeHtml(action.implemented_solution)}</div>
+      </div>`
+    : "";
+
+  return `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+      <title>${escapeHtml(stage.label)}</title>
+    </head>
+    <body style="margin:0;padding:0;background:#e8eef5;font-family:'Segoe UI',Arial,sans-serif;color:#0f172a;">
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;background:#e8eef5;">
+        <tr>
+          <td align="center" style="padding:28px 16px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:760px;width:100%;border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #dbe3ee;border-radius:28px;overflow:hidden;box-shadow:0 24px 60px rgba(15,23,42,0.12);">
+              <tr>
+                <td style="padding:0;background:${theme.heroBase};background-image:linear-gradient(135deg, ${theme.heroStart}, ${theme.heroEnd});">
+                  <div style="padding:32px 32px 30px;background:radial-gradient(circle at top right, rgba(255,255,255,0.22), transparent 34%);">
+                    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;">
+                      <tr>
+                        <td style="vertical-align:top;padding-right:14px;">
+                          <div style="display:inline-block;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,0.14);border:1px solid rgba(255,255,255,0.18);font-size:11px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;color:#ffffff;">
+                            ${escapeHtml(stage.label)}
+                          </div>
+                          <h1 style="margin:18px 0 10px;font-size:31px;line-height:1.18;color:#ffffff;letter-spacing:-0.03em;">
+                            ${escapeHtml(actionTitle || "Corrective Action")}
+                          </h1>
+                          <p style="margin:0;font-size:15px;line-height:1.75;color:rgba(255,255,255,0.90);max-width:470px;">
+                            ${isManagerAudience ? `Dear ${escapeHtml(managerName)},` : `Dear ${escapeHtml(responsibleName)},`}
+                          </p>
+                        </td>
+                        <td align="right" style="vertical-align:top;width:180px;">
+                          <div style="display:inline-block;min-width:150px;padding:16px 18px;border-radius:20px;background:rgba(255,255,255,0.16);border:1px solid rgba(255,255,255,0.18);box-shadow:inset 0 1px 0 rgba(255,255,255,0.18);text-align:left;">
+                            <div style="font-size:11px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:rgba(255,255,255,0.74);margin-bottom:6px;">Overdue</div>
+                            <div style="font-size:30px;font-weight:800;line-height:1;color:#ffffff;">${overdueDays}</div>
+                            <div style="margin-top:6px;font-size:13px;line-height:1.4;color:rgba(255,255,255,0.84);">day${overdueDays === 1 ? "" : "s"} past due</div>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </div>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:28px 32px 0;">
+                  <div style="padding:20px 22px;background:${theme.soft};border:1px solid ${theme.softBorder};border-radius:22px;box-shadow:0 10px 28px ${theme.shadow};">
+                    <div style="font-size:12px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:${theme.muted};margin-bottom:8px;">
+                      Attention Required
+                    </div>
+                    <div style="font-size:17px;font-weight:700;line-height:1.6;color:#0f172a;">
+                      ${recipientIntro}
+                    </div>
+                    <div style="margin-top:8px;font-size:15px;line-height:1.75;color:#334155;">
+                      ${escapeHtml(stage.intro)}
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:20px 32px 0;">
+                  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:separate;border-spacing:0 12px;">
+                    <tr>
+                      <td style="width:50%;padding-right:6px;vertical-align:top;">
+                        <div style="padding:16px 18px;background:${theme.statSurface};border:1px solid ${theme.softBorder};border-radius:18px;">
+                          <div style="font-size:11px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:#64748b;margin-bottom:8px;">Due Date</div>
+                          <div style="font-size:19px;font-weight:800;color:#0f172a;">${escapeHtml(dueOn)}</div>
+                        </div>
+                      </td>
+                      <td style="width:50%;padding-left:6px;vertical-align:top;">
+                        <div style="padding:16px 18px;background:#ffffff;border:1px solid ${statusTheme.border};border-radius:18px;">
+                          <div style="font-size:11px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:#64748b;margin-bottom:8px;">Status</div>
+                          <span style="display:inline-block;padding:8px 12px;border-radius:999px;background:${statusTheme.bg};border:1px solid ${statusTheme.border};font-size:13px;font-weight:800;color:${statusTheme.color};">
+                            ${escapeHtml(statusValue)}
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:16px 32px 0;">
+                  <div style="font-size:12px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:#64748b;margin-bottom:12px;">
+                    Action Overview
+                  </div>
+                  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;overflow:hidden;">
+                    <tr>
+                      <td style="padding:12px 16px;background:#f8fafc;color:#475569;font-weight:700;width:180px;">Plant</td>
+                      <td style="padding:12px 16px;color:#0f172a;">${escapeHtml(action.plant_name || "N/A")}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:12px 16px;background:#f8fafc;color:#475569;font-weight:700;width:180px;border-top:1px solid #e2e8f0;">Department</td>
+                      <td style="padding:12px 16px;color:#0f172a;border-top:1px solid #e2e8f0;">${escapeHtml(action.department_name || "N/A")}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:12px 16px;background:#f8fafc;color:#475569;font-weight:700;width:180px;border-top:1px solid #e2e8f0;">Responsible</td>
+                      <td style="padding:12px 16px;color:#0f172a;border-top:1px solid #e2e8f0;">${escapeHtml(responsibleName)}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:12px 16px;background:#f8fafc;color:#475569;font-weight:700;width:180px;border-top:1px solid #e2e8f0;">Week</td>
+                      <td style="padding:12px 16px;color:#0f172a;border-top:1px solid #e2e8f0;">${escapeHtml(action.week || "N/A")}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:12px 16px;background:#f8fafc;color:#475569;font-weight:700;width:180px;border-top:1px solid #e2e8f0;">Created On</td>
+                      <td style="padding:12px 16px;color:#0f172a;border-top:1px solid #e2e8f0;">${escapeHtml(createdOn)}</td>
+                    </tr>
+                  </table>
+                  ${rootCauseBlock}
+                  ${solutionBlock}
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:22px 32px 32px;">
+                  <div style="padding-top:18px;border-top:1px solid #e2e8f0;font-size:13px;line-height:1.8;color:#64748b;">
+                    This notification was sent automatically by the AVOCarbon KPI System to help keep corrective actions visible and on track.
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>`;
+};
+
+const getPendingCorrectiveActionEscalations = async () => {
+  await ensureCorrectiveActionEscalationSchema();
+
+  const actionsRes = await pool.query(
+    `
+    SELECT
+      ca.corrective_action_id,
+      ca.responsible_id,
+      ca.kpi_id,
+      ca.week,
+      ca.status,
+      ca.root_cause,
+      ca.implemented_solution,
+      ca.due_date,
+      ca.created_date,
+      r.name AS responsible_name,
+      r.email AS responsible_email,
+      p.name AS plant_name,
+      p.manager,
+      p.manager_email,
+      d.name AS department_name,
+      k.subject AS kpi_subject,
+      k.indicator_sub_title
+    FROM public.corrective_actions ca
+    JOIN public."Responsible" r
+      ON ca.responsible_id = r.responsible_id
+    LEFT JOIN public."Plant" p
+      ON r.plant_id = p.plant_id
+    LEFT JOIN public."Department" d
+      ON r.department_id = d.department_id
+    JOIN public."Kpi" k
+      ON ca.kpi_id = k.kpi_id
+    WHERE COALESCE(ca.status, $1::text) = $1::text
+      AND ca.due_date IS NOT NULL
+      AND ca.due_date::date <= CURRENT_DATE - INTERVAL '3 days'
+    ORDER BY ca.due_date ASC, ca.corrective_action_id ASC
+    `,
+    [OPEN_CORRECTIVE_ACTION_STATUS]
+  );
+
+  if (!actionsRes.rows.length) {
+    return [];
+  }
+
+  const actionIds = actionsRes.rows
+    .map((row) => String(row.corrective_action_id ?? "").trim())
+    .filter(Boolean);
+  const escalationLogRes = actionIds.length
+    ? await pool.query(
+      `
+        SELECT corrective_action_id, escalation_stage
+        FROM public.corrective_action_escalation_log
+        WHERE corrective_action_id = ANY($1::bigint[])
+        `,
+      [actionIds]
+    )
+    : { rows: [] };
+
+  const sentStagesByActionId = escalationLogRes.rows.reduce((acc, row) => {
+    const actionId = String(row.corrective_action_id);
+    if (!acc[actionId]) {
+      acc[actionId] = new Set();
+    }
+    acc[actionId].add(row.escalation_stage);
+    return acc;
+  }, {});
+
+  const pendingEscalations = [];
+
+  actionsRes.rows.forEach((action) => {
+    const overdueDays = getCorrectiveActionOverdueDays(action.due_date);
+    const sentStages = sentStagesByActionId[String(action.corrective_action_id)] || new Set();
+
+    CORRECTIVE_ACTION_ESCALATION_STAGES.forEach((stage) => {
+      if (overdueDays < stage.minOverdueDays || sentStages.has(stage.key)) {
+        return;
+      }
+
+      const recipientEmail = normalizeText(
+        stage.audience === "manager" ? action.manager_email : action.responsible_email
+      );
+
+      if (!recipientEmail) {
+        return;
+      }
+
+      pendingEscalations.push({
+        action,
+        stage,
+        overdueDays,
+        recipientEmail
+      });
+    });
+  });
+
+  return pendingEscalations;
+};
+
+const sendCorrectiveActionEscalationEmail = async ({
+  transporter,
+  action,
+  stage,
+  overdueDays,
+  recipientEmail
+}) => {
+  const kpiLabel = [action.kpi_subject, action.indicator_sub_title]
+    .filter(Boolean)
+    .join(" - ");
+  const subject =
+    stage.audience === "manager"
+      ? `Escalation: Corrective action overdue by ${overdueDays} days - ${kpiLabel || action.corrective_action_id}`
+      : `${stage.label}: Corrective action overdue by ${overdueDays} days - ${kpiLabel || action.corrective_action_id}`;
+
+  await transporter.sendMail({
+    from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+    to: recipientEmail,
+    subject,
+    html: buildCorrectiveActionEscalationEmailHtml({ action, stage, overdueDays })
+  });
+
+  await pool.query(
+    `
+    INSERT INTO public.corrective_action_escalation_log
+      (corrective_action_id, escalation_stage, sent_to_email)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (corrective_action_id, escalation_stage) DO NOTHING
+    `,
+    [action.corrective_action_id, stage.key, recipientEmail]
+  );
+};
+
+const runCorrectiveActionEscalationJob = async () => {
+  const pendingEscalations = await getPendingCorrectiveActionEscalations();
+
+  if (!pendingEscalations.length) {
+    console.log("[Corrective Action Escalation] No pending escalation emails.");
+    return { sent: 0, pending: 0 };
+  }
+
+  const transporter = createTransporter();
+  let sentCount = 0;
+
+  for (const escalation of pendingEscalations) {
+    try {
+      await sendCorrectiveActionEscalationEmail({
+        transporter,
+        action: escalation.action,
+        stage: escalation.stage,
+        overdueDays: escalation.overdueDays,
+        recipientEmail: escalation.recipientEmail
+      });
+
+      sentCount += 1;
+      console.log(
+        `[Corrective Action Escalation] ${escalation.stage.key} sent for corrective action ${escalation.action.corrective_action_id} to ${escalation.recipientEmail}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch (error) {
+      console.error(
+        `[Corrective Action Escalation] Failed to send ${escalation.stage.key} for corrective action ${escalation.action.corrective_action_id}:`,
+        error.message
+      );
+    }
+  }
+
+  return {
+    sent: sentCount,
+    pending: pendingEscalations.length
+  };
+};
+
 const buildCorrectiveActionEntryHtml = ({
   kpiValuesId,
   actionIndex,
@@ -5130,7 +18837,8 @@ const buildAssistantKpiContext = (kpis = []) =>
   kpis.slice(0, 30).map((kpi) => ({
     kpi_id: kpi.kpi_id ?? null,
     kpi_values_id: kpi.kpi_values_id ?? null,
-    title: normalizeText(kpi.title || kpi.indicator_title || kpi.indicator_sub_title) || "Untitled KPI",
+    kpi_code: normalizeText(kpi.kpi_code),
+    title: normalizeText(kpi.title || kpi.subject) || "Untitled KPI",
     subtitle: normalizeText(kpi.subtitle || kpi.indicator_sub_title),
     unit: normalizeText(kpi.unit),
     current_value: normalizeText(kpi.current_value ?? kpi.value),
@@ -5158,6 +18866,287 @@ const buildAssistantKpiContext = (kpis = []) =>
       }))
       : []
   }));
+
+const parseStoredKpiKnowledgeBase = (value) => {
+  if (!value) return null;
+
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  return typeof value === "object" ? value : null;
+};
+
+const collectStoredKpiKnowledgeTreeNodes = (treeNode, results = []) => {
+  if (!treeNode || typeof treeNode !== "object") return results;
+
+  results.push(treeNode);
+  (Array.isArray(treeNode.children) ? treeNode.children : []).forEach((childNode) => {
+    collectStoredKpiKnowledgeTreeNodes(childNode, results);
+  });
+
+  return results;
+};
+
+const flattenStoredKpiKnowledgeBaseItems = (knowledgeBase = null) => {
+  const parsedKnowledgeBase = parseStoredKpiKnowledgeBase(knowledgeBase);
+  if (!parsedKnowledgeBase) return [];
+
+  const items = [];
+  const kpiMeta = parsedKnowledgeBase.kpi || {};
+  const linkedSubjects = Array.isArray(parsedKnowledgeBase?.subject_context?.linked_subjects)
+    ? parsedKnowledgeBase.subject_context.linked_subjects
+    : [];
+  const storedKnowledgeNodes = Array.isArray(parsedKnowledgeBase?.subject_context?.knowledge_nodes)
+    ? parsedKnowledgeBase.subject_context.knowledge_nodes
+    : [];
+  const fallbackKnowledgeNodes = storedKnowledgeNodes.length
+    ? []
+    : linkedSubjects.flatMap((entry) =>
+        collectStoredKpiKnowledgeTreeNodes(entry?.knowledge_tree, [])
+      );
+  const knowledgeNodes = storedKnowledgeNodes.length
+    ? storedKnowledgeNodes
+    : fallbackKnowledgeNodes;
+  const targetAllocations = Array.isArray(parsedKnowledgeBase.target_allocations)
+    ? parsedKnowledgeBase.target_allocations
+    : [];
+
+  items.push({
+    item_id: `kpi:${kpiMeta.kpi_id ?? "selected"}`,
+    item_type: "kpi",
+    title: normalizeText(kpiMeta.display_name || kpiMeta.name) || "Selected KPI",
+    subtitle: normalizeText(kpiMeta.code),
+    description: normalizeText(kpiMeta.explanation || kpiMeta.formula || kpiMeta.comments),
+    keywords: buildKnowledgeBaseKeywordList([
+      kpiMeta.display_name,
+      kpiMeta.name,
+      kpiMeta.sub_title,
+      kpiMeta.code,
+      kpiMeta.explanation,
+      kpiMeta.formula,
+      kpiMeta.unit,
+      kpiMeta.frequency,
+      parsedKnowledgeBase?.subject_context?.primary_subject_path
+    ], 16),
+    relation_context: [],
+    metadata: {
+      unit: normalizeText(kpiMeta.unit),
+      frequency: normalizeText(kpiMeta.frequency)
+    }
+  });
+
+  knowledgeNodes.forEach((node) => {
+    if (!node || typeof node !== "object") return;
+
+    items.push({
+      item_id: normalizeText(node.node_id) || `subject:${node.subject_id ?? "unknown"}`,
+      item_type: "subject",
+      title: normalizeText(node.name || node.subject_name || node.path) || "Subject",
+      subtitle: normalizeText(node.path),
+      description: normalizeText(node.knowledge || node.description || node.example || node.comments),
+      keywords: Array.isArray(node.keywords)
+        ? node.keywords.slice(0, 18)
+        : buildKnowledgeBaseKeywordList([
+            node.name,
+            node.path,
+            node.knowledge,
+            node.description,
+            node.example,
+            node.comments
+          ], 18),
+      relation_context: Array.isArray(node.children_ids)
+        ? node.children_ids.slice(0, 5)
+        : []
+    });
+  });
+
+  targetAllocations.forEach((allocation) => {
+    if (!allocation || typeof allocation !== "object") return;
+
+    const allocationTarget = allocation.target || {};
+    const allocationScope = allocation.scope || {};
+    items.push({
+      item_id: `allocation:${allocation.allocation_id ?? "unknown"}`,
+      item_type: "allocation",
+      title: normalizeText(allocation.scope_label) || "Target allocation",
+      subtitle: normalizeText(allocationTarget.type || allocationTarget.status),
+      description: normalizeText([
+        allocation.comments,
+        allocationScope?.function_name,
+        allocationTarget.value !== null && allocationTarget.value !== undefined
+          ? `Target ${allocationTarget.value}${allocationTarget.unit ? ` ${allocationTarget.unit}` : ""}`
+          : null
+      ].filter(Boolean).join(" | ")),
+      keywords: Array.isArray(allocation.keywords)
+        ? allocation.keywords.slice(0, 18)
+        : buildKnowledgeBaseKeywordList([
+            allocation.scope_label,
+            allocation.comments,
+            allocationTarget.type,
+            allocationTarget.status,
+            allocationScope?.function_name
+          ], 18),
+      relation_context: uniqueKnowledgeBaseTexts([
+        allocationScope?.plant?.name,
+        allocationScope?.zone?.name,
+        allocationScope?.unit?.name,
+        allocationScope?.role?.name,
+        allocationScope?.product?.name,
+        allocationScope?.product_line?.name,
+        allocationScope?.market?.name,
+        allocationScope?.customer?.name
+      ], 8)
+    });
+  });
+
+  return items.filter((item) => {
+    return item && (
+      normalizeText(item.title) ||
+      normalizeText(item.description) ||
+      (Array.isArray(item.keywords) && item.keywords.length)
+    );
+  });
+};
+
+const scoreStoredKpiKnowledgeBaseItem = (item, queryText) => {
+  const titleText = normalizeKnowledgeBaseSearchText(item?.title);
+  const subtitleText = normalizeKnowledgeBaseSearchText(item?.subtitle);
+  const descriptionText = normalizeKnowledgeBaseSearchText(item?.description);
+  const keywordText = normalizeKnowledgeBaseSearchText(
+    Array.isArray(item?.keywords) ? item.keywords.join(" ") : ""
+  );
+  const relationText = normalizeKnowledgeBaseSearchText(
+    Array.isArray(item?.relation_context) ? item.relation_context.join(" ") : ""
+  );
+  const normalizedQuery = normalizeKnowledgeBaseSearchText(queryText);
+  const queryTokens = tokenizeKnowledgeBaseText(queryText, 24);
+  const matchedTerms = new Set();
+  let score = item?.item_type === "kpi" ? 2 : 0;
+
+  if (
+    normalizedQuery &&
+    (
+      titleText.includes(normalizedQuery) ||
+      subtitleText.includes(normalizedQuery) ||
+      descriptionText.includes(normalizedQuery) ||
+      keywordText.includes(normalizedQuery) ||
+      relationText.includes(normalizedQuery)
+    )
+  ) {
+    score += 70;
+  }
+
+  queryTokens.forEach((token) => {
+    if (titleText.includes(token)) {
+      matchedTerms.add(token);
+      score += 14;
+      return;
+    }
+
+    if (subtitleText.includes(token) || keywordText.includes(token)) {
+      matchedTerms.add(token);
+      score += 10;
+      return;
+    }
+
+    if (descriptionText.includes(token) || relationText.includes(token)) {
+      matchedTerms.add(token);
+      score += 6;
+    }
+  });
+
+  return {
+    score,
+    matched_terms: [...matchedTerms]
+  };
+};
+
+const buildStoredKpiKnowledgeBaseContext = ({
+  knowledgeBase,
+  message,
+  conversationHistory,
+  selectedKpiSummary,
+  selectedKpi
+}) => {
+  const parsedKnowledgeBase = parseStoredKpiKnowledgeBase(knowledgeBase);
+  if (!parsedKnowledgeBase) {
+    return {
+      available: false,
+      summary: null,
+      top_matches: []
+    };
+  }
+
+  const recentConversationInputs = normalizeAssistantConversationHistory(conversationHistory)
+    .filter((entry) => entry.role === "user")
+    .map((entry) => entry.content)
+    .slice(-4);
+  const searchQuery = [
+    message,
+    ...recentConversationInputs,
+    selectedKpiSummary?.display_name,
+    selectedKpi?.comment,
+    selectedKpi?.root_cause,
+    selectedKpi?.implemented_solution
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const flattenedItems = flattenStoredKpiKnowledgeBaseItems(parsedKnowledgeBase);
+  const scoredMatches = flattenedItems
+    .map((item) => {
+      const scoring = scoreStoredKpiKnowledgeBaseItem(item, searchQuery);
+      return {
+        ...item,
+        ...scoring
+      };
+    })
+    .filter((item) => Number(item.score || 0) > 0)
+    .sort((left, right) => Number(right.score || 0) - Number(left.score || 0))
+    .slice(0, 4)
+    .map((item) => ({
+      item_id: item.item_id,
+      item_type: item.item_type,
+      title: item.title,
+      subtitle: item.subtitle || null,
+      description: item.description || null,
+      keywords: Array.isArray(item.keywords) ? item.keywords.slice(0, 8) : [],
+      relation_context: Array.isArray(item.relation_context)
+        ? item.relation_context.slice(0, 5)
+        : [],
+      matched_terms: item.matched_terms || [],
+      score: item.score
+    }));
+
+  return {
+    available: true,
+    summary: {
+      generated_at: parsedKnowledgeBase.generated_at || null,
+      primary_subject_path:
+        parsedKnowledgeBase?.subject_context?.primary_subject_path || null,
+      linked_subject_count: Array.isArray(parsedKnowledgeBase?.subject_context?.linked_subjects)
+        ? parsedKnowledgeBase.subject_context.linked_subjects.length
+        : 0,
+      knowledge_node_count: Array.isArray(parsedKnowledgeBase?.subject_context?.knowledge_nodes)
+        ? parsedKnowledgeBase.subject_context.knowledge_nodes.length
+        : flattenedItems.filter((entry) => entry.item_type === "subject").length,
+      allocation_count: Array.isArray(parsedKnowledgeBase.target_allocations)
+        ? parsedKnowledgeBase.target_allocations.length
+        : 0,
+      scope_summary: parsedKnowledgeBase.scope_summary || {},
+      keywords: Array.isArray(parsedKnowledgeBase?.search_index?.keywords)
+        ? parsedKnowledgeBase.search_index.keywords.slice(0, 18)
+        : []
+    },
+    usage: parsedKnowledgeBase.ai_usage || null,
+    top_matches: scoredMatches
+  };
+};
 
 const buildAssistantKpiDisplayName = (title, subtitle) => {
   const cleanTitle = normalizeText(title);
@@ -5491,6 +19480,27 @@ const normalizeAssistantConversationHistory = (history = []) =>
     .filter(Boolean)
     .slice(-MAX_ASSISTANT_HISTORY_MESSAGES);
 
+const buildAssistantConversationMemory = (history = []) => {
+  const normalizedHistory = normalizeAssistantConversationHistory(history);
+  const recentUserInputs = normalizedHistory
+    .filter((entry) => entry.role === "user")
+    .map((entry) => entry.content)
+    .slice(-6);
+  const recentAssistantQuestions = normalizedHistory
+    .filter((entry) => entry.role === "assistant")
+    .map((entry) => entry.content)
+    .filter((content) => content.includes("?") || /\n\s*1\.\s+/m.test(content))
+    .slice(-4);
+
+  return {
+    history_available: normalizedHistory.length > 0,
+    recent_user_inputs: recentUserInputs,
+    recent_assistant_questions: recentAssistantQuestions,
+    last_user_input: recentUserInputs.length ? recentUserInputs[recentUserInputs.length - 1] : null,
+    completed_turns: Math.floor(normalizedHistory.length / 2)
+  };
+};
+
 const buildKpiScopedKnowledgeBaseQuery = ({
   message,
   conversationHistory,
@@ -5537,11 +19547,48 @@ const buildKpiScopedKnowledgeBaseQuery = ({
   return queryParts.filter(Boolean).join("\n");
 };
 
+const buildGuidedAssistantQuestionReply = ({
+  selectedKpiSummary,
+  assistantKnowledgeContext
+}) => {
+  const guidedQuestionText = formatKpiAssistantGuidedQuestion(
+    assistantKnowledgeContext?.next_question
+  );
+
+  if (!guidedQuestionText) return null;
+
+  const lines = [];
+
+  if (selectedKpiSummary?.display_name) {
+    lines.push(`Focused KPI: ${selectedKpiSummary.display_name}.`);
+  }
+
+  if (assistantKnowledgeContext?.matched_guide?.name) {
+    lines.push(`Guide: ${assistantKnowledgeContext.matched_guide.name}.`);
+  }
+
+  lines.push("Let's collect the next important point for this KPI.");
+  lines.push(guidedQuestionText);
+
+  return lines.join("\n\n");
+};
+
 const buildKpiAssistantFallbackReply = ({
   selectedKpiSummary,
   selectedKpiDelayFocus,
-  knowledgeBaseContext
+  knowledgeBaseContext,
+  assistantKnowledgeContext,
+  storedKpiKnowledgeContext
 }) => {
+  const guidedQuestionReply = buildGuidedAssistantQuestionReply({
+    selectedKpiSummary,
+    assistantKnowledgeContext
+  });
+
+  if (guidedQuestionReply) {
+    return guidedQuestionReply;
+  }
+
   const lines = [];
 
   if (selectedKpiSummary) {
@@ -5559,6 +19606,20 @@ const buildKpiAssistantFallbackReply = ({
 
   if (selectedKpiDelayFocus?.rationale) {
     lines.push(`Delay KB relevance: ${selectedKpiDelayFocus.rationale}`);
+  }
+
+  if (storedKpiKnowledgeContext?.available) {
+    if (storedKpiKnowledgeContext.summary?.primary_subject_path) {
+      lines.push(`KPI subject path: ${storedKpiKnowledgeContext.summary.primary_subject_path}.`);
+    }
+
+    if (storedKpiKnowledgeContext.top_matches?.length) {
+      const storedSummary = storedKpiKnowledgeContext.top_matches
+        .slice(0, 3)
+        .map((entry) => `${entry.title}${entry.description ? `: ${entry.description}` : ""}`)
+        .join(" | ");
+      lines.push(`Stored KPI knowledge: ${storedSummary}.`);
+    }
   }
 
   if (knowledgeBaseContext?.matches?.length) {
@@ -5601,7 +19662,9 @@ const buildKpiAssistantFallbackReply = ({
 const buildFastKpiAssistantReply = ({
   selectedKpiSummary,
   selectedKpiDelayFocus,
-  knowledgeBaseContext
+  knowledgeBaseContext,
+  assistantKnowledgeContext,
+  storedKpiKnowledgeContext
 }) => {
   const lines = [];
   const topMatches = (knowledgeBaseContext?.matches || []).slice(0, 4);
@@ -5630,6 +19693,41 @@ const buildFastKpiAssistantReply = ({
 
     lines.push(`- **Target Assessment**: ${selectedKpiSummary.target_assessment}`);
     lines.push(`- **Threshold Assessment**: ${selectedKpiSummary.threshold_assessment}`);
+  }
+
+  if (assistantKnowledgeContext?.matched_guide?.name) {
+    lines.push("");
+    lines.push(`### KPI Guide`);
+    lines.push(`- **Guide**: ${assistantKnowledgeContext.matched_guide.name}`);
+
+    if (assistantKnowledgeContext.progress?.total_questions) {
+      lines.push(
+        `- **Progress**: ${assistantKnowledgeContext.progress.answered_count}/${assistantKnowledgeContext.progress.total_questions} guided questions answered`
+      );
+    }
+  }
+
+  if (storedKpiKnowledgeContext?.available) {
+    lines.push("");
+    lines.push(`### KPI Knowledge Base`);
+
+    if (storedKpiKnowledgeContext.summary?.primary_subject_path) {
+      lines.push(`- **Primary Subject**: ${storedKpiKnowledgeContext.summary.primary_subject_path}`);
+    }
+
+    if (
+      storedKpiKnowledgeContext.summary?.allocation_count !== null &&
+      storedKpiKnowledgeContext.summary?.allocation_count !== undefined
+    ) {
+      lines.push(`- **Allocations Covered**: ${storedKpiKnowledgeContext.summary.allocation_count}`);
+    }
+
+    if (storedKpiKnowledgeContext.top_matches?.length) {
+      storedKpiKnowledgeContext.top_matches.forEach((entry, index) => {
+        const detail = entry.description || entry.subtitle || "Relevant KPI knowledge-base entry";
+        lines.push(`${index + 1}. **${entry.title}**: ${detail}`);
+      });
+    }
   }
 
   if (selectedKpiDelayFocus?.rationale) {
@@ -5683,6 +19781,15 @@ const buildFastKpiAssistantReply = ({
     });
   }
 
+  const guidedQuestionText = formatKpiAssistantGuidedQuestion(
+    assistantKnowledgeContext?.next_question
+  );
+  if (guidedQuestionText) {
+    lines.push("");
+    lines.push(`### Next Guided Question`);
+    lines.push(guidedQuestionText);
+  }
+
   return lines.join("\n");
 };
 
@@ -5692,15 +19799,29 @@ const generateKpiAssistantReply = async ({
   selectedKpiId,
   kpis,
   message,
-  conversationHistory
+  conversationHistory,
+  selectedKpiKnowledgeBase
 }) => {
   const assistantKpis = buildAssistantKpiContext(kpis);
   const normalizedConversationHistory = normalizeAssistantConversationHistory(conversationHistory);
+  const conversationMemory = buildAssistantConversationMemory(normalizedConversationHistory);
   const selectedKpi = assistantKpis.find((kpi) =>
     String(kpi.kpi_id) === String(selectedKpiId) ||
     String(kpi.kpi_values_id) === String(selectedKpiId)
   ) || null;
   const selectedKpiSummary = buildSelectedKpiSummary(selectedKpi);
+  const assistantKnowledgeContext = buildKpiAssistantKnowledgeContext({
+    selectedKpi,
+    message,
+    conversationHistory: normalizedConversationHistory
+  });
+  const storedKpiKnowledgeContext = buildStoredKpiKnowledgeBaseContext({
+    knowledgeBase: selectedKpiKnowledgeBase,
+    message,
+    conversationHistory: normalizedConversationHistory,
+    selectedKpiSummary,
+    selectedKpi
+  });
   const selectedKpiDelayFocus = buildSelectedKpiDelayFocus(selectedKpi);
   const knowledgeBaseQuery = buildKpiScopedKnowledgeBaseQuery({
     message,
@@ -5715,92 +19836,1389 @@ const generateKpiAssistantReply = async ({
     preferredNodeIds: selectedKpiDelayFocus.preferred_node_ids || []
   });
   const knowledgeBaseContext = applySelectedKpiKnowledgeBaseFocus(
-    // rawKnowledgeBaseContext,
+    rawKnowledgeBaseContext,
     selectedKpiDelayFocus
   );
   const fastLocalReply = buildFastKpiAssistantReply({
     selectedKpiSummary,
     selectedKpiDelayFocus,
-    knowledgeBaseContext
+    knowledgeBaseContext,
+    assistantKnowledgeContext,
+    storedKpiKnowledgeContext
   });
 
-  return fastLocalReply || buildKpiAssistantFallbackReply({
-    selectedKpiSummary,
-    selectedKpiDelayFocus,
-    knowledgeBaseContext
-  });
+  // if (isFastKpiAssistantRequest({
+  //   message,
+  //   selectedKpi,
+  //   knowledgeBaseContext
+  // })) {
+  //   return fastLocalReply;
+  // }
+
+  const promptKpiContext = selectedKpi ? [selectedKpi] : assistantKpis.slice(0, 8);
+  const promptKnowledgeMatches = (knowledgeBaseContext.matches || []).slice(0, 3);
+  const promptKnowledgeRelated = (knowledgeBaseContext.related || []).slice(0, 2);
+
+  const contextPrompt = `
+CONFIRMED PAGE CONTEXT
+${JSON.stringify({
+    responsible: responsible?.name || null,
+    plant: responsible?.plant_name || null,
+    department: responsible?.department_name || null,
+    week: week || null
+  }, null, 2)}
+
+KNOWN CONVERSATION MEMORY
+${JSON.stringify(conversationMemory, null, 2)}
+
+RECENT KPI CONTEXT
+${JSON.stringify(promptKpiContext, null, 2)}
+
+SELECTED KPI
+${selectedKpi ? JSON.stringify(selectedKpi, null, 2) : "None selected"}
+
+SELECTED KPI SUMMARY
+${JSON.stringify(selectedKpiSummary, null, 2)}
+
+SELECTED KPI STORED KNOWLEDGE BASE SUMMARY
+${storedKpiKnowledgeContext?.available ? JSON.stringify(storedKpiKnowledgeContext.summary, null, 2) : "None"}
+
+SELECTED KPI STORED KNOWLEDGE BASE MATCHES
+${storedKpiKnowledgeContext?.top_matches?.length ? JSON.stringify(storedKpiKnowledgeContext.top_matches, null, 2) : "None"}
+
+MATCHED KNOWLEDGE BASE NODES
+${JSON.stringify(promptKnowledgeMatches, null, 2)}
+
+RELATED KNOWLEDGE BASE NODES
+${JSON.stringify(promptKnowledgeRelated, null, 2)}
+
+MATCHED KPI QUESTION GUIDE
+${JSON.stringify(assistantKnowledgeContext.matched_guide, null, 2)}
+
+RELATED KPI QUESTION GUIDES
+${JSON.stringify(assistantKnowledgeContext.related_guides, null, 2)}
+
+GUIDED QUESTION PROGRESS
+${JSON.stringify(assistantKnowledgeContext.progress, null, 2)}
+
+NEXT GUIDED QUESTION
+${assistantKnowledgeContext.next_question ? JSON.stringify(assistantKnowledgeContext.next_question, null, 2) : "None"}
+
+USER MESSAGE
+${message}
+
+IMPORTANT
+- Follow the system prompt exactly.
+- Treat the conversation history as the active memory for this diagnosis.
+- Use the available memory before asking any follow-up question.
+- Do not repeat a question if the answer is already present or strongly implied in the history.
+- If the user's latest reply is short, resolve it using the immediately preceding assistant question and options.
+- Use the stored KPI knowledge base as the KPI-specific source of subject structure, cause/effect context, and allocation scope when it is available.
+- Use conversation data first, then the provided knowledge base nodes, then general knowledge only if really necessary.
+- If a matched KPI question guide exists, prefer its next unanswered question over inventing a new diagnostic question.
+- Ask question by question for KPI data collection unless the user explicitly asks for a summary, suggestion, or clarification.
+- Use confirmed page/KPI context as part of the conversation evidence.
+- Use the knowledge base to support diagnosis.
+- Do not invent causes, actions, owners, deadlines, metrics, or evidence.
+- During diagnosis, prioritize asking one short question over giving explanations.
+- If support is insufficient, ask the next best short diagnostic question.
+- If a user proposes a shortcut or estimate, evaluate whether it is reasonable before accepting it.
+`.trim();
+
+  let openai = null;
+  try {
+    openai = getOpenAIClient();
+  } catch (err) {
+    return buildKpiAssistantFallbackReply({
+      selectedKpiSummary,
+      selectedKpiDelayFocus,
+      knowledgeBaseContext,
+      assistantKnowledgeContext,
+      storedKpiKnowledgeContext
+    });
+  }
+
+  try {
+
+    const systemPrompt = `
+You are an intelligent assistant designed to capture, structure, analyze, and refine user information through natural conversation in order to identify:
+
+- a root cause
+- an action
+- an owner
+- a reasonable deadline
+
+Your behavior follows these core principles:
+
+### 1. Memory and Context
+- You remember all previously provided user inputs.
+- You NEVER ask a question if the answer has already been provided.
+- You continuously update an internal structured dataset when a schema or JSON target exists.
+- This dataset is STRICTLY internal and must NEVER be shown, printed, summarized as a structure, or referenced explicitly.
+- You reuse past answers when logically valid.
+- You may infer missing links from prior answers, but never invent facts.
+
+### 2. Main Objective
+Your goal is to guide the user efficiently toward a usable diagnosis and decision by identifying:
+- the real problem
+- the root cause
+- the practical corrective action
+- who should own it
+- a realistic deadline
+
+You must keep moving toward these five outputs unless the user changes the topic.
+
+### 3. Reasoning: Cause and Effect
+- You analyze relationships between answers.
+- You detect cause-effect links across the conversation.
+- You distinguish between:
+  - symptom
+  - cause
+  - root cause
+  - effect
+  - action
+  - owner
+  - deadline
+- You refine future questions based on previous answers.
+- If an answer implies another field:
+  - populate it internally if confidence is high, or
+  - ask for confirmation if uncertainty remains.
+- You must not confuse a complaint, an assumption, and a validated root cause.
+
+### 4. Detecting User-Proposed Solutions
+- At any step, if the user proposes an action, shortcut, workaround, decision, operating rule, estimate, bypass, or organizational change, treat it as a potential solution.
+- You must detect such proposals directly from the user's wording, even if they are implicit.
+- Examples of user-proposed solutions include:
+  - "we should estimate"
+  - "let's not wait for supplier quotes"
+  - "sales can launch with assumptions"
+  - "engineering should fill the gaps later"
+  - "we should add a checklist"
+  - "we should block the file"
+- When a proposed solution appears, do NOT accept it automatically.
+- First evaluate whether it is reasonable.
+
+### 5. Reasonableness Test for Proposed Solutions
+Whenever the user suggests a solution, test it using these criteria:
+
+1. Does it reduce the delay or problem in a real way?
+2. Does it create a bigger downstream risk?
+3. Is it acceptable for quality, profitability, customer credibility, and execution?
+4. Is it based on controlled assumptions or on guesswork?
+5. Can it be framed with clear conditions of use?
+6. Does it require validation, containment, or boundaries?
+7. Is it a root-cause solution or just a speed shortcut?
+
+If the solution seems reasonable:
+- accept it provisionally
+- refine it
+- add the conditions that make it safe and professional
+
+If the solution seems only partly reasonable:
+- keep the useful part
+- challenge the risky part
+- reformulate it into a controlled version
+
+If the solution is not reasonable:
+- explain briefly why
+- redirect toward a safer alternative
+- continue the questioning
+
+### 6. Controlled Acceptance of Estimation and Assumptions
+If the user proposes estimating costs, using assumptions, or not waiting for missing data:
+- do not reject automatically
+- assess whether a controlled estimate is acceptable
+- distinguish between:
+  - professional hypothesis
+  - market benchmark
+  - should-cost logic
+  - historical comparable
+  - blind guess
+- Controlled estimation may be acceptable only if:
+  - the missing data are clearly identified
+  - the uncertainty is visible
+  - the impact is limited or understood
+  - the estimate is temporary
+  - someone owns the follow-up
+  - the quote can later be corrected or confirmed if needed
+- If estimation would expose the business to serious pricing error, margin loss, technical mismatch, or customer credibility damage, you must challenge it.
+
+### 7. Question Strategy
+- Ask only one question at a time by default.
+- Questions must be clear, direct, and useful.
+- Keep them short.
+- Prefer questions that help discriminate between causes.
+- Prefer structured answer options when useful.
+
+#### Format for guided questions
+Always put each option on its own line using this exact format:
+
+Question text:
+1. Option A
+2. Option B
+3. Option C
+
+Example:
+
+Where is the biggest delay?
+1. Internal missing data
+2. Supplier response
+3. Validation
+4. Priorities changing
+
+### 8. Smart Grouping
+- When useful, you may group 3 to 4 related elements in one question.
+- Use grouping especially when:
+  - no active deep discussion is underway
+  - several fields are missing
+  - the user appears comfortable progressing faster
+- Keep grouped questions easy to answer.
+- Do not overload the user.
+
+Example:
+
+What is mainly happening?
+1. Sales launches too early
+2. Suppliers are too slow
+3. Approvals are too slow
+4. Priorities keep changing
+
+### 9. Answer Autocomplete
+- If you already have enough information:
+  - do not ask the question
+  - fill the field internally
+- Ask for confirmation only when uncertainty matters.
+- Never pretend certainty when evidence is weak.
+
+### 10. Internal Field Handling
+If a target schema or JSON structure exists:
+- use it internally as the target schema
+- progressively fill it
+- never invent missing values
+- only populate fields when confidence is sufficient
+- never display the internal schema
+- never expose internal updates
+
+### 11. Tone and Interaction Style
+- Always communicate adult-to-adult.
+- Be neutral, concise, and respectful.
+- Never be condescending.
+- Never be overly enthusiastic.
+- Do not overwhelm the user with long explanations.
+- Let the user think and answer independently.
+- Be direct when the user's proposed solution is risky.
+
+### 12. Truth and Reliability
+- Never lie.
+- Never invent data.
+- Never assume facts without enough evidence.
+- If unsure:
+  - ask, or
+  - leave the field unfilled
+- If using general knowledge, keep it separate from conversation-derived facts.
+- Never validate a root cause without enough support from the conversation.
+
+### 13. Knowledge Priority
+Use knowledge in this order:
+1. conversation data
+2. provided files or knowledge base
+3. general knowledge only when necessary
+
+Always distinguish between what the user said and what you infer.
+
+### 14. Response Discipline
+- Keep responses short and purposeful.
+- Ask or act, not both unless necessary.
+- Avoid repeating known information unless needed for precision.
+- Do not produce long summaries during the diagnosis phase.
+- Move the discussion forward.
+
+### 15. Diagnostic Logic
+At each step, you must internally determine whether the user is expressing:
+- a symptom
+- a suspected cause
+- a proposed solution
+- a constraint
+- a decision
+- an owner
+- a deadline
+
+Then decide whether to:
+- store it
+- challenge it
+- refine it
+- ask the next best question
+
+### 16. Root Cause Discipline
+Do not stop at the first plausible cause.
+
+Try to separate:
+- what is happening
+- why it happens
+- why that is allowed to happen
+- what system rule, behavior, or gap creates recurrence
+
+A root cause should explain why the problem repeats or survives.
+
+### 17. Action Quality
+An action is acceptable only if it is:
+- specific
+- practical
+- owned
+- time-bound
+- likely to reduce the problem
+
+Do not accept vague actions like:
+- "communicate better"
+- "be faster"
+- "follow up more"
+
+Refine them into operational actions.
+
+### 18. Owner Quality
+If the user mentions a team, function, or role that clearly owns the issue, capture it internally.
+If ownership is unclear, ask.
+Prefer a real accountable owner rather than a vague collective when possible.
+
+### 19. Deadline Quality
+If the user proposes a deadline, test whether it is realistic.
+
+A reasonable deadline should fit:
+- urgency
+- implementation complexity
+- required coordination
+- business impact
+
+If the deadline is unrealistic, challenge it briefly and ask for a more credible one.
+
+### 20. Execution Loop
+At each step:
+
+1. Analyze known data from the conversation and internal dataset.
+2. Detect any missing or uncertain fields among:
+   - problem
+   - root cause
+   - action
+   - owner
+   - deadline
+3. Detect whether the user has already proposed a solution.
+4. If yes, test whether it is reasonable.
+5. Decide whether to:
+   - fill automatically if confidence is high
+   - ask one targeted question
+   - challenge and refine a risky proposed solution
+6. Prefer grouping when it clearly improves efficiency.
+7. Continue until the diagnosis is good enough or the user stops.
+
+### 21. Expected Interaction Pattern
+When the user gives a statement such as:
+
+"Sales are pushing hard without all the data. It is possible to go faster by estimating some cost and making professional hypotheses. At the same time our suppliers are too long to quote so we should just estimate."
+
+You must recognize that the user has already provided:
+- symptoms
+- possible causes
+- at least one proposed solution
+
+You must then test that solution rather than simply accept it.
+
+A good next step would be a question like:
+
+What is the biggest risk if you estimate instead of waiting?
+1. Pricing too low
+2. Technical mismatch
+3. Customer credibility
+4. Limited risk if assumptions are controlled
+
+### 22. Final Goal
+Efficient, natural, structured diagnosis with:
+- minimal friction
+- no redundancy
+- strong reasoning
+- detection of user-proposed solutions
+- validation of whether those solutions are reasonable
+- zero leakage of internal data structures
+
+### 23. Conversation Continuity
+- The provided prior assistant/user messages are the active memory of this discussion.
+- Never restart the diagnosis unless the user clearly changes topic.
+- Before asking a question, check whether that question was already asked or already answered.
+- If the user answers with a short option like "1", "2", or "3", interpret it as the answer to the most recent guided question in the conversation.
+- Prefer the next unanswered diagnostic question, not a restatement of the previous one.
+
+### 24. KPI Guide Usage
+- If a matched KPI question guide is provided, use it as the preferred questioning path.
+- Reuse the guide question wording when it fits the conversation.
+- Treat the guide questions as a checklist for memory collection on this KPI.
+- Do not jump to recommendations too early when the key guide questions are still unanswered.
+`.trim();
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt
+        },
+        {
+          role: "system",
+          content: contextPrompt
+        },
+        ...normalizedConversationHistory.map((entry) => ({
+          role: entry.role,
+          content: entry.content
+        })),
+        {
+          role: "user",
+          content: message
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 220
+    });
+
+    return (
+      completion.choices[0]?.message?.content?.trim() ||
+      fastLocalReply ||
+      buildKpiAssistantFallbackReply({
+        selectedKpiSummary,
+        selectedKpiDelayFocus,
+        knowledgeBaseContext,
+        assistantKnowledgeContext,
+        storedKpiKnowledgeContext
+      })
+    );
+  } catch (err) {
+    console.error("KPI assistant OpenAI error:", err.message);
+    return fastLocalReply || buildKpiAssistantFallbackReply({
+      selectedKpiSummary,
+      selectedKpiDelayFocus,
+      knowledgeBaseContext,
+      assistantKnowledgeContext,
+      storedKpiKnowledgeContext
+    });
+  }
 };
 
 // ============================================================
 // getResponsibleWithKPIs â€” now also fetches existing corrective
 // action data (root_cause, implemented_solution, evidence)
 // ============================================================
-const getResponsibleWithKPIs = async (responsibleId, week) => {
-  const resResp = await pool.query(
-    `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-             p.name AS plant_name, d.name AS department_name
-      FROM public."Responsible" r
-      JOIN public."Plant" p ON r.plant_id = p.plant_id
-      JOIN public."Department" d ON r.department_id = d.department_id
-      WHERE r.responsible_id = $1`,
-    [responsibleId]
+const formatIsoDateValue = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+};
+
+const parseWeekLabelDate = (weekLabel) => {
+  const text = normalizeOptionalTextInput(weekLabel);
+  const match = text ? text.match(/^(\d{4})-Week(\d{1,2})$/i) : null;
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const weekNumber = Number(match[2]);
+  if (!Number.isInteger(year) || !Number.isInteger(weekNumber) || weekNumber < 1 || weekNumber > 53) {
+    return null;
+  }
+
+  return new Date(Date.UTC(year, 0, 1 + (weekNumber - 1) * 7));
+};
+
+const deriveKpiResultDate = (periodLabel) =>
+  normalizeOptionalDateInput(periodLabel) ||
+  formatIsoDateValue(parseWeekLabelDate(periodLabel)) ||
+  formatIsoDateValue(new Date());
+
+const deriveKpiResultPeriodType = (periodLabel) => {
+  const text = normalizeOptionalTextInput(periodLabel);
+  if (!text) return "Date";
+  if (/^\d{4}-Week\d{1,2}$/i.test(text)) return "Week";
+  if (/^\d{4}-\d{2}$/.test(text)) return "Month";
+  return "Period";
+};
+
+const getKpiResultDisplayPeriod = (row = {}) =>
+  normalizeOptionalTextInput(row.week) ||
+  normalizeOptionalTextInput(row.period_label) ||
+  normalizeOptionalDateInput(row.result_date) ||
+  "";
+
+
+const resolveRecordedByPeopleId = async (candidateId) => {
+  const peopleId = normalizeOptionalIntegerInput(candidateId);
+  if (!peopleId) return null;
+
+  const result = await pool.query(
+    `SELECT people_id FROM public.people WHERE people_id = $1 LIMIT 1`,
+    [peopleId]
   );
-  const responsible = resResp.rows[0];
-  if (!responsible) throw new Error("Responsible not found");
+
+  return result.rows[0]?.people_id ?? null;
+};
+
+const optionalTableAvailabilityCache = new Map();
+
+const hasPublicTable = async (tableName) => {
+  const normalizedName = normalizeOptionalTextInput(tableName);
+  if (!normalizedName) return false;
+
+  if (optionalTableAvailabilityCache.has(normalizedName)) {
+    return optionalTableAvailabilityCache.get(normalizedName);
+  }
+
+  const result = await pool.query(
+    `SELECT to_regclass($1) AS regclass`,
+    [`public.${normalizedName}`]
+  );
+
+  const exists = Boolean(result.rows[0]?.regclass);
+  optionalTableAvailabilityCache.set(normalizedName, exists);
+  return exists;
+};
+
+const actionPlanTableAvailabilityCache = new Map();
+const ACTION_PLAN_SUBJECT_CODE_PREFIX = "kpi-form";
+const ACTION_PLAN_SUBJECT_LINK_KEY_PREFIX = "Link key:";
+
+const hasActionPlanTable = async (tableName) => {
+  const normalizedName = normalizeOptionalTextInput(tableName);
+  if (!normalizedName) return false;
+
+  if (actionPlanTableAvailabilityCache.has(normalizedName)) {
+    return actionPlanTableAvailabilityCache.get(normalizedName);
+  }
+
+  try {
+    const result = await actionPlanPool.query(
+      `SELECT to_regclass($1) AS regclass`,
+      [`public.${normalizedName}`]
+    );
+
+    const exists = Boolean(result.rows[0]?.regclass);
+    actionPlanTableAvailabilityCache.set(normalizedName, exists);
+    return exists;
+  } catch (error) {
+    console.error("Action Plan table availability check failed:", error.message);
+    actionPlanTableAvailabilityCache.set(normalizedName, false);
+    return false;
+  }
+};
+
+const canUseActionPlanCorrectiveActions = async () => {
+  const [hasActionTable, hasSujetTable] = await Promise.all([
+    hasActionPlanTable("action"),
+    hasActionPlanTable("sujet")
+  ]);
+
+  return hasActionTable && hasSujetTable;
+};
+
+const encodeActionPlanPeriodToken = (value) => {
+  const normalizedValue = normalizeOptionalTextInput(value) || "period";
+  return Buffer.from(normalizedValue, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+};
+
+const decodeActionPlanPeriodToken = (value) => {
+  const token = normalizeOptionalTextInput(value);
+  if (!token) return null;
+
+  const base64 = token.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = base64.length % 4 === 0
+    ? ""
+    : "=".repeat(4 - (base64.length % 4));
+
+  try {
+    const decoded = Buffer.from(base64 + padding, "base64").toString("utf8");
+    return normalizeOptionalTextInput(decoded);
+  } catch (error) {
+    return null;
+  }
+};
+
+const buildActionPlanSubjectCode = ({
+  kpiTargetAllocationId,
+  kpiId,
+  periodLabel
+}) => {
+  const allocationId = normalizeOptionalIntegerInput(kpiTargetAllocationId);
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  const normalizedPeriodLabel =
+    normalizeOptionalTextInput(periodLabel) ||
+    formatIsoDateValue(new Date()) ||
+    "period";
+
+  if (!allocationId || !normalizedKpiId) return null;
+
+  return [
+    ACTION_PLAN_SUBJECT_CODE_PREFIX,
+    allocationId,
+    normalizedKpiId,
+    encodeActionPlanPeriodToken(normalizedPeriodLabel)
+  ].join("|");
+};
+
+const buildActionPlanSubjectPattern = ({
+  kpiTargetAllocationId,
+  kpiId
+}) => {
+  const allocationId = normalizeOptionalIntegerInput(kpiTargetAllocationId);
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!allocationId || !normalizedKpiId) return null;
+  return `${ACTION_PLAN_SUBJECT_CODE_PREFIX}|${allocationId}|${normalizedKpiId}|%`;
+};
+
+const buildActionPlanSubjectDescriptionSearchValue = (subjectCode) => {
+  const normalizedSubjectCode = normalizeOptionalTextInput(subjectCode);
+  if (!normalizedSubjectCode) return null;
+  return `%${ACTION_PLAN_SUBJECT_LINK_KEY_PREFIX} ${normalizedSubjectCode}%`;
+};
+
+const buildActionPlanSubjectDescriptionPattern = ({
+  kpiTargetAllocationId,
+  kpiId
+}) => {
+  const subjectPattern = buildActionPlanSubjectPattern({
+    kpiTargetAllocationId,
+    kpiId
+  });
+  return buildActionPlanSubjectDescriptionSearchValue(subjectPattern);
+};
+
+const parseActionPlanSubjectCode = (value) => {
+  const code = normalizeOptionalTextInput(value);
+  if (!code) return null;
+
+  const [prefix, rawAllocationId, rawKpiId, rawPeriodToken] = code.split("|");
+  if (
+    prefix !== ACTION_PLAN_SUBJECT_CODE_PREFIX ||
+    rawAllocationId === undefined ||
+    rawKpiId === undefined ||
+    rawPeriodToken === undefined
+  ) {
+    return null;
+  }
+
+  const allocationId = normalizeOptionalIntegerInput(rawAllocationId);
+  const kpiId = normalizeOptionalIntegerInput(rawKpiId);
+  const periodLabel = decodeActionPlanPeriodToken(rawPeriodToken);
+
+  if (!allocationId || !kpiId || !periodLabel) {
+    return null;
+  }
+
+  return {
+    kpiTargetAllocationId: allocationId,
+    kpiId,
+    periodLabel
+  };
+};
+
+const extractActionPlanSubjectCodeFromDescription = (value) => {
+  const text = normalizeOptionalTextInput(value);
+  if (!text) return null;
+
+  const match = text.match(/Link key:\s*([^\s]+)/i);
+  return normalizeOptionalTextInput(match?.[1]);
+};
+
+const parseActionPlanSubjectReference = ({
+  subjectCode = null,
+  description = null
+} = {}) => {
+  return (
+    parseActionPlanSubjectCode(subjectCode) ||
+    parseActionPlanSubjectCode(extractActionPlanSubjectCodeFromDescription(description))
+  );
+};
+
+const buildActionPlanSubjectMetadata = ({
+  kpiTargetAllocationId,
+  kpiId,
+  periodLabel,
+  subject,
+  kpiName,
+  subjectCode
+}) => {
+  const subjectLabel =
+    normalizeOptionalTextInput(subject) ||
+    normalizeOptionalTextInput(kpiName) ||
+    `KPI ${kpiId}`;
+  const kpiLabel =
+    normalizeOptionalTextInput(kpiName) ||
+    subjectLabel;
+  const periodText =
+    normalizeOptionalTextInput(periodLabel) ||
+    formatIsoDateValue(new Date()) ||
+    "current period";
+  const normalizedSubjectCode =
+    normalizeOptionalTextInput(subjectCode) ||
+    buildActionPlanSubjectCode({
+      kpiTargetAllocationId,
+      kpiId,
+      periodLabel
+    }) ||
+    "";
+
+  return {
+    title: subjectLabel,
+    description:
+      `${ACTION_PLAN_SUBJECT_LINK_KEY_PREFIX} ${normalizedSubjectCode}\n` +
+      `Corrective actions captured from the KPI form for subject "${subjectLabel}" ` +
+      `and KPI "${kpiLabel}" during ${periodText}. ` +
+      `Allocation ${kpiTargetAllocationId}, KPI ${kpiId}.`
+  };
+};
+
+const actionPlanResponsibleEmailCache = new Map();
+
+const findResponsibleEmailByDisplayName = async (responsibleName) => {
+  const normalizedResponsibleName = normalizeOptionalTextInput(responsibleName);
+  if (!normalizedResponsibleName) return null;
+
+  const cacheKey = normalizedResponsibleName.toLowerCase();
+  if (actionPlanResponsibleEmailCache.has(cacheKey)) {
+    return actionPlanResponsibleEmailCache.get(cacheKey);
+  }
+
+  const peopleResult = await pool.query(
+    `
+    SELECT p.email
+    FROM public.people p
+    WHERE
+      LOWER(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, '')))) = LOWER($1)
+      OR LOWER(COALESCE(p.name, '')) = LOWER($1)
+      OR LOWER(COALESCE(p.first_name, '')) = LOWER($1)
+    ORDER BY
+      CASE
+        WHEN LOWER(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, '')))) = LOWER($1) THEN 0
+        WHEN LOWER(COALESCE(p.name, '')) = LOWER($1) THEN 1
+        WHEN LOWER(COALESCE(p.first_name, '')) = LOWER($1) THEN 2
+        ELSE 3
+      END,
+      p.people_id ASC
+    LIMIT 1
+    `,
+    [normalizedResponsibleName]
+  );
+
+  let resolvedEmail = normalizeOptionalTextInput(peopleResult.rows[0]?.email);
+
+  if (!resolvedEmail) {
+    try {
+      const legacyResponsibleResult = await pool.query(
+        `
+        SELECT email
+        FROM public."Responsible"
+        WHERE LOWER(COALESCE(name, '')) = LOWER($1)
+        ORDER BY responsible_id ASC
+        LIMIT 1
+        `,
+        [normalizedResponsibleName]
+      );
+
+      resolvedEmail = normalizeOptionalTextInput(legacyResponsibleResult.rows[0]?.email);
+    } catch (error) {
+      resolvedEmail = null;
+    }
+  }
+
+  actionPlanResponsibleEmailCache.set(cacheKey, resolvedEmail);
+  return resolvedEmail;
+};
+
+const resolveActionPlanResponsibleEmail = async ({
+  responsibleName,
+  responsibleContext
+}) => {
+  const normalizedResponsibleName = normalizeOptionalTextInput(responsibleName);
+  const normalizedContextName = normalizeOptionalTextInput(responsibleContext?.name);
+  const normalizedContextEmail = normalizeOptionalTextInput(responsibleContext?.email);
+
+  if (normalizedResponsibleName && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedResponsibleName)) {
+    return normalizedResponsibleName;
+  }
+
+  if (
+    normalizedContextEmail &&
+    (!normalizedResponsibleName ||
+      !normalizedContextName ||
+      normalizedResponsibleName.toLowerCase() === normalizedContextName.toLowerCase())
+  ) {
+    return normalizedContextEmail;
+  }
+
+  return findResponsibleEmailByDisplayName(normalizedResponsibleName);
+};
+
+const findActionPlanSubjectId = async ({
+  subjectCode = null,
+  descriptionSearchValue = null
+} = {}) => {
+  const normalizedSubjectCode = normalizeOptionalTextInput(subjectCode);
+  const normalizedDescriptionSearchValue = normalizeOptionalTextInput(descriptionSearchValue);
+
+  if (!normalizedSubjectCode && !normalizedDescriptionSearchValue) {
+    return null;
+  }
+
+  const result = await actionPlanPool.query(
+    `
+    SELECT id
+    FROM public.sujet
+    WHERE
+      ($1::text IS NOT NULL AND code = $1)
+      OR ($2::text IS NOT NULL AND COALESCE(description, '') LIKE $2)
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [normalizedSubjectCode, normalizedDescriptionSearchValue]
+  );
+
+  return normalizeOptionalIntegerInput(result.rows[0]?.id);
+};
+
+const mapActionPlanActionRow = (row = {}) => {
+  const subjectInfo = parseActionPlanSubjectReference({
+    subjectCode: row.sujet_code,
+    description: row.sujet_description
+  });
+  if (!subjectInfo) return null;
+
+  const status =
+    normalizeCorrectiveActionStatus(row.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
+    OPEN_CORRECTIVE_ACTION_STATUS;
+
+  return {
+    id: row.id,
+    corrective_action_id: row.id,
+    kpi_values_id: subjectInfo.kpiTargetAllocationId,
+    kpi_target_allocation_id: subjectInfo.kpiTargetAllocationId,
+    kpi_id: subjectInfo.kpiId,
+    week: subjectInfo.periodLabel,
+    period_label: subjectInfo.periodLabel,
+    root_cause: normalizeOptionalTextInput(row.titre) || "",
+    implemented_solution: normalizeOptionalTextInput(row.description) || "",
+    status,
+    due_date: formatIsoDateValue(row.due_date),
+    responsible: normalizeOptionalTextInput(row.responsable) || "",
+    email_responsable: normalizeOptionalTextInput(row.email_responsable),
+    created_date: row.created_at,
+    updated_date: row.updated_at,
+    closed_date: row.closed_date,
+    sujet_id: row.sujet_id,
+    sujet_code: normalizeOptionalTextInput(row.sujet_code),
+    sujet_title: normalizeOptionalTextInput(row.sujet_title)
+  };
+};
+
+const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLabel = null) => {
+  if (!(await canUseActionPlanCorrectiveActions())) {
+    return {
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+
+  const patterns = Array.from(new Set(
+    (Array.isArray(kpiRows) ? kpiRows : [])
+      .map((row) => buildActionPlanSubjectPattern({
+        kpiTargetAllocationId: row.kpi_target_allocation_id ?? row.kpi_values_id,
+        kpiId: row.kpi_id
+      }))
+      .filter(Boolean)
+  ));
+  const descriptionPatterns = Array.from(new Set(
+    (Array.isArray(kpiRows) ? kpiRows : [])
+      .map((row) => buildActionPlanSubjectDescriptionPattern({
+        kpiTargetAllocationId: row.kpi_target_allocation_id ?? row.kpi_values_id,
+        kpiId: row.kpi_id
+      }))
+      .filter(Boolean)
+  ));
+
+  if (!patterns.length && !descriptionPatterns.length) {
+    return {
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+
+  try {
+    const actionsRes = await actionPlanPool.query(
+      `
+      SELECT
+        a.id,
+        a.sujet_id,
+        a.type,
+        a.titre,
+        a.description,
+        a.status,
+        a.responsable,
+        a.email_responsable,
+        a.due_date,
+        a.created_at,
+        a.updated_at,
+        a.closed_date,
+        s.code AS sujet_code,
+        s.titre AS sujet_title,
+        s.description AS sujet_description
+      FROM public.action a
+      JOIN public.sujet s
+        ON s.id = a.sujet_id
+      WHERE (
+        ($1::text[] IS NOT NULL AND COALESCE(s.code, '') LIKE ANY($1::text[]))
+        OR ($2::text[] IS NOT NULL AND COALESCE(s.description, '') LIKE ANY($2::text[]))
+      )
+        AND LOWER(COALESCE(a.type, 'action')) = 'action'
+      ORDER BY COALESCE(a.updated_at, a.created_at) DESC, a.id DESC
+      `,
+      [patterns.length ? patterns : null, descriptionPatterns.length ? descriptionPatterns : null]
+    );
+
+    const normalizedCurrentPeriod = normalizeOptionalTextInput(currentPeriodLabel);
+    const currentByAllocationId = {};
+    const historyByAllocationId = {};
+
+    actionsRes.rows.forEach((row) => {
+      const mappedAction = mapActionPlanActionRow(row);
+      if (!mappedAction) return;
+
+      const allocationKey = String(
+        mappedAction.kpi_target_allocation_id ?? mappedAction.kpi_values_id ?? ""
+      ).trim();
+      if (!allocationKey) return;
+
+      if (!historyByAllocationId[allocationKey]) {
+        historyByAllocationId[allocationKey] = [];
+      }
+      historyByAllocationId[allocationKey].push(mappedAction);
+
+      if (normalizedCurrentPeriod && mappedAction.period_label === normalizedCurrentPeriod) {
+        if (!currentByAllocationId[allocationKey]) {
+          currentByAllocationId[allocationKey] = [];
+        }
+        currentByAllocationId[allocationKey].push(mappedAction);
+      }
+    });
+
+    return {
+      currentByAllocationId,
+      historyByAllocationId
+    };
+  } catch (error) {
+    console.error("Failed to load Action Plan corrective actions:", error.message);
+    return {
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+};
+
+const ensureActionPlanSubject = async ({
+  kpiTargetAllocationId,
+  kpiId,
+  periodLabel,
+  subject,
+  kpiName,
+  insertedBy
+}) => {
+  const subjectCode = buildActionPlanSubjectCode({
+    kpiTargetAllocationId,
+    kpiId,
+    periodLabel
+  });
+  if (!subjectCode) return null;
+  const descriptionSearchValue = buildActionPlanSubjectDescriptionSearchValue(subjectCode);
+
+  const metadata = buildActionPlanSubjectMetadata({
+    kpiTargetAllocationId,
+    kpiId,
+    periodLabel,
+    subject,
+    kpiName,
+    subjectCode
+  });
+
+  const existingSubjectId = await findActionPlanSubjectId({
+    subjectCode,
+    descriptionSearchValue
+  });
+  if (existingSubjectId) {
+    await actionPlanPool.query(
+      `
+      UPDATE public.sujet
+      SET
+        code = NULL,
+        titre = $2,
+        description = $3,
+        updated_at = NOW(),
+        inserted_by = COALESCE($4, inserted_by)
+      WHERE id = $1
+      `,
+      [existingSubjectId, metadata.title, metadata.description, normalizeOptionalTextInput(insertedBy)]
+    );
+
+    return {
+      sujetId: existingSubjectId,
+      subjectCode
+    };
+  }
+
+  const insertedSubjectRes = await actionPlanPool.query(
+    `
+    INSERT INTO public.sujet (code, titre, description, inserted_by)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id
+    `,
+    [null, metadata.title, metadata.description, normalizeOptionalTextInput(insertedBy)]
+  );
+
+  return {
+    sujetId: normalizeOptionalIntegerInput(insertedSubjectRes.rows[0]?.id),
+    subjectCode
+  };
+};
+
+const syncActionPlanCorrectiveActionsForPeriod = async ({
+  kpiTargetAllocationId,
+  kpiId,
+  periodLabel,
+  subject,
+  kpiName,
+  actions = [],
+  responsibleContext = null
+}) => {
+  const subjectCode = buildActionPlanSubjectCode({
+    kpiTargetAllocationId,
+    kpiId,
+    periodLabel
+  });
+  const subjectDescriptionSearchValue = buildActionPlanSubjectDescriptionSearchValue(subjectCode);
+
+  if (!subjectCode || !(await canUseActionPlanCorrectiveActions())) {
+    return { savedCount: 0, deletedCount: 0 };
+  }
+
+  const submittedActions = Array.isArray(actions) ? actions : [];
+  const meaningfulActions = submittedActions.filter(hasMeaningfulCorrectiveActionInput);
+
+  let sujetId = await findActionPlanSubjectId({
+    subjectCode,
+    descriptionSearchValue: subjectDescriptionSearchValue
+  });
+  const existingActionsRes = sujetId
+    ? await actionPlanPool.query(
+      `
+      SELECT id
+      FROM public.action
+      WHERE sujet_id = $1
+        AND LOWER(COALESCE(type, 'action')) = 'action'
+      ORDER BY id ASC
+      `,
+      [sujetId]
+    )
+    : { rows: [] };
+
+  const existingActionIds = new Set(
+    existingActionsRes.rows
+      .map((row) => normalizeOptionalIntegerInput(row.id))
+      .filter((value) => Number.isInteger(value))
+  );
+
+  if (!meaningfulActions.length) {
+    if (!sujetId || !existingActionIds.size) {
+      return { savedCount: 0, deletedCount: 0 };
+    }
+
+    await actionPlanPool.query(
+      `DELETE FROM public.action WHERE sujet_id = $1`,
+      [sujetId]
+    );
+    await actionPlanPool.query(
+      `DELETE FROM public.sujet WHERE id = $1`,
+      [sujetId]
+    );
+
+    return {
+      savedCount: 0,
+      deletedCount: existingActionIds.size
+    };
+  }
+
+  const ensuredSubject = await ensureActionPlanSubject({
+    kpiTargetAllocationId,
+    kpiId,
+    periodLabel,
+    subject,
+    kpiName,
+    insertedBy: normalizeOptionalTextInput(responsibleContext?.email)
+  });
+  sujetId = normalizeOptionalIntegerInput(ensuredSubject?.sujetId);
+  if (!sujetId) {
+    return { savedCount: 0, deletedCount: 0 };
+  }
+
+  let savedCount = 0;
+  const keptActionIds = new Set();
+
+  for (let index = 0; index < meaningfulActions.length; index += 1) {
+    const action = meaningfulActions[index];
+    const actionId = normalizeOptionalIntegerInput(
+      action.correctiveActionId ??
+      action.corrective_action_id ??
+      action.id
+    );
+    const status =
+      normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
+      OPEN_CORRECTIVE_ACTION_STATUS;
+    const responsibleName =
+      normalizeOptionalTextInput(action.responsibleName ?? action.responsible) ||
+      normalizeOptionalTextInput(responsibleContext?.name);
+    const responsibleEmail = await resolveActionPlanResponsibleEmail({
+      responsibleName,
+      responsibleContext
+    });
+    const values = [
+      normalizeOptionalTextInput(action.rootCause ?? action.root_cause),
+      normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution),
+      status,
+      responsibleName,
+      normalizeOptionalDateInput(action.dueDate ?? action.due_date),
+      index + 1,
+      responsibleEmail
+    ];
+
+    if (actionId && existingActionIds.has(actionId)) {
+      const updatedActionRes = await actionPlanPool.query(
+        `
+        UPDATE public.action
+        SET
+          titre = $2,
+          description = $3,
+          status = $4,
+          responsable = $5,
+          due_date = $6,
+          ordre = $7,
+          email_responsable = $8,
+          type = 'action',
+          updated_at = NOW(),
+          closed_date = CASE
+            WHEN LOWER($4::text) = 'closed' THEN COALESCE(closed_date, CURRENT_DATE)
+            ELSE NULL
+          END
+        WHERE id = $1
+          AND sujet_id = $9
+        RETURNING id
+        `,
+        [actionId, ...values, sujetId]
+      );
+
+      const updatedActionId = normalizeOptionalIntegerInput(updatedActionRes.rows[0]?.id);
+      if (updatedActionId) {
+        keptActionIds.add(updatedActionId);
+        savedCount += 1;
+        continue;
+      }
+    }
+
+    const insertedActionRes = await actionPlanPool.query(
+      `
+    INSERT INTO public.action (
+      sujet_id,
+      type,
+      titre,
+      description,
+      status,
+      responsable,
+      due_date,
+     ordre,
+     email_responsable,
+     closed_date
+    )
+      VALUES (
+        $1,
+        'action',
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        CASE
+          WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
+          ELSE NULL
+        END
+      )
+      RETURNING id
+      `,
+      [sujetId, ...values]
+    );
+
+    const insertedActionId = normalizeOptionalIntegerInput(insertedActionRes.rows[0]?.id);
+    if (insertedActionId) {
+      keptActionIds.add(insertedActionId);
+      savedCount += 1;
+    }
+  }
+
+  const staleActionIds = Array.from(existingActionIds).filter(
+    (id) => !keptActionIds.has(id)
+  );
+
+  if (staleActionIds.length) {
+    await actionPlanPool.query(
+      `DELETE FROM public.action WHERE sujet_id = $1 AND id = ANY($2::bigint[])`,
+      [sujetId, staleActionIds]
+    );
+  }
+
+  return {
+    savedCount,
+    deletedCount: staleActionIds.length
+  };
+};
+
+const updateActionPlanCorrectiveActionStatus = async (correctiveActionId, nextStatus) => {
+  const actionId = normalizeOptionalIntegerInput(correctiveActionId);
+  if (!actionId) return null;
+
+  const result = await actionPlanPool.query(
+    `
+    UPDATE public.action
+    SET
+      status = $2,
+      updated_at = NOW(),
+      closed_date = CASE
+        WHEN LOWER($2::text) = 'closed' THEN COALESCE(closed_date, CURRENT_DATE)
+        ELSE NULL
+      END
+    WHERE id = $1
+    RETURNING id, status
+    `,
+    [actionId, nextStatus]
+  );
+
+  if (!result.rows.length) {
+    return null;
+  }
+
+  return {
+    corrective_action_id: result.rows[0].id,
+    status:
+      normalizeCorrectiveActionStatus(result.rows[0].status, nextStatus) ||
+      nextStatus
+  };
+};
+
+const getResponsibleWithKPIs = async (responsibleId, week) => {
+  const responsible = await loadFormResponsibleContext(responsibleId);
+  const normalizedWeek = normalizeOptionalTextInput(week);
+  const responsibleNumericId = normalizeOptionalIntegerInput(
+    responsible?.people_id ?? responsibleId
+  );
+  const correctiveActionsEnabled = await canUseActionPlanCorrectiveActions();
 
   const kpiRes = await pool.query(
-    `SELECT kv.kpi_values_id,
-           COALESCE(
-             (
-               SELECT NULLIF(BTRIM(h.new_value::text), '')
-               FROM public.kpi_values_hist26 h
-               WHERE h.kpi_values_id = kv.kpi_values_id
-                 AND h.responsible_id = $1
-                 AND h.week = $2
-               ORDER BY h.updated_at DESC, h.hist_id DESC
-               LIMIT 1
-             ),
-             NULLIF(BTRIM(kv.value::text), '')
-           ) AS value,
-           kv.week, k.kpi_id,
-           ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
-           COALESCE(
-             (SELECT MAX(updated_at) FROM public.kpi_values_hist26
-              WHERE kpi_values_id = kv.kpi_values_id), NOW()
-           ) as last_updated,
-           (SELECT h.comment FROM public.kpi_values_hist26 h
-            WHERE h.kpi_values_id = kv.kpi_values_id
-              AND h.responsible_id = $1 AND h.week = $2
-            ORDER BY h.updated_at DESC, h.hist_id DESC LIMIT 1) as latest_comment
-    FROM public.kpi_values kv
-    JOIN "Kpi" k ON kv.kpi_id = k.kpi_id
-    LEFT JOIN public.responsible_kpis rk
-      ON rk.responsible_kpi_id = kv.responsible_kpi_id
-    WHERE kv.responsible_id = $1 AND kv.week = $2
-    ORDER BY k.kpi_id ASC`,
-    [responsibleId, week]
+    `
+    SELECT
+      kta.kpi_target_allocation_id AS kpi_values_id,
+      kta.kpi_target_allocation_id,
+      kta.kpi_id,
+      COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject,
+      COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
+      COALESCE(kta.target_unit, k.unit) AS unit,
+      COALESCE(latest_result.target_value, kta.target_value, k.target_value) AS target,
+      k.min_value AS min,
+      k.max_value AS max,
+      k.tolerance_type,
+      k.up_tolerance,
+      k.low_tolerance,
+      k.frequency,
+      k.kpi_explanation AS definition,
+      k.calculation_on,
+      k.target_auto_adjustment,
+      COALESCE(latest_result.upper_limit, k.high_limit) AS high_limit,
+      COALESCE(latest_result.lower_limit, k.low_limit) AS low_limit,
+      k.target_direction,
+      latest_result.raw_value AS value,
+      latest_result.comments AS latest_comment,
+      COALESCE(latest_result.recorded_at, CURRENT_TIMESTAMP) AS last_updated
+    FROM public.kpi_target_allocation kta
+    JOIN public.kpi k ON k.kpi_id = kta.kpi_id
+    LEFT JOIN LATERAL (
+      SELECT s.subject_name
+      FROM public.subject_kpi sk
+      JOIN public.subject s ON s.subject_id = sk.subject_id
+      WHERE sk.kpi_id = k.kpi_id
+      ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+      LIMIT 1
+    ) subject_link ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        kr.raw_value,
+        kr.target_value,
+        kr.upper_limit,
+        kr.lower_limit,
+        kr.comments,
+        kr.recorded_at
+      FROM public.kpi_result kr
+      WHERE kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
+        AND (
+          ($1::text IS NOT NULL AND (kr.period_label = $1 OR kr.week = $1))
+          OR $1::text IS NULL
+        )
+      ORDER BY
+        CASE WHEN $1::text IS NOT NULL AND (kr.period_label = $1 OR kr.week = $1) THEN 0 ELSE 1 END,
+        kr.recorded_at DESC,
+        kr.kpi_result_id DESC
+      LIMIT 1
+    ) latest_result ON TRUE
+    WHERE $2::integer IS NOT NULL
+      AND kta.set_by_people_id = $2
+    ORDER BY
+      COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') ASC,
+      COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') ASC,
+      kta.kpi_target_allocation_id ASC
+    `,
+    [normalizedWeek, responsibleNumericId]
   );
 
-  const correctiveActionsRes = await pool.query(
-    `SELECT corrective_action_id, responsible_id, kpi_id, week,
-            root_cause, implemented_solution, evidence,
-            status, created_date, updated_date, due_date, responsible
-     FROM public.corrective_actions
-     WHERE responsible_id = $1 AND week = $2
-     ORDER BY kpi_id ASC, COALESCE(updated_date, created_date) DESC, corrective_action_id DESC`,
-     [responsibleId, week]
-  );
+  const {
+    currentByAllocationId,
+    historyByAllocationId
+  } = correctiveActionsEnabled
+    ? await loadActionPlanCorrectiveActionMaps(kpiRes.rows, normalizedWeek)
+    : { currentByAllocationId: {}, historyByAllocationId: {} };
 
-  const actionsByKpiId = {};
-  correctiveActionsRes.rows.forEach((action) => {
-    if (!actionsByKpiId[action.kpi_id]) {
-      actionsByKpiId[action.kpi_id] = [];
-    }
-    actionsByKpiId[action.kpi_id].push(action);
+  Object.values(historyByAllocationId).forEach((rows) => {
+    (rows || []).forEach((action) => {
+      if (!action) return;
+
+      action.corrective_action_id =
+        action.corrective_action_id ??
+        action.id ??
+        null;
+    });
   });
 
   const kpis = kpiRes.rows.map((kpi) => {
-    const correctiveActions = sortCorrectiveActions(actionsByKpiId[kpi.kpi_id] || []);
+    const allocationKey = String(
+      kpi.kpi_target_allocation_id ?? kpi.kpi_values_id ?? ""
+    ).trim();
+    const currentPeriodActions = currentByAllocationId[allocationKey] || [];
+    const openActions = currentPeriodActions.filter((action) => {
+      return (
+        normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !==
+        CLOSED_CORRECTIVE_ACTION_STATUS
+      );
+    });
+
+    const correctiveActions = sortCorrectiveActions(openActions);
     const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
 
     return {
@@ -5817,47 +21235,32 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     };
   });
 
-  return { responsible, kpis };
-};
-
-const getWeekLabelForDate = (date = new Date()) => {
-  const currentDate = new Date(date);
-  const year = currentDate.getFullYear();
-  const startDate = new Date(year, 0, 1);
-  const days = Math.floor((currentDate - startDate) / (24 * 60 * 60 * 1000));
-  const weekNumber = Math.ceil((days + startDate.getDay() + 1) / 7);
-  return `${year}-Week${weekNumber}`;
-};
-
-const KPI_EMAIL_CONFIG = {
-  appBaseUrl: "https://kpi-form.azurewebsites.net",
-  enableKpiSubmissionEmailCron: true,
-  kpiSubmissionEmailCron: "0 9 * * 2",
-  timezone: "Africa/Tunis",
-};
-
-const getAppBaseUrl = () =>
-  KPI_EMAIL_CONFIG.appBaseUrl.replace(/\/+$/, "");
-
-const KPI_SUBMISSION_CHART_WEEK_WINDOW = 4;
-
-const getKpiEmailRecipientsForWeek = async (week) => {
-  const resps = await pool.query(
-    `SELECT DISTINCT r.responsible_id
-     FROM public."Responsible" r
-     JOIN public.kpi_values kv
-       ON kv.responsible_id = r.responsible_id
-     WHERE kv.week = $1
-       AND r.email IS NOT NULL
-       AND TRIM(r.email) != ''
-     ORDER BY r.responsible_id ASC`,
-    [week]
-  );
-
-  return resps.rows;
+  return {
+    responsible,
+    kpis,
+    correctiveActionsEnabled,
+    correctiveActionHistoryByAllocation: historyByAllocationId
+  };
 };
 
 const generateEmailHtml = ({ responsible, week }) => {
+  // Convert week format (e.g., "2026-Week12") to month and year
+  const getMonthYearFromWeek = (weekStr) => {
+    const match = weekStr.match(/(\d{4})-Week(\d+)/);
+    if (!match) return weekStr; // Return original if format doesn't match
+
+    const year = parseInt(match[1]);
+    const weekNumber = parseInt(match[2]);
+
+    // Calculate approximate date from week number (week 1 starts around Jan 1)
+    const date = new Date(year, 0, 1 + (weekNumber - 1) * 7);
+
+    // Return month and year (e.g., "March 2026")
+    return date.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  };
+
+  const monthYear = getMonthYearFromWeek(week);
+
   return `
   <!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI Form</title></head>
   <body style="font-family:'Segoe UI',sans-serif;background:#f4f4f4;padding:20px;margin:0;">
@@ -5869,39 +21272,32 @@ const generateEmailHtml = ({ responsible, week }) => {
              alt="AVOCarbon Logo" style="width:90px;height:90px;object-fit:contain;">
       </div>
       
-      <!-- KPI plant with cadre/border - directly under logo and centered -->
+      <!-- KPI codir with cadre/border - directly under logo and centered -->
       <div style="border:2px solid #0078D7;border-radius:8px;padding:6px 25px;display:inline-block;margin:0 auto 15px auto;">
-        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI Plant</span>
+        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI codir</span>
       </div>
       
-      <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${week}</h2>
+      <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${monthYear}</h2>
       
       <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsible.plant_name}</h3>
       
-      <a href="${getAppBaseUrl()}/form?responsible_id=${responsible.responsible_id}&week=${week}"
+      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsible.responsible_id}&week=${week}"
          style="display:inline-block;padding:14px 35px;background:#0078D7;color:white;
                 border-radius:50px;text-decoration:none;font-weight:600;font-size:16px;
                 margin-bottom:20px;border:none;cursor:pointer;">
         Fill KPI Form
       </a>
       
-      <p style="margin:0;font-size:13px;color:#666;">Click the button above to fill your KPIs for ${week}.</p>
+      <p style="margin:0;font-size:13px;color:#666;">Click the button above to fill your KPIs for ${monthYear}.</p>
     </div>
   </body></html>`;
 };
 
+
 const checkAndTriggerCorrectiveActions = async (responsibleId, kpiId, week, newValue, histId) => {
   try {
     const kpiRes = await pool.query(
-      `
-      SELECT COALESCE(rk.target, k.target) AS target
-      FROM public."Kpi" k
-      LEFT JOIN public.responsible_kpis rk
-        ON rk.kpi_id = k.kpi_id
-       AND rk.responsible_id = $1
-      WHERE k.kpi_id = $2
-      `,
-      [responsibleId, kpiId]
+      `SELECT target FROM public."Kpi" WHERE kpi_id = $1`, [kpiId]
     );
     if (!kpiRes.rows.length) return { targetUpdated: false };
 
@@ -6026,16 +21422,127 @@ const upsertCorrectiveAction = async (
 // ============================================================
 // AI SUGGESTION HELPER â€” generates 2 CA suggestions for a KPI
 // ============================================================
+const generateCASuggestions = async (kpi) => {
+  try {
+    const openai = getOpenAIClient();
+    const goodDirection = inferKpiDirection(kpi);
+
+    const currentVal = parseFloat(kpi.value || 0);
+    const targetVal = parseFloat(kpi.target || 0);
+    const lowLimit = parseFloat(kpi.low_limit || 0);
+    const highLimit = parseFloat(kpi.high_limit || 0);
+
+    const gapToTarget = !isNaN(targetVal) ? (targetVal - currentVal).toFixed(2) : "N/A";
+    const gapToLow = !isNaN(lowLimit) ? (lowLimit - currentVal).toFixed(2) : "N/A";
+
+    const prompt = `
+CONFIRMED PAGE CONTEXT
+${JSON.stringify({
+      responsible: responsible?.name || null,
+      plant: responsible?.plant_name || null,
+      department: responsible?.department_name || null,
+      week: week || null
+    }, null, 2)}
+
+SELECTED KPI
+${selectedKpi ? JSON.stringify(selectedKpi, null, 2) : "None selected"}
+
+SELECTED KPI SUMMARY
+${JSON.stringify(selectedKpiSummary, null, 2)}
+
+MATCHED KNOWLEDGE BASE NODES
+${JSON.stringify(promptKnowledgeMatches, null, 2)}
+
+RELATED KNOWLEDGE BASE NODES
+${JSON.stringify(promptKnowledgeRelated, null, 2)}
+
+USER MESSAGE
+${message}
+
+IMPORTANT
+- Follow the system prompt exactly.
+- Use conversation data first.
+- Use the provided knowledge base nodes as diagnostic support.
+- Use confirmed page/KPI context as supporting evidence.
+- Do not invent causes, actions, owners, deadlines, metrics, or evidence.
+`.trim();
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.35,
+      max_tokens: 700,
+    });
+
+    const raw = completion.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(raw);
+
+    return [
+      {
+        root_cause: parsed.suggestion_1?.root_cause || "",
+        immediate_action: parsed.suggestion_1?.immediate_action || "",
+        evidence: parsed.suggestion_1?.evidence || "",
+      },
+      {
+        root_cause: parsed.suggestion_2?.root_cause || "",
+        immediate_action: parsed.suggestion_2?.immediate_action || "",
+        evidence: parsed.suggestion_2?.evidence || "",
+      },
+    ];
+  } catch (err) {
+    console.error("AI suggestion error:", kpi.subject, err.message);
+    return null;
+  }
+};
+
+// GET /generate-ca-suggestion?kpi_id=&responsible_id=&week=
+app.get("/generate-ca-suggestion", async (req, res) => {
+  try {
+    const { kpi_id, responsible_id, week } = req.query;
+
+    const kpiRes = await pool.query(
+      `SELECT k.kpi_id, k.subject, k.indicator_sub_title,
+              k.unit, k.target, k.definition, k.calculation_on,
+              k.frequency, k.low_limit, k.high_limit, kv.value
+       FROM public."Kpi" k
+       LEFT JOIN public.kpi_values kv
+         ON kv.kpi_id = k.kpi_id
+        AND kv.responsible_id = $2
+        AND kv.week = $3
+       WHERE k.kpi_id = $1
+       LIMIT 1`,
+      [kpi_id, responsible_id, week]
+    );
+
+    if (!kpiRes.rows.length)
+      return res.status(404).json({ error: "KPI not found" });
+
+    const suggestions = await generateCASuggestions(kpiRes.rows[0]);
+
+    if (!suggestions || suggestions.length === 0)
+      return res.status(500).json({ error: "Could not generate suggestion" });
+
+    // Randomly pick one suggestion to give variety on re-generate
+    const suggestion = suggestions[Math.floor(Math.random() * suggestions.length)];
+    res.json({ suggestion });
+  } catch (err) {
+    console.error("Error generating CA suggestion:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post("/kpi-ai-assistant", async (req, res) => {
+  const client = await pool.connect();
+
   try {
+    await ensureKpiAssistantConversationSchema();
+
     const {
       responsible_id,
       week,
       selected_kpi_id,
       message,
-      kpis,
-      conversation_history
+      kpis
     } = req.body || {};
 
     const cleanMessage = String(message || "").trim();
@@ -6043,33 +21550,229 @@ app.post("/kpi-ai-assistant", async (req, res) => {
       return res.status(400).json({ error: "Message is required" });
     }
 
-    let responsible = null;
-    if (responsible_id) {
-      const responsibleRes = await pool.query(
-        `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-                p.name AS plant_name, d.name AS department_name
-         FROM public."Responsible" r
-         JOIN public."Plant" p ON r.plant_id = p.plant_id
-         JOIN public."Department" d ON r.department_id = d.department_id
-         WHERE r.responsible_id = $1`,
-        [responsible_id]
-      );
-      responsible = responsibleRes.rows[0] || null;
+    await client.query("BEGIN");
+
+    const responsibleRes = await client.query(
+      `SELECT
+         p.people_id AS responsible_id,
+         p.name,
+         p.first_name,
+         p.email,
+         p.work_at_unit_id,
+         u.unit_name AS plant_name
+       FROM public.people p
+       LEFT JOIN public.unit u ON u.unit_id = p.work_at_unit_id
+       WHERE p.people_id = $1`,
+      [responsible_id]
+    );
+
+    const responsible = responsibleRes.rows[0] || null;
+    if (!responsible) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Responsible person not found" });
     }
+
+// Try to find a role assignment, but don't block if none exists
+const assignmentRes = await client.query(
+  `SELECT assignment_id
+   FROM public.people_role_assignment
+   WHERE people_id = $1
+     AND assignment_status = 'ACTIVE'
+   ORDER BY is_primary DESC, assignment_id DESC
+   LIMIT 1`,
+  [responsible_id]
+);
+
+// Fall back to using people_id directly as the conversation key
+const assignment = assignmentRes.rows[0];
+const assignmentId = normalizeOptionalIntegerInput(assignment?.assignment_id);
+const peopleId =
+  normalizeOptionalIntegerInput(responsible?.responsible_id) ||
+  normalizeOptionalIntegerInput(responsible_id);
+
+if (!assignmentId && !peopleId) {
+  await client.query("ROLLBACK");
+  return res.status(400).json({
+    error: "Responsible conversation identity is invalid"
+  });
+}
+
+    const selectedId = selected_kpi_id ? Number(selected_kpi_id) : null;
+
+    let kpiId = null;
+    let selectedKpiKnowledgeBase = null;
+
+    if (selectedId) {
+    const kpiLookupRes = await client.query(
+    `SELECT kpi_id FROM public.kpi_target_allocation
+     WHERE kpi_target_allocation_id = $1 LIMIT 1`,
+     [selectedId]
+     );
+     kpiId = kpiLookupRes.rows[0]?.kpi_id ?? selectedId;
+
+    const kpiKnowledgeBaseRes = await client.query(
+    `SELECT kpi_knowledge_base
+       FROM public.kpi
+      WHERE kpi_id = $1
+      LIMIT 1`,
+     [kpiId]
+     );
+     selectedKpiKnowledgeBase = kpiKnowledgeBaseRes.rows[0]?.kpi_knowledge_base ?? null;
+
+    }
+
+    const existingConversationRow = await loadKpiAssistantConversationRow(
+      client,
+      {
+        assignmentId,
+        peopleId,
+        kpiId,
+        forUpdate: true
+      }
+    );
+
+    const conversationHistory = Array.isArray(existingConversationRow?.conversation)
+      ? existingConversationRow.conversation
+      : [];
 
     const reply = await generateKpiAssistantReply({
       responsible,
       week,
-      selectedKpiId: selected_kpi_id,
+      selectedKpiId: kpiId,
       kpis: Array.isArray(kpis) ? kpis : [],
       message: cleanMessage,
-      conversationHistory: Array.isArray(conversation_history) ? conversation_history : []
+      conversationHistory,
+      selectedKpiKnowledgeBase
     });
 
-    res.json({ reply });
+    const updatedConversation = [
+      ...conversationHistory,
+      {
+        role: "user",
+        content: cleanMessage,
+        text: cleanMessage,
+        ts: Date.now()
+      },
+      {
+        role: "assistant",
+        content: reply,
+        text: reply,
+        ts: Date.now()
+      }
+    ].slice(-50);
+
+    if (existingConversationRow) {
+      await client.query(
+        `UPDATE public.kpi_assistant_conversation
+         SET conversation = $1::jsonb,
+             people_role_assignment_id = COALESCE($2, people_role_assignment_id),
+             people_id = COALESCE($3, people_id),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE conversation_id = $4`,
+        [
+          JSON.stringify(updatedConversation),
+          assignmentId,
+          peopleId,
+          existingConversationRow.conversation_id
+        ]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO public.kpi_assistant_conversation
+          (people_role_assignment_id, people_id, kpi_id, conversation)
+         VALUES ($1, $2, $3, $4::jsonb)`,
+        [
+          assignmentId,
+          peopleId,
+          kpiId,
+          JSON.stringify(updatedConversation)
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      reply,
+      conversation: updatedConversation
+    });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("KPI AI assistant error:", err.message);
     res.status(500).json({ error: err.message || "Could not generate AI response" });
+  } finally {
+    client.release();
+  }
+});
+
+
+app.get("/kpi-ai-assistant/conversation", async (req, res) => {
+  const { responsible_id, kpi_id } = req.query;
+
+  try {
+    await ensureKpiAssistantConversationSchema();
+
+const assignmentRes = await pool.query(
+  `
+  SELECT 
+    pra.assignment_id,
+    pra.role_id,
+    r.role_name,
+    p.name
+  FROM public.people_role_assignment pra
+  JOIN public.role r
+    ON r.role_id = pra.role_id
+  JOIN public.people p
+    ON p.people_id = pra.people_id
+  WHERE pra.people_id = $1
+    AND pra.assignment_status = 'ACTIVE'
+  ORDER BY pra.is_primary DESC, pra.assignment_id DESC
+  LIMIT 1
+  `,
+  [Number(responsible_id)]
+);
+
+    const assignment = assignmentRes.rows[0];
+    const assignmentId = normalizeOptionalIntegerInput(assignment?.assignment_id);
+    const peopleId = normalizeOptionalIntegerInput(responsible_id);
+
+    if (!assignmentId && !peopleId) {
+      return res.json({ conversation: [] });
+    }
+
+    const selectedId = kpi_id ? Number(kpi_id) : null;
+    let realKpiId = null;
+
+    if (selectedId) {
+      const kpiLookupRes = await pool.query(
+        `
+        SELECT kpi_id
+        FROM public.kpi_target_allocation
+        WHERE kpi_target_allocation_id = $1
+        LIMIT 1
+        `,
+        [selectedId]
+      );
+
+      realKpiId = kpiLookupRes.rows[0]?.kpi_id ?? selectedId;
+    }
+
+    const existingConversationRow = await loadKpiAssistantConversationRow(
+      pool,
+      {
+        assignmentId,
+        peopleId,
+        kpiId: realKpiId,
+        forUpdate: false
+      }
+    );
+
+    return res.json({
+      conversation: existingConversationRow?.conversation ?? []
+    });
+  } catch (err) {
+    console.error("Fetch conversation error:", err.message);
+    return res.status(500).json({ conversation: [] });
   }
 });
 
@@ -6105,13 +21808,13 @@ app.get("/corrective-actions-list", async (req, res) => {
            PARTITION BY ca.kpi_id, ca.week
            ORDER BY COALESCE(ca.updated_date, ca.created_date) ASC, ca.corrective_action_id ASC
          ) AS action_number,
-         COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-         COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-         COALESCE(rk.unit, k.unit) AS unit,
+         k.subject AS indicator_title,
+         k.indicator_sub_title,
+         k.unit,
          kv.value,
-         ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
-         ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
-         ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit
+         k.target,
+         k.low_limit,
+         k.high_limit
        FROM public.corrective_actions ca
        JOIN public."Kpi" k
          ON ca.kpi_id = k.kpi_id
@@ -6119,8 +21822,6 @@ app.get("/corrective-actions-list", async (req, res) => {
          ON kv.kpi_id = ca.kpi_id
         AND kv.responsible_id = ca.responsible_id
         AND kv.week = ca.week
-       LEFT JOIN public.responsible_kpis rk
-         ON rk.responsible_kpi_id = kv.responsible_kpi_id
        WHERE ca.responsible_id = $1
         ORDER BY
           COALESCE(ca.updated_date, ca.created_date) DESC NULLS LAST,
@@ -6128,7 +21829,11 @@ app.get("/corrective-actions-list", async (req, res) => {
       [responsible_id]
     );
 
-    const actions = actionsRes.rows;
+    const actions = actionsRes.rows.filter(
+      (action) =>
+        normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !==
+        CLOSED_CORRECTIVE_ACTION_STATUS
+    );
     const latestSubmittedActionId = actions[0]?.corrective_action_id ?? null;
 
     const formatDate = (dateValue) => {
@@ -6568,20 +22273,18 @@ app.get("/corrective-action-form", async (req, res) => {
     const kpiResp = await pool.query(
       `SELECT
          k.kpi_id,
-         COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-         COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-         COALESCE(rk.unit, k.unit) AS unit,
-         ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
-         ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
-         ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit,
+         k.subject AS indicator_title,
+         k.indicator_sub_title,
+         k.unit,
+         k.target,
+         k.low_limit,
+         k.high_limit,
          kv.value
        FROM public."Kpi" k
        LEFT JOIN public.kpi_values kv
          ON k.kpi_id = kv.kpi_id
         AND kv.responsible_id = $2
         AND kv.week = $3
-       LEFT JOIN public.responsible_kpis rk
-         ON rk.responsible_kpi_id = kv.responsible_kpi_id
        WHERE k.kpi_id = $1
        LIMIT 1`,
       [kpi_id, responsible_id, week]
@@ -6988,6 +22691,21 @@ app.post("/api/corrective-actions/:correctiveActionId/status", async (req, res) 
       return res.status(400).json({ error: "Invalid corrective action status" });
     }
 
+    if (await canUseActionPlanCorrectiveActions()) {
+      const actionPlanResult = await updateActionPlanCorrectiveActionStatus(
+        correctiveActionId,
+        nextStatus
+      );
+
+      if (actionPlanResult) {
+        return res.json(actionPlanResult);
+      }
+    }
+
+    if (!(await hasPublicTable("corrective_actions"))) {
+      return res.status(404).json({ error: "Corrective action not found" });
+    }
+
     const result = await pool.query(
       `UPDATE public.corrective_actions
        SET status = $2::text,
@@ -7028,22 +22746,16 @@ app.get("/corrective-actions-bulk", async (req, res) => {
     if (!responsible) return res.status(404).send("Responsible not found");
 
     const actionsRes = await pool.query(
-      `SELECT ca.*, k.kpi_id,
-              COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-              COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-              COALESCE(rk.unit, k.unit) AS unit,
-              ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
-              kv.value
+      `SELECT ca.*, k.kpi_id, k.subject AS indicator_title, k.indicator_sub_title,
+              k.unit, k.target, kv.value
        FROM public.corrective_actions ca
        JOIN public."Kpi" k ON ca.kpi_id = k.kpi_id
        LEFT JOIN public.kpi_values kv
          ON ca.kpi_id = kv.kpi_id
         AND kv.responsible_id = ca.responsible_id
         AND kv.week = ca.week
-       LEFT JOIN public.responsible_kpis rk
-         ON rk.responsible_kpi_id = kv.responsible_kpi_id
        WHERE ca.responsible_id = $1 AND ca.week = $2 AND ca.status = 'Open'
-       ORDER BY COALESCE(rk.indicator_title, k.indicator_title)`,
+       ORDER BY k.subject`,
       [responsible_id, week]
     );
     const actions = actionsRes.rows;
@@ -7053,11 +22765,11 @@ app.get("/corrective-actions-bulk", async (req, res) => {
         <div style="text-align:center;padding:60px;font-family:'Segoe UI',sans-serif;">
           <h2 style="color:#4caf50;">No Open Corrective Actions</h2>
           <p>All corrective actions for week ${week} have been completed.</p>
-          <a href="/dashboard?responsible_id=${responsible_id}"
-             style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;
-                    text-decoration:none;border-radius:6px;font-weight:bold;">
-            Go to Dashboard
-          </a>
+          <a href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}"
+         style="display:inline-block;padding:12px 25px;background:#0078D7;color:white;
+          text-decoration:none;border-radius:6px;font-weight:bold;">
+          Go to Dashboard
+         </a>
         </div>`);
     }
 
@@ -7135,14 +22847,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                   </div>
                   <div class="ai-card-text" id="ia-text-${action.corrective_action_id}"></div>
                 </div>
-                <div class="ai-suggestion-card evidence-card"
-                     onclick="applyToField('evidence_${action.corrective_action_id}',this)">
-                  <div class="ai-card-label">
-                    <span class="ai-card-icon">&#128202;</span>Evidence
-                    <span class="apply-hint">Click to apply &#8595;</span>
-                  </div>
-                  <div class="ai-card-text" id="ev-text-${action.corrective_action_id}"></div>
-                </div>
               </div>
             </div>
 
@@ -7170,16 +22874,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
                         id="solution_${action.corrective_action_id}" required
                         placeholder="Click 'Generate Suggestion' above, or describe actions taken manually"
               >${action.implemented_solution || ''}</textarea>
-            </div>
-            <div class="form-group">
-              <label for="evidence_${action.corrective_action_id}">
-                &#128202; Evidence <span class="required">*</span>
-              </label>
-              <textarea name="evidence_${action.corrective_action_id}"
-                        id="evidence_${action.corrective_action_id}" required
-                        placeholder="What evidence shows improvement?"
-              >${action.evidence || ''}</textarea>
-              <div class="help-text">Provide data, metrics, or observations demonstrating effectiveness</div>
             </div>
 
             <div class="form-grid">
@@ -7276,19 +22970,17 @@ app.get("/corrective-actions-bulk", async (req, res) => {
           @keyframes fadeIn{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:translateY(0);}}
           .suggestion-content{padding:14px 16px;animation:fadeIn 0.3s ease;}
           .suggestion-error{padding:12px 16px;font-size:13px;color:#92400e;background:#fff7ed;}
-          .ai-suggestion-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}
+          .ai-suggestion-row{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;}
           .ai-suggestion-card{background:white;border-radius:8px;padding:14px;cursor:pointer;
             transition:transform 0.15s,box-shadow 0.15s;border:1.5px solid transparent;}
           .ai-suggestion-card:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,0.1);}
           .ai-suggestion-card.applied{border-color:#4ade80!important;background:#f0fdf4;}
           .root-cause-card{border-top:3px solid #ef4444;}
           .action-card{border-top:3px solid #f59e0b;}
-          .evidence-card{border-top:3px solid #3b82f6;}
           .ai-card-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;
             margin-bottom:8px;display:flex;align-items:center;gap:5px;}
           .root-cause-card .ai-card-label{color:#dc2626;}
           .action-card .ai-card-label{color:#d97706;}
-          .evidence-card .ai-card-label{color:#2563eb;}
           .apply-hint{margin-left:auto;font-size:10px;font-weight:500;color:#9ca3af;
             text-transform:none;letter-spacing:0;}
           .ai-card-text{font-size:13px;color:#374151;line-height:1.55;}
@@ -7390,7 +23082,6 @@ app.get("/corrective-actions-bulk", async (req, res) => {
               const s = data.suggestion;
               document.getElementById('rc-text-' + caId).textContent = s.root_cause       || '';
               document.getElementById('ia-text-' + caId).textContent = s.immediate_action || '';
-              document.getElementById('ev-text-' + caId).textContent = s.evidence         || '';
               suggDiv.style.display = 'block';
             } catch (err) {
               errDiv.style.display = 'block';
@@ -7419,31 +23110,28 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
     for (const caId of ids) {
       const rootCause = normalizeText(formData[`root_cause_${caId}`]);
       const solution = normalizeText(formData[`solution_${caId}`]);
-      const evidence = normalizeText(formData[`evidence_${caId}`]);
       const dueDate = formData[`due_date_${caId}`] || null;
       const responsibleName = normalizeText(formData[`responsible_${caId}`]);
-      if (rootCause || solution || evidence || dueDate || responsibleName) {
+      if (rootCause || solution || dueDate || responsibleName) {
         await pool.query(
           `UPDATE public.corrective_actions
            SET root_cause=$1,
                implemented_solution=$2,
-               evidence=$3,
-               due_date=$4::date,
-               responsible=$5::text,
+               due_date=$3::date,
+               responsible=$4::text,
                status = CASE
                  WHEN $1::text IS NOT NULL
                   AND $2::text IS NOT NULL
-                  AND $3::text IS NOT NULL
-                  AND $4::date IS NOT NULL
-                  AND NULLIF(BTRIM($5::text), '') IS NOT NULL
+                  AND $3::date IS NOT NULL
+                  AND NULLIF(BTRIM($4::text), '') IS NOT NULL
                  THEN 'Waiting for validation'
                  ELSE status
                END,
                updated_date=NOW()
-           WHERE corrective_action_id=$6`,
-          [rootCause, solution, evidence, dueDate, responsibleName, caId]
+           WHERE corrective_action_id=$5`,
+          [rootCause, solution, dueDate, responsibleName, caId]
         );
-        if (rootCause && solution && evidence && dueDate && responsibleName) {
+        if (rootCause && solution && dueDate && responsibleName) {
           completedCount++;
         }
       }
@@ -7467,17 +23155,7 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
         <p>You have successfully submitted all corrective actions for week ${week}.<br>
            The quality team will review your submissions.</p>
         <a href="/corrective-actions-list?responsible_id=${responsible_id}">View Corrective Actions</a>
-      </div>
-      <script>
-        try {
-          if (window.localStorage) {
-            window.localStorage.removeItem("kpi-form-draft:${responsible_id}:${week}");
-          }
-        } catch (err) {
-          // Ignore storage cleanup errors after a successful submit.
-        }
-      </script>
-      </body></html>`);
+      </div></body></html>`);
   } catch (err) {
     res.status(500).send(`<h2 style="color:red;">Error: ${err.message}</h2>`);
   }
@@ -7487,6 +23165,12 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
 app.post("/redirect", async (req, res) => {
   try {
     const { responsible_id, week, ...values } = req.body;
+    const normalizedWeek = normalizeOptionalTextInput(week) || formatIsoDateValue(new Date());
+    const resultDate = deriveKpiResultDate(normalizedWeek);
+    const periodType = deriveKpiResultPeriodType(normalizedWeek);
+    const recordedByPeopleId = await resolveRecordedByPeopleId(responsible_id);
+    const responsibleContext = await loadFormResponsibleContext(responsible_id);
+    const correctiveActionsEnabled = await canUseActionPlanCorrectiveActions();
 
     // Extract KPI values
     const kpiValues = Object.entries(values)
@@ -7498,125 +23182,184 @@ app.post("/redirect", async (req, res) => {
       .filter(([k]) => k.startsWith("comment_"))
       .reduce((acc, [k, v]) => { acc[k.split("_")[1]] = v; return acc; }, {});
 
-    const responsibleRes = await pool.query(
-      `SELECT name FROM public."Responsible" WHERE responsible_id = $1`,
-      [responsible_id]
-    );
-    const defaultResponsibleName = responsibleRes.rows[0]?.name || null;
-
+    const defaultResponsibleName = responsibleContext.name || null;
     const targetUpdates = [];
     let correctiveActionsCount = 0;
 
-    for (let item of kpiValues) {
-      const oldRes = await pool.query(
-        `SELECT value, kpi_id, responsible_kpi_id FROM public."kpi_values" WHERE kpi_values_id = $1`,
-        [item.kpi_values_id]
-      );
-      if (!oldRes.rows.length) continue;
+    for (const item of kpiValues) {
+      const allocationId = normalizeOptionalIntegerInput(item.kpi_values_id);
+      const rawValueText = normalizeOptionalTextInput(item.value);
+      if (!allocationId || rawValueText === null) continue;
 
-      const {
-        value: old_value,
-        kpi_id,
-        responsible_kpi_id: currentResponsibleKpiId
-      } = oldRes.rows[0];
-
-      // Fetch KPI limits to determine if corrective action is needed
-      const kpiInfoRes = await pool.query(
-        `
-        SELECT
-          COALESCE(rk.kpi_id, k.kpi_id) AS kpi_id,
-          rk.responsible_kpi_id,
-          COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-          COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-          COALESCE(rk.target, k.target) AS target,
-          COALESCE(rk.low_limit, k.low_limit) AS low_limit,
-          COALESCE(rk.high_limit, k.high_limit) AS high_limit
-        FROM public."Kpi" k
-        LEFT JOIN public.responsible_kpis rk
-          ON rk.responsible_kpi_id = $2
-        WHERE k.kpi_id = COALESCE(rk.kpi_id, $1)
-        `,
-        [kpi_id, currentResponsibleKpiId]
-      );
-      const kpiInfo = kpiInfoRes.rows[0] || {};
-      const effectiveKpiId = Number(kpiInfo.kpi_id || kpi_id);
-      const kpiValueSnapshots = buildKpiValueSnapshotPayload(kpiInfo);
-      const lowLimit = parseMetricNumber(kpiInfo.low_limit);
-      const highLimit = parseMetricNumber(kpiInfo.high_limit);
-      const goodDirection = inferKpiDirection(kpiInfo);
-      const numValue = parseFloat(item.value);
-      const submittedActions = getSubmittedCorrectiveActions(
-        values,
-        item.kpi_values_id,
-        defaultResponsibleName
-      );
-      await insertKpiValueHistory(pool, {
-        kpiValuesId: item.kpi_values_id,
-        responsibleId: responsible_id,
-        kpiId: effectiveKpiId,
-        week,
-        oldValue: old_value,
-        newValue: item.value,
-        comment: comments[item.kpi_values_id] || null
-      });
-
-      await pool.query(
-        `UPDATE public."kpi_values" SET value = $1 WHERE kpi_values_id = $2`,
-        [item.value, item.kpi_values_id]
-      );
-      await updateKpiValueSnapshots(pool, item.kpi_values_id, {
-        responsible_kpi_id: kpiInfo.responsible_kpi_id ?? null,
-        ...kpiValueSnapshots
-      });
-
-      // -------------------------------------------------------
-      // Save corrective action if the KPI is outside the good-direction limit
-      // and the user filled in the corrective action fields
-      // -------------------------------------------------------
-      const meaningfulActions = submittedActions.filter(hasMeaningfulCorrectiveActionInput);
-
-      if (meaningfulActions.length) {
-        for (const action of meaningfulActions) {
-          await upsertCorrectiveAction(responsible_id, effectiveKpiId, week, action);
-          correctiveActionsCount++;
-        }
-      } else if (
-        !isNaN(numValue) &&
-        needsCorrectiveAction(numValue, lowLimit, highLimit, goodDirection)
-      ) {
-        const existing = await pool.query(
-          `SELECT corrective_action_id
-     FROM public.corrective_actions
-     WHERE responsible_id = $1 AND kpi_id = $2 AND week = $3
-     LIMIT 1`,
-          [responsible_id, effectiveKpiId, week]
-        );
-
-        if (existing.rows.length === 0) {
-          await pool.query(
-            `INSERT INTO public.corrective_actions
-       (responsible_id, kpi_id, week, status, due_date, responsible)
-       VALUES ($1, $2, $3, 'Open', CURRENT_DATE + 7, $4)`,
-            [responsible_id, effectiveKpiId, week, normalizeText(defaultResponsibleName)]
-          );
-        }
+      const normalizedValue = normalizeOptionalNumericInput(rawValueText);
+      if (normalizedValue === null) {
+        throw createHttpError(400, "All KPI values must be numeric.");
       }
 
-      const histRes = await pool.query(
-        `SELECT hist_id FROM public.kpi_values_hist26
-         WHERE kpi_values_id=$1 AND responsible_id=$2 AND kpi_id=$3 AND week=$4
-         ORDER BY updated_at DESC LIMIT 1`,
-        [item.kpi_values_id, responsible_id, effectiveKpiId, week]
+      const numericValue = Number(normalizedValue);
+      const allocationRes = await pool.query(
+        `
+        SELECT
+          kta.kpi_target_allocation_id,
+          kta.kpi_id,
+          kta.kpi_type,
+          kta.last_best_target,
+          COALESCE(kta.target_value, k.target_value) AS effective_target_value,
+          COALESCE(kta.target_unit, k.unit) AS effective_unit,
+          k.low_limit,
+          k.high_limit,
+          k.target_direction,
+          COALESCE(k.kpi_name, k.kpi_sub_title, 'KPI') AS kpi_name,
+          COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject_name
+        FROM public.kpi_target_allocation kta
+        JOIN public.kpi k ON k.kpi_id = kta.kpi_id
+        LEFT JOIN LATERAL (
+          SELECT s.subject_name
+          FROM public.subject_kpi sk
+          JOIN public.subject s
+            ON s.subject_id = sk.subject_id
+          WHERE sk.kpi_id = k.kpi_id
+          ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+          LIMIT 1
+        ) subject_link ON TRUE
+        WHERE kta.kpi_target_allocation_id = $1
+        LIMIT 1
+        `,
+        [allocationId]
       );
-      if (histRes.rows.length > 0) {
-        const result = await checkAndTriggerCorrectiveActions(
-          responsible_id, effectiveKpiId, week, item.value, histRes.rows[0].hist_id
+      if (!allocationRes.rows.length) continue;
+
+      const allocation = allocationRes.rows[0];
+      const kpiId = allocation.kpi_id;
+      const submittedActions = correctiveActionsEnabled
+        ? getSubmittedCorrectiveActions(
+          values,
+          item.kpi_values_id,
+          defaultResponsibleName
+        )
+        : [];
+      const commentText = normalizeOptionalTextInput(comments[item.kpi_values_id]);
+      const existingResultRes = await pool.query(
+        `
+        SELECT kpi_result_id
+        FROM public.kpi_result
+        WHERE kpi_target_allocation_id = $1
+          AND kpi_id = $2
+          AND COALESCE(period_label, '') = $3
+        ORDER BY recorded_at DESC, kpi_result_id DESC
+        LIMIT 1
+        `,
+        [allocationId, kpiId, normalizedWeek]
+      );
+      const existingResultId = existingResultRes.rows[0]?.kpi_result_id || null;
+
+      if (existingResultId) {
+        await pool.query(
+          `
+          UPDATE public.kpi_result
+          SET
+            result_date = $2,
+            week = $3,
+            period_type = $4,
+            period_label = $5,
+            raw_value = $6,
+            lower_limit = $7,
+            upper_limit = $8,
+            target_value = $9,
+            best_new_target = $10,
+            unit = $11,
+            kpi_type = $12,
+            result_status = $13,
+            data_source = $14,
+            recorded_by_people_id = $15,
+            recorded_at = CURRENT_TIMESTAMP,
+            comments = $16
+          WHERE kpi_result_id = $1
+          `,
+          [
+            existingResultId,
+            resultDate,
+            normalizedWeek,
+            periodType,
+            normalizedWeek,
+            numericValue,
+            allocation.low_limit,
+            allocation.high_limit,
+            allocation.effective_target_value,
+            allocation.last_best_target,
+            allocation.effective_unit,
+            allocation.kpi_type,
+            "Recorded",
+            "Manual form",
+            recordedByPeopleId,
+            commentText
+          ]
         );
-        if (result.targetUpdated && result.updateInfo) targetUpdates.push(result.updateInfo);
+      } else {
+        await pool.query(
+          `
+          INSERT INTO public.kpi_result (
+            kpi_target_allocation_id,
+            kpi_id,
+            result_date,
+            week,
+            period_type,
+            period_label,
+            raw_value,
+            lower_limit,
+            upper_limit,
+            target_value,
+            best_new_target,
+            unit,
+            kpi_type,
+            result_status,
+            data_source,
+            recorded_by_people_id,
+            comments
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+          `,
+          [
+            allocationId,
+            kpiId,
+            resultDate,
+            normalizedWeek,
+            periodType,
+            normalizedWeek,
+            numericValue,
+            allocation.low_limit,
+            allocation.high_limit,
+            allocation.effective_target_value,
+            allocation.last_best_target,
+            allocation.effective_unit,
+            allocation.kpi_type,
+            "Recorded",
+            "Manual form",
+            recordedByPeopleId,
+            commentText
+          ]
+        );
+      }
+
+      // -------------------------------------------------------
+      // Save the corrective actions for this KPI period in the Action Plan DB.
+      // -------------------------------------------------------
+      if (correctiveActionsEnabled) {
+        const syncResult = await syncActionPlanCorrectiveActionsForPeriod({
+          kpiTargetAllocationId: allocationId,
+          kpiId,
+          periodLabel: normalizedWeek,
+          subject: allocation.subject_name,
+          kpiName: allocation.kpi_name,
+          actions: submittedActions,
+          responsibleContext
+        });
+
+        correctiveActionsCount += syncResult.savedCount || 0;
       }
     }
 
-    let notifications = [];
+    let notifications = ["KPI results saved successfully"];
     if (targetUpdates.length > 0)
       notifications.push(`ðŸŽ¯ <strong>${targetUpdates.length} KPI target${targetUpdates.length > 1 ? 's' : ''} updated</strong>`);
     if (correctiveActionsCount > 0)
@@ -7632,14 +23375,12 @@ app.post("/redirect", async (req, res) => {
            text-decoration:none;border-radius:6px;font-weight:bold;margin:5px;}</style></head>
       <body><div class="sc">
         <h1 style="color:#28a745;">KPI Submitted Successfully!</h1>
-        <p>Your KPI values for ${week} have been saved.</p>
-        <div style="background:#f8f9fa;padding:20px;border-radius:8px;margin:20px 0;">
-          ${notifications.map(n => `<div class="ni"><span style="margin-right:10px;">ðŸ“Œ</span><span>${n}</span></div>`).join('')}
-        </div>
-        <a href="/dashboard?responsible_id=${responsible_id}" class="btn">Go to Dashboard</a>
+        <p>Your KPI values for ${normalizedWeek} have been saved.</p>
+     
+        <a href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}" class="btn">Go to Dashboard</a>
       </div></body></html>`);
   } catch (err) {
-    res.status(500).send(`<h2 style="color:red;">âŒ Failed: ${err.message}</h2>`);
+    res.status(err.statusCode || 500).send(`<h2 style="color:red;">âŒ Failed: ${err.message}</h2>`);
   }
 });
 
@@ -7647,43 +23388,47 @@ app.post("/redirect", async (req, res) => {
 
 app.get("/api/kpi-chart-data", async (req, res) => {
   try {
-    const { responsible_id, kpi_id, kpi_values_id, week } = req.query;
-    const resolvedKpiValuesId = String(kpi_values_id || "").trim();
-    const resolvedKpiId = String(kpi_id || "").trim();
-    const chartIdentifierField = resolvedKpiValuesId ? "kpi_values_id" : "kpi_id";
-    const chartIdentifierValue = resolvedKpiValuesId || resolvedKpiId;
+    const { kpi_id, week, kpi_values_id } = req.query;
+    const allocationId = normalizeOptionalIntegerInput(kpi_values_id);
+    const kpiId = normalizeOptionalIntegerInput(kpi_id);
+    const normalizedWeek = normalizeOptionalTextInput(week);
 
-    if (!responsible_id || !chartIdentifierValue || !week) {
-      return res.status(400).json({ error: "Missing responsible_id, kpi_values_id or kpi_id, or week" });
+    if ((!allocationId && !kpiId) || !normalizedWeek) {
+      return res.status(400).json({ error: "Missing kpi_values_id or kpi_id, or week" });
     }
+
+    const baseWhereClause = allocationId
+      ? "kr.kpi_target_allocation_id = $1"
+      : "kr.kpi_id = $1";
+    const baseWhereValue = allocationId || kpiId;
 
     const histRes = await pool.query(
       `
-      SELECT DISTINCT ON (week)
-        week,
-        new_value,
-        updated_at
-      FROM public.kpi_values_hist26
-      WHERE responsible_id = $1
-        AND ${chartIdentifierField} = $2
-        AND new_value IS NOT NULL
-        AND new_value <> ''
-      ORDER BY week, updated_at DESC, hist_id DESC
+      SELECT DISTINCT ON (COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')))
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+        kr.raw_value AS new_value,
+        kr.recorded_at AS updated_at
+      FROM public.kpi_result kr
+      WHERE ${baseWhereClause}
+        AND kr.raw_value IS NOT NULL
+      ORDER BY
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+        kr.recorded_at DESC,
+        kr.kpi_result_id DESC
       `,
-      [responsible_id, chartIdentifierValue]
+      [baseWhereValue]
     );
 
     const currentRes = await pool.query(
       `
-      SELECT kv.value
-      FROM public.kpi_values kv
-      WHERE kv.responsible_id = $1
-        AND kv.${chartIdentifierField} = $2
-        AND kv.week = $3
-      ORDER BY kv.kpi_values_id DESC
+      SELECT kr.raw_value AS value
+      FROM public.kpi_result kr
+      WHERE ${baseWhereClause}
+        AND (kr.period_label = $2 OR kr.week = $2)
+      ORDER BY kr.recorded_at DESC, kr.kpi_result_id DESC
       LIMIT 1
       `,
-      [responsible_id, chartIdentifierValue, week]
+      [baseWhereValue, normalizedWeek]
     );
 
     function weekLabelToDate(weekStr) {
@@ -7694,64 +23439,130 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       return new Date(year, 0, 1 + (weekNum - 1) * 7);
     }
 
-    const weekMap = {};
+    function weekToMonthLabel(weekStr) {
+      const d = weekLabelToDate(weekStr);
+      if (isNaN(d.getTime())) return weekStr || "";
+      return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+    }
+
+    function monthLabelToDate(monthLabel) {
+      const d = new Date("1 " + monthLabel);
+      return isNaN(d.getTime()) ? new Date(0) : d;
+    }
+
+    const monthMap = {};
     for (const row of histRes.rows) {
       const value = parseFloat(row.new_value);
       if (isNaN(value)) continue;
 
-      weekMap[row.week] = value;
+      const monthLabel = weekToMonthLabel(row.week);
+      if (!monthMap[monthLabel]) monthMap[monthLabel] = { sum: 0, count: 0 };
+      monthMap[monthLabel].sum += value;
+      monthMap[monthLabel].count += 1;
     }
 
-    const currentWeekLabel = week;
+    const currentMonthLabel = weekToMonthLabel(normalizedWeek);
     const currentValue = parseFloat(currentRes.rows[0]?.value);
 
     if (!isNaN(currentValue)) {
-      weekMap[currentWeekLabel] = currentValue;
+      monthMap[currentMonthLabel] = { sum: currentValue, count: 1 };
     }
 
-    const labels = Object.keys(weekMap).sort(
-      (a, b) => weekLabelToDate(a) - weekLabelToDate(b)
-    ).slice(-KPI_SUBMISSION_CHART_WEEK_WINDOW);
+    const labels = Object.keys(monthMap).sort(
+      (a, b) => monthLabelToDate(a) - monthLabelToDate(b)
+    );
 
-    const values = labels.map((label) => Number(Number(weekMap[label]).toFixed(2)));
+    const values = labels.map((label) => {
+      const m = monthMap[label];
+      return Number((m.sum / m.count).toFixed(2));
+    });
 
-    res.json({ labels, values, currentWeekLabel, currentValue: isNaN(currentValue) ? null : currentValue });
+    res.json({ labels, values, currentMonthLabel, currentValue: isNaN(currentValue) ? null : currentValue });
   } catch (err) {
     console.error("kpi-chart-data error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
+
+
 // ---------- Form page ----------
 app.get("/form", async (req, res) => {
   try {
     const { responsible_id, week } = req.query;
-    const { responsible, kpis } = await getResponsibleWithKPIs(responsible_id, week);
+  const peopleRes = await pool.query(
+  `SELECT people_id,
+          TRIM(first_name || ' ' || name) AS display_name
+   FROM public.people
+   WHERE status = 'Active'
+   ORDER BY first_name ASC, name ASC`
+  );
+
+const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_name);
+    const {
+      responsible,
+      kpis,
+      correctiveActionsEnabled,
+      correctiveActionHistoryByAllocation
+    } = await getResponsibleWithKPIs(responsible_id, week);
+
+    const responsibleContext = await loadFormResponsibleContext(responsible_id);
 
     if (!kpis.length) {
-      return res.send("<p>No KPIs found for this week.</p>");
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>No KPI Targets</title>
+          <style>
+            body{font-family:'Segoe UI',sans-serif;background:#f4f6f9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;}
+            .empty-state{max-width:620px;background:#fff;border-radius:18px;padding:32px;box-shadow:0 20px 50px rgba(15,23,42,0.08);border:1px solid #e2e8f0;}
+            h1{margin:0 0 12px;font-size:28px;color:#0f172a;}
+            p{margin:0 0 12px;color:#475569;line-height:1.6;}
+            code{background:#eef2ff;padding:2px 6px;border-radius:6px;color:#1d4ed8;}
+          </style>
+        </head>
+        <body>
+          <div class="empty-state">
+            <h1>No KPI values to enter yet</h1>
+            <p>The <code>/form</code> page now shows only KPI target allocations where <code>set_by_people_id</code> matches the current <code>responsible_id</code>.</p>
+            <p>No target allocations are currently assigned to this responsible. Set the responsible in <code>kpi_target_allocation.set_by_people_id</code>, then this page will display only that person’s related KPIs and save submitted values into <code>kpi_result</code>.</p>
+          </div>
+        </body>
+        </html>
+      `);
     }
+
+    const allocationIds = kpis
+      .map((kpi) => normalizeOptionalIntegerInput(kpi.kpi_values_id))
+      .filter((value) => Number.isInteger(value));
 
     const histRes = await pool.query(
       `
-      SELECT DISTINCT ON (kpi_values_id, week)
-        kpi_values_id,
-        week,
-        new_value,
-        updated_at
-      FROM public.kpi_values_hist26
-      WHERE responsible_id = $1
-        AND new_value IS NOT NULL
-        AND new_value <> ''
-      ORDER BY kpi_values_id, week, updated_at DESC, hist_id DESC
+      SELECT DISTINCT ON (kr.kpi_target_allocation_id, COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')))
+        kr.kpi_target_allocation_id AS kpi_values_id,
+        kr.kpi_id,
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+        kr.raw_value AS new_value,
+        kr.recorded_at AS updated_at
+      FROM public.kpi_result kr
+      WHERE kr.kpi_target_allocation_id = ANY($1::int[])
+        AND kr.raw_value IS NOT NULL
+      ORDER BY
+        kr.kpi_target_allocation_id,
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+        kr.recorded_at DESC,
+        kr.kpi_result_id DESC
       `,
-      [responsible_id]
+      [allocationIds]
     );
 
-    const historyByKpiValuesId = {};
+    const historyByKpi = {};
     histRes.rows.forEach((row) => {
-      if (!historyByKpiValuesId[row.kpi_values_id]) historyByKpiValuesId[row.kpi_values_id] = [];
-      historyByKpiValuesId[row.kpi_values_id].push({
+      const historyKey = String(row.kpi_values_id || row.kpi_id);
+      if (!historyByKpi[historyKey]) historyByKpi[historyKey] = [];
+      historyByKpi[historyKey].push({
         week: row.week,
         value: parseFloat(row.new_value)
       });
@@ -7765,12 +23576,32 @@ app.get("/form", async (req, res) => {
       return new Date(year, 0, 1 + (weekNum - 1) * 7);
     }
 
-    function findPreviousWeekLabel(currentWeekLabel, labels) {
-      const currentDate = weekLabelToDate(currentWeekLabel);
+    function weekToMonthLabel(weekStr) {
+      const d = weekLabelToDate(weekStr);
+      if (isNaN(d.getTime())) return weekStr || "";
+      return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+    }
+
+    function monthLabelToDate(monthLabel) {
+      const d = new Date("1 " + monthLabel);
+      return isNaN(d.getTime()) ? new Date(0) : d;
+    }
+
+    function findPreviousMonthLabel(currentMonthLabel, labels) {
+      const currentDate = monthLabelToDate(currentMonthLabel);
       return Array.from(new Set((labels || []).filter(Boolean)))
-        .sort((a, b) => weekLabelToDate(a) - weekLabelToDate(b))
-        .filter((label) => weekLabelToDate(label) < currentDate)
+        .sort((a, b) => monthLabelToDate(a) - monthLabelToDate(b))
+        .filter((label) => monthLabelToDate(label) < currentDate)
         .pop() || null;
+    }
+
+    function sortHistoryEntries(entries, getUpdatedAt) {
+      return (Array.isArray(entries) ? entries.slice() : []).sort((a, b) => {
+        const weekDiff = weekLabelToDate(b?.week) - weekLabelToDate(a?.week);
+        if (weekDiff !== 0) return weekDiff;
+
+        return new Date(getUpdatedAt(b) || 0) - new Date(getUpdatedAt(a) || 0);
+      });
     }
 
     const encodeModalPayload = (value) =>
@@ -7778,65 +23609,70 @@ app.get("/form", async (req, res) => {
 
     const commentsHistoryRes = await pool.query(
       `
-      SELECT DISTINCT ON (kpi_id, week)
-        kpi_id,
-        week,
-        comment,
-        updated_at
-      FROM public.kpi_values_hist26
-      WHERE responsible_id = $1
-        AND comment IS NOT NULL
-        AND BTRIM(comment) <> ''
-      ORDER BY kpi_id, week, updated_at DESC
+      SELECT DISTINCT ON (kr.kpi_target_allocation_id, COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')))
+        kr.kpi_target_allocation_id AS kpi_values_id,
+        kr.kpi_id,
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+        kr.comments AS comment,
+        kr.recorded_at AS updated_at
+      FROM public.kpi_result kr
+      WHERE kr.kpi_target_allocation_id = ANY($1::int[])
+        AND kr.comments IS NOT NULL
+        AND BTRIM(kr.comments) <> ''
+      ORDER BY
+        kr.kpi_target_allocation_id,
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+        kr.recorded_at DESC,
+        kr.kpi_result_id DESC
       `,
-      [responsible_id]
+      [allocationIds]
     );
+    const correctiveActionsHistoryRows = Object.values(
+      correctiveActionHistoryByAllocation || {}
+    ).flat();
 
-    const correctiveActionsHistoryRes = await pool.query(
-      `
-      SELECT
-        kpi_id,
-        week,
-        root_cause,
-        implemented_solution,
-        evidence,
-        status,
-        due_date,
-        responsible,
-        created_date,
-        updated_date
-      FROM public.corrective_actions
-      WHERE responsible_id = $1
-      ORDER BY kpi_id ASC, week ASC, COALESCE(updated_date, created_date) DESC
-      `,
-      [responsible_id]
-    );
-
-    const commentsByKpiWeek = {};
+    const commentsByKpiMonth = {};
     commentsHistoryRes.rows.forEach((row) => {
-      if (!commentsByKpiWeek[row.kpi_id]) commentsByKpiWeek[row.kpi_id] = {};
-      if (!commentsByKpiWeek[row.kpi_id][row.week]) commentsByKpiWeek[row.kpi_id][row.week] = [];
-      commentsByKpiWeek[row.kpi_id][row.week].push({
+      const monthLabel = weekToMonthLabel(row.week);
+      const commentKey = String(row.kpi_values_id || row.kpi_id);
+      if (!commentsByKpiMonth[commentKey]) commentsByKpiMonth[commentKey] = {};
+      if (!commentsByKpiMonth[commentKey][monthLabel]) commentsByKpiMonth[commentKey][monthLabel] = [];
+      commentsByKpiMonth[commentKey][monthLabel].push({
         week: row.week,
+        month_label: monthLabel,
         text: row.comment,
         updated_at: row.updated_at
       });
     });
 
-    const correctiveActionsByKpiWeek = {};
-    correctiveActionsHistoryRes.rows.forEach((row) => {
+    const correctiveActionsByKpiMonth = {};
+    correctiveActionsHistoryRows.forEach((row) => {
+      const historyKey = String(
+        row.kpi_values_id ??
+        row.kpi_target_allocation_id ??
+        row.kpi_id ??
+        ""
+      ).trim();
+      if (!historyKey) return;
+
+      const periodLabel = row.week || row.period_label || "";
+      const monthLabel = weekToMonthLabel(periodLabel);
       const updatedAt = row.updated_date || row.created_date || null;
 
-      if (!correctiveActionsByKpiWeek[row.kpi_id]) {
-        correctiveActionsByKpiWeek[row.kpi_id] = {};
+      if (!correctiveActionsByKpiMonth[historyKey]) {
+        correctiveActionsByKpiMonth[historyKey] = {};
       }
 
-      if (!correctiveActionsByKpiWeek[row.kpi_id][row.week]) {
-        correctiveActionsByKpiWeek[row.kpi_id][row.week] = [];
+      if (!correctiveActionsByKpiMonth[historyKey][monthLabel]) {
+        correctiveActionsByKpiMonth[historyKey][monthLabel] = [];
       }
 
-      correctiveActionsByKpiWeek[row.kpi_id][row.week].push({
-        week: row.week,
+      correctiveActionsByKpiMonth[historyKey][monthLabel].push({
+        corrective_action_id: row.corrective_action_id || null,
+        id: row.id || row.corrective_action_id || null,
+        kpi_values_id: historyKey,
+        week: periodLabel,
+        month_label: monthLabel,
         status: row.status || "",
         root_cause: row.root_cause || "",
         implemented_solution: row.implemented_solution || "",
@@ -7848,9 +23684,9 @@ app.get("/form", async (req, res) => {
     });
 
     // optional: sort newest first
-    Object.keys(correctiveActionsByKpiWeek).forEach((kpiId) => {
-      Object.keys(correctiveActionsByKpiWeek[kpiId]).forEach((weekLabel) => {
-        correctiveActionsByKpiWeek[kpiId][weekLabel].sort((a, b) => {
+    Object.keys(correctiveActionsByKpiMonth).forEach((kpiId) => {
+      Object.keys(correctiveActionsByKpiMonth[kpiId]).forEach((monthLabel) => {
+        correctiveActionsByKpiMonth[kpiId][monthLabel].sort((a, b) => {
           return new Date(b.updated_at || 0) - new Date(a.updated_at || 0);
         });
       });
@@ -7876,17 +23712,19 @@ app.get("/form", async (req, res) => {
         ? parseFloat(kpi.value) : null;
 
       const goodDirection = inferKpiDirection(kpi);
-      const showCA = currentValue !== null &&
+      const showCA = correctiveActionsEnabled && currentValue !== null &&
         needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
-      const correctiveActions = sortCorrectiveActions(
+      const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
         Array.isArray(kpi.corrective_actions) ? kpi.corrective_actions : []
-      );
+      ) : [];
       const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
       const caStatus = latestCorrectiveAction?.status || "";
       const safeCaStatusClass = String(caStatus || "").toLowerCase().replace(/\s+/g, "-");
-      const correctiveActionsToRender = correctiveActions.length ? correctiveActions : [{
+      const correctiveActionsToRender = correctiveActionsEnabled
+        ? (correctiveActions.length ? correctiveActions : [{
         responsible: responsible.name || ""
-      }];
+      }])
+        : [];
       const correctiveActionsHtml = correctiveActionsToRender
         .map((action, actionIndex) => buildCorrectiveActionEntryHtml({
           kpiValuesId: kpi.kpi_values_id,
@@ -7900,45 +23738,61 @@ app.get("/form", async (req, res) => {
       // â”€â”€ Corrective actions section (no footer add-btn inside) â”€â”€
 
 
-      const rawHistory = historyByKpiValuesId[kpi.kpi_values_id] || [];
+      const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
       const sortedHistory = rawHistory
         .filter((h) => !isNaN(h.value))
         .sort((a, b) => weekLabelToDate(a.week) - weekLabelToDate(b.week));
 
-      const currentWeekLabel = week;
-      const weekMap = {};
+      const currentMonthLabel = weekToMonthLabel(week);
+      const monthMap = {};
 
       sortedHistory.forEach((item) => {
-        weekMap[item.week] = item.value;
+        const monthLabel = weekToMonthLabel(item.week);
+
+        if (!monthMap[monthLabel]) {
+          monthMap[monthLabel] = { sum: 0, count: 0 };
+        }
+
+        monthMap[monthLabel].sum += item.value;
+        monthMap[monthLabel].count += 1;
       });
 
-      // also force the current input value into the current week
+      // also force the current input value into the current month
       if (currentValue !== null) {
-        weekMap[currentWeekLabel] = currentValue;
+        monthMap[currentMonthLabel] = {
+          sum: currentValue,
+          count: 1
+        };
       }
 
-      let historyLabels = Object.keys(weekMap).sort(
-        (a, b) => weekLabelToDate(a) - weekLabelToDate(b)
-      ).slice(-KPI_SUBMISSION_CHART_WEEK_WINDOW);
-
-      let historyValues = historyLabels.map((label) => Number(Number(weekMap[label]).toFixed(2)));
-
-      const commentWeeks = Object.keys(commentsByKpiWeek[kpi.kpi_id] || {});
-      const correctiveActionWeeks = Object.keys(correctiveActionsByKpiWeek[kpi.kpi_id] || {});
-      const previousWeekLabel = findPreviousWeekLabel(
-        currentWeekLabel,
-        historyLabels.concat(commentWeeks, correctiveActionWeeks)
+      let historyLabels = Object.keys(monthMap).sort(
+        (a, b) => monthLabelToDate(a) - monthLabelToDate(b)
       );
-      const previousWeekActions = previousWeekLabel
-        ? correctiveActionsByKpiWeek[kpi.kpi_id]?.[previousWeekLabel] || []
-        : [];
-      const previousWeekComments = previousWeekLabel
-        ? (commentsByKpiWeek[kpi.kpi_id]?.[previousWeekLabel] || [])
-          .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
-        : [];
-      const hasPreviousWeekDetails = Boolean(
-        (previousWeekActions && previousWeekActions.length) ||
-        (previousWeekComments && previousWeekComments.length)
+
+      let historyValues = historyLabels.map((label) => {
+        const m = monthMap[label];
+        return Number((m.sum / m.count).toFixed(2));
+      });
+
+      const allHistoryActions = sortHistoryEntries(
+        Object.values(
+          correctiveActionsByKpiMonth[kpi.kpi_id] ||
+          correctiveActionsByKpiMonth[String(kpi.kpi_values_id)] ||
+          {}
+        ).flat(),
+        (entry) => entry?.updated_at
+      );
+      const allHistoryComments = sortHistoryEntries(
+        Object.values(
+          commentsByKpiMonth[String(kpi.kpi_values_id)] ||
+          commentsByKpiMonth[kpi.kpi_id] ||
+          {}
+        ).flat(),
+        (entry) => entry?.updated_at
+      );
+      const hasHistoryDetails = Boolean(
+        (correctiveActionsEnabled && allHistoryActions && allHistoryActions.length) ||
+        (allHistoryComments && allHistoryComments.length)
       );
 
       kpiCardsHtml += `
@@ -7952,16 +23806,14 @@ app.get("/form", async (req, res) => {
        data-history-labels='${JSON.stringify(historyLabels)}'
        data-history-values='${JSON.stringify(historyValues)}'
        data-current-week="${week}"
-       data-current-week-label="${currentWeekLabel}"
+       data-current-month-label="${currentMonthLabel}"
        data-unit="${kpi.unit || ""}"
-      data-prev-week-label="${previousWeekLabel || ""}"
-      data-prev-week-actions="${encodeModalPayload(previousWeekActions)}"
-      data-prev-week-comments="${encodeModalPayload(previousWeekComments)}">
+      data-history-actions="${encodeModalPayload(allHistoryActions)}"
+      data-history-comments="${encodeModalPayload(allHistoryComments)}">
 
           <div class="kpi-header">
             <div>
-              <div class="kpi-title">${getKpiDisplayTitle(kpi)}</div>
-              ${kpi.indicator_sub_title ? `<div class="kpi-subtitle">${kpi.indicator_sub_title}</div>` : ""}
+             <div class="kpi-title">${kpi.indicator_sub_title || "KPI"}</div>
             </div>
           </div>
 
@@ -8023,18 +23875,20 @@ app.get("/form", async (req, res) => {
           </div>
                 </div>
 
-                <div class="kpi-history-panel ${hasPreviousWeekDetails ? "history-available" : "history-empty"}">
+                <div class="kpi-history-panel ${hasHistoryDetails ? "history-available" : "history-empty"}">
                   <div class="kpi-history-copy">
-                 
+                    ${correctiveActionsEnabled
+                      ? ""
+                      : '<div class="view-ca-note">Enter the KPI value for this period. The form will save it directly into the <strong>kpi_result</strong> table.</div>'}
                   </div>
-                  <button
+                  ${correctiveActionsEnabled ? `<button
                     type="button"
                     class="view-ca-btn"
                     data-kpi-values-id="${kpi.kpi_values_id}"
                     onclick="openHistoryModal('${kpi.kpi_values_id}'); return false;">
                     <span>View Corrective Action</span>
                     <span class="view-ca-btn-icon" aria-hidden="true">&#8599;</span>
-                  </button>
+                  </button>` : ""}
                 </div>
                     <!-- â”€â”€ Unified card action bar â”€â”€ -->
         <div class="kpi-card-actions">
@@ -8051,7 +23905,7 @@ app.get("/form", async (req, res) => {
   </div>
 
   <div class="kpi-card-actions-right">
-    <button
+    ${correctiveActionsEnabled ? `<button
       type="button"
       class="card-action-btn card-action-btn--primary open-ca-modal-btn"
       data-kpi-values-id="${kpi.kpi_values_id}"
@@ -8060,7 +23914,7 @@ app.get("/form", async (req, res) => {
         <path d="M10 4v12M4 10h12"/>
       </svg>
       Add Action
-    </button>
+    </button>` : ""}
   </div>
 </div>
               </div>
@@ -8084,12 +23938,24 @@ app.get("/form", async (req, res) => {
               </div>
             </div>
           </div>
-         <div class="ca-actions-stack" data-kpi-values-id="${kpi.kpi_values_id}" style="display:none;">
+         ${correctiveActionsEnabled ? `<div class="ca-actions-stack" data-kpi-values-id="${kpi.kpi_values_id}" style="display:none;">
          ${correctiveActionsHtml}
-           </div>
+           </div>` : ""}
         </div>
       `;
     });
+
+ const responsibleFullName = [
+  String(responsibleContext?.name || "").trim(),
+  String(responsibleContext?.first_name || "").trim()
+].filter(Boolean).join(" ");
+
+const defaultCorrectiveActionResponsible = correctiveActionResponsibleOptions.find(
+  opt => opt.toLowerCase() === responsibleFullName.toLowerCase()
+) || correctiveActionResponsibleOptions[0] || "";
+    const correctiveActionResponsibleOptionsHtml = correctiveActionResponsibleOptions
+      .map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
+      .join("");
 
     res.send(`
       <!DOCTYPE html>
@@ -8122,19 +23988,7 @@ app.get("/form", async (req, res) => {
             background:#0078D7;
             color:white;
             padding:20px;
-          }
-          .header-inner{
-            display:flex;
-            align-items:center;
-            justify-content:space-between;
-            gap:16px;
-          }
-          .header-title{
-            width:100%;
             text-align:center;
-            font-size:22px;
-            font-weight:700;
-            margin:0;
           }
           .form-section{padding:30px;}
           .info-section{
@@ -8384,6 +24238,76 @@ app.get("/form", async (req, res) => {
   font-family: inherit;
 }
 
+.history-filter-bar{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:flex-end;
+  gap:12px;
+  margin:0 0 14px;
+}
+
+.history-filter-group{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  min-width:180px;
+  flex:1 1 180px;
+}
+
+.history-filter-label{
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+  color:#64748b;
+}
+
+.history-filter-input{
+  min-height:42px;
+  padding:10px 12px;
+  border:1px solid #cbd5e1;
+  border-radius:12px;
+  background:#fff;
+  color:#0f172a;
+  font:inherit;
+  transition:border-color .2s ease, box-shadow .2s ease;
+}
+
+.history-filter-input:focus{
+  outline:none;
+  border-color:#93c5fd;
+  box-shadow:0 0 0 4px rgba(59,130,246,0.12);
+}
+
+.history-filter-clear{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:42px;
+  padding:10px 16px;
+  border:none;
+  border-radius:12px;
+  background:#e2e8f0;
+  color:#0f172a;
+  font-size:12px;
+  font-weight:800;
+  cursor:pointer;
+  transition:transform .2s ease, box-shadow .2s ease, background-color .2s ease, opacity .2s ease;
+}
+
+.history-filter-clear:hover{
+  transform:translateY(-1px);
+  background:#cbd5e1;
+  box-shadow:0 10px 20px rgba(15,23,42,0.08);
+}
+
+.history-filter-clear:disabled{
+  opacity:0.62;
+  cursor:not-allowed;
+  transform:none;
+  box-shadow:none;
+}
+
           /* â”€â”€ CA Section â”€â”€ */
           .ca-container{
             margin-top:16px;
@@ -8574,241 +24498,823 @@ app.get("/form", async (req, res) => {
   50%{transform:translateY(-2px);}
 }
 
-          /* â”€â”€ CA Table Modal â”€â”€ */
-        .ca-modal-overlay {
-        position: fixed;
-        inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: rgba(15, 23, 42, 0.55);
-        opacity: 0;
-        visibility: hidden;
-        pointer-events: none;
-        z-index: 9999;
-        transition: opacity 0.25s ease, visibility 0.25s ease;
-       }
-          .ca-modal-overlay.active{opacity:1;pointer-events:auto;}
-          .ca-modal-box{
-            width:min(98vw,980px);
-            max-height:min(90vh,820px);
-            background:#fff;border-radius:22px;
-            box-shadow:0 30px 80px rgba(15,23,42,0.30);
-            display:flex;flex-direction:column;overflow:hidden;
-            transform:translateY(18px) scale(0.98);
-            transition:transform 0.22s ease;
+          /* CA Table Modal */
+          .ca-modal-overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 18px;
+            background: rgba(15, 23, 42, 0.62);
+            backdrop-filter: blur(8px);
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            z-index: 9999;
+            transition: opacity 0.25s ease, visibility 0.25s ease;
           }
           .ca-modal-overlay.active {
             opacity: 1;
             visibility: visible;
             pointer-events: auto;
           }
-          .ca-modal-overlay.active .ca-modal-box{transform:translateY(0) scale(1);}
-          .ca-modal-panel {
-           width: min(1100px, 92vw);
-           max-height: 90vh;
-           overflow: auto;
-           background: #fff;
-           border-radius: 18px;
-           transform: translateY(12px);
-           transition: transform 0.25s ease;
-           }
+          .ca-modal-box {
+            width: min(98.6vw, 1460px);
+            max-height: min(92vh, 900px);
+            background:
+              radial-gradient(circle at top right, rgba(59,130,246,0.08), transparent 28%),
+              linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+            border-radius: 26px;
+            border: 1px solid rgba(226, 232, 240, 0.92);
+            box-shadow: 0 36px 90px rgba(15,23,42,0.28);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            transform: translateY(18px) scale(0.98);
+            transition: transform 0.22s ease;
+          }
+          .ca-modal-overlay.active .ca-modal-box {
+            transform: translateY(0) scale(1);
+          }
+          .ca-modal-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 24px 28px 18px;
+            border-bottom: 1px solid rgba(226,232,240,0.92);
+            background:
+              radial-gradient(circle at top right, rgba(239,68,68,0.10), transparent 32%),
+              linear-gradient(180deg, #fff8f7 0%, #ffffff 100%);
+          }
+          .ca-modal-title {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 900;
+            letter-spacing: -0.04em;
+            color: #991b1b;
+          }
+          .ca-modal-subtitle {
+            margin: 6px 0 0;
+            font-size: 13px;
+            color: #64748b;
+            line-height: 1.55;
+          }
+          .ca-modal-close {
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 999px;
+            background: #fee2e2;
+            color: #b91c1c;
+            font-size: 24px;
+            line-height: 1;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: background 0.2s ease, transform 0.2s ease;
+          }
+          .ca-modal-close:hover {
+            background: #fecaca;
+            transform: translateY(-1px);
+          }
+          .ca-modal-body {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            padding: 20px 20px 24px;
+            background:
+              radial-gradient(circle at top right, rgba(59,130,246,0.05), transparent 24%),
+              linear-gradient(180deg, #fbfdff 0%, #f4f8ff 100%);
+          }
 
-          .ca-modal-overlay.active .ca-modal-panel {
-           transform: translateY(0);
-           }
-          .ca-modal-header{
-            display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
-            padding:22px 26px 18px;
-            border-bottom:1px solid #fee2e2;
-            background:linear-gradient(180deg,#fff5f5,#fff8f5);
+          .ca-table-wrap,
+          .ca-entry-editor-wrap {
+            overflow-x: auto;
+            border-radius: 22px;
+            border: 1px solid rgba(191,219,254,0.6);
+            background: rgba(255,255,255,0.96);
+            box-shadow:
+              inset 0 1px 0 rgba(255,255,255,0.92),
+              0 18px 42px rgba(15,23,42,0.07);
           }
-          .ca-modal-header-text{}
-          .ca-modal-title{margin:0;font-size:20px;font-weight:900;color:#991b1b;}
-          .ca-modal-subtitle{margin:5px 0 0;font-size:13px;color:#64748b;}
-          .ca-modal-close{
-            width:40px;height:40px;border:none;border-radius:999px;
-            background:#fee2e2;color:#b91c1c;font-size:22px;line-height:1;
-            cursor:pointer;flex-shrink:0;transition:background 0.2s;
-          }
-          .ca-modal-close:hover{background:#fecaca;}
-          .ca-modal-body{flex:1;min-height:0;overflow:auto;padding:22px 26px;}
 
-          /* Table */
-          .ca-table-wrap{overflow-x:auto;border-radius:14px;border:1px solid #fee2e2;}
-          .ca-table{
-            width:100%;border-collapse:collapse;font-size:13px;
+          .ca-table-wrap {
+            max-height: 320px;
+            overflow-y: auto;
           }
-          .ca-table thead tr{background:#fff5f5;}
-          .ca-table th{
-            padding:12px 14px;text-align:left;font-size:11px;font-weight:800;
-            text-transform:uppercase;letter-spacing:0.6px;color:#991b1b;
-            border-bottom:2px solid #fecaca;white-space:nowrap;
+
+          .ca-table,
+          .ca-entry-editor-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 13px;
+            table-layout: fixed;
           }
-          .ca-table td{
-            padding:12px 14px;border-bottom:1px solid #fef2f2;
-            vertical-align:top;color:#374151;line-height:1.5;
+
+          .ca-table {
+            min-width: 1080px;
           }
-          .ca-col-actions{
-            width: 130px;
+
+          .ca-entry-editor-table {
+            min-width: 1040px;
+          }
+
+          .ca-table thead tr,
+          .ca-entry-editor-table thead tr {
+            background:
+              radial-gradient(circle at top right, rgba(239,68,68,0.08), transparent 34%),
+              linear-gradient(180deg, #fff9f7 0%, #edf5ff 100%);
+          }
+
+          .ca-table th,
+          .ca-entry-editor-table th {
+            padding: 14px 16px;
+            text-align: left;
+            font-size: 11px;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.11em;
+            color: #52637d;
+            border-bottom: 1px solid rgba(226,232,240,0.96);
+            white-space: nowrap;
+          }
+
+          .ca-table td,
+          .ca-entry-editor-table td {
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(241,245,249,0.96);
+            vertical-align: top;
+            color: #334155;
+            line-height: 1.55;
+            background: rgba(255,255,255,0.98);
+          }
+
+          .ca-table tbody tr:hover td {
+            background: linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
+          }
+
+          .ca-table tbody tr:nth-child(even) td {
+            background: rgba(248,251,255,0.92);
+          }
+
+          .ca-table tr:last-child td,
+          .ca-entry-editor-table tr:last-child td {
+            border-bottom: none;
+          }
+
+          .ca-table .ca-col-num {
+            width: 52px;
+            font-weight: 900;
+            color: #0f172a;
+          }
+
+          .ca-col-actions,
+          .ca-entry-actions-col {
             text-align: right;
             white-space: nowrap;
           }
 
-          .ca-table td.ca-col-actions{
-            text-align: right;
-            white-space: nowrap;
+          .ca-table-empty {
+            text-align: center;
+            padding: 56px 24px;
+            color: #64748b;
+            font-size: 14px;
+            line-height: 1.7;
+            background:
+              radial-gradient(circle at top center, rgba(59,130,246,0.06), transparent 34%),
+              linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
           }
 
+          .ca-table-copy {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+          }
 
-.ca-table-edit-btn,
-.ca-table-delete-btn{
-  appearance: none;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  height: 34px;
-  min-width: 34px;
-  padding: 0 12px;
+          .ca-table-copy-title {
+            font-size: 13px;
+            font-weight: 800;
+            color: #172033;
+            line-height: 1.55;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+          }
+
+          .ca-table-copy-meta {
+            font-size: 11px;
+            font-weight: 700;
+            color: #94a3b8;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+          }
+
+          .ca-date-chip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 36px;
+            padding: 0 12px;
+            border-radius: 999px;
+            background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(14,165,233,0.08));
+            color: #1d4ed8;
+            font-size: 12px;
+            font-weight: 900;
+            letter-spacing: 0.02em;
+            border: 1px solid rgba(147,197,253,0.48);
+          }
+
+          .ca-responsible-cell {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+          }
+
+          .ca-responsible-avatar {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, rgba(37,99,235,0.14), rgba(16,185,129,0.12));
+            color: #1d4ed8;
+            font-size: 12px;
+            font-weight: 900;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+            flex-shrink: 0;
+          }
+
+          .ca-responsible-copy {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 0;
+          }
+
+          .ca-responsible-name {
+            font-size: 13px;
+            font-weight: 800;
+            color: #172033;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+
+          .ca-responsible-role {
+            font-size: 11px;
+            color: #94a3b8;
+          }
+
+          .ca-table-actions {
+            display: inline-flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            flex-wrap: wrap;
+          }
+
+          .ca-table-status,
+          .ca-entry-status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 900;
+            border: 1px solid transparent;
+          }
+
+          .ca-table-status::before,
+          .ca-entry-status-pill::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            opacity: 0.88;
+          }
+
+          .ca-table-status.open,
+          .ca-entry-status-pill.open {
+            background: rgba(239,68,68,0.10);
+            color: #b91c1c;
+            border-color: rgba(239,68,68,0.14);
+          }
+          .ca-table-status.closed,
+          .ca-table-status.completed,
+          .ca-entry-status-pill.closed,
+          .ca-entry-status-pill.completed {
+            background: rgba(16,185,129,0.12);
+            color: #047857;
+            border-color: rgba(16,185,129,0.16);
+          }
+          .ca-table-status.waiting-for-validation,
+          .ca-entry-status-pill.waiting-for-validation {
+            background: rgba(245,158,11,0.12);
+            color: #b45309;
+            border-color: rgba(245,158,11,0.16);
+          }
+
+          .ca-table-edit-btn,
+          .ca-table-delete-btn {
+            appearance: none;
+            border: 1px solid transparent;
+            border-radius: 12px;
+            height: 36px;
+            min-width: 36px;
+            padding: 0 12px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 800;
+            line-height: 1;
+            cursor: pointer;
+            transition:
+              background 0.18s ease,
+              color 0.18s ease,
+              border-color 0.18s ease,
+              box-shadow 0.18s ease,
+              transform 0.18s ease;
+          }
+
+          .ca-table-edit-btn {
+            background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+            color: #2563eb;
+            border-color: #bfdbfe;
+            box-shadow: 0 8px 18px rgba(37,99,235,0.08);
+          }
+          .ca-table-edit-btn:hover {
+            background: #eff6ff;
+            border-color: #93c5fd;
+            box-shadow: 0 14px 26px rgba(37,99,235,0.12);
+            transform: translateY(-1px);
+          }
+
+          .ca-table-delete-btn {
+            background: linear-gradient(180deg, #ffffff 0%, #fff7f7 100%);
+            color: #dc2626;
+            border-color: #fecaca;
+            box-shadow: 0 8px 18px rgba(220,38,38,0.08);
+            padding: 0;
+            font-size: 16px;
+            font-weight: 700;
+          }
+          .ca-table-delete-btn:hover {
+            background: #fef2f2;
+            border-color: #fca5a5;
+            box-shadow: 0 14px 26px rgba(220,38,38,0.12);
+            transform: translateY(-1px);
+          }
+
+          .ca-table-edit-btn:focus-visible,
+          .ca-table-delete-btn:focus-visible {
+            outline: none;
+            box-shadow:
+              0 0 0 3px rgba(59, 130, 246, 0.18),
+              0 8px 18px rgba(15, 23, 42, 0.10);
+          }
+
+          .ca-tbl-btn {
+            border: 1px solid rgba(226,232,240,0.9);
+            border-radius: 12px;
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 800;
+            cursor: pointer;
+            background: #ffffff;
+            color: #475569;
+            transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+          }
+          .ca-tbl-delete {
+            color: #dc2626;
+            border-color: #fecaca;
+            background: #fff7f7;
+          }
+          .ca-tbl-delete:hover {
+            background: #fef2f2;
+            border-color: #fca5a5;
+          }
+
+          .ca-modal-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 18px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+            padding: 0 4px;
+          }
+
+          .ca-modal-toolbar-note {
+            font-size: 12px;
+            color: #64748b;
+            line-height: 1.5;
+            max-width: 520px;
+          }
+
+     .ca-modal-add-row-btn {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
+  gap: 8px;
+
+  padding: 12px 18px;
+
+  border: 1px solid #1d4ed8;
+  border-radius: 999px;
+
+  background: linear-gradient(135deg,#2563eb,#3b82f6);
+  color: #ffffff;
+
+  font-size: 13px;
+  font-weight: 900;
+
   cursor: pointer;
-  transition:
-    background 0.18s ease,
-    color 0.18s ease,
-    border-color 0.18s ease,
-    box-shadow 0.18s ease,
-    transform 0.18s ease;
+
+  transition: all 0.18s ease;
+
+  box-shadow: 0 12px 28px rgba(37,99,235,0.18);
 }
 
-.ca-table-edit-btn{
-  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-  color: #1d4ed8;
-  border-color: #bfdbfe;
-  box-shadow: 0 2px 6px rgba(29, 78, 216, 0.08);
-}
-
-.ca-table-edit-btn:hover{
-  background: #eff6ff;
-  border-color: #93c5fd;
-  box-shadow: 0 6px 14px rgba(29, 78, 216, 0.14);
+.ca-modal-add-row-btn:hover {
+  background: linear-gradient(135deg,#1d4ed8,#2563eb);
   transform: translateY(-1px);
-}
-  .ca-table-edit-btn:active{
-  transform: translateY(0);
-  box-shadow: 0 2px 6px rgba(29, 78, 216, 0.08);
+  box-shadow: 0 16px 32px rgba(37,99,235,0.24);
 }
 
-.ca-table-delete-btn{
-  background: linear-gradient(180deg, #ffffff 0%, #fff7f7 100%);
-  color: #dc2626;
-  border-color: #fecaca;
-  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.08);
-  padding: 0;
-  font-size: 15px;
-  font-weight: 600;
-}
+          .ca-modal-form-section {
+            margin-top: 10px;
+            border: 1px solid rgba(147,197,253,0.42);
+            border-radius: 24px;
+            overflow: hidden;
+            background:
+              radial-gradient(circle at top right, rgba(59,130,246,0.08), transparent 24%),
+              linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(246,250,255,0.99) 100%);
+            box-shadow:
+              inset 0 1px 0 rgba(255,255,255,0.92),
+              0 20px 44px rgba(15,23,42,0.08);
+          }
 
-.ca-table-delete-btn:hover{
-  background: #fef2f2;
-  border-color: #fca5a5;
-  box-shadow: 0 6px 14px rgba(220, 38, 38, 0.14);
-  transform: translateY(-1px);
-}
+          .ca-modal-form-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 18px 20px;
+            background:
+              radial-gradient(circle at top right, rgba(59,130,246,0.10), transparent 24%),
+              linear-gradient(180deg, #ffffff 0%, #f1f7ff 100%);
+            border-bottom: 1px solid rgba(226,232,240,0.96);
+          }
 
-.ca-table-delete-btn:active{
-  transform: translateY(0);
-  box-shadow: 0 2px 6px rgba(220, 38, 38, 0.08);
-}
+          .ca-modal-form-header-main {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+          }
 
-.ca-table-edit-btn:focus-visible,
-.ca-table-delete-btn:focus-visible{
-  outline: none;
-  box-shadow:
-    0 0 0 3px rgba(59, 130, 246, 0.18),
-    0 4px 12px rgba(15, 23, 42, 0.10);
-}
+          .ca-modal-form-title {
+            display: block;
+            font-size: 17px;
+            font-weight: 900;
+            color: #0f172a;
+            letter-spacing: -0.02em;
+          }
 
-.ca-table-delete-btn:focus-visible{
-  box-shadow:
-    0 0 0 3px rgba(239, 68, 68, 0.18),
-    0 4px 12px rgba(15, 23, 42, 0.10);
-}
+          .ca-modal-form-caption {
+            font-size: 12px;
+            color: #64748b;
+          }
 
-          .ca-table tr:last-child td{border-bottom:none;}
-          .ca-table tr:hover td{background:#fff5f5;}
-          .ca-table .ca-col-num{width:36px;font-weight:800;color:#b91c1c;}
-          .ca-table .ca-col-actions{width:100px;text-align:right;white-space:nowrap;}
-          .ca-table-empty{
-            text-align:center;padding:40px 20px;color:#94a3b8;font-size:14px;
+          .ca-modal-form-tags {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
           }
-          .ca-table-status{
-            display:inline-block;padding:3px 10px;border-radius:999px;
-            font-size:11px;font-weight:700;
-            background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;
-          }
-          .ca-table-status.open{background:#fef2f2;color:#b91c1c;border-color:#fecaca;}
-          .ca-table-status.closed,.ca-table-status.completed{background:#ecfdf5;color:#047857;border-color:#a7f3d0;}
-          .ca-table-status.waiting-for-validation{background:#fff7ed;color:#c2410c;border-color:#fed7aa;}
 
-          .ca-tbl-btn{
-            border:none;border-radius:7px;padding:5px 11px;font-size:11px;font-weight:700;cursor:pointer;
+          .ca-modal-form-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 30px;
+            padding: 0 12px;
+            border-radius: 999px;
+            background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(14,165,233,0.08));
+            color: #1d4ed8;
+            font-size: 11px;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            border: 1px solid rgba(147,197,253,0.4);
           }
-          .ca-tbl-edit{background:#eff6ff;color:#1d4ed8;}
-          .ca-tbl-edit:hover{background:#dbeafe;}
-          .ca-tbl-delete{background:#fef2f2;color:#dc2626;margin-left:5px;}
-          .ca-tbl-delete:hover{background:#fee2e2;}
 
-          /* Modal form */
-          .ca-modal-form-section{
-            margin-top:22px;
-            border:1.5px solid #fecaca;
-            border-radius:16px;
-            overflow:hidden;
+          .ca-modal-form-chip::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            opacity: 0.88;
           }
-          .ca-modal-form-header{
-            display:flex;align-items:center;justify-content:space-between;
-            padding:14px 18px;background:#fff5f5;
-            border-bottom:1px solid #fecaca;
+
+          .ca-entry-editor-wrap {
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
           }
-          .ca-modal-form-title{font-size:14px;font-weight:800;color:#991b1b;}
-          .ca-modal-form-body{padding:18px;display:grid;gap:14px;}
-          .ca-modal-form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
-          .ca-modal-field label{display:block;font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;}
-          .ca-modal-input,.ca-modal-textarea,.ca-modal-select{
-            width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:8px;
-            font-size:13px;font-family:inherit;background:#fff;box-sizing:border-box;
+
+          .ca-entry-editor-table {
+            min-width: 1040px;
           }
-          .ca-modal-textarea{min-height:72px;resize:vertical;}
-          .ca-modal-input:focus,.ca-modal-textarea:focus,.ca-modal-select:focus{
-            border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.10);
+
+          .ca-entry-editor-table tbody tr {
+            position: relative;
           }
-          .ca-modal-form-footer{
-            display:flex;justify-content:flex-end;gap:10px;
-            padding:14px 18px;
-            border-top:1px solid #fecaca;background:#fff5f5;
+
+          .ca-entry-editor-table td {
+            vertical-align: top;
+            background: linear-gradient(180deg, rgba(252,254,255,0.99) 0%, rgba(244,249,255,0.99) 100%);
           }
-          .ca-modal-cancel-btn{
-            padding:9px 20px;border:1px solid #d1d5db;border-radius:8px;
-            background:#fff;color:#374151;font-size:13px;font-weight:700;cursor:pointer;
+
+          .ca-entry-editor-table tbody tr td:first-child {
+            box-shadow: inset 4px 0 0 #2563eb;
           }
-          .ca-modal-save-btn{
-            padding:9px 24px;border:none;border-radius:8px;
-            background:linear-gradient(135deg,#ef4444,#dc2626);
-            color:white;font-size:13px;font-weight:700;cursor:pointer;
-            box-shadow:0 4px 12px rgba(220,38,38,0.22);
+
+          .ca-entry-index-col {
+            width: 94px;
           }
-          .ca-modal-add-row-btn{
-            display:inline-flex;align-items:center;gap:8px;
-            margin-top:16px;
-            padding:10px 18px;border:1.5px dashed #fca5a5;border-radius:10px;
-            background:transparent;color:#b91c1c;font-size:13px;font-weight:700;cursor:pointer;
-            transition:background 0.15s;width:100%;justify-content:center;
+
+          .ca-draft-cell {
+            min-width: 94px;
           }
-          .ca-modal-add-row-btn:hover{background:#fff5f5;}
+
+          .ca-draft-badge {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 12px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(14,165,233,0.08));
+            border: 1px solid rgba(147,197,253,0.4);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+          }
+
+          .ca-draft-badge-kicker {
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: #2563eb;
+          }
+
+          .ca-draft-badge strong {
+            font-size: 13px;
+            font-weight: 900;
+            color: #0f172a;
+            line-height: 1.4;
+          }
+
+          .ca-editor-cell {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          }
+
+          .ca-responsible-select {
+            position: relative;
+            width: 100%;
+          }
+
+          .ca-responsible-trigger {
+            width: 100%;
+            min-height: 46px;
+            padding: 12px 40px 12px 13px;
+            border: 1px solid rgba(191,219,254,0.7);
+            border-radius: 14px;
+            background: #ffffff;
+            color: #0f172a;
+            font-size: 13px;
+            font-family: inherit;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            cursor: pointer;
+            text-align: left;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+          }
+
+          .ca-responsible-trigger:hover {
+            border-color: #93c5fd;
+          }
+
+          .ca-responsible-select.is-open .ca-responsible-trigger,
+          .ca-responsible-trigger:focus-visible {
+            border-color: #60a5fa;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(59,130,246,0.10);
+            transform: translateY(-1px);
+          }
+
+          .ca-responsible-trigger.is-placeholder .ca-responsible-trigger-label {
+            color: #64748b;
+          }
+
+          .ca-responsible-trigger-label {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .ca-responsible-trigger-chevron {
+            position: absolute;
+            right: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #334155;
+            font-size: 15px;
+            pointer-events: none;
+          }
+
+          .ca-responsible-menu {
+            position: fixed;
+            z-index: 12050;
+            background: #ffffff;
+            border: 1px solid rgba(191,219,254,0.95);
+            border-radius: 16px;
+            box-shadow: 0 22px 44px rgba(15,23,42,0.18);
+            padding: 8px;
+          }
+
+          .ca-responsible-menu[hidden] {
+            display: none !important;
+          }
+
+          .ca-responsible-options {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 340px;
+            overflow: auto;
+          }
+
+          .ca-responsible-option {
+            width: 100%;
+            border: none;
+            border-radius: 12px;
+            background: transparent;
+            color: #0f172a;
+            font-size: 13px;
+            font-family: inherit;
+            padding: 10px 12px;
+            text-align: left;
+            cursor: pointer;
+            transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+          }
+
+          .ca-responsible-option:hover {
+            background: #eff6ff;
+            color: #1d4ed8;
+          }
+
+          .ca-responsible-option.is-selected {
+            background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.10));
+            color: #1d4ed8;
+            font-weight: 700;
+          }
+
+          .ca-responsible-option.is-placeholder {
+            color: #64748b;
+          }
+
+          .ca-modal-select-native {
+            position: absolute;
+            width: 0;
+            height: 0;
+            opacity: 0;
+            pointer-events: none;
+          }
+
+          .ca-editor-cell-note {
+            font-size: 11px;
+            line-height: 1.45;
+            color: #64748b;
+          }
+
+          .ca-editor-status-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-height: 100%;
+            padding: 12px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.88);
+            border: 1px solid rgba(226,232,240,0.9);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
+          }
+
+          .ca-modal-input,
+          .ca-modal-textarea,
+          .ca-modal-select {
+            width: 100%;
+            padding: 12px 13px;
+            border: 1px solid rgba(191,219,254,0.7);
+            border-radius: 14px;
+            font-size: 13px;
+            font-family: inherit;
+            background: #ffffff;
+            color: #0f172a;
+            box-sizing: border-box;
+            box-shadow:
+              inset 0 1px 0 rgba(255,255,255,0.92),
+              0 6px 14px rgba(15,23,42,0.03);
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+          }
+
+          .ca-modal-input {
+            min-height: 46px;
+          }
+
+          .ca-modal-textarea {
+            min-height: 92px;
+            resize: vertical;
+            line-height: 1.55;
+          }
+
+          .ca-modal-input:focus,
+          .ca-modal-textarea:focus,
+          .ca-modal-select:focus {
+            border-color: #60a5fa;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(59,130,246,0.10);
+            transform: translateY(-1px);
+          }
+
+          .ca-entry-actions-cell {
+            min-width: 210px;
+          }
+
+          .ca-entry-actions-stack {
+            display: flex;
+            flex-direction: row;
+            width: 100%;
+            min-width: 200px;
+            justify-content: stretch;
+            gap: 12px;
+            align-items: center;
+            padding: 2px 0;
+          }
+
+          .ca-modal-cancel-btn,
+          .ca-modal-save-btn {
+            width: auto;
+            flex: 1 1 0;
+            min-width: 104px;
+            min-height: 44px;
+            padding: 0 18px;
+            border-radius: 14px;
+            font-size: 13px;
+            font-weight: 900;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+          }
+
+          .ca-modal-cancel-btn {
+            border: 1px solid rgba(203,213,225,0.96);
+            background: #ffffff;
+            color: #334155;
+          }
+          .ca-modal-cancel-btn:hover {
+            background: #f8fafc;
+            transform: translateY(-1px);
+          }
+
+          .ca-modal-save-btn {
+            border: none;
+            background: linear-gradient(135deg, #2563eb, #0ea5e9);
+            color: white;
+            box-shadow: 0 12px 24px rgba(37,99,235,0.22);
+          }
+          .ca-modal-save-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 16px 30px rgba(37,99,235,0.28);
+          }
+
+          .ca-entry-editor-table .ca-modal-save-btn,
+          .ca-entry-editor-table .ca-modal-cancel-btn {
+            font-size: 13px;
+          }
 
           /* â”€â”€ Modals (chart + history) â”€â”€ */
           body.chart-modal-open{overflow:hidden;}
@@ -8910,6 +25416,85 @@ app.get("/form", async (req, res) => {
             border-color:#93c5fd;
             box-shadow:0 0 0 4px rgba(59,130,246,0.12);
           }
+
+
+          .assistant-message.assistant.greeting-message{
+  background: linear-gradient(135deg, #ffffff 0%, #f4f8ff 100%);
+  border: 1px solid #dbe7ff;
+  border-radius: 22px;
+  padding: 18px 20px;
+  max-width: 320px;
+  box-shadow:
+    0 10px 30px rgba(37, 99, 235, 0.10),
+    inset 0 1px 0 rgba(255,255,255,0.9);
+  position: relative;
+  overflow: hidden;
+  animation: greetingFade 0.35s ease;
+}
+
+.assistant-message.assistant.greeting-message::before{
+  content:"";
+  position:absolute;
+  top:-60px;
+  right:-60px;
+  width:140px;
+  height:140px;
+  border-radius:50%;
+  background: radial-gradient(circle,
+    rgba(59,130,246,0.18) 0%,
+    rgba(59,130,246,0) 72%);
+}
+
+.greeting-title{
+  font-size:16px;
+  font-weight:800;
+  color:#0f172a;
+  margin-bottom:14px;
+  line-height:1.4;
+}
+
+.greeting-meta{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+
+.greeting-item{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:10px 12px;
+  border-radius:14px;
+  background: rgba(255,255,255,0.78);
+  border:1px solid #e2e8f0;
+  backdrop-filter: blur(6px);
+}
+
+.greeting-label{
+  font-size:11px;
+  font-weight:800;
+  letter-spacing:0.7px;
+  text-transform:uppercase;
+  color:#64748b;
+  min-width:70px;
+}
+
+.greeting-value{
+  font-size:14px;
+  font-weight:700;
+  color:#1e293b;
+}
+
+@keyframes greetingFade{
+  from{
+    opacity:0;
+    transform:translateY(10px) scale(0.98);
+  }
+  to{
+    opacity:1;
+    transform:translateY(0) scale(1);
+  }
+}
           .history-status-select:disabled{opacity:0.72;cursor:wait;}
           .history-status-select.status-open{background-color:#fef2f2;color:#b91c1c;border-color:#fecaca;}
           .history-status-select.status-waiting-for-validation{background-color:#fff7ed;color:#c2410c;border-color:#fed7aa;}
@@ -8947,6 +25532,65 @@ app.get("/form", async (req, res) => {
           .btn-cancel{padding:10px 20px;border:1px solid #ccc;background:white;border-radius:6px;cursor:pointer;font-weight:600;}
           .btn-confirm{padding:10px 20px;border:none;background:linear-gradient(135deg,#0078D7,#005ea6);color:white;border-radius:6px;cursor:pointer;font-weight:600;}
           .submit-btn{background:#0078D7;color:white;border:none;padding:12px 30px;border-radius:4px;font-size:16px;font-weight:600;cursor:pointer;display:block;width:100%;margin-top:20px;}
+          .close-action-confirm-overlay{
+            position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+            padding:20px;background:rgba(15,23,42,0.62);backdrop-filter:blur(8px);
+            z-index:10005;opacity:0;pointer-events:none;transition:opacity 0.24s ease;
+          }
+          .close-action-confirm-overlay.active{opacity:1;pointer-events:auto;}
+          .close-action-confirm-card{
+            width:min(92vw,470px);background:#fff;border-radius:24px;overflow:hidden;
+            border:1px solid #fecaca;box-shadow:0 28px 80px rgba(15,23,42,0.32);
+            transform:translateY(18px) scale(0.97);transition:transform 0.24s ease;
+          }
+          .close-action-confirm-overlay.active .close-action-confirm-card{transform:translateY(0) scale(1);}
+          .close-action-confirm-hero{
+            padding:24px 24px 18px;
+            background:
+              radial-gradient(circle at top right, rgba(239,68,68,0.18), transparent 34%),
+              linear-gradient(135deg,#fff5f5 0%,#fff7ed 100%);
+            border-bottom:1px solid #fee2e2;
+          }
+          .close-action-confirm-badge{
+            display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;
+            background:#ffffff;border:1px solid #fecaca;color:#b91c1c;font-size:11px;
+            font-weight:900;letter-spacing:0.08em;text-transform:uppercase;
+            box-shadow:0 6px 18px rgba(239,68,68,0.08);
+          }
+          .close-action-confirm-title{
+            margin:14px 0 8px;font-size:24px;font-weight:900;line-height:1.2;color:#111827;
+          }
+          .close-action-confirm-text{
+            margin:0;font-size:15px;line-height:1.7;color:#475569;
+          }
+
+          
+          .close-action-confirm-body{padding:22px 24px 24px;}
+          .close-action-confirm-note{
+            padding:14px 16px;border-radius:16px;background:#fff7ed;border:1px solid #fed7aa;
+            color:#9a3412;font-size:13px;line-height:1.65;
+          }
+          .close-action-confirm-actions{
+            display:flex;justify-content:flex-end;gap:12px;margin-top:20px;flex-wrap:wrap;
+          }
+          .close-action-confirm-cancel{
+            padding:12px 18px;border:1px solid #dbe3ee;border-radius:14px;background:#ffffff;
+            color:#334155;font-size:14px;font-weight:800;cursor:pointer;
+            transition:background 0.18s ease,border-color 0.18s ease,transform 0.18s ease;
+          }
+          .close-action-confirm-cancel:hover{background:#f8fafc;border-color:#cbd5e1;transform:translateY(-1px);}
+          .close-action-confirm-confirm{
+            padding:12px 18px;border:none;border-radius:14px;
+            background:linear-gradient(135deg,#ef4444,#dc2626);color:#ffffff;
+            font-size:14px;font-weight:800;cursor:pointer;
+            box-shadow:0 12px 26px rgba(220,38,38,0.22);
+            transition:transform 0.18s ease,box-shadow 0.18s ease;
+          }
+          .close-action-confirm-confirm:hover{transform:translateY(-1px);box-shadow:0 16px 30px rgba(220,38,38,0.28);}
+          .close-action-confirm-cancel:focus-visible,
+          .close-action-confirm-confirm:focus-visible{
+            outline:none;box-shadow:0 0 0 4px rgba(59,130,246,0.15);
+          }
 
           /* â”€â”€ AI Assistant â”€â”€ */
           .assistant-shell{
@@ -9040,6 +25684,13 @@ app.get("/form", async (req, res) => {
           .assistant-message{max-width:85%;padding:14px 16px;border-radius:20px;line-height:1.55;font-size:14px;white-space:pre-wrap;}
           .assistant-message.assistant{align-self:flex-start;background:#eef4fb;color:#1f2a37;border:1px solid #d7e2ee;}
           .assistant-message.user{align-self:flex-end;background:#0f6cbd;color:white;}
+          .assistant-composer{padding:16px;border-top:1px solid #e5edf6;background:#fbfdff;}
+          .assistant-form{display:flex;align-items:flex-end;gap:12px;padding:8px;border:2px solid #8cc4f3;border-radius:18px;background:white;box-shadow:0 8px 18px rgba(15,108,189,0.08);}
+          .assistant-input{flex:1;border:none;resize:none;min-height:48px;max-height:140px;font:inherit;padding:10px 12px;background:transparent;}
+          .assistant-input:focus{outline:none;}
+          .assistant-send{width:48px;height:48px;border:none;border-radius:14px;background:linear-gradient(135deg,#5aa7e8,#79b8ee);color:white;font-size:22px;cursor:pointer;flex-shrink:0;}
+          .assistant-status{margin-bottom:10px;font-size:12px;color:#6a7a8a;}
+
           /* â”€â”€ Responsive â”€â”€ */
           @media(max-width:900px){
             .info-section{grid-template-columns:repeat(2,minmax(0,1fr));}
@@ -9056,22 +25707,34 @@ app.get("/form", async (req, res) => {
               max-height:94vh;
               border-radius:16px;
              }
-            .ca-modal-box{max-height:min(94vh,820px);}
+            .ca-modal-box{
+              width: min(100vw - 12px, 1240px);
+              max-height: 94vh;
+              border-radius: 18px;
+            }
           }
           @media(max-width:700px){
             .ca-dates-grid{grid-template-columns:1fr;}
-            .ca-modal-form-row{grid-template-columns:1fr;}
+            .ca-modal-body{padding:16px 14px 18px;}
+            .ca-modal-header{padding:18px 18px 14px;}
+            .ca-modal-title{
+             font-size:18px;
+             font-weight:900;
+             color:#1e3a8a;
+             }
+            .ca-modal-toolbar{align-items:stretch;}
+            .ca-modal-add-row-btn{width:100%;justify-content:center;}
             .kpi-history-panel{width:calc(100% - 8px);}
             .kpi-card-actions{flex-direction:column;align-items:stretch;}
             .kpi-card-actions-right{justify-content:flex-end;}
+            .history-filter-group{min-width:100%;flex-basis:100%;}
+            .history-filter-clear{width:100%;justify-content:center;}
           }
           @media(max-width:600px){
             .info-section{grid-template-columns:1fr;}
             .ca-ai-row{grid-template-columns:1fr;}
             .assistant-shell{right:16px;bottom:16px;}
             .assistant-panel{height:min(76vh,620px);}
-            .header-inner{flex-direction:column;align-items:stretch;}
-            .header-title{text-align:center;}
           }
         </style>
       </head>
@@ -9095,13 +25758,37 @@ app.get("/form", async (req, res) => {
           </div>
         </div>
 
+        <div id="closeActionConfirmModal" class="close-action-confirm-overlay" aria-hidden="true">
+          <div class="close-action-confirm-card" role="dialog" aria-modal="true" aria-labelledby="closeActionConfirmTitle">
+            <div class="close-action-confirm-hero">
+              <div class="close-action-confirm-badge">
+                <span aria-hidden="true">&#9888;&#65039;</span>
+                Close Corrective Action
+              </div>
+              <h3 id="closeActionConfirmTitle" class="close-action-confirm-title">Are you sure you want to close this corrective action?</h3>
+              <p id="closeActionConfirmMessage" class="close-action-confirm-text">
+                Closing this corrective action will remove it from the current active list.
+              </p>
+            </div>
+            <div class="close-action-confirm-body">
+              <div id="closeActionConfirmNote" class="close-action-confirm-note">
+                The corrective action will stay saved in the system, but it will no longer appear in the current list.
+              </div>
+              <div class="close-action-confirm-actions">
+                <button id="closeActionConfirmCancel" type="button" class="close-action-confirm-cancel">Cancel</button>
+                <button id="closeActionConfirmConfirm" type="button" class="close-action-confirm-confirm">Yes, close it</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Chart expand modal -->
         <div id="chartModal" class="chart-modal-overlay" aria-hidden="true">
           <div class="chart-modal-box" role="dialog" aria-modal="true" aria-labelledby="chartModalTitle">
             <div class="chart-modal-header">
               <div>
                 <h3 id="chartModalTitle">KPI Trend</h3>
-                <p id="chartModalSubtitle">Weekly KPI performance overview</p>
+                <p id="chartModalSubtitle">Monthly KPI performance overview</p>
               </div>
               <button id="chartModalClose" type="button" class="chart-modal-close" aria-label="Close">&times;</button>
             </div>
@@ -9141,12 +25828,20 @@ app.get("/form", async (req, res) => {
               <!-- Table of existing actions -->
               <div class="ca-table-wrap">
                 <table class="ca-table" id="caModalTable">
+                  <colgroup>
+                    <col style="width:5%;">
+                    <col style="width:24%;">
+                    <col style="width:26%;">
+                    <col style="width:11%;">
+                    <col style="width:16%;">
+                    <col style="width:9%;">
+                    <col style="width:9%;">
+                  </colgroup>
                   <thead>
                     <tr>
                       <th class="ca-col-num">#</th>
                       <th>Root Cause</th>
                       <th>Immediate Action</th>
-                      <th>Evidence</th>
                       <th>Due Date</th>
                       <th>Responsible</th>
                       <th>Status</th>
@@ -9154,46 +25849,104 @@ app.get("/form", async (req, res) => {
                     </tr>
                   </thead>
                   <tbody id="caModalTableBody">
-                    <tr><td colspan="8" class="ca-table-empty">No corrective actions yet.</td></tr>
+                    <tr><td colspan="7" class="ca-table-empty">No corrective actions yet.</td></tr>
                   </tbody>
                 </table>
               </div>
 
-              <!-- Add new / Edit form -->
-              <button type="button" class="ca-modal-add-row-btn" id="caModalAddRowBtn">
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M7 1v12M1 7h12"/></svg>
-                Add New Corrective Action
-              </button>
+              <div class="ca-modal-toolbar">
+                <button type="button" class="ca-modal-add-row-btn" id="caModalAddRowBtn">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M7 1v12M1 7h12"/></svg>
+                  Add New Corrective Action
+                </button>
+               
+              </div>
 
               <div class="ca-modal-form-section" id="caModalFormSection" style="display:none;">
                 <div class="ca-modal-form-header">
-                  <span class="ca-modal-form-title" id="caModalFormTitle">New Corrective Action</span>
+                  <div class="ca-modal-form-header-main">
+                    <span class="ca-modal-form-title" id="caModalFormTitle">New Corrective Action</span>
+                    <div class="ca-modal-form-caption" id="caModalFormCaption">Inline action editor in professional table format.</div>
+                
+                  </div>
                   <button type="button" class="ca-tbl-btn ca-tbl-delete" id="caModalFormCollapse">&times; Cancel</button>
                 </div>
-                <div class="ca-modal-form-body">
-                  <input type="hidden" id="caModalEditIndex" value="">
-                  <div class="ca-modal-form-row">
-                    <div class="ca-modal-field">
-                      <label>Due Date <span class="ca-required">*</span></label>
-                      <input type="date" id="caModalDueDate" class="ca-modal-input">
-                    </div>
-                    <div class="ca-modal-field">
-                      <label>Responsible <span class="ca-required">*</span></label>
-                      <input type="text" id="caModalResponsible" class="ca-modal-input" placeholder="Name">
-                    </div>
-                  </div>
-                  <div class="ca-modal-field">
-                    <label>Root Cause <span class="ca-required">*</span></label>
-                    <textarea id="caModalRootCause" class="ca-modal-textarea" placeholder="Describe the root cause..."></textarea>
-                  </div>
-                  <div class="ca-modal-field">
-                    <label>Immediate Action / Solution <span class="ca-required">*</span></label>
-                    <textarea id="caModalSolution" class="ca-modal-textarea" placeholder="Describe the implemented solution..."></textarea>
-                  </div>
-                </div>
-                <div class="ca-modal-form-footer">
-                  <button type="button" class="ca-modal-cancel-btn" id="caModalCancelForm">Cancel</button>
-                  <button type="button" class="ca-modal-save-btn" id="caModalSaveForm">Save Action</button>
+                <input type="hidden" id="caModalEditIndex" value="">
+                <div class="ca-entry-editor-wrap">
+                  <table class="ca-entry-editor-table">
+                    <colgroup>
+                      <col style="width:10%;">
+                      <col style="width:14%;">
+                      <col style="width:18%;">
+                      <col style="width:24%;">
+                      <col style="width:12%;">
+                      <col style="width:22%;">
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th>Due Date <span class="ca-required">*</span></th>
+                        <th>Responsible <span class="ca-required">*</span></th>
+                        <th>Root Cause <span class="ca-required">*</span></th>
+                        <th>Immediate Action / Solution <span class="ca-required">*</span></th>
+                        <th>Status</th>
+                        <th class="ca-entry-actions-col">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                      
+                        <td>
+                          <div class="ca-editor-cell">
+                            <input type="date" id="caModalDueDate" class="ca-modal-input">
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-cell">
+                            <div class="ca-responsible-select" id="caModalResponsibleShell">
+                              <button
+                                type="button"
+                                class="ca-responsible-trigger is-placeholder"
+                                id="caModalResponsibleTrigger"
+                                aria-haspopup="listbox"
+                                aria-expanded="false">
+                                <span class="ca-responsible-trigger-label" id="caModalResponsibleTriggerLabel">Select responsible</span>
+                                <span class="ca-responsible-trigger-chevron" aria-hidden="true">▾</span>
+                              </button>
+                              <div class="ca-responsible-menu" id="caModalResponsibleMenu" hidden>
+                                <div class="ca-responsible-options" id="caModalResponsibleOptions" role="listbox" aria-label="Responsible options"></div>
+                              </div>
+                              <select id="caModalResponsible" class="ca-modal-select ca-modal-select-native" tabindex="-1" aria-hidden="true">
+                                <option value="">Select responsible</option>
+                                ${correctiveActionResponsibleOptionsHtml}
+                              </select>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-cell">
+                            <textarea id="caModalRootCause" class="ca-modal-textarea" placeholder="Describe the root cause..."></textarea>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-cell">
+                            <textarea id="caModalSolution" class="ca-modal-textarea" placeholder="Describe the immediate action or implemented solution..."></textarea>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-status-panel">
+                            <span class="ca-entry-status-pill open" id="caModalStatusBadge">Open</span>
+                            <div class="ca-editor-cell-note" id="caModalStatusNote">New actions start with Open status.</div>
+                          </div>
+                        </td>
+                        <td class="ca-entry-actions-cell">
+                          <div class="ca-entry-actions-stack">
+                            <button type="button" class="ca-modal-cancel-btn" id="caModalCancelForm">Cancel</button>
+                            <button type="button" class="ca-modal-save-btn" id="caModalSaveForm">Save Action</button>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>
@@ -9203,16 +25956,14 @@ app.get("/form", async (req, res) => {
         <!-- Main container -->
         <div class="container">
           <div class="header">
-            <div class="header-inner">
-              <h2 class="header-title">KPI Submission - ${week}</h2>
-            </div>
+            <h2 style="color:white;font-size:22px;margin:0;">KPI Submission - ${week}</h2>
           </div>
 
           <div class="form-section">
             <div class="info-section">
               <div class="info-row"><div class="info-label">Name</div><div class="info-value">${responsible.name}</div></div>
               <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsible.plant_name}</div></div>
-              <div class="info-row"><div class="info-label">Department</div><div class="info-value">${responsible.department_name}</div></div>
+              <div class="info-row"><div class="info-label">Role</div><div class="info-value">${responsible.role_name || responsible.role || "—"}</div></div>
               <div class="info-row"><div class="info-label">Week</div><div class="info-value">${week}</div></div>
             </div>
 
@@ -9245,6 +25996,13 @@ app.get("/form", async (req, res) => {
               </div>
             </div>
             <div class="assistant-messages" id="assistantMessages"></div>
+            <div class="assistant-composer">
+              <div class="assistant-status" id="assistantStatus">This AI support uses conversation memory and asks question by question to collect KPI diagnosis data.</div>
+              <form class="assistant-form" id="assistantForm">
+                <textarea class="assistant-input" id="assistantInput" placeholder="Ask about a KPI and the assistant will guide you step by step" rows="1"></textarea>
+                <button type="submit" class="assistant-send" id="assistantSend" aria-label="Send">&#10148;</button>
+              </form>
+            </div>
           </div>
       
         </div>
@@ -9274,7 +26032,7 @@ function getCaModalActions(kvId) {
         card.querySelector('input[name="ca_status_' + kvId + '[]"]')
       );
 
-      if (rootCause || implSolution || dueDate || responsible || actionId) {
+      if (rootCause || implSolution || dueDate || actionId) {
         caModalStore[kvId].push({
         id: actionId,
         root_cause: rootCause,
@@ -9308,6 +26066,68 @@ function getCaModalActions(kvId) {
             return matched || "Open";
           }
 
+          function isClosedCorrectiveActionStatus(status) {
+            return getCanonicalCorrectiveActionStatus(status) === "Closed";
+          }
+
+          let closeActionConfirmState = null;
+
+          function settleCloseActionConfirm(confirmed) {
+            if (!closeActionConfirmState) return;
+
+            const pending = closeActionConfirmState;
+            closeActionConfirmState = null;
+
+            const modal = document.getElementById("closeActionConfirmModal");
+            if (modal) {
+              modal.classList.remove("active");
+              modal.setAttribute("aria-hidden", "true");
+            }
+
+            if (!confirmed && pending.triggerEl && document.contains(pending.triggerEl)) {
+              window.setTimeout(() => pending.triggerEl.focus(), 0);
+            }
+
+            pending.resolve(Boolean(confirmed));
+          }
+
+          function confirmCloseCorrectiveAction(options) {
+            const modal = document.getElementById("closeActionConfirmModal");
+            const message = document.getElementById("closeActionConfirmMessage");
+            const note = document.getElementById("closeActionConfirmNote");
+            const confirmButton = document.getElementById("closeActionConfirmConfirm");
+
+            if (!modal) {
+              return Promise.resolve(window.confirm("Are you sure you want to close this corrective action?"));
+            }
+
+            if (message) {
+              message.textContent = "Closing this corrective action will remove it from the current active list.";
+            }
+
+            if (note) {
+              note.textContent = "The corrective action will stay saved in the system, but it will no longer appear in the current list.";
+            }
+
+            if (closeActionConfirmState) {
+              settleCloseActionConfirm(false);
+            }
+
+            return new Promise((resolve) => {
+              closeActionConfirmState = {
+                resolve,
+                triggerEl: options && options.triggerEl ? options.triggerEl : null
+              };
+
+              modal.classList.add("active");
+              modal.setAttribute("aria-hidden", "false");
+
+              if (confirmButton) {
+                window.setTimeout(() => confirmButton.focus(), 0);
+              }
+            });
+          }
+
           function setCorrectiveActionBadgeState(badge, status) {
             if (!badge) return;
             const canonicalStatus = getCanonicalCorrectiveActionStatus(status);
@@ -9330,6 +26150,36 @@ function getCaModalActions(kvId) {
             return canonicalStatus;
           }
 
+          function syncHistoryActionStatusInCard(kvId, actionId, status) {
+            const normalizedActionId = String(actionId || "").trim();
+            if (!normalizedActionId) return;
+
+            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+            if (!card) return;
+
+            const historyActions = decodeModalPayload(card.dataset.historyActions, []);
+            if (!Array.isArray(historyActions) || !historyActions.length) return;
+
+            let hasChanges = false;
+            const canonicalStatus = getCanonicalCorrectiveActionStatus(status);
+            const nextHistoryActions = historyActions.map(function(action) {
+              const currentActionId = String(
+                (action && (action.id || action.corrective_action_id)) || ""
+              ).trim();
+
+              if (currentActionId !== normalizedActionId) {
+                return action;
+              }
+
+              hasChanges = true;
+              return Object.assign({}, action, { status: canonicalStatus });
+            });
+
+            if (hasChanges) {
+              card.dataset.historyActions = encodeModalPayload(nextHistoryActions);
+            }
+          }
+
           function truncate(str, n) {
             const s = String(str || "");
             return s.length > n ? s.slice(0, n) + "â€¦" : s;
@@ -9340,27 +26190,96 @@ function getCaModalActions(kvId) {
        if (!tbody) return;
        const actions = getCaModalActions(kvId);
        if (!actions.length) {
-       tbody.innerHTML = '<tr><td colspan="8" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
+       tbody.innerHTML = '<tr><td colspan="7" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
        return;
        }
 
        tbody.innerHTML = actions.map((a, i) => {
       const sc = statusClass(a.status);
+      const responsibleName = String(a.responsible || "").trim();
+      const responsibleInitial = responsibleName ? responsibleName.charAt(0).toUpperCase() : "?";
       return \`<tr>
       <td class="ca-col-num">\${i + 1}</td>
-      <td title="\${escapeHtml(a.root_cause)}">\${escapeHtml(truncate(a.root_cause, 60))}</td>
-      <td title="\${escapeHtml(a.implemented_solution)}">\${escapeHtml(truncate(a.implemented_solution, 60))}</td>
-      <td title="\${escapeHtml(a.evidence || "")}">\${escapeHtml(truncate(a.evidence || "", 40))}</td>
-      <td>\${escapeHtml(a.due_date)}</td>
-      <td>\${escapeHtml(a.responsible)}</td>
+      <td title="\${escapeHtml(a.root_cause)}">
+        <div class="ca-table-copy">
+          <div class="ca-table-copy-title">\${escapeHtml(truncate(a.root_cause, 110))}</div>
+          <div class="ca-table-copy-meta">Cause analysis</div>
+        </div>
+      </td>
+      <td title="\${escapeHtml(a.implemented_solution)}">
+        <div class="ca-table-copy">
+          <div class="ca-table-copy-title">\${escapeHtml(truncate(a.implemented_solution, 110))}</div>
+          <div class="ca-table-copy-meta">Immediate response</div>
+        </div>
+      </td>
+      <td><span class="ca-date-chip">\${escapeHtml(a.due_date)}</span></td>
+      <td>
+        <div class="ca-responsible-cell">
+          <span class="ca-responsible-avatar">\${escapeHtml(responsibleInitial)}</span>
+          <span class="ca-responsible-copy">
+            <span class="ca-responsible-name">\${escapeHtml(responsibleName || "Not assigned")}</span>
+            <span class="ca-responsible-role">Action owner</span>
+          </span>
+        </div>
+      </td>
       <td>\${a.status ? \`<span class="ca-table-status \${sc}">\${escapeHtml(a.status)}</span>\` : "&mdash;"}</td>
       <td class="ca-col-actions">
-        <button type="button" class="ca-table-edit-btn" onclick="caModalOpenForm(\${i})">Edit</button>
-        <button type="button" class="ca-table-delete-btn" onclick="caModalDeleteAction(\${i})">&times;</button>
+        <div class="ca-table-actions">
+          <button type="button" class="ca-table-edit-btn" onclick="caModalOpenForm(\${i})">Edit</button>
+          <button type="button" class="ca-table-delete-btn" onclick="caModalDeleteAction(\${i})">&times;</button>
+        </div>
       </td>
        </tr>\`;
         }).join("");
       }
+
+    function updateCaModalEditorMeta(action = null, editIndex = null) {
+      const statusBadge = document.getElementById("caModalStatusBadge");
+      const statusNote = document.getElementById("caModalStatusNote");
+      const saveBtn = document.getElementById("caModalSaveForm");
+      const formCaption = document.getElementById("caModalFormCaption");
+      const formChip = document.getElementById("caModalFormChip");
+      const rowMode = document.getElementById("caModalRowMode");
+      const normalizedStatus = getCanonicalCorrectiveActionStatus(action && action.status) || "Open";
+      const statusClass = statusClassName(normalizedStatus);
+      const isEditing = editIndex !== null && editIndex !== undefined && editIndex >= 0;
+
+      if (statusBadge) {
+        statusBadge.textContent = normalizedStatus;
+        statusBadge.className = "ca-entry-status-pill " + statusClass;
+      }
+
+      if (statusNote) {
+        statusNote.textContent = isEditing
+          ? "Editing keeps the current status until it is changed later in the workflow."
+          : "New actions start with Open status.";
+      }
+
+      if (saveBtn) {
+        saveBtn.textContent = isEditing
+          ? "Update Action"
+          : "Save Action";
+      }
+
+      if (formCaption) {
+        formCaption.textContent = isEditing
+          ? "Refine the selected corrective action directly inside the table editor."
+          : "Add a new corrective action directly inside the structured draft row.";
+      }
+
+      if (formChip) {
+        formChip.textContent = isEditing ? "Edit row" : "Draft row";
+      }
+
+      if (rowMode) {
+        rowMode.textContent = isEditing ? ("Editing #" + (Number(editIndex) + 1)) : "New action";
+      }
+    }
+
+    function statusClassName(status) {
+      const value = String(status || "Open").trim().toLowerCase().replace(/\s+/g, "-");
+      return value || "open";
+    }
 
     function caModalOpenForm(editIndex) {
      const section = document.getElementById("caModalFormSection");
@@ -9376,16 +26295,19 @@ function getCaModalActions(kvId) {
     if (formTitle) formTitle.textContent = "Edit Action #" + (editIndex + 1);
     if (editIdx) editIdx.value = String(editIndex);
     document.getElementById("caModalDueDate").value = a.due_date || "";
-    document.getElementById("caModalResponsible").value = a.responsible || "";
+    setCaModalResponsibleValue(a.responsible || "");
     document.getElementById("caModalRootCause").value = a.root_cause || "";
     document.getElementById("caModalSolution").value = a.implemented_solution || "";
+    updateCaModalEditorMeta(a, editIndex);
   } else {
     if (formTitle) formTitle.textContent = "New Corrective Action";
     if (editIdx) editIdx.value = "";
-    ["caModalDueDate","caModalResponsible","caModalRootCause","caModalSolution"].forEach(id => {
+    ["caModalDueDate","caModalRootCause","caModalSolution"].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.value = "";
     });
+    setCaModalResponsibleValue(DEFAULT_CA_RESPONSIBLE);
+    updateCaModalEditorMeta(null, null);
   }
 
   section.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -9398,6 +26320,8 @@ function getCaModalActions(kvId) {
           function caModalCollapseForm() {
             const section = document.getElementById("caModalFormSection");
             if (section) section.style.display = "none";
+            closeCaResponsibleDropdown();
+            updateCaModalEditorMeta(null, null);
           }
 
 function caModalSaveForm() {
@@ -9524,8 +26448,8 @@ function syncDomFromStore(kvId) {
 
             const modalTitle = document.getElementById("caModalTitle");
             const modalSubtitle = document.getElementById("caModalSubtitle");
-            if (modalTitle) modalTitle.textContent = "Corrective Actions â€” " + title.trim();
-            if (modalSubtitle) modalSubtitle.textContent = "Add, edit, or remove corrective action entries";
+            if (modalTitle) modalTitle.textContent = " ";
+            if (modalSubtitle) modalSubtitle.textContent = "";
 
             caModalCollapseForm();
             renderCaModalTable(kvId);
@@ -9538,6 +26462,7 @@ function syncDomFromStore(kvId) {
           function closeCaTableModal() {
             const overlay = document.getElementById("caTableModal");
             if (!overlay) return;
+            closeCaResponsibleDropdown();
             overlay.classList.remove("active");
             overlay.setAttribute("aria-hidden", "true");
             if (!document.querySelector(".chart-modal-overlay.active") &&
@@ -9554,84 +26479,24 @@ function syncDomFromStore(kvId) {
           function getTrimmedText(node) { return getTextContent(node).trim(); }
           function getInputValue(node) { return node && typeof node.value === "string" ? node.value : ""; }
           function getTrimmedValue(node) { return getInputValue(node).trim(); }
-          const kpiFormDraftStorageKey = "kpi-form-draft:${responsible_id}:${week}";
-          const kpiFormDraftState = loadKpiFormDraftState();
-
-          function loadKpiFormDraftState() {
-            try {
-              const raw = window.localStorage ? window.localStorage.getItem(kpiFormDraftStorageKey) : null;
-              if (!raw) return {};
-              const parsed = JSON.parse(raw);
-              return parsed && typeof parsed === "object" ? parsed : {};
-            } catch (err) {
-              return {};
-            }
+          function normalizeMetricInputValue(value) {
+            const text = String(value ?? "").trim();
+            if (!text) return "";
+            const numeric = Number(text);
+            return Number.isFinite(numeric) ? String(numeric) : text;
           }
-
-          function persistKpiFormDraftState() {
-            try {
-              if (!window.localStorage) return;
-              const draftKeys = Object.keys(kpiFormDraftState);
-              if (!draftKeys.length) {
-                window.localStorage.removeItem(kpiFormDraftStorageKey);
-                return;
-              }
-              window.localStorage.setItem(kpiFormDraftStorageKey, JSON.stringify(kpiFormDraftState));
-            } catch (err) {
-              // Ignore storage errors so the form remains usable.
-            }
-          }
-
-          function ensureKpiFormDraftEntry(kvId) {
-            const key = String(kvId || "").trim();
-            if (!key) return null;
-            if (!kpiFormDraftState[key] || typeof kpiFormDraftState[key] !== "object") {
-              kpiFormDraftState[key] = {};
-            }
-            return kpiFormDraftState[key];
-          }
-
-          function hasKpiFormDraftField(kvId, fieldName) {
-            const key = String(kvId || "").trim();
-            if (!key || !fieldName) return false;
-            return Boolean(
-              kpiFormDraftState[key] &&
-              Object.prototype.hasOwnProperty.call(kpiFormDraftState[key], fieldName)
-            );
-          }
-
-          function getKpiFormDraftField(kvId, fieldName) {
-            if (!hasKpiFormDraftField(kvId, fieldName)) return "";
-            return String(kpiFormDraftState[String(kvId).trim()][fieldName] ?? "");
-          }
-
-          function setKpiFormDraftField(kvId, fieldName, value) {
-            const entry = ensureKpiFormDraftEntry(kvId);
-            if (!entry || !fieldName) return;
-            entry[fieldName] = String(value ?? "");
-            persistKpiFormDraftState();
-          }
-
-          function clearKpiFormDraftState() {
-            Object.keys(kpiFormDraftState).forEach(function(key) {
-              delete kpiFormDraftState[key];
-            });
-            persistKpiFormDraftState();
-          }
-
-          function applyDraftToValueInput(input) {
+          function setValueInputServerState(input, serverValue) {
             if (!input) return;
-            const kvId = input.dataset.kpiValuesId;
-            if (!hasKpiFormDraftField(kvId, "value")) return;
-            input.value = getKpiFormDraftField(kvId, "value");
+            input.dataset.serverValue = normalizeMetricInputValue(serverValue);
+            input.dataset.dirty = "false";
           }
-
-          function applyDraftToCommentInput(textarea) {
-            if (!textarea) return;
-            const nameMatch = String(textarea.name || "").match(/^comment_(.+)$/);
-            const kvId = nameMatch ? nameMatch[1] : "";
-            if (!kvId || !hasKpiFormDraftField(kvId, "comment")) return;
-            textarea.value = getKpiFormDraftField(kvId, "comment");
+          function syncValueInputDirtyState(input) {
+            if (!input) return false;
+            const currentValue = normalizeMetricInputValue(input.value);
+            const serverValue = normalizeMetricInputValue(input.dataset.serverValue);
+            const isDirty = currentValue !== serverValue;
+            input.dataset.dirty = isDirty ? "true" : "false";
+            return isDirty;
           }
 
           function getCorrectiveActionStack(kvId) {
@@ -9781,43 +26646,33 @@ function syncDomFromStore(kvId) {
             };
           }
 
-          function loadAssistantThreads() {
-            try {
-              const raw = window.localStorage ? window.localStorage.getItem(assistantStorageKey) : null;
-              if (!raw) return {};
-              const parsed = JSON.parse(raw);
-              const normalized = {};
-              Object.keys(parsed || {}).forEach((key) => {
-                const threadMessages = Array.isArray(parsed[key]?.messages)
-                  ? parsed[key].messages.map(normalizeAssistantThreadMessage).filter(Boolean).slice(-18)
-                  : [];
-                normalized[key] = { messages: threadMessages };
-              });
-              return normalized;
-            } catch (err) {
-              return {};
-            }
-          }
+      // Threads are now in-memory only; DB is the source of truth
+      function loadAssistantThreads() {
+          return {};
+         }
+      function persistAssistantThreads() {
+       // No-op: the POST /kpi-ai-assistant endpoint saves to DB automatically
+     }
+      function clearAssistantThreads() {
+       assistantState.threads = {};
+      }
 
-          function persistAssistantThreads() {
-            try {
-              if (!window.localStorage) return;
-              window.localStorage.setItem(assistantStorageKey, JSON.stringify(assistantState.threads));
-            } catch (err) {
-              // Ignore storage errors so the assistant remains usable.
-            }
-          }
+     async function fetchConversationFromServer(kvId) {
+       const kpiId = kvId === null || kvId === undefined ? null : kvId;
+       const params = new URLSearchParams({ 
+        responsible_id: String(${JSON.stringify(responsible_id)})
+      });
+       if (kpiId !== null) params.set("kpi_id", String(kpiId));
 
-          function clearAssistantThreads() {
-            assistantState.threads = {};
-            try {
-              if (window.localStorage) {
-                window.localStorage.removeItem(assistantStorageKey);
-              }
-            } catch (err) {
-              // Ignore storage errors so reset still clears in-memory state.
-            }
-          }
+     try {
+       const res = await fetch("/kpi-ai-assistant/conversation?" + params.toString());
+       if (!res.ok) return [];
+       const data = await res.json();
+       return Array.isArray(data.conversation) ? data.conversation : [];
+    } catch {
+      return [];
+     }
+    }
 
           function getAssistantThreadKey(kvId) {
             const resolvedKpiId = kvId === undefined ? assistantState.selectedKpiId : kvId;
@@ -9877,13 +26732,36 @@ function syncDomFromStore(kvId) {
             if (!assistantMessages) return;
             const msg = document.createElement("div");
             msg.className = "assistant-message " + role;
-            msg.innerHTML = String(text || "")
+            msg.innerHTML = formatAssistantMessageHtml(text);
+            assistantMessages.appendChild(msg);
+            assistantMessages.scrollTop = assistantMessages.scrollHeight;
+          }
+
+          function formatAssistantMessageHtml(text, showCursor) {
+            const safeText = String(text || "")
               .replace(/&/g, "&amp;")
               .replace(/</g, "&lt;")
               .replace(/>/g, "&gt;")
               .split("\\n")
               .join("<br>");
+            return showCursor
+              ? safeText + '<span class="assistant-cursor">|</span>'
+              : safeText;
+          }
+
+          function appendStreamingAssistantMessage(role, initialText) {
+            if (!assistantMessages) return null;
+            const msg = document.createElement("div");
+            msg.className = "assistant-message " + role;
+            msg.innerHTML = formatAssistantMessageHtml(initialText || "", role === "assistant");
             assistantMessages.appendChild(msg);
+            assistantMessages.scrollTop = assistantMessages.scrollHeight;
+            return msg;
+          }
+
+          function updateStreamingAssistantMessage(messageNode, text, isComplete) {
+            if (!messageNode) return;
+            messageNode.innerHTML = formatAssistantMessageHtml(text || "", !isComplete);
             assistantMessages.scrollTop = assistantMessages.scrollHeight;
           }
 
@@ -9894,44 +26772,44 @@ function syncDomFromStore(kvId) {
          return;
          }
 
-    const msg = document.createElement("div");
-    msg.className = "assistant-message " + role;
-    assistantMessages.appendChild(msg);
-    assistantMessages.scrollTop = assistantMessages.scrollHeight;
+       const msg = document.createElement("div");
+        msg.className = "assistant-message " + role;
+        assistantMessages.appendChild(msg);
+        assistantMessages.scrollTop = assistantMessages.scrollHeight;
 
-    const safeText = String(text || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+        const safeText = String(text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+ 
+       if (role !== "assistant" || safeText.length > 400) {
+         msg.innerHTML = safeText.split("\\n").join("<br>");
+         assistantMessages.scrollTop = assistantMessages.scrollHeight;
+         resolve();
+         return;
+         }
 
-    if (role !== "assistant" || safeText.length > 400) {
-      msg.innerHTML = safeText.split("\\n").join("<br>");
-      assistantMessages.scrollTop = assistantMessages.scrollHeight;
-      resolve();
-      return;
-    }
+        let i = 0;
+       const typingSpeed = 5;
 
-    let i = 0;
-    const typingSpeed = 5;
+      function typeNext() {
+        const partial = safeText.slice(0, i).split("\\n").join("<br>");
+        msg.innerHTML = partial + '<span class="assistant-cursor">|</span>';
+        assistantMessages.scrollTop = assistantMessages.scrollHeight;
 
-    function typeNext() {
-      const partial = safeText.slice(0, i).split("\\n").join("<br>");
-      msg.innerHTML = partial + '<span class="assistant-cursor">|</span>';
-      assistantMessages.scrollTop = assistantMessages.scrollHeight;
-
-      if (i < safeText.length) {
-        i++;
-        setTimeout(typeNext, typingSpeed);
-      } else {
+        if (i < safeText.length) {
+         i++;
+         setTimeout(typeNext, typingSpeed);
+        } else {
         msg.innerHTML = safeText.split("\\n").join("<br>");
         assistantMessages.scrollTop = assistantMessages.scrollHeight;
         resolve();
+       }
       }
-    }
 
-    typeNext();
-  });
-}
+     typeNext();
+         });
+         }
           function setAssistantStatus(text) { if (assistantStatus) assistantStatus.textContent = text; }
           function getKpiCardById(kvId) { return document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]'); }
           function getAssistantKpiDisplayName(card) {
@@ -9941,22 +26819,28 @@ function syncDomFromStore(kvId) {
             return subtitle && title ? (subtitle + " (" + title + ")") : (subtitle || title || "Selected KPI");
           }
 
-          function buildAssistantGreeting() {
-           return "AI Support will be ready soon.";
-          } 
+           function buildAssistantGreeting() {
+           return "Welcome ${responsible.name || "Responsible"}\\n\\n" +
+           "Role: ${responsible.role_name || responsible.role || "General access"}\\n" +
+           "Assistant: ${responsible.role_name || responsible.role || "KPI"} Assistant\\n" +
+           "I will use this conversation as memory and guide the KPI question by question.";
+          }
 
-          function ensureAssistantGreeting() {
+           function ensureAssistantGreeting() {
             const thread = getCurrentAssistantThread();
             if (!thread.messages.length) {
               const greeting = buildAssistantGreeting();
               pushAssistantThreadMessage("assistant", greeting, greeting);
             }
-          }
+           }
 
           function renderAssistantConversation() {
             if (!assistantMessages) return;
+            ensureAssistantGreeting();
             assistantMessages.innerHTML = "";
-            appendAssistantMessageInstant("assistant", buildAssistantGreeting());
+            getCurrentAssistantThread().messages.forEach((entry) => {
+              appendAssistantMessageInstant(entry.role, entry.text);
+            });
           }
 
           function extractGuidedQuestionOptions(text) {
@@ -10038,45 +26922,80 @@ function syncDomFromStore(kvId) {
             assistantInput.placeholder = "Ask about " + kpiName;
           }
 
-          function openAssistant() {
-            if (!assistantShell) return;
-            assistantShell.classList.add("open");
-            if (assistantLauncher) assistantLauncher.innerHTML = "&times;";
-            if (assistantFocus) {
-              if (!assistantState.selectedKpiId) {
-                assistantFocus.textContent = "All KPIs on this form";
-                setAssistantStatus("AI support will be ready soon.");
-              } else {
-                const card = getKpiCardById(assistantState.selectedKpiId);
-                assistantFocus.textContent = "Focused on: " + getAssistantKpiDisplayName(card);
-                setAssistantStatus("Focused on " + getAssistantKpiDisplayName(card) + ". AI support will be ready soon.");
-              }
-            }
-            syncAssistantInputPlaceholder();
-            renderAssistantConversation();
-            if (assistantInput) assistantInput.focus();
-          }
+    async function openAssistant() {
+    if (!assistantShell) return;
+    assistantShell.classList.add("open");
+     if (assistantLauncher) assistantLauncher.innerHTML = "&times;";
+     if (assistantFocus) {
+     assistantFocus.textContent =
+     "${responsible.role_name || responsible.role || "KPI"} Assistant";
+    }
+    syncAssistantInputPlaceholder();
+
+    // Show a loading state while we fetch from DB
+    if (assistantMessages) {
+      assistantMessages.innerHTML =
+      '<div class="assistant-message assistant">Loading conversation...</div>';
+    }
+
+     // Load conversation from DB into in-memory thread
+    const threadKey = getAssistantThreadKey(assistantState.selectedKpiId);
+     const serverMessages = await fetchConversationFromServer(assistantState.selectedKpiId);
+
+     if (serverMessages.length) {
+      assistantState.threads[threadKey] = {
+      messages: serverMessages.map((entry) => ({
+        role: entry.role,
+        text: entry.text || entry.content || "",
+        contextText: entry.content || entry.text || "",
+        ts: entry.ts || Date.now()
+      })).filter((e) => e.role && e.text)
+     };
+      } else {
+       // No prior conversation — let ensureAssistantGreeting() add the welcome message
+       assistantState.threads[threadKey] = { messages: [] };
+      }
+
+       renderAssistantConversation();
+       if (assistantInput) assistantInput.focus();
+       }
           function closeAssistant() {
             if (!assistantShell) return;
             assistantShell.classList.remove("open");
             if (assistantLauncher) assistantLauncher.innerHTML = "&#129302;";
           }
 
-          function resetAssistantForTesting() {
+          async function resetAssistantForTesting() {
+            const selectedCard = getKpiCardById(assistantState.selectedKpiId);
+            const realKpiId = selectedCard?.dataset?.kpiId;
+
+            if (realKpiId) {
+              try {
+                await fetch(
+                  "/api/kpis/" + encodeURIComponent(realKpiId) + "/ai-support/conversation?responsible_id=" + encodeURIComponent("${responsible_id}"),
+                  { method: "DELETE" }
+                );
+              } catch (error) {
+                // Keep local reset behavior even if the server reset fails.
+              }
+            }
+
             clearAssistantThreads();
             renderAssistantConversation();
-            setAssistantStatus("AI support will be ready soon.");
+            setAssistantStatus("Assistant reset. Start the workflow again.");
             if (assistantInput) assistantInput.focus();
           }
           window.resetAssistantForTesting = resetAssistantForTesting;
 
-          function openAssistantForKpi(kvId) {
-            assistantState.selectedKpiId = kvId;
-            openAssistant();
-            const card = getKpiCardById(kvId);
-            const kpiName = getAssistantKpiDisplayName(card);
-            setAssistantStatus("Focused on " + kpiName + ". AI support will be ready soon.");
-          }
+         function openAssistantForKpi(kvId) {
+         assistantState.selectedKpiId = kvId;
+         openAssistant(); // openAssistant is now async and fetches from DB
+         const card = getKpiCardById(kvId);
+         const kpiName = getAssistantKpiDisplayName(card);
+         setAssistantStatus(
+         "Focused on " + kpiName + ". This AI support uses conversation memory, KPI guides, and the knowledge base when relevant."
+        );
+       }
           window.openAssistantForKpi = openAssistantForKpi;
           
 
@@ -10085,6 +27004,7 @@ async function sendAssistantPrompt(message) {
   if (!cleanMessage || assistantState.pending) return;
 
   const resolvedMessage = resolveAssistantUserMessage(cleanMessage);
+  let streamedMessageNode = null;
 
   assistantState.pending = true;
   if (assistantSend) assistantSend.disabled = true;
@@ -10094,38 +27014,157 @@ async function sendAssistantPrompt(message) {
   setAssistantStatus("Thinking...");
 
   try {
-    const res = await fetch("/kpi-ai-assistant", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        responsible_id: "${responsible_id}",
-        week: "${week}",
-        selected_kpi_id: assistantState.selectedKpiId,
-        kpis: collectAssistantKpis(),
-        message: resolvedMessage,
-        conversation_history: getAssistantRequestHistory(resolvedMessage)
-      })
-    });
+   const selectedCard = getKpiCardById(assistantState.selectedKpiId);
+   const realKpiId = selectedCard?.dataset?.kpiId;
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Request failed");
+  if (!realKpiId) {
+  throw new Error("No KPI selected.");
+  }
 
-    const assistantReply = data.reply || "I could not generate a response.";
-    pushAssistantThreadMessage("assistant", assistantReply, assistantReply);
+  const res = await fetch("/api/kpis/" + encodeURIComponent(realKpiId) + "/ai-support", {
+   method: "POST",
+   headers: { "Content-Type": "application/json" },
+   body: JSON.stringify({
+    message: resolvedMessage,
+    responsible_id: "${responsible_id}",
+    stream: true
+  })
+  });
 
-    await addAssistantMessage(
-      "assistant",
-      assistantReply
-    );
+    const responseType = String(res.headers.get("content-type") || "").toLowerCase();
+    if (!res.ok && !responseType.includes("text/event-stream")) {
+      const errorData = await res.json().catch(() => null);
+      throw new Error(errorData?.error || "Request failed");
+    }
 
+    if (!responseType.includes("text/event-stream") || !res.body) {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Request failed");
+
+      const assistantReply = data.answer || "I could not generate a response.";
+      if (Array.isArray(data.conversation)) {
+        const thread = getCurrentAssistantThread();
+        thread.messages = data.conversation.map((entry) => ({
+          role: entry.role,
+          text: entry.text || entry.content,
+          contextText: entry.content || entry.text,
+          ts: entry.ts || Date.now()
+        })).filter((entry) => entry.role && entry.text);
+      } else {
+        pushAssistantThreadMessage("assistant", assistantReply, assistantReply);
+      }
+
+      await addAssistantMessage("assistant", assistantReply);
+      setAssistantStatus("AI assistant is ready.");
+      return;
+    }
+
+    streamedMessageNode = appendStreamingAssistantMessage("assistant", "");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let streamedAnswer = "";
+    let finalPayload = null;
+    let streamedError = "";
+    setAssistantStatus("Streaming response from the KPI knowledge base...");
+
+    const processStreamEvent = (rawEvent) => {
+      const eventLines = String(rawEvent || "")
+      .split(/\\r?\\n/)
+      .filter(Boolean);
+    if (!eventLines.length) return;
+
+      let eventName = "message";
+      const dataLines = [];
+
+      eventLines.forEach((line) => {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+          return;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      });
+
+      if (!dataLines.length) return;
+
+      let payload = null;
+     try {
+    payload = JSON.parse(dataLines.join("\\n"));
+    } catch (error) {
+     payload = { value: dataLines.join("\\n") };
+     }
+
+      if (eventName === "delta") {
+        const delta = String(payload?.delta || "");
+        if (!delta) return;
+        streamedAnswer += delta;
+        updateStreamingAssistantMessage(streamedMessageNode, streamedAnswer, false);
+        return;
+      }
+
+      if (eventName === "done") {
+        finalPayload = payload || null;
+        return;
+      }
+
+      if (eventName === "error") {
+        streamedError = String(payload?.error || "I could not answer right now. Please try again.");
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      let separatorIndex = buffer.indexOf("\\n\\n");
+
+      while (separatorIndex >= 0) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        processStreamEvent(rawEvent);
+        separatorIndex = buffer.indexOf("\\n\\n");
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      processStreamEvent(buffer);
+    }
+
+    if (streamedError) {
+      throw new Error(streamedError);
+    }
+
+    const assistantReply = String(finalPayload?.answer || streamedAnswer || "").trim() || "I could not generate a response.";
+
+    if (Array.isArray(finalPayload?.conversation)) {
+      const thread = getCurrentAssistantThread();
+      thread.messages = finalPayload.conversation.map((entry) => ({
+        role: entry.role,
+        text: entry.text || entry.content,
+        contextText: entry.content || entry.text,
+        ts: entry.ts || Date.now()
+      })).filter((entry) => entry.role && entry.text);
+    } else {
+      pushAssistantThreadMessage("assistant", assistantReply, assistantReply);
+    }
+
+    updateStreamingAssistantMessage(streamedMessageNode, assistantReply, true);
     setAssistantStatus("AI assistant is ready.");
   } catch (err) {
     const fallbackReply = "I could not answer right now. Please try again.";
     pushAssistantThreadMessage("assistant", fallbackReply, fallbackReply);
-    await addAssistantMessage(
-      "assistant",
-      fallbackReply
-    );
+    if (streamedMessageNode) {
+      updateStreamingAssistantMessage(streamedMessageNode, fallbackReply, true);
+    } else {
+      await addAssistantMessage(
+        "assistant",
+        fallbackReply
+      );
+    }
     setAssistantStatus("AI assistant is unavailable.");
   } finally {
     assistantState.pending = false;
@@ -10133,14 +27172,14 @@ async function sendAssistantPrompt(message) {
   }
 }
 
-          if (assistantLauncher) assistantLauncher.addEventListener("click", () => {
-            if (assistantShell.classList.contains("open")) {
-              closeAssistant();
-              return;
-            }
-            assistantState.selectedKpiId = null;
-            openAssistant();
-          });
+        if (assistantLauncher) assistantLauncher.addEventListener("click", () => {
+         if (assistantShell.classList.contains("open")) {
+         closeAssistant();
+          return;
+        }
+        assistantState.selectedKpiId = null;
+        openAssistant(); // async, no need to await here
+       });
           if (assistantClose) assistantClose.addEventListener("click", closeAssistant);
           if (assistantReset) assistantReset.addEventListener("click", resetAssistantForTesting);
           if (assistantInput) {
@@ -10165,6 +27204,149 @@ async function sendAssistantPrompt(message) {
           const kpiCharts = {};
           let expandedChart = null;
           let expandedChartKpiValuesId = null;
+          const CA_RESPONSIBLE_OPTIONS = ${JSON.stringify(correctiveActionResponsibleOptions)};
+          const DEFAULT_CA_RESPONSIBLE = ${JSON.stringify(defaultCorrectiveActionResponsible)};
+
+          function getCaResponsibleDropdownElements() {
+            return {
+              shell: document.getElementById("caModalResponsibleShell"),
+              trigger: document.getElementById("caModalResponsibleTrigger"),
+              triggerLabel: document.getElementById("caModalResponsibleTriggerLabel"),
+              menu: document.getElementById("caModalResponsibleMenu"),
+              options: document.getElementById("caModalResponsibleOptions"),
+              select: document.getElementById("caModalResponsible")
+            };
+          }
+
+          function closeCaResponsibleDropdown({ restoreFocus = false } = {}) {
+            const { shell, trigger, menu } = getCaResponsibleDropdownElements();
+            if (!shell || !trigger || !menu) return;
+
+            shell.classList.remove("is-open");
+            menu.hidden = true;
+            trigger.setAttribute("aria-expanded", "false");
+
+            if (restoreFocus) {
+              trigger.focus();
+            }
+          }
+
+          function ensureCaResponsibleDropdownPortal() {
+            const { menu } = getCaResponsibleDropdownElements();
+            if (!menu) return;
+
+            if (menu.parentElement !== document.body) {
+              document.body.appendChild(menu);
+            }
+          }
+
+          function renderCaResponsibleDropdownOptions() {
+            const { options, select } = getCaResponsibleDropdownElements();
+            if (!options || !select) return;
+
+            const nativeOptions = Array.from(select.options || []);
+            const selectedValue = String(select.value || "");
+            const visibleOptions = nativeOptions.filter((option) => String(option.value || "") !== "");
+
+            options.innerHTML = visibleOptions.map((option) => {
+              const value = String(option.value || "");
+              const label = String(option.text || option.label || value || "Select responsible");
+              const isSelected = value === selectedValue;
+
+              return '<button type="button" class="ca-responsible-option' +
+                (isSelected ? ' is-selected' : '') +
+                '" role="option" aria-selected="' + (isSelected ? "true" : "false") +
+                '" data-value="' + escapeHtml(value) + '">' +
+                escapeHtml(label) +
+              '</button>';
+            }).join("");
+          }
+
+          function positionCaResponsibleDropdown() {
+            const { trigger, menu, options } = getCaResponsibleDropdownElements();
+            if (!trigger || !menu || !options || menu.hidden) return;
+
+            const triggerRect = trigger.getBoundingClientRect();
+            const availableBelow = Math.max(window.innerHeight - triggerRect.bottom - 18, 180);
+            menu.style.top = Math.round(triggerRect.bottom + 8) + "px";
+            menu.style.left = Math.round(triggerRect.left) + "px";
+            menu.style.width = Math.round(triggerRect.width) + "px";
+            menu.style.maxHeight = Math.round(Math.min(availableBelow, 360)) + "px";
+            options.style.maxHeight = Math.round(Math.min(Math.max(availableBelow - 16, 164), 340)) + "px";
+          }
+
+          function ensureCaResponsibleDropdownSpace() {
+            const { trigger, menu } = getCaResponsibleDropdownElements();
+            const modalBody = trigger?.closest(".ca-modal-body");
+            if (!trigger || !menu || !modalBody) return;
+
+            const triggerRect = trigger.getBoundingClientRect();
+            const desiredHeight = Math.min(menu.scrollHeight || 320, 360);
+            const overflow = triggerRect.bottom + desiredHeight + 16 - window.innerHeight;
+
+            if (overflow > 0) {
+              modalBody.scrollTop += overflow;
+            }
+          }
+
+          function syncCaResponsibleDropdown() {
+            const { trigger, triggerLabel, options, select } = getCaResponsibleDropdownElements();
+            if (!trigger || !triggerLabel || !options || !select) return;
+
+            const nativeOptions = Array.from(select.options || []);
+            const selectedValue = String(select.value || "");
+            const selectedOption = nativeOptions.find(
+              (option) => String(option.value || "") === selectedValue
+            );
+            const placeholderText = nativeOptions[0]?.text || "Select responsible";
+
+            triggerLabel.textContent = selectedOption?.text || placeholderText;
+            trigger.classList.toggle("is-placeholder", !selectedValue);
+            renderCaResponsibleDropdownOptions();
+            closeCaResponsibleDropdown();
+          }
+
+          function applyCaResponsibleDropdownValue(nextValue = "") {
+            const { select } = getCaResponsibleDropdownElements();
+            if (!select) return;
+
+            select.value = String(nextValue || "").trim();
+            syncCaResponsibleDropdown();
+          }
+
+          function toggleCaResponsibleDropdown(forceOpen) {
+            const { shell, trigger, menu, select } = getCaResponsibleDropdownElements();
+            if (!shell || !trigger || !menu || !select) return;
+
+            const shouldOpen = typeof forceOpen === "boolean"
+              ? forceOpen
+              : menu.hidden;
+
+            if (!shouldOpen) {
+              closeCaResponsibleDropdown();
+              return;
+            }
+
+            renderCaResponsibleDropdownOptions();
+            ensureCaResponsibleDropdownPortal();
+            shell.classList.add("is-open");
+            menu.hidden = false;
+            trigger.setAttribute("aria-expanded", "true");
+            ensureCaResponsibleDropdownSpace();
+            positionCaResponsibleDropdown();
+            requestAnimationFrame(positionCaResponsibleDropdown);
+          }
+
+          function setCaModalResponsibleValue(value) {
+            const { select } = getCaResponsibleDropdownElements();
+            if (!select) return;
+
+            const normalizedValue = String(value || "").trim();
+            select.value = CA_RESPONSIBLE_OPTIONS.includes(normalizedValue)
+              ? normalizedValue
+              : "";
+            syncCaResponsibleDropdown();
+          }
 
           async function refreshKpiChartFromServer(kvId) {
   const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
@@ -10172,15 +27354,14 @@ async function sendAssistantPrompt(message) {
 
   const responsibleId = new URLSearchParams(window.location.search).get("responsible_id");
   const week = card.dataset.currentWeek;
-  const resolvedKpiValuesId = String(card.dataset.kpiValuesId || kvId || "").trim();
   const kpiId = card.dataset.kpiId;
 
-  if (!responsibleId || !week || (!resolvedKpiValuesId && !kpiId)) return;
+  if (!responsibleId || !week || !kpiId) return;
 
   const url =
     "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
-    "&kpi_values_id=" + encodeURIComponent(resolvedKpiValuesId) +
-    "&kpi_id=" + encodeURIComponent(kpiId || "") +
+    "&kpi_values_id=" + encodeURIComponent(kvId) +
+    "&kpi_id=" + encodeURIComponent(kpiId) +
     "&week=" + encodeURIComponent(week);
 
   const res = await fetch(url);
@@ -10191,33 +27372,39 @@ async function sendAssistantPrompt(message) {
 
   card.dataset.historyLabels = JSON.stringify(data.labels);
   card.dataset.historyValues = JSON.stringify(data.values);
-  if (data.currentWeekLabel) {
-    card.dataset.currentWeekLabel = data.currentWeekLabel;
+  if (data.currentMonthLabel) {
+    card.dataset.currentMonthLabel = data.currentMonthLabel;
   }
 
   const input = document.getElementById("value_" + kvId);
-  const hasDraftValue = hasKpiFormDraftField(kvId, "value");
-  if (input && hasDraftValue) {
-    input.value = getKpiFormDraftField(kvId, "value");
-  } else if (input && document.activeElement !== input && data.currentValue !== null) {
-    input.value = data.currentValue;
+  const preserveDraftValue = input
+    ? (syncValueInputDirtyState(input) || document.activeElement === input)
+    : false;
+
+  if (input && !preserveDraftValue) {
+    const nextValue = data.currentValue !== null && data.currentValue !== undefined
+      ? String(data.currentValue)
+      : "";
+    input.value = nextValue;
+    setValueInputServerState(input, nextValue);
   }
 
   const chart = kpiCharts[kvId];
   if (!chart) {
     buildKpiChart(kvId);
-    if (input && hasDraftValue) {
-      updateCurrentWeekBarFromInput(kvId, input.value);
+    if (preserveDraftValue && input) {
+      updateCurrentMonthBarFromInput(kvId, input.value);
     }
     return;
   }
 
   chart.data.labels = data.labels;
   chart.data.datasets[0].data = data.values;
-  if (input && hasDraftValue) {
-    updateCurrentWeekBarFromInput(kvId, input.value);
+  if (preserveDraftValue && input) {
+    updateCurrentMonthBarFromInput(kvId, input.value);
     return;
   }
+
   updateKpiChart(kvId);
 }
 
@@ -10315,24 +27502,147 @@ async function sendAssistantPrompt(message) {
             }
           };
 
+          const kpiBarFlowLinePlugin = {
+            id: "kpiBarFlowLine",
+            afterDatasetsDraw(chart, args, opts) {
+              const datasetIndex = Number.isInteger(opts?.datasetIndex) ? opts.datasetIndex : 0;
+              const meta = chart.getDatasetMeta(datasetIndex);
+              const area = chart.chartArea;
+              if (!meta?.data?.length || !area) return;
+
+              const offset = Number.isFinite(opts?.offset) ? opts.offset : 12;
+              const pointRadius = Number.isFinite(opts?.pointRadius) ? opts.pointRadius : 3.5;
+              const lineWidth = Number.isFinite(opts?.lineWidth) ? opts.lineWidth : 3;
+              const color = opts?.color || "#111827";
+              const pointFill = opts?.pointFill || color;
+              const pointStroke = opts?.pointStroke || "#ffffff";
+              const points = [];
+
+              meta.data.forEach((barElement, index) => {
+                const rawValue = chart.data?.datasets?.[datasetIndex]?.data?.[index];
+                const numericValue = Number(rawValue);
+
+                if (!Number.isFinite(numericValue) || !Number.isFinite(barElement?.x) || !Number.isFinite(barElement?.y)) {
+                  return;
+                }
+
+                points.push({
+                  x: barElement.x,
+                  y: Math.max(barElement.y - offset, area.top + 8)
+                });
+              });
+
+              if (points.length < 2) return;
+
+              const ctx = chart.ctx;
+              ctx.save();
+              ctx.lineWidth = lineWidth;
+              ctx.strokeStyle = color;
+              ctx.lineCap = "round";
+              ctx.lineJoin = "round";
+              ctx.beginPath();
+              ctx.moveTo(points[0].x, points[0].y);
+
+              for (let index = 1; index < points.length; index += 1) {
+                const previousPoint = points[index - 1];
+                const currentPoint = points[index];
+                const cp1x = previousPoint.x + (currentPoint.x - previousPoint.x) * 0.35;
+                const cp1y = previousPoint.y;
+                const cp2x = currentPoint.x - (currentPoint.x - previousPoint.x) * 0.35;
+                const cp2y = currentPoint.y;
+                ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, currentPoint.x, currentPoint.y);
+              }
+
+              ctx.stroke();
+
+              points.forEach((point) => {
+                ctx.beginPath();
+                ctx.fillStyle = pointFill;
+                ctx.arc(point.x, point.y, pointRadius, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = pointStroke;
+                ctx.stroke();
+                ctx.lineWidth = lineWidth;
+                ctx.strokeStyle = color;
+              });
+
+              ctx.restore();
+            }
+          };
+
           function getThresholdLines(lowLimit, target, highLimit) {
             const lines = [];
-            if (!isNaN(highLimit)) lines.push({ key:"high_limit", label:"High", value:highLimit, borderColor:"#f59e0b", borderDash:[10,4], borderWidth:2 });
-            if (!isNaN(target)) lines.push({ key:"target", label:"Target", value:target, borderColor:"#22c55e", borderDash:[], borderWidth:2.5 });
-            if (!isNaN(lowLimit)) lines.push({ key:"low_limit", label:"Low", value:lowLimit, borderColor:"#ef4444", borderDash:[4,4], borderWidth:2 });
+            const low = parseFloat(lowLimit);
+            const targetValue = parseFloat(target);
+            const high = parseFloat(highLimit);
+            const hasLow = !isNaN(low);
+            const hasTarget = !isNaN(targetValue);
+            const hasHigh = !isNaN(high);
+
+            if (hasHigh) {
+              lines.push({
+                key:"high_limit",
+                label:"Upper Limit",
+                value:high,
+                borderColor:"#f59e0b",
+                borderDash:[8,5],
+                borderWidth:2
+              });
+            }
+
+            if (hasTarget) {
+              lines.push({
+                key:"target",
+                label:"Target",
+                value:targetValue,
+                borderColor:"#22c55e",
+                borderDash:[8,5],
+                borderWidth:2
+              });
+            }
+
+            if (hasLow) {
+              lines.push({
+                key:"low_limit",
+                label:"Lower Limit",
+                value:low,
+                borderColor:"#ef4444",
+                borderDash:[8,5],
+                borderWidth:2
+              });
+            }
+
             return lines;
+          }
+
+          function normalizePointDirection(direction) {
+            const normalizedDirection = String(direction || "").trim().toLowerCase();
+            return normalizedDirection === "down" ? "down" : "up";
           }
 
           function getPointColor(value, lowLimit, highLimit, direction) {
             const val = parseFloat(value);
-            const rawLow = parseFloat(lowLimit), rawHigh = parseFloat(highLimit);
-            const hasLow = !isNaN(rawLow), hasHigh = !isNaN(rawHigh);
-            const lower = hasLow && hasHigh ? Math.min(rawLow,rawHigh) : hasLow ? rawLow : hasHigh ? rawHigh : null;
-            const upper = hasLow && hasHigh ? Math.max(rawLow,rawHigh) : hasHigh ? rawHigh : hasLow ? rawLow : null;
-            const dir = String(direction||"up").toLowerCase() === "down" ? "down" : "up";
-            if (isNaN(val)) return "#6b7280";
-            if (dir === "down") return (upper !== null && val > upper) ? "#ef4444" : "#22c55e";
-            return (lower !== null && val < lower) ? "#ef4444" : "#22c55e";
+            const rawLow = parseFloat(lowLimit);
+            const rawHigh = parseFloat(highLimit);
+            const resolvedDirection = normalizePointDirection(direction);
+            const hasLow = !isNaN(rawLow);
+            const hasHigh = !isNaN(rawHigh);
+            const lower = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : null;
+            const upper = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : null;
+
+            if (isNaN(val)) return "#94a3b8";
+            if (resolvedDirection === "down") {
+              return upper !== null && val > upper ? "#e34b24" : "#b7dc58";
+            }
+            return lower !== null && val < lower ? "#e34b24" : "#b7dc58";
+          }
+
+          function getPointBorderColor(value, lowLimit, highLimit, direction) {
+            const fill = getPointColor(value, lowLimit, highLimit, direction);
+            if (fill === "#e34b24") return "#ba3415";
+            if (fill === "#b7dc58") return "#86a93a";
+            return "#64748b";
           }
 
           function computeBounds(values, lowLimit, target, highLimit) {
@@ -10375,19 +27685,23 @@ async function sendAssistantPrompt(message) {
             const lowLimit = parseFloat(card.dataset.lowLimit);
             const highLimit = parseFloat(card.dataset.highLimit);
             const target = parseFloat(card.dataset.target);
-            const dir = card.dataset.goodDirection || "up";
+            const goodDirection = card.dataset.goodDirection || "up";
             let labels = [], values = [];
             try { labels = JSON.parse(card.dataset.historyLabels || "[]"); values = JSON.parse(card.dataset.historyValues || "[]"); } catch(e){}
-            const colors = values.map(v => getPointColor(v, lowLimit, highLimit, dir));
+            const colors = values.map(v => getPointColor(v, lowLimit, highLimit, goodDirection));
+            const borderColors = values.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection));
             const bounds = computeBounds(values, lowLimit, target, highLimit);
             kpiCharts[kvId] = new Chart(canvas.getContext("2d"), {
               type:"bar",
-              data:{ labels, datasets:[{ label:"Value", data:values, backgroundColor:colors, borderRadius:6, borderSkipped:false, barThickness:30 }] },
+              data:{ labels, datasets:[{ label:"Value", data:values, backgroundColor:colors, borderColor:borderColors, borderWidth:1.5, borderRadius:6, borderSkipped:false, barThickness:30 }] },
               options:{
                 responsive:true, maintainAspectRatio:false, animation:false,
                 layout:{ padding:{ right:12 } },
-                plugins:{ legend:{ display:false }, kpiThresholdLines:{ lines: getThresholdLines(lowLimit,target,highLimit) } },
-                scales:{ x:{ grid:{ display:false }, ticks:{ callback:function(value){ const rawLabel = this.getLabelForValue(value); return formatWeekLabelClient(rawLabel); } } }, y:{ min:bounds.min, max:bounds.max } }
+                plugins:{
+                  legend:{ display:false },
+                  kpiThresholdLines:{ lines: getThresholdLines(lowLimit,target,highLimit) }
+                },
+                scales:{ x:{ grid:{ display:false } }, y:{ min:bounds.min, max:bounds.max } }
               },
               plugins:[kpiThresholdLinesPlugin]
             });
@@ -10398,10 +27712,12 @@ async function sendAssistantPrompt(message) {
             if (!card) return;
             const chart = kpiCharts[kvId]; if (!chart) return;
             const lowLimit = parseFloat(card.dataset.lowLimit), highLimit = parseFloat(card.dataset.highLimit), target = parseFloat(card.dataset.target);
-            const dir = card.dataset.goodDirection || "up";
+            const goodDirection = card.dataset.goodDirection || "up";
             const data = chart.data.datasets[0].data;
-            const colors = data.map(v => getPointColor(v, lowLimit, highLimit, dir));
+            const colors = data.map(v => getPointColor(v, lowLimit, highLimit, goodDirection));
+            const borderColors = data.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection));
             chart.data.datasets[0].backgroundColor = colors;
+            chart.data.datasets[0].borderColor = borderColors;
             const bounds = computeBounds(data, lowLimit, target, highLimit);
             chart.options.scales.y.min = bounds.min; chart.options.scales.y.max = bounds.max;
             chart.options.plugins.kpiThresholdLines.lines = getThresholdLines(lowLimit, target, highLimit);
@@ -10418,30 +27734,36 @@ async function sendAssistantPrompt(message) {
   return new Date(year, 0, 1 + (weekNum - 1) * 7);
 }
 
-function getFallbackCurrentWeekLabel(card, labels) {
-  const storedWeekLabel = String(card?.dataset?.currentWeekLabel || "").trim();
-  if (storedWeekLabel) return storedWeekLabel;
+function weekToMonthLabelClient(weekStr) {
+  const d = weekLabelToDateClient(weekStr);
+  if (!d || isNaN(d.getTime())) return "";
+  return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+}
+
+function getFallbackCurrentMonthLabel(card, labels) {
+  const storedMonthLabel = String(card?.dataset?.currentMonthLabel || "").trim();
+  if (storedMonthLabel) return storedMonthLabel;
 
   const weekFromCard = String(card?.dataset?.currentWeek || "").trim();
-  if (weekFromCard) return weekFromCard;
+  const monthFromCardWeek = weekToMonthLabelClient(weekFromCard);
+  if (monthFromCardWeek) return monthFromCardWeek;
 
   const pageWeek = new URLSearchParams(window.location.search).get("week") || "";
-  if (pageWeek) return pageWeek;
+  const monthFromPageWeek = weekToMonthLabelClient(pageWeek);
+  if (monthFromPageWeek) return monthFromPageWeek;
+
+  const browserMonthLabel = new Date().toLocaleString("en-US", { month: "short", year: "numeric" });
+  if (Array.isArray(labels) && labels.includes(browserMonthLabel)) return browserMonthLabel;
 
   if (Array.isArray(labels) && labels.length) {
     return labels[labels.length - 1];
   }
 
-  return "";
-}
-
-function formatWeekLabelClient(weekStr) {
-  const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
-  return m ? "Week " + parseInt(m[2], 10) : String(weekStr || "");
+  return browserMonthLabel;
 }
 
 
-          function updateCurrentWeekBarFromInput(kvId, rawValue) {
+          function updateCurrentMonthBarFromInput(kvId, rawValue) {
   const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
   const chart = kpiCharts[kvId];
   if (!card || !chart) return;
@@ -10459,10 +27781,10 @@ function formatWeekLabelClient(weekStr) {
     values = [];
   }
 
-  const currentWeekLabel = getFallbackCurrentWeekLabel(card, labels);
-  if (!currentWeekLabel) return;
+  const currentMonthLabel = getFallbackCurrentMonthLabel(card, labels);
+  if (!currentMonthLabel) return;
 
-  const existingIndex = labels.indexOf(currentWeekLabel);
+  const existingIndex = labels.indexOf(currentMonthLabel);
 
   if (isNaN(value)) {
     if (existingIndex >= 0) {
@@ -10472,19 +27794,10 @@ function formatWeekLabelClient(weekStr) {
     if (existingIndex >= 0) {
       values[existingIndex] = value;
     } else {
-      labels.push(currentWeekLabel);
+      labels.push(currentMonthLabel);
       values.push(value);
     }
   }
-
-  const normalized = labels.map(function(label, index) {
-    return { label: label, value: values[index] };
-  }).sort(function(a, b) {
-    return weekLabelToDateClient(a.label) - weekLabelToDateClient(b.label);
-  }).slice(-${KPI_SUBMISSION_CHART_WEEK_WINDOW});
-
-  labels = normalized.map(function(item) { return item.label; });
-  values = normalized.map(function(item) { return item.value; });
 
   card.dataset.historyLabels = JSON.stringify(labels);
   card.dataset.historyValues = JSON.stringify(values);
@@ -10501,6 +27814,7 @@ function formatWeekLabelClient(weekStr) {
             expandedChart.data.datasets = src.data.datasets.map((d,i) => {
               const c = Object.assign({}, d);
               c.data = d.data.slice(); c.backgroundColor = Array.isArray(d.backgroundColor) ? d.backgroundColor.slice() : d.backgroundColor;
+              c.borderColor = Array.isArray(d.borderColor) ? d.borderColor.slice() : d.borderColor;
               if (i===0){ c.barThickness=56; c.maxBarThickness=72; c.borderRadius=10; }
               return c;
             });
@@ -10530,7 +27844,7 @@ function formatWeekLabelClient(weekStr) {
             if (!kpiCharts[kvId]) buildKpiChart(kvId);
             const src = kpiCharts[kvId]; if (!src) return;
             if (chartModalTitle) chartModalTitle.textContent = getTrimmedText(card.querySelector(".kpi-title")) || "KPI Trend";
-            if (chartModalSubtitle) chartModalSubtitle.textContent = getTrimmedText(card.querySelector(".kpi-subtitle")) || "Weekly KPI performance overview";
+            if (chartModalSubtitle) chartModalSubtitle.textContent = getTrimmedText(card.querySelector(".kpi-subtitle")) || "Monthly KPI performance overview";
             if (expandedChart) { expandedChart.destroy(); expandedChart = null; }
             expandedChartKpiValuesId = kvId;
             chartModal.classList.add("active"); chartModal.setAttribute("aria-hidden","false");
@@ -10549,8 +27863,11 @@ function formatWeekLabelClient(weekStr) {
                 options:{
                   responsive:true, maintainAspectRatio:false, animation:false,
                   interaction:{ mode:"index", intersect:false }, layout:{ padding:{right:12} },
-                  plugins:{ legend:{display:false}, kpiThresholdLines:{ lines:(src.options.plugins.kpiThresholdLines.lines||[]).map(l=>({...l,borderDash:(l.borderDash||[]).slice()})) } },
-                  scales:{ x:{grid:{display:false},ticks:{color:"#475569",font:{size:14,weight:"600"},callback:function(value){ const rawLabel = this.getLabelForValue(value); return formatWeekLabelClient(rawLabel); }}}, y:{min:src.options.scales.y.min,max:src.options.scales.y.max,ticks:{color:"#64748b",font:{size:13}},grid:{color:"#e2e8f0"}} }
+                  plugins:{
+                    legend:{display:false},
+                    kpiThresholdLines:{ lines:(src.options.plugins.kpiThresholdLines.lines||[]).map(l=>({...l,borderDash:(l.borderDash||[]).slice()})) }
+                  },
+                  scales:{ x:{grid:{display:false},ticks:{color:"#475569",font:{size:14,weight:"600"}}}, y:{min:src.options.scales.y.min,max:src.options.scales.y.max,ticks:{color:"#64748b",font:{size:13}},grid:{color:"#e2e8f0"}} }
                 },
                 plugins:[expandedChartValueLabelsPlugin, kpiThresholdLinesPlugin]
               });
@@ -10560,14 +27877,144 @@ function formatWeekLabelClient(weekStr) {
           /* â”€â”€ History modal helpers â”€â”€ */
           function escapeHistoryHtml(v) { return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
           function formatHistoryText(v) { return escapeHistoryHtml(v).split("\\n").join("<br>"); }
+          function encodeModalPayload(v) { try { return encodeURIComponent(JSON.stringify(v ?? null)); } catch(e){ return ""; } }
           function decodeModalPayload(v, fb) { try { const d=decodeURIComponent(v||""); if(!d) return fb; const p=JSON.parse(d); return (p===null||p===undefined)?fb:p; } catch(e){ return fb; } }
-          function formatHistoryWeek(w) { return escapeHistoryHtml(formatWeekLabelClient(w)); }
+          function formatHistoryWeek(w) { const m=String(w||"").match(/^(\\d{4})-Week(\\d{1,2})$/); return m?"Week "+parseInt(m[2],10):escapeHistoryHtml(w||""); }
           function getHistoryStatusClass(s) { return "status-"+String(s||"Open").trim().toLowerCase().replace(/\s+/g,"-"); }
+          function getHistoryDueDateFilterValue(rawDueDate) {
+            const text = String(rawDueDate || "").trim();
+            if (!text) return "";
+
+            const isoMatch = text.match(/^(\d{4}-\d{2}-\d{2})/);
+            if (isoMatch) {
+              return isoMatch[1];
+            }
+
+            const parsedDate = new Date(text);
+            if (isNaN(parsedDate.getTime())) {
+              return "";
+            }
+
+            const year = String(parsedDate.getFullYear());
+            const month = String(parsedDate.getMonth() + 1).padStart(2, "0");
+            const day = String(parsedDate.getDate()).padStart(2, "0");
+            return year + "-" + month + "-" + day;
+          }
+
+          function applyHistoryDueDateFilters(panelEl) {
+            if (!panelEl) return;
+
+            const fromInput = panelEl.querySelector('[data-history-filter="due-from"]');
+            const toInput = panelEl.querySelector('[data-history-filter="due-to"]');
+            const clearButton = panelEl.querySelector('[data-history-filter="clear"]');
+            const tableWrap = panelEl.querySelector("[data-history-table-wrap]");
+            const emptyState = panelEl.querySelector("[data-history-filter-empty]");
+            const rows = panelEl.querySelectorAll("tbody tr");
+
+            const fromValue = String(fromInput?.value || "").trim();
+            const toValue = String(toInput?.value || "").trim();
+            let visibleCount = 0;
+
+            rows.forEach(function(row) {
+              const dueDateValue = String(row.dataset.historyDueDate || "").trim();
+              let isVisible = true;
+
+              if (fromValue) {
+                isVisible = Boolean(dueDateValue) && dueDateValue >= fromValue;
+              }
+
+              if (isVisible && toValue) {
+                isVisible = Boolean(dueDateValue) && dueDateValue <= toValue;
+              }
+
+              row.hidden = !isVisible;
+
+              if (isVisible) {
+                visibleCount += 1;
+                const numberCell = row.querySelector(".history-row-number");
+                if (numberCell) {
+                  numberCell.textContent = String(visibleCount);
+                }
+              }
+            });
+
+            if (tableWrap) {
+              tableWrap.hidden = visibleCount === 0;
+            }
+
+            if (emptyState) {
+              emptyState.hidden = visibleCount !== 0;
+            }
+
+            if (clearButton) {
+              clearButton.disabled = !(fromValue || toValue);
+            }
+          }
+
+          function bindHistoryDueDateFilters() {
+            document.querySelectorAll("[data-history-filter-panel]").forEach(function(panelEl) {
+              const fromInput = panelEl.querySelector('[data-history-filter="due-from"]');
+              const toInput = panelEl.querySelector('[data-history-filter="due-to"]');
+              const clearButton = panelEl.querySelector('[data-history-filter="clear"]');
+
+              if (!fromInput || !toInput) {
+                return;
+              }
+
+              const syncInputsAndApply = function(source) {
+                if (fromInput.value && toInput.value && fromInput.value > toInput.value) {
+                  if (source === "from") {
+                    toInput.value = fromInput.value;
+                  } else if (source === "to") {
+                    fromInput.value = toInput.value;
+                  }
+                }
+
+                if (toInput.value) {
+                  fromInput.max = toInput.value;
+                } else {
+                  fromInput.removeAttribute("max");
+                }
+
+                if (fromInput.value) {
+                  toInput.min = fromInput.value;
+                } else {
+                  toInput.removeAttribute("min");
+                }
+
+                applyHistoryDueDateFilters(panelEl);
+              };
+
+              fromInput.oninput = function() {
+                syncInputsAndApply("from");
+              };
+
+              toInput.oninput = function() {
+                syncInputsAndApply("to");
+              };
+
+              if (clearButton) {
+                clearButton.onclick = function() {
+                  fromInput.value = "";
+                  toInput.value = "";
+                  syncInputsAndApply();
+                };
+              }
+
+              syncInputsAndApply();
+            });
+          }
 
           function renderHistoryStatusContent(action, options) {
             const canonicalStatus = getCanonicalCorrectiveActionStatus(action.status);
+            const allowEditableStatus = Boolean(
+              options &&
+              options.editableStatus &&
+              action &&
+              action._editableStatus
+            );
 
-            if (!options || !options.editableStatus) {
+            if (!allowEditableStatus) {
               return canonicalStatus
                 ? '<span class="history-chip ' + getHistoryStatusClass(canonicalStatus) + '">' + escapeHistoryHtml(canonicalStatus) + '</span>'
                 : '&mdash;';
@@ -10603,8 +28050,10 @@ function formatWeekLabelClient(weekStr) {
 
             const kvId = String(selectEl.dataset.kpiValuesId || "").trim();
             const actionIndex = parseInt(selectEl.dataset.actionIndex || "", 10);
+            const hasActionIndex = !Number.isNaN(actionIndex);
+            const actionId = String(selectEl.dataset.actionId || "").trim();
 
-            if (!kvId || Number.isNaN(actionIndex)) {
+            if (!kvId || (!hasActionIndex && !actionId)) {
               applyHistoryStatusSelectState(selectEl, selectEl.dataset.previousStatus || "Open");
               return;
             }
@@ -10612,16 +28061,37 @@ function formatWeekLabelClient(weekStr) {
             const previousStatus = getCanonicalCorrectiveActionStatus(selectEl.dataset.previousStatus || "Open");
             const nextStatus = getCanonicalCorrectiveActionStatus(selectEl.value);
 
-            applyHistoryStatusSelectState(selectEl, nextStatus);
-            updateCorrectiveActionStatusInStore(kvId, actionIndex, nextStatus);
+            if (
+              isClosedCorrectiveActionStatus(nextStatus) &&
+              !isClosedCorrectiveActionStatus(previousStatus)
+            ) {
+              const confirmed = await confirmCloseCorrectiveAction({ triggerEl: selectEl });
+              if (!confirmed) {
+                applyHistoryStatusSelectState(selectEl, previousStatus);
+                return;
+              }
+            }
 
-            const actionId = String(selectEl.dataset.actionId || "").trim();
             if (!actionId) {
+              if (isClosedCorrectiveActionStatus(nextStatus)) {
+                removeCorrectiveActionFromStore(kvId, actionIndex);
+                selectEl.dataset.previousStatus = nextStatus;
+                openHistoryModal(kvId);
+                return;
+              }
+
+              applyHistoryStatusSelectState(selectEl, nextStatus);
+              updateCorrectiveActionStatusInStore(kvId, actionIndex, nextStatus);
               selectEl.dataset.previousStatus = nextStatus;
               return;
             }
 
             selectEl.disabled = true;
+            applyHistoryStatusSelectState(selectEl, nextStatus);
+
+            if (!isClosedCorrectiveActionStatus(nextStatus) && hasActionIndex) {
+              updateCorrectiveActionStatusInStore(kvId, actionIndex, nextStatus);
+            }
 
             try {
               const response = await fetch('/api/corrective-actions/' + encodeURIComponent(actionId) + '/status', {
@@ -10636,11 +28106,24 @@ function formatWeekLabelClient(weekStr) {
               }
 
               const savedStatus = getCanonicalCorrectiveActionStatus(payload.status || nextStatus);
-              updateCorrectiveActionStatusInStore(kvId, actionIndex, savedStatus);
-              applyHistoryStatusSelectState(selectEl, savedStatus);
+              syncHistoryActionStatusInCard(kvId, actionId, savedStatus);
               selectEl.dataset.previousStatus = savedStatus;
+
+              if (isClosedCorrectiveActionStatus(savedStatus)) {
+                if (hasActionIndex) {
+                  removeCorrectiveActionFromStore(kvId, actionIndex);
+                }
+                openHistoryModal(kvId);
+              } else {
+                if (hasActionIndex) {
+                  updateCorrectiveActionStatusInStore(kvId, actionIndex, savedStatus);
+                }
+                applyHistoryStatusSelectState(selectEl, savedStatus);
+              }
             } catch (error) {
-              updateCorrectiveActionStatusInStore(kvId, actionIndex, previousStatus);
+              if (hasActionIndex) {
+                updateCorrectiveActionStatusInStore(kvId, actionIndex, previousStatus);
+              }
               applyHistoryStatusSelectState(selectEl, previousStatus);
               alert(error.message || 'Could not update corrective action status.');
             } finally {
@@ -10666,15 +28149,46 @@ function formatWeekLabelClient(weekStr) {
             }
           }
 
+          function getHistoryPeriodLabel(action) {
+            if (!action) return "Current month";
+
+            const monthLabel = String(action.month_label || "").trim();
+            if (monthLabel) return monthLabel;
+
+            const weekLabel = String(action.week || "").trim();
+            if (!weekLabel) return "Current month";
+
+            return weekToMonthLabelClient(weekLabel) || weekLabel;
+          }
+
           function hasCorrectiveActionContent(action) {
             if (!action) return false;
             return Boolean(
               String(action.root_cause || "").trim() ||
               String(action.implemented_solution || "").trim() ||
               String(action.due_date || "").trim() ||
-              String(action.responsible || "").trim() ||
               String(action.id || action.corrective_action_id || "").trim()
             );
+          }
+
+          function shouldShowCurrentCorrectiveAction(action) {
+            return hasCorrectiveActionContent(action) && !isClosedCorrectiveActionStatus(action.status);
+          }
+
+          function removeCorrectiveActionFromStore(kvId, actionIndex) {
+            const actions = getCaModalActions(kvId);
+            if (!Array.isArray(actions) || actionIndex < 0 || actionIndex >= actions.length) {
+              return null;
+            }
+
+            const removedAction = actions.splice(actionIndex, 1)[0] || null;
+            syncDomFromStore(kvId);
+
+            if (caModalKvId === kvId) {
+              renderCaModalTable(kvId);
+            }
+
+            return removedAction;
           }
 
           function renderHistoryActionsTable(actions, emptyMessage, options) {
@@ -10682,35 +28196,54 @@ function formatWeekLabelClient(weekStr) {
               return '<div class="history-empty">' + escapeHistoryHtml(emptyMessage) + '</div>';
             }
 
+            const dueDateFrom = escapeHistoryHtml(options?.dueDateFrom || "");
+            const dueDateTo = escapeHistoryHtml(options?.dueDateTo || "");
+
             return '' +
-              '<div class="history-table-wrap">' +
-                '<table class="history-table">' +
+              '<div data-history-filter-panel>' +
+                '<div class="history-filter-bar">' +
+                  '<div class="history-filter-group">' +
+                    '<label class="history-filter-label" for="historyDueFrom">Due Date From</label>' +
+                    '<input id="historyDueFrom" class="history-filter-input" data-history-filter="due-from" type="date" value="' + dueDateFrom + '">' +
+                  '</div>' +
+                  '<div class="history-filter-group">' +
+                    '<label class="history-filter-label" for="historyDueTo">Due Date To</label>' +
+                    '<input id="historyDueTo" class="history-filter-input" data-history-filter="due-to" type="date" value="' + dueDateTo + '">' +
+                  '</div>' +
+                  '<button type="button" class="history-filter-clear" data-history-filter="clear">Clear Filter</button>' +
+                '</div>' +
+                '<div class="history-empty" data-history-filter-empty hidden>No corrective actions match the selected due date range.</div>' +
+                '<div class="history-table-wrap" data-history-table-wrap>' +
+                  '<table class="history-table">' +
                   '<thead>' +
                     '<tr>' +
                       '<th>#</th>' +
-                      '<th>Week</th>' +
+                      '<th>Month</th>' +
                       '<th>Root Cause</th>' +
                       '<th>Implemented Solution</th>' +
                       '<th>Due Date</th>' +
                       '<th>Responsible</th>' +
                       '<th>Status</th>' +
-                    '</tr>' +
-                  '</thead>' +
-                  '<tbody>' +
-                    actions.map(function(action, index) {
-                      return '' +
-                        '<tr>' +
-                          '<td>' + (index + 1) + '</td>' +
-                          '<td>' + formatHistoryWeek(action.week || action.month_label || "Current") + '</td>' +
-                          '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
-                          '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
-                          '<td>' + escapeHistoryHtml(action.due_date || "") + '</td>' +
-                          '<td>' + escapeHistoryHtml(action.responsible || "") + '</td>' +
-                          '<td>' + renderHistoryStatusContent(action, options) + '</td>' +
-                        '</tr>';
-                    }).join("") +
-                  '</tbody>' +
-                '</table>' +
+                      '</tr>' +
+                    '</thead>' +
+                    '<tbody>' +
+                      actions.map(function(action, index) {
+                        const filterDueDate = getHistoryDueDateFilterValue(action.due_date);
+                        const dueDateDisplay = filterDueDate || String(action.due_date || "").trim();
+                        return '' +
+                          '<tr data-history-due-date="' + escapeHistoryHtml(filterDueDate) + '">' +
+                            '<td class="history-row-number">' + (index + 1) + '</td>' +
+                            '<td>' + escapeHistoryHtml(getHistoryPeriodLabel(action)) + '</td>' +
+                            '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
+                            '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
+                            '<td>' + escapeHistoryHtml(dueDateDisplay) + '</td>' +
+                            '<td>' + escapeHistoryHtml(action.responsible || "") + '</td>' +
+                            '<td>' + renderHistoryStatusContent(action, options) + '</td>' +
+                          '</tr>';
+                      }).join("") +
+                    '</tbody>' +
+                  '</table>' +
+                '</div>' +
               '</div>';
           }
 
@@ -10723,69 +28256,78 @@ function formatWeekLabelClient(weekStr) {
 
   if (!card || !historyModal || !historyModalContent) return;
 
+  const activeModalKvId = String(historyModal.dataset.kpiValuesId || "").trim();
+  const dueDateFromInput = activeModalKvId === String(kvId)
+    ? historyModalContent.querySelector('[data-history-filter="due-from"]')
+    : null;
+  const dueDateToInput = activeModalKvId === String(kvId)
+    ? historyModalContent.querySelector('[data-history-filter="due-to"]')
+    : null;
+  const dueDateFrom = String(dueDateFromInput?.value || "").trim();
+  const dueDateTo = String(dueDateToInput?.value || "").trim();
+
   const titleText = getTrimmedText(card.querySelector(".kpi-title")) || "Corrective Actions";
   const subtitleText = getTrimmedText(card.querySelector(".kpi-subtitle"));
-  const currentWeekLabel = card.dataset.currentWeekLabel || card.dataset.currentWeek || "Current week";
-  const prevLabel = card.dataset.prevWeekLabel || "";
+  const currentMonthLabel = card.dataset.currentMonthLabel || "Current month";
   const liveActions = getCaModalActions(kvId)
     .map(function(action, actionIndex) {
-      return Object.assign({ week: currentWeekLabel, status: action.status || "Open", _storeIndex: actionIndex }, action);
+      return Object.assign({
+        week: currentMonthLabel,
+        month_label: currentMonthLabel,
+        status: action.status || "Open",
+        _editableStatus: true,
+        _storeIndex: actionIndex
+      }, action);
     })
-    .filter(hasCorrectiveActionContent);
-  const prevActions = decodeModalPayload(card.dataset.prevWeekActions, []);
-  const prevComments = decodeModalPayload(card.dataset.prevWeekComments, []);
-  const comments = Array.isArray(prevComments) ? prevComments : [];
-  const previousActions = (Array.isArray(prevActions) ? prevActions : []).filter(hasCorrectiveActionContent);
+    .filter(shouldShowCurrentCorrectiveAction);
+  const historyActions = decodeModalPayload(card.dataset.historyActions, []);
+  const historyComments = decodeModalPayload(card.dataset.historyComments, []);
+  const liveActionIds = new Set(
+    liveActions
+      .map(function(action) {
+        return String((action && (action.id || action.corrective_action_id)) || "").trim();
+      })
+      .filter(Boolean)
+  );
+  const combinedActions = liveActions.concat(
+    (Array.isArray(historyActions) ? historyActions : [])
+      .filter(hasCorrectiveActionContent)
+      .filter(function(action) {
+        return !isClosedCorrectiveActionStatus(action.status);
+      })
+      .filter(function(action) {
+        const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
+        return !actionId || !liveActionIds.has(actionId);
+      })
+      .map(function(action) {
+        const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
+        return Object.assign({ _editableStatus: Boolean(actionId) }, action);
+      })
+  );
   const sections = [];
 
   if (historyModalTitle) historyModalTitle.textContent = titleText;
   if (historyModalSubtitle) {
-    const displayCurrentWeekLabel = formatWeekLabelClient(currentWeekLabel);
     historyModalSubtitle.textContent = subtitleText
-      ? displayCurrentWeekLabel + ' • ' + subtitleText
-      : displayCurrentWeekLabel;
+      ? currentMonthLabel + ' • ' + subtitleText
+      : currentMonthLabel;
   }
 
   sections.push(
     '<div class="history-section">' +
-      '<h4 class="history-section-title">Current Corrective Actions</h4>' +
+      '<h4 class="history-section-title">Corrective Actions</h4>' +
       renderHistoryActionsTable(
-        liveActions,
-        'No corrective actions saved yet for this KPI in the current week.',
-        { editableStatus: true, kvId: kvId }
+        combinedActions,
+        'No corrective actions were found for this KPI.',
+        { editableStatus: true, kvId: kvId, dueDateFrom: dueDateFrom, dueDateTo: dueDateTo }
       ) +
     '</div>'
   );
 
-  if (previousActions.length) {
-    sections.push(
-      '<div class="history-section">' +
-        '<h4 class="history-section-title">Previous Week Corrective Actions</h4>' +
-        renderHistoryActionsTable(previousActions, 'No previous-week corrective actions were found.') +
-      '</div>'
-    );
-  }
-
-  if (comments.length) {
-    const commentsHtml = '<div class="history-comments-list">' + comments.map(c =>
-      '<div class="history-comment-card">' +
-        '<div class="history-comment-label">' +
-          formatHistoryWeek(c.week || prevLabel || "") +
-        '</div>' +
-        '<div class="history-comment-text">' + formatHistoryText(c.text || "") + '</div>' +
-      '</div>'
-    ).join("") + '</div>';
-
-    sections.push(
-      '<div class="history-section">' +
-        '<h4 class="history-section-title">Previous Week Comments</h4>' +
-        commentsHtml +
-      '</div>'
-    );
-  }
-
   historyModalContent.innerHTML = sections.join('');
+  historyModal.dataset.kpiValuesId = String(kvId);
   bindHistoryStatusControls();
+  bindHistoryDueDateFilters();
   historyModal.classList.add("active");
   historyModal.setAttribute("aria-hidden", "false");
   document.body.classList.add("chart-modal-open");
@@ -10798,25 +28340,14 @@ function formatWeekLabelClient(weekStr) {
   // Value inputs
   document.querySelectorAll(".value-input").forEach(input => {
     const kvId = input.dataset.kpiValuesId;
-    buildKpiChart(kvId);
-    applyDraftToValueInput(input);
+    setValueInputServerState(input, input.value);
     checkLowLimit(input);
-    updateCurrentWeekBarFromInput(kvId, input.value);
+    buildKpiChart(kvId);
 
     input.addEventListener("input", function() {
-      setKpiFormDraftField(kvId, "value", this.value);
+      syncValueInputDirtyState(this);
       checkLowLimit(this);
-      updateCurrentWeekBarFromInput(kvId, this.value);
-    });
-  });
-
-  document.querySelectorAll(".comment-input").forEach(textarea => {
-    const nameMatch = String(textarea.name || "").match(/^comment_(.+)$/);
-    const kvId = nameMatch ? nameMatch[1] : "";
-    applyDraftToCommentInput(textarea);
-    textarea.addEventListener("input", function() {
-      if (!kvId) return;
-      setKpiFormDraftField(kvId, "comment", this.value);
+      updateCurrentMonthBarFromInput(kvId, this.value);
     });
   });
 
@@ -10874,6 +28405,23 @@ function formatWeekLabelClient(weekStr) {
               historyModal.addEventListener("click", e => { if (e.target===historyModal) closeHistoryModal(); });
             }
 
+            const closeActionConfirmModal = document.getElementById("closeActionConfirmModal");
+            const closeActionConfirmCancel = document.getElementById("closeActionConfirmCancel");
+            const closeActionConfirmConfirm = document.getElementById("closeActionConfirmConfirm");
+            if (closeActionConfirmCancel) {
+              closeActionConfirmCancel.addEventListener("click", () => settleCloseActionConfirm(false));
+            }
+            if (closeActionConfirmConfirm) {
+              closeActionConfirmConfirm.addEventListener("click", () => settleCloseActionConfirm(true));
+            }
+            if (closeActionConfirmModal) {
+              closeActionConfirmModal.addEventListener("click", e => {
+                if (e.target === closeActionConfirmModal) {
+                  settleCloseActionConfirm(false);
+                }
+              });
+            }
+
             // CA Table Modal close
             const caModalClose = document.getElementById("caModalClose");
             const caTableModal = document.getElementById("caTableModal");
@@ -10889,10 +28437,51 @@ function formatWeekLabelClient(weekStr) {
             if (caModalCancelForm) caModalCancelForm.addEventListener("click", caModalCollapseForm);
             const caModalSaveFormBtn = document.getElementById("caModalSaveForm");
             if (caModalSaveFormBtn) caModalSaveFormBtn.addEventListener("click", caModalSaveForm);
+            const caModalResponsibleTrigger = document.getElementById("caModalResponsibleTrigger");
+            const caModalResponsibleOptions = document.getElementById("caModalResponsibleOptions");
+            const caModalBody = document.querySelector("#caTableModal .ca-modal-body");
+            if (caModalResponsibleTrigger) {
+              caModalResponsibleTrigger.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                toggleCaResponsibleDropdown();
+              });
+            }
+            if (caModalResponsibleOptions) {
+              caModalResponsibleOptions.addEventListener("click", (event) => {
+                const optionButton = event.target.closest(".ca-responsible-option");
+                if (!optionButton) return;
+                applyCaResponsibleDropdownValue(optionButton.dataset.value || "");
+              });
+            }
+            if (caModalBody) {
+              caModalBody.addEventListener("scroll", () => {
+                const { menu } = getCaResponsibleDropdownElements();
+                if (menu && !menu.hidden) {
+                  positionCaResponsibleDropdown();
+                }
+              });
+            }
+            window.addEventListener("resize", () => {
+              const { menu } = getCaResponsibleDropdownElements();
+              if (menu && !menu.hidden) {
+                positionCaResponsibleDropdown();
+              }
+            });
+            document.addEventListener("click", (event) => {
+              const { shell, menu } = getCaResponsibleDropdownElements();
+              if (!shell || !menu || menu.hidden) return;
+              if (shell.contains(event.target) || menu.contains(event.target)) return;
+              closeCaResponsibleDropdown();
+            });
+            syncCaResponsibleDropdown();
 
             // Escape key
             document.addEventListener("keydown", e => {
               if (e.key === "Escape") {
+                const { menu } = getCaResponsibleDropdownElements();
+                if (menu && !menu.hidden) { closeCaResponsibleDropdown({ restoreFocus: true }); return; }
+                if (document.getElementById("closeActionConfirmModal").classList.contains("active")) { settleCloseActionConfirm(false); return; }
                 if (document.getElementById("caTableModal").classList.contains("active")) { closeCaTableModal(); return; }
                 if (document.getElementById("chartModal").classList.contains("active")) { closeChartModal(); return; }
                 if (document.getElementById("historyModal").classList.contains("active")) { closeHistoryModal(); return; }
@@ -10952,46 +28541,109 @@ function formatWeekLabelClient(weekStr) {
 // ---------- Dashboard ----------
 app.get("/dashboard", async (req, res) => {
   try {
-    const { responsible_id } = req.query;
+    const responsibleId = normalizeOptionalIntegerInput(req.query?.responsible_id);
+    if (!responsibleId) {
+      return res.status(400).send("Missing responsible_id");
+    }
+    const responsible_id = responsibleId;
 
-    const resResp = await pool.query(
-      `SELECT r.*, p.name AS plant_name, d.name AS department_name
-       FROM public."Responsible" r
-       JOIN public."Plant" p ON r.plant_id = p.plant_id
-       JOIN public."Department" d ON r.department_id = d.department_id
-       WHERE r.responsible_id = $1`,
-      [responsible_id]
+    const responsibleContext = await loadFormResponsibleContext(responsible_id);
+    const responsiblePeopleId = normalizeOptionalIntegerInput(
+      responsibleContext?.people_id ?? responsible_id
     );
 
-    const responsible = resResp.rows[0];
-    if (!responsible) throw new Error("Responsible not found");
+    if (!responsiblePeopleId) {
+      throw new Error("Responsible not found");
+    }
+
+    const responsible = {
+      name: responsibleContext?.name || `Person #${responsiblePeopleId}`,
+      plant_name: responsibleContext?.plant_name || "Allocated scope",
+      department_name: responsibleContext?.department_name || ""
+    };
 
     const kpiRes = await pool.query(
-      `SELECT DISTINCT ON (h.week, h.kpi_id)
-              h.hist_id,
-              h.kpi_values_id,
-              h.new_value as value,
-              h.week,
-              h.kpi_id,
-              h.updated_at,
-              ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES}
-       FROM public.kpi_values_hist26 h
-       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-       LEFT JOIN public.kpi_values kv
-         ON kv.kpi_values_id = h.kpi_values_id
-       LEFT JOIN public.responsible_kpis rk
-         ON rk.responsible_kpi_id = kv.responsible_kpi_id
-       WHERE h.responsible_id = $1
-       ORDER BY h.week DESC, h.kpi_id ASC, h.updated_at DESC`,
-      [responsible_id]
+      `
+      WITH ranked_results AS (
+        SELECT
+          kr.kpi_result_id,
+          kr.kpi_target_allocation_id AS kpi_values_id,
+          kr.kpi_target_allocation_id,
+          kr.kpi_id,
+          kr.result_date,
+          kr.week,
+          kr.period_label,
+          kr.raw_value AS value,
+          kr.lower_limit AS result_low_limit,
+          kr.upper_limit AS result_high_limit,
+          kr.target_value AS result_target_value,
+          kr.unit AS result_unit,
+          kr.recorded_at AS updated_at,
+          DATE_TRUNC('month', COALESCE(kr.result_date::timestamp, kr.recorded_at)) AS month_bucket,
+          ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('month', COALESCE(kr.result_date::timestamp, kr.recorded_at)), kr.kpi_target_allocation_id
+            ORDER BY COALESCE(kr.recorded_at, kr.result_date::timestamp) DESC, kr.kpi_result_id DESC
+          ) AS rn
+        FROM public.kpi_result kr
+        WHERE kr.recorded_by_people_id = $1
+      )
+      SELECT
+        rr.kpi_result_id AS hist_id,
+        rr.kpi_values_id,
+        rr.kpi_target_allocation_id,
+        rr.week,
+        rr.period_label,
+        rr.result_date,
+        rr.kpi_id,
+        rr.value,
+        rr.updated_at,
+        COALESCE(k.kpi_name, k.kpi_sub_title, 'KPI') AS subject,
+        COALESCE(subject_link.subject_name, k.kpi_sub_title, '') AS indicator_sub_title,
+        COALESCE(rr.result_unit, kta.target_unit, k.unit) AS unit,
+        COALESCE(rr.result_target_value, kta.target_value, k.target_value) AS target,
+        k.min_value AS min,
+        k.max_value AS max,
+        k.tolerance_type,
+        k.up_tolerance,
+        k.low_tolerance,
+        k.frequency,
+        k.kpi_explanation AS definition,
+        k.calculation_on,
+        k.target_auto_adjustment,
+        COALESCE(rr.result_high_limit, k.high_limit) AS high_limit,
+        COALESCE(rr.result_low_limit, k.low_limit) AS low_limit,
+        k.target_direction
+      FROM ranked_results rr
+      JOIN public.kpi k
+        ON k.kpi_id = rr.kpi_id
+      LEFT JOIN public.kpi_target_allocation kta
+        ON kta.kpi_target_allocation_id = rr.kpi_target_allocation_id
+      LEFT JOIN LATERAL (
+        SELECT s.subject_name
+        FROM public.subject_kpi sk
+        JOIN public.subject s
+          ON s.subject_id = sk.subject_id
+        WHERE sk.kpi_id = rr.kpi_id
+        ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+        LIMIT 1
+      ) subject_link ON TRUE
+      WHERE rr.rn = 1
+      ORDER BY
+        rr.month_bucket DESC,
+        COALESCE(k.kpi_name, k.kpi_sub_title, 'KPI') ASC,
+        rr.kpi_result_id DESC
+      `,
+      [responsiblePeopleId]
     );
 
     const monthMap = new Map();
 
     kpiRes.rows.forEach((kpi) => {
-      if (!kpi.updated_at) return;
+      const sourceDate = kpi.result_date || kpi.updated_at;
+      if (!sourceDate) return;
 
-      const date = new Date(kpi.updated_at);
+      const date = new Date(sourceDate);
+      if (isNaN(date.getTime())) return;
       const monthKey = `${date.getFullYear()}-${date.getMonth()}`;
 
       if (!monthMap.has(monthKey)) monthMap.set(monthKey, []);
@@ -11008,6 +28660,7 @@ app.get("/dashboard", async (req, res) => {
       const numericValue = normalizeMetricNumberByUnit(value, unit);
       if (numericValue === null) return "Not filled";
       const formatted = numericValue.toLocaleString("en-US", {
+        useGrouping: false,
         minimumFractionDigits: 0,
         maximumFractionDigits: isPercentageUnit(unit) ? 1 : 2
       });
@@ -11543,7 +29196,7 @@ app.get("/dashboard", async (req, res) => {
         </div>
         <div class="identity-card">
           <div class="identity-label">Group</div>
-          <div class="identity-value">${escapeHtml(responsible.plant_name || "-")}</div>
+          <div class="identity-value">${escapeHtml(responsible.plant_name || "")}</div>
         </div>
         <div class="identity-card">
           <div class="identity-label">Department</div>
@@ -11648,7 +29301,7 @@ app.get("/dashboard", async (req, res) => {
             <div class="kpi-card">
               <div class="kpi-top">
                 <div>
-                  <h3 class="kpi-title">${escapeHtml(getKpiDisplayTitle(kpi))}</h3>
+                  <h3 class="kpi-title">${escapeHtml(kpi.subject || "-")}</h3>
                   <p class="kpi-subtitle">${escapeHtml(kpi.indicator_sub_title || "No KPI subtitle provided.")}</p>
                 </div>
                 <div class="status-chip ${statusClass}">
@@ -11752,15 +29405,8 @@ app.get("/dashboard-history", async (req, res) => {
     const { responsible_id } = req.query;
     const histRes = await pool.query(
       `SELECT h.hist_id, h.kpi_id, h.week, h.old_value, h.new_value, h.updated_at,
-              COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-              COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-              COALESCE(rk.unit, k.unit) AS unit
-       FROM public.kpi_values_hist26 h
-       JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-       LEFT JOIN public.kpi_values kv
-         ON kv.kpi_values_id = h.kpi_values_id
-       LEFT JOIN public.responsible_kpis rk
-         ON rk.responsible_kpi_id = kv.responsible_kpi_id
+              k.subject, k.indicator_sub_title, k.unit
+       FROM public.kpi_values_hist26 h JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
        WHERE h.responsible_id = $1 ORDER BY h.updated_at DESC`, [responsible_id]);
     const rows = histRes.rows;
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI History</title>
@@ -11773,7 +29419,7 @@ app.get("/dashboard-history", async (req, res) => {
       <table><thead><tr><th>Indicator</th><th>Sub Title</th><th>Week</th>
         <th>Old Value</th><th>New Value</th><th>Unit</th><th>Updated At</th></tr></thead>
       <tbody>${rows.map(r => `<tr>
-        <td>${r.indicator_title || '-'}</td><td>${r.indicator_sub_title || '-'}</td><td>${r.week}</td>
+        <td>${r.subject}</td><td>${r.indicator_sub_title || '-'}</td><td>${r.week}</td>
         <td>${r.old_value ?? 'â€”'}</td><td>${r.new_value ?? 'â€”'}</td>
         <td>${r.unit || ''}</td><td>${new Date(r.updated_at).toLocaleString()}</td>
       </tr>`).join('')}</tbody></table></div></body></html>`);
@@ -11782,6 +29428,7 @@ app.get("/dashboard-history", async (req, res) => {
   }
 });
 
+// ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week) => {
   try {
     const { responsible } = await getResponsibleWithKPIs(responsibleId, week);
@@ -11815,7 +29462,7 @@ const generateVerticalBarChart = (chartData) => {
     stats, target, low_limit, high_limit,
     direction,
     tolerance_type, up_tolerance, low_tolerance,
-    frequency, comments = [],
+    frequency, definition, comments = [],
     correctiveActions = []
   } = chartData;
 
@@ -12107,12 +29754,6 @@ const generateVerticalBarChart = (chartData) => {
               <div style="font-size:12px;color:#374151;">${ca.implemented_solution}</div>
             </div>
           ` : ''}
-          ${ca.evidence ? `
-            <div>
-              <div style="font-size:11px;font-weight:700;color:#2563eb;">Evidence</div>
-              <div style="font-size:12px;color:#374151;">${ca.evidence}</div>
-            </div>
-          ` : ''}
         </div>
       `).join('')}
     </div>
@@ -12221,7 +29862,6 @@ const generateVerticalBarChart = (chartData) => {
               ${preChartLimitsHtml}
               <table border="0" cellpadding="0" cellspacing="0" width="100%">
                 <tr>
-  
                   <td valign="top" style="padding-left:5px;">
                     <table border="0" cellpadding="0" cellspacing="0" width="100%" style="text-align:center;">
                       <tr>
@@ -12230,11 +29870,11 @@ const generateVerticalBarChart = (chartData) => {
                                width="500"
                                height="${chartHeightPx}"
                                alt="KPI Trend Chart"
-                               style="max-width:100%;
-                                      border-radius:8px;
-                                      border:1px solid #f0f0f0;
-                                      display:block;
-                                      margin:auto;" />
+                             style="max-width:100%;
+                             border-radius:8px;
+                             border:1px solid #f0f0f0;
+                             display:block;
+                             margin:auto;" />
                         </td>
                       </tr>
                     </table>
@@ -12272,7 +29912,9 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
     const histRes = await pool.query(
       `WITH KpiHistory AS (
         SELECT h.kpi_id, h.week, h.new_value, h.updated_at, h.comment,
-               ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+               k.subject, k.indicator_sub_title, k.unit, k.target, k.target_direction, k.min, k.max,
+               k.tolerance_type, k.up_tolerance, k.low_tolerance, k.frequency, k.definition,
+               k.low_limit, k.high_limit,
                ca.corrective_action_id,
                ca.root_cause,
                ca.implemented_solution,
@@ -12283,10 +29925,6 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
                ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
         FROM public.kpi_values_hist26 h
         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-        LEFT JOIN public.kpi_values kv
-          ON kv.kpi_values_id = h.kpi_values_id
-        LEFT JOIN public.responsible_kpis rk
-          ON rk.responsible_kpi_id = kv.responsible_kpi_id
         LEFT JOIN LATERAL (
           SELECT corrective_action_id, root_cause, implemented_solution,
                  evidence, status, created_date, updated_date
@@ -12314,7 +29952,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
       const kpiId = row.kpi_id;
       if (!kpisData[kpiId]) {
         kpisData[kpiId] = {
-          title: row.indicator_title || row.indicator_sub_title || 'Untitled KPI',
+          title: row.subject,
           subtitle: row.indicator_sub_title || '',
           unit: row.unit || '',
           target: row.target,
@@ -12328,6 +29966,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           up_tolerance: row.up_tolerance,
           low_tolerance: row.low_tolerance,
           frequency: row.frequency,
+          definition: row.definition,
           _monthlyMap: {},   // { "Feb 2026": { sum, count } }
           comments: [],
           correctiveActions: []
@@ -12421,6 +30060,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
         up_tolerance: kpiData.up_tolerance,
         low_tolerance: kpiData.low_tolerance,
         frequency: kpiData.frequency,
+        definition: kpiData.definition,
         data: dataPoints,
         weekLabels: displayWeekLabels,
         fullWeeks: weekLabels,
@@ -12449,7 +30089,12 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
 };
 
 function getCurrentWeek() {
-  return getWeekLabelForDate(new Date());
+  const now = new Date();
+  const year = now.getFullYear();
+  const startDate = new Date(year, 0, 1);
+  const days = Math.floor((now - startDate) / (24 * 60 * 60 * 1000));
+  const weekNumber = Math.ceil((days + startDate.getDay() + 1) / 7);
+  return `${year}-Week${weekNumber}`;
 }
 
 const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
@@ -12570,13 +30215,9 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
     try {
       const pending = await pool.query(
         `SELECT p.id, p.kpi_id, p.week, p.new_target,
-                COALESCE(rk.target, k.target) AS current_kpi_target,
-                COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title
+                k.target AS current_kpi_target, k.subject
          FROM public.pending_target_updates p
          JOIN public."Kpi" k ON k.kpi_id = p.kpi_id
-         LEFT JOIN public.responsible_kpis rk
-           ON rk.kpi_id = k.kpi_id
-          AND rk.responsible_id = p.responsible_id
          WHERE p.responsible_id = $1 AND p.applied = false`,
         [responsibleId]
       );
@@ -12592,15 +30233,12 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
           continue;
         }
 
-        // 1. Update the responsible-specific KPI assignment target
-        await upsertResponsibleKpiAssignment(
-          pool,
-          responsibleId,
-          row.kpi_id,
-          { target: String(newVal) },
-          { preserveMissing: true }
+        // 1. Update Kpi.target
+        await pool.query(
+          `UPDATE public."Kpi" SET target = $1 WHERE kpi_id = $2`,
+          [String(newVal), row.kpi_id]
         );
-        console.log(`ðŸŽ¯ KPI target updated: "${row.indicator_title}" (${row.kpi_id}) ${currVal} â†’ ${newVal}`);
+        console.log(`ðŸŽ¯ Kpi.target updated: "${row.subject}" (${row.kpi_id}) ${currVal} â†’ ${newVal}`);
 
         // 2. Update kpi_values_hist26.target for that week
         await pool.query(
@@ -12610,13 +30248,6 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
           [newVal, responsibleId, row.kpi_id, row.week]
         );
         console.log(`ðŸ“ kpi_values_hist26.target updated: KPI ${row.kpi_id} week ${row.week} â†’ ${newVal}`);
-
-        await pool.query(
-          `UPDATE public.kpi_values
-           SET target_snapshot = $1
-           WHERE responsible_id = $2 AND kpi_id = $3 AND week = $4`,
-          [newVal, responsibleId, row.kpi_id, row.week]
-        );
 
         // 3. Mark as applied
         await pool.query(
@@ -12636,74 +30267,34 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
     throw error;
   }
 };
-let submissionEmailCronRunning = false;
-
-const runKpiSubmissionEmailJob = async (week = getCurrentWeek()) => {
-  const lockId = "send_kpi_weekly_email_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
-
-  try {
-    if (submissionEmailCronRunning) return;
-    submissionEmailCronRunning = true;
-
-    const recipients = await getKpiEmailRecipientsForWeek(week);
-    for (const recipient of recipients) {
-      await sendKPIEmail(recipient.responsible_id, week);
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-    }
-
-    console.log(`KPI submission emails sent to ${recipients.length} responsibles for ${week}`);
-  } catch (error) {
-    console.error("Scheduled KPI submission email error:", error.message);
-  } finally {
-    submissionEmailCronRunning = false;
-    await releaseJobLock(lockId, lock.lockHash);
-  }
-};
-
-
-
 // ---------- Cron: weekly KPI submission email ----------
-let cronRunning = false;
-cron.schedule("15 9 * * 1", async () => {
-  const lockId = "send_kpi_weekly_email_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
-  try {
-    if (cronRunning) return;
-    cronRunning = true;
-    const now = new Date();
-    const startOfYear = new Date(now.getFullYear(), 0, 1);
-    const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
-    const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
-
-    // Use previous week, handling year rollover (Week 1 → last week of prev year)
-    let targetYear = now.getFullYear();
-    let targetWeek = currentWeek - 1;
-    if (targetWeek < 1) {
-      targetYear -= 1;
-      const startOfPrevYear = new Date(targetYear, 0, 1);
-      const endOfPrevYear = new Date(targetYear, 11, 31);
-      const dayOfPrevYear = Math.floor((endOfPrevYear - startOfPrevYear) / (24 * 60 * 60 * 1000));
-      targetWeek = Math.ceil((dayOfPrevYear + startOfPrevYear.getDay() + 1) / 7);
-    }
-
-    const forcedWeek = `${targetYear}-Week${targetWeek}`;
-    const resps = await pool.query(
-      `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
-       JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
-      [forcedWeek]
-    );
-    for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
-    console.log(`KPI emails sent to ${resps.rows.length} responsibles for ${forcedWeek}`);
-  } catch (err) {
-    console.error("Scheduled email error:", err.message);
-  } finally {
-    cronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+// let cronRunning = false;
+// cron.schedule("17 11 * * *", async () => {
+//   const lockId = "send_kpi_weekly_email_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (cronRunning) return;
+//     cronRunning = true;
+//     const now = new Date();
+//     const startOfYear = new Date(now.getFullYear(), 0, 1);
+//     const dayOfYear = Math.floor((now - startOfYear) / (24 * 60 * 60 * 1000));
+//     const currentWeek = Math.ceil((dayOfYear + startOfYear.getDay() + 1) / 7);
+//     const forcedWeek = `${now.getFullYear()}-Week${currentWeek}`;
+//     const resps = await pool.query(
+//       `SELECT DISTINCT r.responsible_id FROM public."Responsible" r
+//        JOIN public.kpi_values kv ON kv.responsible_id = r.responsible_id WHERE kv.week = $1`,
+//       [forcedWeek]
+//     );
+//     for (let r of resps.rows) await sendKPIEmail(r.responsible_id, forcedWeek);
+//     console.log(`KPI emails sent to ${resps.rows.length} responsibles`);
+//   } catch (err) {
+//     console.error("Scheduled email error:", err.message);
+//   } finally {
+//     cronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 
 // ---------- Cron: weekly reports ----------
@@ -12904,7 +30495,6 @@ const createIndividualKPIChart = (kpi) => {
   const hasCA = kpi.correctiveAction && (
     kpi.correctiveAction.rootCause ||
     kpi.correctiveAction.implementedSolution ||
-    kpi.correctiveAction.evidence ||
     correctiveActionDueDate
   );
   const hasSide = hasComments || hasCA;
@@ -13007,19 +30597,6 @@ const createIndividualKPIChart = (kpi) => {
           </td></tr>
         </table>` : ''}
 
-        ${kpi.correctiveAction.evidence ? `
-        <table border="0" cellpadding="0" cellspacing="0" width="100%">
-          <tr><td style="padding:8px 10px;background:#f0f9ff;border-radius:6px;
-                         border-left:3px solid #3b82f6;">
-            <div style="font-size:9px;font-weight:800;color:#2563eb;
-                        text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">
-              Evidence
-            </div>
-            <div style="font-size:11px;color:#374151;line-height:1.5;">
-              ${kpi.correctiveAction.evidence}
-            </div>
-          </td></tr>
-        </table>` : ''}
       </div>` : ''}
 
     </td>` : '';
@@ -13096,7 +30673,7 @@ const createIndividualKPIChart = (kpi) => {
 // generateManagerReportHtml
 // ============================================================
 const generateManagerReportHtml = (reportData) => {
-  const { plant, week, kpisByDepartment, stats } = reportData;
+  const { plant, week, kpisByDepartment, stats, deliveryRecipient } = reportData;
   let kpiSections = '';
   const departments = Object.keys(kpisByDepartment).sort();
   departments.forEach(department => {
@@ -13139,10 +30716,12 @@ const generateManagerReportHtml = (reportData) => {
 <body>
   <div style="padding:30px 20px;max-width:1400px;margin:0 auto;">
     <div style="background:white;border-radius:12px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.05);margin-bottom:30px;">
-      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI Plant DASHBOARD</h1>
+      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI CODIR DASHBOARD</h1>
       <div style="font-size:14px;color:#6c757d;">
         <strong>${plant.plant_name}</strong>  Week: <strong>${week.replace('2026-Week', 'W')}</strong>
-        Manager: <strong>${plant.manager || 'N/A'}</strong></div>
+        Manager: <strong>${plant.manager || 'N/A'}</strong>
+        ${deliveryRecipient ? `&nbsp;&nbsp;|&nbsp;&nbsp;Recipient: <strong>${deliveryRecipient}</strong>` : ''}
+      </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:15px;
                   background:#f8f9fa;padding:20px;border-radius:8px;margin-top:20px;">
         <div style="text-align:center;">
@@ -13202,14 +30781,11 @@ app.get("/kpi-trends", async (req, res) => {
     const historyRes = await pool.query(
       `WITH KPIHistory AS (
          SELECT h.kpi_id, h.week, h.new_value, h.updated_at, h.comment,
-                ${RESPONSIBLE_KPI_RESOLVED_SELECT_WITH_KPI_VALUES},
+                k.subject, k.indicator_sub_title, k.unit, k.target, k.min, k.max,
+                k.tolerance_type, k.up_tolerance, k.low_tolerance, k.frequency, k.definition,
+                k.calculation_on, k.high_limit, k.low_limit,
                 ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.week ORDER BY h.updated_at DESC) as rn
-         FROM public.kpi_values_hist26 h
-         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-         LEFT JOIN public.kpi_values kv
-           ON kv.kpi_values_id = h.kpi_values_id
-         LEFT JOIN public.responsible_kpis rk
-           ON rk.responsible_kpi_id = kv.responsible_kpi_id
+         FROM public.kpi_values_hist26 h JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
          WHERE h.responsible_id = $1
            AND h.new_value IS NOT NULL AND h.new_value != ''
            AND h.new_value ~ '^[0-9.]+$'
@@ -13253,7 +30829,7 @@ function processKPIChartData(rows) {
     const kpiId = row.kpi_id;
     if (!kpis.has(kpiId)) {
       kpis.set(kpiId, {
-        id: kpiId, title: row.indicator_title || row.indicator_sub_title || 'Untitled KPI', subtitle: row.indicator_sub_title,
+        id: kpiId, subject: row.subject, subtitle: row.indicator_sub_title,
         unit: row.unit || '',
         target: row.target && row.target !== 'None' ? parseFloat(row.target) : null,
         direction: inferKpiDirection(row),
@@ -13261,7 +30837,7 @@ function processKPIChartData(rows) {
         max: row.max && row.max !== 'None' ? parseFloat(row.max) : null,
         high_limit: row.high_limit && row.high_limit !== 'None' ? parseFloat(row.high_limit) : null,
         low_limit: row.low_limit && row.low_limit !== 'None' ? parseFloat(row.low_limit) : null,
-        tolerance_type: row.tolerance_type,
+        definition: row.definition, tolerance_type: row.tolerance_type,
         up_tolerance: row.up_tolerance, low_tolerance: row.low_tolerance,
         values: [], weeks: [], colors: [], comments: []
       });
@@ -13386,7 +30962,7 @@ function generateKPIChartHTML(kpi, index) {
     <div class="kpi-card">
       <div class="kpi-header">
         <div>
-          <h3 style="font-size:20px;font-weight:700;color:#111827;margin-bottom:5px;">${kpi.title}</h3>
+          <h3 style="font-size:20px;font-weight:700;color:#111827;margin-bottom:5px;">${kpi.subject}</h3>
           ${kpi.subtitle ? `<p style="font-size:14px;color:#6b7280;">${kpi.subtitle}</p>` : ''}
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -13452,6 +31028,11 @@ function generateKPIChartHTML(kpi, index) {
           <div style="width:12px;height:12px;border-radius:50%;background:#ef4444;"></div>
           <span style="font-size:12px;color:#6b7280;">Outside good direction</span></div>
       </div>
+      ${kpi.definition ? `
+        <div style="margin-top:20px;padding:15px;background:#f8fafc;border-radius:12px;border-left:4px solid #667eea;">
+          <div style="font-size:12px;color:#64748b;margin-bottom:5px;">Definitsqcion</div>
+          <div style="font-size:14px;color:#475569;">${kpi.definition}</div>
+        </div>` : ''}
     </div>`;
 }
 
@@ -13500,7 +31081,7 @@ function initializeChartJS(kpi, index) {
         labels: ${JSON.stringify(weekLabels)},
         datasets: [
           {
-            label: '${kpi.title}',
+            label: '${kpi.subject}',
             data: ${JSON.stringify(kpi.values)},
             borderColor: '#94a3b8',
             borderWidth: 2,
@@ -13574,110 +31155,391 @@ const weekToMonthLabel = (weekStr) => {
   return date.toLocaleString('en-US', { month: 'short', year: 'numeric' }); // "Feb 2026"
 };
 
+const CEO_REPORT_RECIPIENT_EMAIL = "mootaz.farwa@avocarbon.com";
+
+const hasMeaningfulManagerReportCorrectiveAction = (action = {}) =>
+  Boolean(
+    normalizeOptionalTextInput(action.root_cause) ||
+    normalizeOptionalTextInput(action.implemented_solution) ||
+    normalizeOptionalDateInput(action.due_date)
+  );
+
+const selectManagerReportCorrectiveAction = ({
+  currentActions = [],
+  historyActions = []
+} = {}) => {
+  const currentMeaningfulActions = sortCorrectiveActions(
+    (Array.isArray(currentActions) ? currentActions : []).filter(hasMeaningfulManagerReportCorrectiveAction)
+  );
+  if (currentMeaningfulActions.length) {
+    return currentMeaningfulActions[0];
+  }
+
+  const historyMeaningfulActions = sortCorrectiveActions(
+    (Array.isArray(historyActions) ? historyActions : []).filter(hasMeaningfulManagerReportCorrectiveAction)
+  );
+  return historyMeaningfulActions.length ? historyMeaningfulActions[0] : null;
+};
+
+const resolveManagerReportActionPlanContext = async (rows = [], currentPeriodLabel = null) => {
+  const reportRows = Array.isArray(rows) ? rows : [];
+
+  if (!reportRows.length || !(await canUseActionPlanCorrectiveActions())) {
+    return {
+      rows: reportRows,
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+
+  const allRowsHaveDirectAllocations = reportRows.every((row) => {
+    const allocationId = normalizeOptionalIntegerInput(row.kpi_target_allocation_id ?? row.kpi_values_id);
+    const kpiId = normalizeOptionalIntegerInput(row.kpi_id);
+    return Number.isInteger(allocationId) && allocationId > 0 && Number.isInteger(kpiId) && kpiId > 0;
+  });
+
+  if (allRowsHaveDirectAllocations) {
+    const {
+      currentByAllocationId,
+      historyByAllocationId
+    } = await loadActionPlanCorrectiveActionMaps(reportRows, currentPeriodLabel);
+
+    return {
+      rows: reportRows,
+      currentByAllocationId,
+      historyByAllocationId
+    };
+  }
+
+  const uniqueResponsibleIds = Array.from(
+    new Set(
+      reportRows
+        .map((row) => normalizeOptionalIntegerInput(row.responsible_id))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+  const responsibleContexts = await Promise.all(
+    uniqueResponsibleIds.map(async (responsibleId) => ([
+      String(responsibleId),
+      await loadFormResponsibleContext(responsibleId)
+    ]))
+  );
+
+  const peopleIdByResponsibleId = new Map(
+    responsibleContexts.map(([responsibleId, context]) => ([
+      responsibleId,
+      normalizeOptionalIntegerInput(context?.people_id)
+    ]))
+  );
+
+  const uniquePeopleIds = Array.from(
+    new Set(
+      Array.from(peopleIdByResponsibleId.values()).filter(
+        (value) => Number.isInteger(value) && value > 0
+      )
+    )
+  );
+
+  if (!uniquePeopleIds.length) {
+    return {
+      rows: reportRows,
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+
+  const allocationRes = await pool.query(
+    `
+    SELECT
+      kta.kpi_target_allocation_id,
+      kta.set_by_people_id,
+      kta.kpi_id,
+      COALESCE(k.kpi_name, '') AS kpi_name,
+      COALESCE(k.kpi_sub_title, '') AS kpi_group,
+      COALESCE(k.unit, '') AS kpi_unit,
+      COALESCE(kta.target_unit, '') AS target_unit
+    FROM public.kpi_target_allocation kta
+    JOIN public.kpi k
+      ON k.kpi_id = kta.kpi_id
+    WHERE kta.set_by_people_id = ANY($1::int[])
+    ORDER BY
+      COALESCE(kta.updated_at, kta.created_at) DESC,
+      kta.kpi_target_allocation_id DESC
+    `,
+    [uniquePeopleIds]
+  );
+
+  const allocationsByPeopleId = new Map();
+  allocationRes.rows.forEach((row) => {
+    const peopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
+    if (!peopleId) return;
+
+    const peopleKey = String(peopleId);
+    if (!allocationsByPeopleId.has(peopleKey)) {
+      allocationsByPeopleId.set(peopleKey, []);
+    }
+
+    allocationsByPeopleId.get(peopleKey).push(row);
+  });
+
+  const normalizeMatchText = (value) => normalizeOptionalTextInput(value)?.toLowerCase() || "";
+
+  const pickBestAllocationMatch = (row, allocations = []) => {
+    const legacyKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+    const legacyGroup = normalizeMatchText(row.indicator_title);
+    const legacyName = normalizeMatchText(row.indicator_sub_title);
+    const legacyUnit = normalizeMatchText(row.unit);
+
+    let bestMatch = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    allocations.forEach((allocation) => {
+      const allocationKpiId = normalizeOptionalIntegerInput(allocation.kpi_id);
+      const allocationGroup = normalizeMatchText(allocation.kpi_group);
+      const allocationName = normalizeMatchText(allocation.kpi_name);
+      const allocationUnit = normalizeMatchText(allocation.target_unit || allocation.kpi_unit);
+
+      const exactIdMatch =
+        Number.isInteger(legacyKpiId) &&
+        Number.isInteger(allocationKpiId) &&
+        legacyKpiId === allocationKpiId;
+      const exactNameMatch = Boolean(legacyName && allocationName && legacyName === allocationName);
+      const exactGroupMatch = Boolean(legacyGroup && allocationGroup && legacyGroup === allocationGroup);
+      const exactUnitMatch = Boolean(legacyUnit && allocationUnit && legacyUnit === allocationUnit);
+
+      let score = Number.POSITIVE_INFINITY;
+
+      if (exactIdMatch && exactNameMatch && exactGroupMatch) score = 0;
+      else if (exactNameMatch && exactGroupMatch && exactUnitMatch) score = 1;
+      else if (exactIdMatch && exactNameMatch) score = 2;
+      else if (exactIdMatch && exactGroupMatch) score = 3;
+      else if (exactNameMatch && exactUnitMatch) score = 4;
+      else if (exactNameMatch) score = 5;
+      else if (exactIdMatch) score = 6;
+      else if (exactGroupMatch && exactUnitMatch) score = 7;
+      else if (exactGroupMatch) score = 8;
+
+      if (score < bestScore) {
+        bestMatch = allocation;
+        bestScore = score;
+      }
+    });
+
+    return Number.isFinite(bestScore) ? bestMatch : null;
+  };
+
+  const rowsWithAllocations = reportRows.map((row) => {
+    const responsibleId = normalizeOptionalIntegerInput(row.responsible_id);
+    const peopleId = responsibleId
+      ? peopleIdByResponsibleId.get(String(responsibleId)) || null
+      : null;
+    const matchedAllocation = peopleId
+      ? pickBestAllocationMatch(row, allocationsByPeopleId.get(String(peopleId)) || [])
+      : null;
+
+    return {
+      ...row,
+      kpi_target_allocation_id:
+        normalizeOptionalIntegerInput(matchedAllocation?.kpi_target_allocation_id) || null,
+      action_plan_kpi_id:
+        normalizeOptionalIntegerInput(matchedAllocation?.kpi_id) || null
+    };
+  });
+
+  const matchedAllocationRows = rowsWithAllocations
+    .filter((row) =>
+      Number.isInteger(normalizeOptionalIntegerInput(row.kpi_target_allocation_id)) &&
+      Number.isInteger(normalizeOptionalIntegerInput(row.action_plan_kpi_id))
+    )
+    .map((row) => ({
+      kpi_target_allocation_id: row.kpi_target_allocation_id,
+      kpi_values_id: row.kpi_target_allocation_id,
+      kpi_id: row.action_plan_kpi_id
+    }));
+
+  if (!matchedAllocationRows.length) {
+    return {
+      rows: rowsWithAllocations,
+      currentByAllocationId: {},
+      historyByAllocationId: {}
+    };
+  }
+
+  const {
+    currentByAllocationId,
+    historyByAllocationId
+  } = await loadActionPlanCorrectiveActionMaps(matchedAllocationRows, currentPeriodLabel);
+
+  return {
+    rows: rowsWithAllocations,
+    currentByAllocationId,
+    historyByAllocationId
+  };
+};
+
 
 const getDepartmentKPIReport = async (plantId, week) => {
   try {
     const plantRes = await pool.query(
-      `SELECT p.plant_id, p.name AS plant_name, p.manager, p.manager_email
-       FROM public."Plant" p WHERE p.plant_id = $1 AND p.manager_email IS NOT NULL`,
+      `
+      SELECT
+        u.unit_id AS plant_id,
+        u.unit_name AS plant_name,
+        NULLIF(TRIM(CONCAT_WS(' ', COALESCE(m.first_name, ''), COALESCE(m.name, ''))), '') AS manager,
+        m.email AS manager_email
+      FROM public.unit u
+      LEFT JOIN public.people m
+        ON m.people_id = u.manager_id
+      WHERE u.unit_id = $1
+      `,
       [plantId]
     );
     const plant = plantRes.rows[0];
-    if (!plant || !plant.manager_email) return null;
+    if (!plant) return null;
 
     const kpiRes = await pool.query(
-      `WITH LatestKPIValues AS (
-         SELECT h.kpi_id, h.responsible_id, r.name AS responsible_name, h.week, h.new_value,
-                h.updated_at, h.comment, r.department_id, d.name AS department_name,
-                ${buildResolvedResponsibleKpiSelect("k", "rk", "kv")},
-                ROW_NUMBER() OVER (PARTITION BY h.kpi_id, h.responsible_id, h.week ORDER BY h.updated_at DESC) as rn
-         FROM public.kpi_values_hist26 h
-         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-         JOIN public."Department" d ON r.department_id = d.department_id
-         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-         LEFT JOIN public.kpi_values kv
-           ON kv.kpi_values_id = h.kpi_values_id
-         LEFT JOIN public.responsible_kpis rk
-           ON rk.responsible_kpi_id = kv.responsible_kpi_id
-         WHERE r.plant_id = $1 AND h.week = $2
-           AND h.new_value IS NOT NULL AND h.new_value != ''
-           AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$'
-       )
-       SELECT lkv.*,
-              ca.root_cause, ca.implemented_solution, ca.evidence, ca.status AS ca_status,
-              ca.due_date AS ca_due_date, ca.week AS ca_week
-       FROM LatestKPIValues lkv
-       LEFT JOIN LATERAL (
-         SELECT root_cause, implemented_solution, evidence, status, due_date, week
-         FROM public.corrective_actions
-         WHERE kpi_id = lkv.kpi_id
-           AND responsible_id = lkv.responsible_id
-         ORDER BY
-           CASE
-             WHEN week = lkv.week
-              AND (
-                NULLIF(BTRIM(COALESCE(root_cause, '')), '') IS NOT NULL
-                OR NULLIF(BTRIM(COALESCE(implemented_solution, '')), '') IS NOT NULL
-                OR NULLIF(BTRIM(COALESCE(evidence, '')), '') IS NOT NULL
-                OR due_date IS NOT NULL
-              ) THEN 0
-             WHEN
-                NULLIF(BTRIM(COALESCE(root_cause, '')), '') IS NOT NULL
-                OR NULLIF(BTRIM(COALESCE(implemented_solution, '')), '') IS NOT NULL
-                OR NULLIF(BTRIM(COALESCE(evidence, '')), '') IS NOT NULL
-                OR due_date IS NOT NULL THEN 1
-             WHEN week = lkv.week THEN 2
-             ELSE 3
-           END,
-           COALESCE(updated_date, created_date) DESC,
-           corrective_action_id DESC
-         LIMIT 1
-       ) ca ON TRUE
-       WHERE lkv.rn = 1 ORDER BY lkv.indicator_title`,
+      `
+      WITH plant_allocations AS (
+        SELECT
+          kta.kpi_target_allocation_id,
+          kta.kpi_id,
+          owner.people_id AS responsible_id,
+          NULLIF(TRIM(CONCAT_WS(' ', COALESCE(owner.first_name, ''), COALESCE(owner.name, ''))), '') AS responsible_name
+        FROM public.kpi_target_allocation kta
+        LEFT JOIN public.people owner
+          ON owner.people_id = kta.set_by_people_id
+        WHERE COALESCE(kta.plant_id, owner.work_at_unit_id) = $1
+      ),
+      latest_kpi_values AS (
+        SELECT
+          pa.kpi_target_allocation_id,
+          pa.kpi_id,
+          pa.responsible_id,
+          pa.responsible_name,
+          COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+          kr.raw_value AS new_value,
+          kr.recorded_at AS updated_at,
+          kr.comments AS comment,
+          kr.unit AS result_unit,
+          kr.target_value AS result_target_value,
+          kr.upper_limit AS result_high_limit,
+          kr.lower_limit AS result_low_limit,
+          ROW_NUMBER() OVER (
+            PARTITION BY pa.kpi_target_allocation_id
+            ORDER BY kr.recorded_at DESC, kr.kpi_result_id DESC
+          ) AS rn
+        FROM plant_allocations pa
+        JOIN public.kpi_result kr
+          ON kr.kpi_target_allocation_id = pa.kpi_target_allocation_id
+        WHERE ($2::text IS NULL OR kr.period_label = $2 OR kr.week = $2)
+          AND kr.raw_value IS NOT NULL
+          AND kr.raw_value != ''
+          AND CAST(kr.raw_value AS TEXT) ~ '^[0-9.]+$'
+      )
+      SELECT
+        lkv.kpi_target_allocation_id,
+        lkv.kpi_id,
+        lkv.responsible_id,
+        lkv.responsible_name,
+        lkv.week,
+        lkv.new_value,
+        lkv.updated_at,
+        lkv.comment,
+        COALESCE(k.kpi_sub_title, subject_link.subject_name, k.kpi_name, 'KPI') AS indicator_title,
+        COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
+        COALESCE(lkv.result_unit, kta.target_unit, k.unit) AS unit,
+        COALESCE(lkv.result_target_value, kta.target_value, k.target_value) AS target,
+        k.min_value AS min,
+        k.max_value AS max,
+        COALESCE(lkv.result_high_limit, k.high_limit) AS high_limit,
+        COALESCE(lkv.result_low_limit, k.low_limit) AS low_limit,
+        ''::text AS department_name,
+        k.target_direction
+      FROM latest_kpi_values lkv
+      JOIN public.kpi_target_allocation kta
+        ON kta.kpi_target_allocation_id = lkv.kpi_target_allocation_id
+      JOIN public.kpi k
+        ON k.kpi_id = lkv.kpi_id
+      LEFT JOIN LATERAL (
+        SELECT s.subject_name
+        FROM public.subject_kpi sk
+        JOIN public.subject s
+          ON s.subject_id = sk.subject_id
+        WHERE sk.kpi_id = lkv.kpi_id
+        ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+        LIMIT 1
+      ) subject_link ON TRUE
+      WHERE lkv.rn = 1
+      ORDER BY indicator_title, indicator_sub_title, lkv.kpi_target_allocation_id
+      `,
       [plantId, week]
     );
 
     if (!kpiRes.rows.length) return null;
 
+    const {
+      rows: kpiReportRows,
+      currentByAllocationId,
+      historyByAllocationId
+    } = await resolveManagerReportActionPlanContext(kpiRes.rows, week);
+
     const weeklyTrendRes = await pool.query(
-      `WITH WeeklyKPIData AS (
-         SELECT k.kpi_id,
-                COALESCE(rk.indicator_title, k.indicator_title) AS indicator_title,
-                COALESCE(rk.indicator_sub_title, k.indicator_sub_title) AS indicator_sub_title,
-                COALESCE(rk.unit, k.unit) AS unit,
-                ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")} AS target,
-                COALESCE(rk.min, k.min) AS min,
-                COALESCE(rk.max, k.max) AS max,
-                ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")} AS high_limit,
-                ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")} AS low_limit,
-                h.week, AVG(CAST(h.new_value AS NUMERIC)) as avg_value,
-                CAST(SPLIT_PART(h.week, 'Week', 2) AS INTEGER) as week_num
-         FROM public.kpi_values_hist26 h
-         JOIN public."Kpi" k ON h.kpi_id = k.kpi_id
-         JOIN public."Responsible" r ON h.responsible_id = r.responsible_id
-         LEFT JOIN public.kpi_values kv
-           ON kv.kpi_values_id = h.kpi_values_id
-         LEFT JOIN public.responsible_kpis rk
-           ON rk.responsible_kpi_id = kv.responsible_kpi_id
-         WHERE r.plant_id = $1 AND h.new_value IS NOT NULL AND h.new_value != ''
-           AND CAST(h.new_value AS TEXT) ~ '^[0-9.]+$' AND h.week LIKE '2026-Week%'
-         GROUP BY k.kpi_id,
-                  COALESCE(rk.indicator_title, k.indicator_title),
-                  COALESCE(rk.indicator_sub_title, k.indicator_sub_title),
-                  COALESCE(rk.unit, k.unit),
-                  ${buildResolvedKpiValueFieldExpression("target", "k", "rk", "kv")},
-                  COALESCE(rk.min, k.min),
-                  COALESCE(rk.max, k.max),
-                  ${buildResolvedKpiValueFieldExpression("high_limit", "k", "rk", "kv")},
-                  ${buildResolvedKpiValueFieldExpression("low_limit", "k", "rk", "kv")},
-                  h.week
-       )
-       SELECT * FROM WeeklyKPIData ORDER BY kpi_id, week_num DESC LIMIT 500`,
+      `
+      WITH plant_allocations AS (
+        SELECT
+          kta.kpi_target_allocation_id,
+          kta.kpi_id,
+          owner.people_id AS responsible_id,
+          NULLIF(TRIM(CONCAT_WS(' ', COALESCE(owner.first_name, ''), COALESCE(owner.name, ''))), '') AS responsible_name
+        FROM public.kpi_target_allocation kta
+        LEFT JOIN public.people owner
+          ON owner.people_id = kta.set_by_people_id
+        WHERE COALESCE(kta.plant_id, owner.work_at_unit_id) = $1
+      )
+      SELECT
+        pa.kpi_target_allocation_id,
+        pa.kpi_id,
+        pa.responsible_id,
+        pa.responsible_name,
+        COALESCE(k.kpi_sub_title, subject_link.subject_name, k.kpi_name, 'KPI') AS indicator_title,
+        COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
+        COALESCE(kr.unit, kta.target_unit, k.unit) AS unit,
+        COALESCE(kr.target_value, kta.target_value, k.target_value) AS target,
+        k.min_value AS min,
+        k.max_value AS max,
+        COALESCE(kr.upper_limit, k.high_limit) AS high_limit,
+        COALESCE(kr.lower_limit, k.low_limit) AS low_limit,
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+        CAST(kr.raw_value AS NUMERIC) AS avg_value
+      FROM plant_allocations pa
+      JOIN public.kpi_target_allocation kta
+        ON kta.kpi_target_allocation_id = pa.kpi_target_allocation_id
+      JOIN public.kpi_result kr
+        ON kr.kpi_target_allocation_id = pa.kpi_target_allocation_id
+      JOIN public.kpi k
+        ON k.kpi_id = pa.kpi_id
+      LEFT JOIN LATERAL (
+        SELECT s.subject_name
+        FROM public.subject_kpi sk
+        JOIN public.subject s
+          ON s.subject_id = sk.subject_id
+        WHERE sk.kpi_id = pa.kpi_id
+        ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+        LIMIT 1
+      ) subject_link ON TRUE
+      WHERE kr.raw_value IS NOT NULL
+        AND kr.raw_value != ''
+        AND CAST(kr.raw_value AS TEXT) ~ '^[0-9.]+$'
+      ORDER BY pa.kpi_target_allocation_id ASC, week ASC
+      `,
       [plantId]
     );
 
     const extractDept = (t) => {
       if (!t) return 'Other';
+      if (t.includes(' / ')) return t.split(' / ')[0].trim() || 'Other';
+      if (t.includes('/')) return t.split('/')[0].trim() || 'Other';
       if (t.includes('Actual - ')) {
         const ex = t.split('Actual - ')[1];
         if (ex.includes('/')) return ex.split('/')[0].trim();
@@ -13692,16 +31554,18 @@ const getDepartmentKPIReport = async (plantId, week) => {
 
     // Accumulate weekly values grouped into months
     weeklyTrendRes.rows.forEach(row => {
-      const key = `${row.kpi_id}_${row.indicator_title}`;
+      const key = String(row.kpi_target_allocation_id || `${row.kpi_id}_${row.responsible_id || ''}`);
       const dept = extractDept(row.indicator_title);
       const month = weekToMonthLabel(row.week); // e.g. "Feb 2026"
 
       if (!weeklyDataByKPI[key]) {
         weeklyDataByKPI[key] = {
+          allocation_id: row.kpi_target_allocation_id,
           kpi_id: row.kpi_id, title: row.indicator_title, subtitle: row.indicator_sub_title || '',
           unit: row.unit || '', target: row.target, min: row.min, max: row.max,
           high_limit: row.high_limit, low_limit: row.low_limit,
           department: dept,
+          responsible: row.responsible_name || '',
           _monthlyMap: {},  // { "Feb 2026": { sum, count } }
           weeks: [], values: []
         };
@@ -13722,11 +31586,13 @@ const getDepartmentKPIReport = async (plantId, week) => {
       delete kpi._monthlyMap;
     });
 
-    kpiRes.rows.forEach(row => {
+    kpiReportRows.forEach(row => {
       const dept = extractDept(row.indicator_title);
-      const key = `${row.kpi_id}_${row.indicator_title}`;
+      const key = String(row.kpi_target_allocation_id || `${row.kpi_id}_${row.responsible_id || ''}`);
       if (!kpisByDepartment[dept]) kpisByDepartment[dept] = [];
-      let existing = kpisByDepartment[dept].find(k => k.id === row.kpi_id && k.title === row.indicator_title);
+      let existing = kpisByDepartment[dept].find(
+        (k) => String(k.allocationId || '') === String(row.kpi_target_allocation_id || '')
+      );
       if (!existing) {
         existing = {
           id: row.kpi_id, title: row.indicator_title, subtitle: row.indicator_sub_title || '',
@@ -13736,20 +31602,31 @@ const getDepartmentKPIReport = async (plantId, week) => {
           currentValue: parseFloat(row.new_value),
           weeklyData: weeklyDataByKPI[key] || { weeks: [], values: [] },
           lastUpdated: row.updated_at, responsible: row.responsible_name || '',
+          allocationId: row.kpi_target_allocation_id || null,
+          kpiTargetAllocationId: row.kpi_target_allocation_id || null,
           comments: [], correctiveAction: null
         };
         kpisByDepartment[dept].push(existing);
       }
       if (row.comment && row.comment.trim())
         existing.comments.push({ week: row.week, text: row.comment.trim() });
-      if (!existing.correctiveAction && (row.root_cause || row.implemented_solution || row.evidence || row.ca_due_date)) {
+
+      const allocationKey = String(row.kpi_target_allocation_id || "").trim();
+      const selectedCorrectiveAction = allocationKey
+        ? selectManagerReportCorrectiveAction({
+          currentActions: currentByAllocationId[allocationKey] || [],
+          historyActions: historyByAllocationId[allocationKey] || []
+        })
+        : null;
+
+      if (!existing.correctiveAction && selectedCorrectiveAction) {
         existing.correctiveAction = {
-          rootCause: (row.root_cause || '').trim(),
-          implementedSolution: (row.implemented_solution || '').trim(),
-          evidence: (row.evidence || '').trim(),
-          dueDate: row.ca_due_date || null,
-          week: row.ca_week || null,
-          status: row.ca_status || ''
+          rootCause: normalizeOptionalTextInput(selectedCorrectiveAction.root_cause) || '',
+          implementedSolution: normalizeOptionalTextInput(selectedCorrectiveAction.implemented_solution) || '',
+          evidence: '',
+          dueDate: selectedCorrectiveAction.due_date || null,
+          week: selectedCorrectiveAction.week || selectedCorrectiveAction.period_label || null,
+          status: normalizeOptionalTextInput(selectedCorrectiveAction.status) || ''
         };
       }
     });
@@ -13776,8 +31653,14 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
     const reportWeek = currentWeek;
     const reportData = await getDepartmentKPIReport(plantId, reportWeek);
     if (!reportData || reportData.stats.totalKPIs === 0) return null;
+    const deliveryRecipient =
+      normalizeOptionalTextInput(CEO_REPORT_RECIPIENT_EMAIL) ||
+      normalizeOptionalTextInput(reportData.plant?.manager_email);
 
-    const emailHtml = generateManagerReportHtml(reportData);
+    const emailHtml = generateManagerReportHtml({
+      ...reportData,
+      deliveryRecipient
+    });
 
     // â”€â”€ Generate plant-wide recommendations PDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let pdfAttachment = null;
@@ -13802,62 +31685,160 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
     const transporter = createTransporter();
     await transporter.sendMail({
       from: '"AVOCarbon Plant Analytics" <administration.STS@avocarbon.com>',
-      to: reportData.plant.manager_email,
+      to: deliveryRecipient,
       subject: `Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${reportWeek.replace('2026-Week', '')}`,
       html: emailHtml,
       attachments: pdfAttachment ? [pdfAttachment] : [],
     });
 
-    console.log(`KPI report${pdfAttachment ? ' + recommendations PDF' : ''} sent to ${reportData.plant.manager_email}`);
+    console.log(`KPI report${pdfAttachment ? ' + recommendations PDF' : ''} sent to ${deliveryRecipient}`);
+    return {
+      plant: reportData.plant,
+      week: reportWeek,
+      recipientEmail: deliveryRecipient
+    };
   } catch (error) {
     console.error(`Failed to send report for plant ${plantId}:`, error.message);
+    throw error;
   }
 };
 
+app.get("/ceo-report/plants/:plantId", async (req, res) => {
+  try {
+    const plantId = normalizeOptionalIntegerInput(req.params.plantId);
+    const reportWeek = normalizeOptionalTextInput(req.query?.week) || getCurrentWeek();
+
+    if (!plantId) {
+      return res.status(400).send("Invalid plantId");
+    }
+
+    const reportData = await getDepartmentKPIReport(plantId, reportWeek);
+    if (!reportData || reportData.stats.totalKPIs === 0) {
+      return res.status(404).send("No KPI report data available for this plant and week.");
+    }
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(generateManagerReportHtml({
+      ...reportData,
+      deliveryRecipient: CEO_REPORT_RECIPIENT_EMAIL
+    }));
+  } catch (error) {
+    console.error("CEO report preview error:", error.message);
+    res.status(500).send("Failed to generate CEO report preview.");
+  }
+});
+
+app.post("/api/ceo-report/plants/:plantId/send", async (req, res) => {
+  try {
+    const plantId = normalizeOptionalIntegerInput(req.params.plantId);
+    const reportWeek =
+      normalizeOptionalTextInput(req.body?.week ?? req.query?.week) ||
+      getCurrentWeek();
+
+    if (!plantId) {
+      return res.status(400).json({ error: "Invalid plantId" });
+    }
+
+    const result = await sendDepartmentKPIReportEmail(plantId, reportWeek);
+    if (!result) {
+      return res.status(404).json({
+        error: "No KPI report data available for this plant and week."
+      });
+    }
+
+    res.json({
+      success: true,
+      plant_id: plantId,
+      week: result.week,
+      recipient_email: result.recipientEmail
+    });
+  } catch (error) {
+    console.error("CEO report send error:", error.message);
+    res.status(500).json({ error: "Failed to send CEO report email." });
+  }
+});
+
+// ---------- Cron: corrective action escalation reminders ----------
+let correctiveActionEscalationCronRunning = false;
+cron.schedule("35 9 * * *", async () => {
+  const lockId = "corrective_action_escalation_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+  try {
+    if (correctiveActionEscalationCronRunning) return;
+    correctiveActionEscalationCronRunning = true;
+    const result = await runCorrectiveActionEscalationJob();
+    console.log(
+      `[Corrective Action Escalation] Processed ${result.pending} pending escalation(s); sent ${result.sent} email(s).`
+    );
+  } catch (error) {
+    console.error("[Corrective Action Escalation] Cron error:", error.message);
+  } finally {
+    correctiveActionEscalationCronRunning = false;
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+  }
+}, { scheduled: true, timezone: "Africa/Tunis" });
+
 // ---------- Cron: weekly manager/plant report ----------
-// let managerCronRunning = false;
-// cron.schedule("18 17 * * *", async () => {
-//   const lockId = "department_report_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
-//   try {
-//     if (managerCronRunning) return;
-//     managerCronRunning = true;
-//     const now = new Date();
-//     const year = now.getFullYear();
-//     const getWeekNumber = (date) => {
-//       const d = new Date(date); d.setHours(0, 0, 0, 0);
-//       d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//       const yearStart = new Date(d.getFullYear(), 0, 1);
-//       return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//     };
-//     const weekNumber = getWeekNumber(now);
-//     const currentWeek = `${year}-Week${weekNumber}`;
-//     console.log(`[Manager Report] Sending reports for week ${currentWeek}...`);
-//     const plantsRes = await pool.query(
-//       `SELECT plant_id, name, manager_email FROM public."Plant"
-//        WHERE manager_email IS NOT NULL AND manager_email != ''`
-//     );
-//     console.log(`ðŸ“‹ Found ${plantsRes.rows.length} plants with manager emails`);
-//     for (const plant of plantsRes.rows) {
-//       try {
-//         await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-//         console.log(`Report sent for plant: ${plant.name}`);
-//         await new Promise(resolve => setTimeout(resolve, 1500));
-//       } catch (err) {
-//         console.error(`  âŒ Failed for plant ${plant.name}:`, err.message);
-//       }
-//     }
-//     console.log(`[Manager Report] All plant reports sent`);
-//   } catch (error) {
-//     console.error("âŒ [Manager Report] Cron error:", error.message);
-//   } finally {
-//     managerCronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+let managerCronRunning = false;
+cron.schedule("07 11 * * *", async () => {
+  const lockId = "department_report_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+  try {
+    if (managerCronRunning) return;
+    managerCronRunning = true;
+    const now = new Date();
+    const year = now.getFullYear();
+    const getWeekNumber = (date) => {
+      const d = new Date(date); d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+      const yearStart = new Date(d.getFullYear(), 0, 1);
+      return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+    };
+    const weekNumber = getWeekNumber(now);
+    const currentWeek = `${year}-Week${weekNumber}`;
+    console.log(`[Manager Report] Sending reports for week ${currentWeek}...`);
+    const plantsRes = await pool.query(
+      `
+      SELECT DISTINCT
+        u.unit_id AS plant_id,
+        u.unit_name AS name
+      FROM public.kpi_target_allocation kta
+      LEFT JOIN public.people owner
+        ON owner.people_id = kta.set_by_people_id
+      JOIN public.unit u
+        ON u.unit_id = COALESCE(kta.plant_id, owner.work_at_unit_id)
+      ORDER BY u.unit_name ASC, u.unit_id ASC
+      `
+    );
+    console.log(`ðŸ“‹ Found ${plantsRes.rows.length} units with KPI allocations`);
+    for (const plant of plantsRes.rows) {
+      try {
+        await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
+        console.log(`Report sent for plant: ${plant.name}`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      } catch (err) {
+        console.error(`  âŒ Failed for plant ${plant.name}:`, err.message);
+      }
+    }
+    console.log(`[Manager Report] All plant reports sent`);
+  } catch (error) {
+    console.error("âŒ [Manager Report] Cron error:", error.message);
+  } finally {
+    managerCronRunning = false;
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+  }
+}, { scheduled: true, timezone: "Africa/Tunis" });
 
 
 registerRecommendationRoutes(app, pool, createTransporter);
+ensureCorrectiveActionEscalationSchema()
+  .then(() => {
+    console.log("[Corrective Action Escalation] Tracking table is ready.");
+  })
+  .catch((error) => {
+    console.error("[Corrective Action Escalation] Tracking table setup failed:", error.message);
+  });
 // ---------- Start server ----------
 app.listen(port, () => console.log(`ðŸš€ Server running on port ${port}`));
