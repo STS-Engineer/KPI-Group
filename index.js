@@ -29772,9 +29772,7 @@ const generateVerticalBarChart = (chartData) => {
             <span style="color:${directionMeta.accent};margin-right:6px;">${directionMeta.icon}</span>
             ${directionMeta.label} = ${directionMeta.summary}
           </div>
-          <div style="font-size:12px;color:#475569;line-height:1.5;">
-            Examples: ${directionMeta.examples}. This direction is used for colors, alerts, and target management.
-          </div>
+     
         </td>
       </tr>
     </table>
@@ -30085,7 +30083,7 @@ const generateVerticalBarChart = (chartData) => {
           ${unit ? `<p style="margin:5px 0 0;color:#888;font-size:12px;">Unit: ${unit} | Frequency: ${frequency || 'Monthly'}</p>` : ''}
         </div>
 
-        ${directionGuideHtml}
+      
         ${statsBox}
         ${thresholdFocusHtml}
 
@@ -30158,7 +30156,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           kta.kpi_target_allocation_id,
           kta.kpi_id
         FROM public.kpi_target_allocation kta
-        WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) = $1
+        WHERE kta.set_by_people_id = $1
       ),
       latest_period_values AS (
         SELECT
@@ -30241,7 +30239,7 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
           kta.kpi_target_allocation_id,
           kta.kpi_id
         FROM public.kpi_target_allocation kta
-        WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) = $1
+        WHERE kta.set_by_people_id = $1
       )
       SELECT DISTINCT ON (
         ra.kpi_target_allocation_id,
@@ -30495,18 +30493,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
               </div>
             </td></tr>
 
-            <tr><td style="padding:16px 30px 0;">
-              <div style="background:#f8fbff;border:1px solid #dbeafe;border-radius:10px;padding:16px 18px;">
-                <div style="font-size:12px;font-weight:700;color:#0f6cbd;text-transform:uppercase;
-                            letter-spacing:0.08em;margin-bottom:8px;">Good Direction Guide</div>
-                <div style="font-size:14px;color:#1f2937;line-height:1.6;">
-                  <strong>Up</strong> = higher is better, for example Sales and OTD.<br />
-                  <strong>Down</strong> = lower is better, for example Scrap, accidents, and customer claims.<br />
-                  This direction is used for colors, alerts, and target management across the report.
-                </div>
-              </div>
-            </td></tr>
-
+        
             <tr><td style="padding:30px;">${chartsHtml}</td></tr>
 
             <tr><td style="padding:20px;background:#f8f9fa;border-top:1px solid #e9ecef;
@@ -30605,68 +30592,68 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-let cronRunning = false;
+// let cronRunning = false;
 
-cron.schedule("02 10 * * *", async () => {
-  const lockId = "send_kpi_weekly_email_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
+// cron.schedule("02 10 * * *", async () => {
+//   const lockId = "send_kpi_weekly_email_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
 
-  try {
-    if (cronRunning) return;
-    cronRunning = true;
+//   try {
+//     if (cronRunning) return;
+//     cronRunning = true;
 
-    const currentWeek = getPreviousWeek(getCurrentWeek());
+//     const currentWeek = getPreviousWeek(getCurrentWeek());
 
-    const recipients = await loadKpiSubmissionEmailRecipients();
+//     const recipients = await loadKpiSubmissionEmailRecipients();
 
-    for (const recipient of recipients) {
-      try {
-        await sendKPIEmail(recipient.people_id, currentWeek);
-        await new Promise((resolve) => setTimeout(resolve, 750));
-      } catch (error) {
-        console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
-      }
-    }
+//     for (const recipient of recipients) {
+//       try {
+//         await sendKPIEmail(recipient.people_id, currentWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 750));
+//       } catch (error) {
+//         console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
+//       }
+//     }
 
-    console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
-  } catch (err) {
-    console.error("Scheduled email error:", err.message);
-  } finally {
-    cronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+//     console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
+//   } catch (err) {
+//     console.error("Scheduled email error:", err.message);
+//   } finally {
+//     cronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ---------- Cron: weekly reports ----------
-let reportCronRunning = false;
-cron.schedule("31 10 * * *", async () => {
-  const lockId = "weekly_kpi_report_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
-  try {
-    if (reportCronRunning) return;
-    reportCronRunning = true;
-    const reportWeek = getPreviousWeek(getCurrentWeek());
-    const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+// let reportCronRunning = false;
+// cron.schedule("55 12 * * *", async () => {
+//   const lockId = "weekly_kpi_report_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (reportCronRunning) return;
+//     reportCronRunning = true;
+//     const reportWeek = getPreviousWeek(getCurrentWeek());
+//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
 
-    for (const recipient of recipients) {
-      try {
-        await generateWeeklyReportEmail(recipient.people_id, reportWeek);
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      } catch (err) {
-        console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
-      }
-    }
+//     for (const recipient of recipients) {
+//       try {
+//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 1500));
+//       } catch (err) {
+//         console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
+//       }
+//     }
 
-    console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-  } catch (error) {
-    console.error("Report cron error:", error.message);
-  } finally {
-    reportCronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+//   } catch (error) {
+//     console.error("Report cron error:", error.message);
+//   } finally {
+//     reportCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
 // createIndividualKPIChart
@@ -31977,8 +31964,10 @@ const getDepartmentKPIReport = async (plantId, week) => {
   }
 };
 
-const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
+async function sendDepartmentKPIReportEmail(responsiblePeopleId, currentWeek, recipientOverride = null) {
   try {
+    const recipientEmail = recipientOverride?.recipientEmail;
+    const recipientName = recipientOverride?.recipientName;
     const reportWeek = currentWeek;
     const reportData = await getDepartmentKPIReport(plantId, reportWeek);
     if (!reportData || reportData.stats.totalKPIs === 0) return null;
@@ -32014,7 +32003,7 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
     const transporter = createTransporter();
     await transporter.sendMail({
       from: '"AVOCarbon Plant Analytics" <administration.STS@avocarbon.com>',
-      to: deliveryRecipient,
+      to: recipientEmail,
       subject: `Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${reportWeek.replace('2026-Week', '')}`,
       html: emailHtml,
       attachments: pdfAttachment ? [pdfAttachment] : [],
@@ -32031,6 +32020,39 @@ const sendDepartmentKPIReportEmail = async (plantId, currentWeek) => {
     throw error;
   }
 };
+
+async function runHierarchyKpiReports(frequency) {
+  const now = new Date();
+  const year = now.getFullYear();
+
+  const getWeekNumber = (date) => {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() + 4 - (d.getDay() || 7));
+    const yearStart = new Date(d.getFullYear(), 0, 1);
+    return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  };
+
+  const weekNumber = getWeekNumber(now);
+  const currentWeek = `${year}-Week${weekNumber}`;
+
+  const responsiblesRes = await pool.query(
+    `
+    SELECT DISTINCT
+      COALESCE(kta.created_by_people_id, kta.set_by_people_id) AS responsible_people_id
+    FROM public.kpi_target_allocation kta
+    JOIN public.kpi k
+      ON k.kpi_id = kta.kpi_id
+    WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) IS NOT NULL
+      AND LOWER(k.frequency) = LOWER($1)
+    `,
+    [frequency]
+  );
+
+  for (const row of responsiblesRes.rows) {
+    await sendKPIReportToHierarchy(row.responsible_people_id, currentWeek);
+  }
+}
 
 app.get("/ceo-report/plants/:plantId", async (req, res) => {
   try {
@@ -32108,55 +32130,98 @@ app.post("/api/ceo-report/plants/:plantId/send", async (req, res) => {
 //   }
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
+
+
+async function getPeopleHierarchy(peopleId) {
+  const result = await pool.query(
+    `
+    WITH RECURSIVE hierarchy AS (
+      SELECT
+        p.people_id,
+        p.first_name,
+        p.name,
+        p.email,
+        p.direct_boss_people_id,
+        0 AS level
+      FROM public.people p
+      WHERE p.people_id = $1
+
+      UNION ALL
+
+      SELECT
+        boss.people_id,
+        boss.first_name,
+        boss.name,
+        boss.email,
+        boss.direct_boss_people_id,
+        h.level + 1
+      FROM public.people boss
+      JOIN hierarchy h
+        ON boss.people_id = h.direct_boss_people_id
+      WHERE h.level < 20
+    )
+    SELECT *
+    FROM hierarchy
+    ORDER BY level ASC
+    `,
+    [peopleId]
+  );
+
+  return result.rows;
+}
+async function sendKPIReportToHierarchy(responsiblePeopleId, currentWeek) {
+  const hierarchy = await getPeopleHierarchy(responsiblePeopleId);
+
+  if (!hierarchy.length) return;
+
+  const responsible = hierarchy[0];
+  const managers = hierarchy.slice(1).filter(manager => manager.email);
+
+  for (const manager of managers) {
+    await sendDepartmentKPIReportEmail(
+      responsiblePeopleId,
+      currentWeek,
+      {
+        recipientEmail: manager.email,
+        recipientPeopleId: manager.people_id,
+        recipientName: `${manager.first_name || ""} ${manager.name || ""}`.trim()
+      }
+    );
+
+    console.log(
+      `Report for ${responsible.first_name || ""} ${responsible.name || ""} sent to ${manager.email}`
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+}
 // ---------- Cron: weekly manager/plant report ----------
 // let managerCronRunning = false;
-// cron.schedule("07 11 * * *", async () => {
-//   const lockId = "department_report_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
+
+// cron.schedule("07 11 * * 1", async () => {
+//   if (managerCronRunning) return;
+//   managerCronRunning = true;
+
 //   try {
-//     if (managerCronRunning) return;
-//     managerCronRunning = true;
-//     const now = new Date();
-//     const year = now.getFullYear();
-//     const getWeekNumber = (date) => {
-//       const d = new Date(date); d.setHours(0, 0, 0, 0);
-//       d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-//       const yearStart = new Date(d.getFullYear(), 0, 1);
-//       return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-//     };
-//     const weekNumber = getWeekNumber(now);
-//     const currentWeek = `${year}-Week${weekNumber}`;
-//     console.log(`[Manager Report] Sending reports for week ${currentWeek}...`);
-//     const plantsRes = await pool.query(
-//       `
-//       SELECT DISTINCT
-//         u.unit_id AS plant_id,
-//         u.unit_name AS name
-//       FROM public.kpi_target_allocation kta
-//       LEFT JOIN public.people owner
-//         ON owner.people_id = COALESCE(kta.created_by_people_id, kta.set_by_people_id)
-//       JOIN public.unit u
-//         ON u.unit_id = COALESCE(kta.plant_id, owner.work_at_unit_id)
-//       ORDER BY u.unit_name ASC, u.unit_id ASC
-//       `
-//     );
-//     console.log(`ðŸ“‹ Found ${plantsRes.rows.length} units with KPI allocations`);
-//     for (const plant of plantsRes.rows) {
-//       try {
-//         await sendDepartmentKPIReportEmail(plant.plant_id, currentWeek);
-//         console.log(`Report sent for plant: ${plant.name}`);
-//         await new Promise(resolve => setTimeout(resolve, 1500));
-//       } catch (err) {
-//         console.error(`  âŒ Failed for plant ${plant.name}:`, err.message);
-//       }
-//     }
-//     console.log(`[Manager Report] All plant reports sent`);
+//     await runHierarchyKpiReports("Weekly");
 //   } catch (error) {
-//     console.error("âŒ [Manager Report] Cron error:", error.message);
+//     console.error("[Weekly Hierarchy Report] Error:", error.message);
 //   } finally {
 //     managerCronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
+
+
+// cron.schedule("07 11 1 * *", async () => {
+//   if (managerCronRunning) return;
+//   managerCronRunning = true;
+
+//   try {
+//     await runHierarchyKpiReports("Monthly");
+//   } catch (error) {
+//     console.error("[Monthly Hierarchy Report] Error:", error.message);
+//   } finally {
+//     managerCronRunning = false;
 //   }
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
