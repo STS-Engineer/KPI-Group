@@ -21,11 +21,6 @@
 
 const OpenAI = require("openai");
 const { generateKPIPdf } = require('./kpi-pdf-builder');
-const { buildResolvedKpiSelect } = require("./responsible-kpi-sql");
-
-const RESPONSIBLE_KPI_RESOLVED_SELECT = buildResolvedKpiSelect("k", "rk");
-const getKpiDisplayTitle = (kpi = {}) =>
-    String(kpi.indicator_title || kpi.indicator_sub_title || "Untitled KPI").trim();
 
 // ── Colour / status helper (mirrors server.js getDotColor) ───────────────────
 const getStatus = (value, lowLimit) => {
@@ -41,69 +36,129 @@ const getStatus = (value, lowLimit) => {
 // ── Fetch all KPI data for a responsible + week ───────────────────────────────
 const fetchKPIData = async (pool, responsibleId, week) => {
     const resResp = await pool.query(
-        `SELECT r.responsible_id, r.name, r.email, r.plant_id, r.department_id,
-                p.name  AS plant_name,  d.name AS department_name,
-                p.manager, p.manager_email
-         FROM public."Responsible" r
-         JOIN public."Plant"      p ON r.plant_id      = p.plant_id
-         JOIN public."Department" d ON r.department_id = d.department_id
-         WHERE r.responsible_id = $1`,
+        `SELECT p.people_id AS responsible_id,
+                NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS name,
+                p.email,
+                p.work_at_unit_id AS plant_id,
+                u.unit_name AS plant_name,
+                ''::text AS department_name,
+                NULLIF(TRIM(CONCAT_WS(' ', COALESCE(m.first_name, ''), COALESCE(m.name, ''))), '') AS manager,
+                m.email AS manager_email
+         FROM public.people p
+         LEFT JOIN public.unit   u ON p.work_at_unit_id = u.unit_id
+         LEFT JOIN public.people m ON u.manager_id      = m.people_id
+         WHERE p.people_id = $1`,
         [responsibleId]
     );
     const responsible = resResp.rows[0];
     if (!responsible) throw new Error("Responsible not found");
 
     const kpiRes = await pool.query(
-        `SELECT kv.kpi_values_id, kv.value, kv.week,
+        `
+         SELECT
+                kta.kpi_target_allocation_id AS kpi_values_id,
+                latest_result.raw_value AS value,
+                COALESCE(
+                    latest_result.week,
+                    latest_result.period_label,
+                    TO_CHAR(latest_result.result_date, 'YYYY-MM-DD'),
+                    $2::text
+                ) AS week,
                 k.kpi_id,
-                ${RESPONSIBLE_KPI_RESOLVED_SELECT},
-                (SELECT MAX(h.updated_at)
-                 FROM public.kpi_values_hist26 h
-                 WHERE h.kpi_values_id = kv.kpi_values_id) AS last_updated,
-                (SELECT h.comment
-                 FROM public.kpi_values_hist26 h
-                 WHERE h.kpi_values_id = kv.kpi_values_id
-                   AND h.responsible_id = $1 AND h.week = $2
-                 ORDER BY h.updated_at DESC LIMIT 1) AS latest_comment,
-                ca.root_cause, ca.implemented_solution,
-                ca.evidence,   ca.status AS ca_status
-         FROM public.kpi_values kv
-         JOIN public."Kpi" k ON kv.kpi_id = k.kpi_id
-         LEFT JOIN public.responsible_kpis rk
-                ON rk.kpi_id = k.kpi_id
-               AND rk.responsible_id = kv.responsible_id
-         LEFT JOIN public.corrective_actions ca
-                ON ca.kpi_id          = kv.kpi_id
-               AND ca.responsible_id  = $1
-               AND ca.week            = $2
-         WHERE kv.responsible_id = $1 AND kv.week = $2
-         ORDER BY k.kpi_id ASC`,
+                COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject,
+                COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
+                COALESCE(latest_result.unit, kta.target_unit, k.unit) AS unit,
+                COALESCE(latest_result.target_value, kta.target_value, k.target_value) AS target,
+                COALESCE(latest_result.lower_limit, k.low_limit) AS low_limit,
+                COALESCE(latest_result.upper_limit, k.high_limit) AS high_limit,
+                k.kpi_explanation AS definition,
+                k.frequency,
+                latest_result.recorded_at AS last_updated,
+                latest_result.comments AS latest_comment,
+                NULL::text AS root_cause,
+                NULL::text AS implemented_solution,
+                NULL::text AS evidence,
+                NULL::text AS ca_status
+         FROM public.kpi_target_allocation kta
+         JOIN public.kpi k
+           ON k.kpi_id = kta.kpi_id
+         LEFT JOIN LATERAL (
+                SELECT s.subject_name
+                FROM public.subject_kpi sk
+                JOIN public.subject s
+                  ON s.subject_id = sk.subject_id
+                WHERE sk.kpi_id = k.kpi_id
+                ORDER BY COALESCE(sk.is_primary, false) DESC, sk.subject_kpi_id ASC
+                LIMIT 1
+         ) subject_link ON TRUE
+         LEFT JOIN LATERAL (
+                SELECT
+                    kr.result_date,
+                    kr.week,
+                    kr.period_label,
+                    kr.raw_value,
+                    kr.target_value,
+                    kr.lower_limit,
+                    kr.upper_limit,
+                    kr.unit,
+                    kr.recorded_at,
+                    kr.comments
+                FROM public.kpi_result kr
+                WHERE kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
+                  AND (($2::text IS NOT NULL AND (kr.period_label = $2 OR kr.week = $2)) OR $2::text IS NULL)
+                ORDER BY
+                    CASE WHEN $2::text IS NOT NULL AND (kr.period_label = $2 OR kr.week = $2) THEN 0 ELSE 1 END,
+                    kr.recorded_at DESC,
+                    kr.kpi_result_id DESC
+                LIMIT 1
+         ) latest_result ON TRUE
+         WHERE kta.set_by_people_id = $1
+         ORDER BY kta.kpi_target_allocation_id ASC
+         `,
         [responsibleId, week]
     );
 
     // Historical values for trend analysis (last 8 weeks per KPI)
     const histRes = await pool.query(
-        `SELECT DISTINCT ON (h.kpi_id, h.week)
-                h.kpi_id, h.week, h.new_value
-         FROM public.kpi_values_hist26 h
-         WHERE h.responsible_id = $1
-           AND h.new_value IS NOT NULL AND h.new_value <> ''
-         ORDER BY h.kpi_id, h.week DESC, h.updated_at DESC
-         LIMIT 200`,
+        `
+         SELECT DISTINCT ON (
+                kr.kpi_target_allocation_id,
+                COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD'))
+         )
+                kr.kpi_id,
+                kr.kpi_target_allocation_id AS kpi_values_id,
+                COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+                kr.raw_value AS new_value
+         FROM public.kpi_result kr
+         JOIN public.kpi_target_allocation kta
+           ON kta.kpi_target_allocation_id = kr.kpi_target_allocation_id
+         WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) = $1
+           AND NULLIF(TRIM(kr.raw_value::text), '') IS NOT NULL
+         ORDER BY
+                kr.kpi_target_allocation_id,
+                COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+                kr.recorded_at DESC,
+                kr.kpi_result_id DESC
+         LIMIT 400
+         `,
         [responsibleId]
     );
 
-    // Group history by kpi_id
+    // Group history by allocation id so separate KPI assignments do not collapse.
     const histMap = {};
     histRes.rows.forEach(r => {
-        if (!histMap[r.kpi_id]) histMap[r.kpi_id] = [];
-        histMap[r.kpi_id].push({ week: r.week, value: parseFloat(r.new_value) });
+        const historyKey = String(r.kpi_values_id || r.kpi_id);
+        if (!histMap[historyKey]) histMap[historyKey] = [];
+        histMap[historyKey].push({
+            week: r.week,
+            value: Number.parseFloat(String(r.new_value || "0").trim()) || 0
+        });
     });
 
     const kpis = kpiRes.rows.map(k => ({
         ...k,
-        status:  getStatus(k.value, k.low_limit),
-        history: (histMap[k.kpi_id] || []).slice(0, 8).reverse(),
+        status: getStatus(k.value, k.low_limit),
+        history: (histMap[String(k.kpi_values_id || k.kpi_id)] || []).slice(0, 8).reverse(),
     }));
 
     return { responsible, kpis };
@@ -111,10 +166,6 @@ const fetchKPIData = async (pool, responsibleId, week) => {
 
 // ── Build the OpenAI prompt for a single KPI ─────────────────────────────────
 const buildKPIPrompt = (kpi, responsible) => {
-    const kpiTitle = getKpiDisplayTitle(kpi);
-    const kpiSubtitle = kpi.indicator_sub_title && kpi.indicator_sub_title !== kpiTitle
-        ? ` — ${kpi.indicator_sub_title}`
-        : "";
     const histLine = kpi.history.length
         ? kpi.history.map(h => `${h.week}: ${h.value}`).join(", ")
         : "No historical data";
@@ -132,7 +183,7 @@ const buildKPIPrompt = (kpi, responsible) => {
 
 Analyse this KPI for ${responsible.plant_name} — ${responsible.department_name}:
 
-KPI: ${kpiTitle}${kpiSubtitle}
+KPI: ${kpi.subject}${kpi.indicator_sub_title ? ` — ${kpi.indicator_sub_title}` : ""}
 Unit: ${kpi.unit || "N/A"}
 Current value: ${kpi.value} ${kpi.unit || ""}
 Low limit: ${kpi.low_limit ?? "N/A"}
@@ -141,6 +192,7 @@ Target: ${kpi.target ?? "N/A"}
 Status: ${kpi.status}
 Gap from low limit: ${gap}
 Historical trend (oldest → newest): ${histLine}
+${kpi.definition     ? `Definition: ${kpi.definition}`                          : ""}
 ${kpi.latest_comment ? `Manager comment: ${kpi.latest_comment}`                 : ""}
 ${kpi.ca_status      ? `Existing corrective action status: ${kpi.ca_status}`    : ""}
 
@@ -180,7 +232,7 @@ const generateAIRecommendations = async (kpis, responsible) => {
             const parsed = JSON.parse(raw);
 
             recs.push({
-                kpi_name:      getKpiDisplayTitle(kpi),
+                kpi_name:      kpi.subject,
                 kpi_subtitle:  kpi.indicator_sub_title || "",
                 kpi_id:        kpi.kpi_id,
                 unit:          kpi.unit || "",
@@ -192,9 +244,9 @@ const generateAIRecommendations = async (kpis, responsible) => {
                 ...parsed,
             });
         } catch (err) {
-            console.error(`AI recommendation failed for ${getKpiDisplayTitle(kpi)}:`, err.message);
+            console.error(`AI recommendation failed for ${kpi.subject}:`, err.message);
             recs.push({
-                kpi_name:           getKpiDisplayTitle(kpi),
+                kpi_name:           kpi.subject,
                 kpi_subtitle:       kpi.indicator_sub_title || "",
                 kpi_id:             kpi.kpi_id,
                 unit:               kpi.unit || "",
@@ -230,6 +282,8 @@ Week: ${week}
 
 KPI Summary:
 - Total KPIs: ${kpis.length}
+- Critical (below limit): ${critical.length} — ${critical.map(k => k.subject).join(", ") || "none"}
+- Watch (near limit):     ${watch.length}    — ${watch.map(k => k.subject).join(", ")    || "none"}
 - On track:               ${kpis.length - critical.length - watch.length}
 
 Write a concise executive strategic overview (3-4 sentences) and provide 5-7 prioritised next steps.
@@ -284,7 +338,7 @@ const buildPDFPayload = (responsible, kpis, recommendations, strategic, week) =>
     week,
     kpis: kpis.map(k => ({
         kpi_id:             k.kpi_id,
-        indicator_title:    getKpiDisplayTitle(k),
+        subject:            k.subject,
         indicator_sub_title: k.indicator_sub_title,
         unit:               k.unit,
         value:              k.value,
@@ -435,13 +489,23 @@ const generatePlantKPIRecommendationsPDFBuffer = async (pool, plantId, week) => 
 
     // Get all responsibles for this plant
     const responsiblesRes = await pool.query(
-        `SELECT r.responsible_id, r.name, r.email,
-                p.name AS plant_name, d.name AS department_name,
-                p.manager, p.manager_email
-         FROM public."Responsible" r
-         JOIN public."Plant"      p ON r.plant_id      = p.plant_id
-         JOIN public."Department" d ON r.department_id = d.department_id
-         WHERE r.plant_id = $1`,
+        `SELECT DISTINCT
+                p.people_id AS responsible_id,
+                NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS name,
+                p.email,
+                u.unit_name AS plant_name,
+                ''::text AS department_name,
+                NULLIF(TRIM(CONCAT_WS(' ', COALESCE(m.first_name, ''), COALESCE(m.name, ''))), '') AS manager,
+                m.email AS manager_email
+         FROM public.kpi_target_allocation kta
+         JOIN public.people p
+           ON p.people_id = kta.set_by_people_id
+         JOIN public.unit u
+           ON u.unit_id = COALESCE(kta.plant_id, p.work_at_unit_id)
+         LEFT JOIN public.people m
+           ON u.manager_id = m.people_id
+         WHERE COALESCE(kta.plant_id, p.work_at_unit_id) = $1
+         ORDER BY name ASC, p.people_id ASC`,
         [plantId]
     );
 
@@ -507,7 +571,7 @@ const generatePlantKPIRecommendationsPDFBuffer = async (pool, plantId, week) => 
         week,
         kpis: allKPIs.map(k => ({
             kpi_id:              k.kpi_id,
-            indicator_title:     getKpiDisplayTitle(k),
+            subject:             k.subject,
             indicator_sub_title: k._responsible
                                     ? `${k.indicator_sub_title || ''} [${k._responsible}]`.trim()
                                     : k.indicator_sub_title,
@@ -534,14 +598,23 @@ const generateAndSendManagerReport = async (pool, createTransporter, plantId, we
     console.log(`🔄 Generating manager report for plant=${plantId} week=${week}`);
 
     const responsiblesRes = await pool.query(
-        `SELECT responsible_id, name, email
-         FROM public."Responsible"
-         WHERE plant_id = $1`,
+        `
+        SELECT DISTINCT
+            p.people_id AS responsible_id,
+            NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS name,
+            p.email
+        FROM public.kpi_target_allocation kta
+        LEFT JOIN public.people p
+            ON p.people_id = kta.set_by_people_id
+        WHERE COALESCE(kta.plant_id, p.work_at_unit_id) = $1
+          AND p.people_id IS NOT NULL
+        ORDER BY name ASC NULLS LAST, p.people_id ASC
+        `,
         [plantId]
     );
 
     if (responsiblesRes.rows.length === 0) {
-        throw new Error("No responsibles found for this plant");
+        throw new Error("No KPI owners found for this plant");
     }
 
     const results = [];
@@ -559,7 +632,15 @@ const generateAndSendManagerReport = async (pool, createTransporter, plantId, we
 
     // Optional summary log to plant manager
     const plantRes = await pool.query(
-        `SELECT manager, manager_email FROM public."Plant" WHERE plant_id = $1`,
+        `
+        SELECT
+            NULLIF(TRIM(CONCAT_WS(' ', COALESCE(m.first_name, ''), COALESCE(m.name, ''))), '') AS manager,
+            m.email AS manager_email
+        FROM public.unit u
+        LEFT JOIN public.people m
+            ON u.manager_id = m.people_id
+        WHERE u.unit_id = $1
+        `,
         [plantId]
     );
     const plant = plantRes.rows[0];
