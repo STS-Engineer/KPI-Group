@@ -30594,66 +30594,66 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // ---------- Cron: weekly KPI submission email ----------
 // let cronRunning = false;
 
-cron.schedule("10 00 * * *", async () => {
-  const lockId = "send_kpi_weekly_email_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
+// cron.schedule("02 10 * * *", async () => {
+//   const lockId = "send_kpi_weekly_email_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
 
-  try {
-    if (cronRunning) return;
-    cronRunning = true;
+//   try {
+//     if (cronRunning) return;
+//     cronRunning = true;
 
-    const currentWeek = getPreviousWeek(getCurrentWeek());
+//     const currentWeek = getPreviousWeek(getCurrentWeek());
 
-    const recipients = await loadKpiSubmissionEmailRecipients();
+//     const recipients = await loadKpiSubmissionEmailRecipients();
 
-    for (const recipient of recipients) {
-      try {
-        await sendKPIEmail(recipient.people_id, currentWeek);
-        await new Promise((resolve) => setTimeout(resolve, 750));
-      } catch (error) {
-        console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
-      }
-    }
+//     for (const recipient of recipients) {
+//       try {
+//         await sendKPIEmail(recipient.people_id, currentWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 750));
+//       } catch (error) {
+//         console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
+//       }
+//     }
 
-    console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
-  } catch (err) {
-    console.error("Scheduled email error:", err.message);
-  } finally {
-    cronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+//     console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
+//   } catch (err) {
+//     console.error("Scheduled email error:", err.message);
+//   } finally {
+//     cronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
----------- Cron: weekly reports ----------
-let reportCronRunning = false;
-cron.schedule("15 00 * * *", async () => {
-  const lockId = "weekly_kpi_report_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
-  try {
-    if (reportCronRunning) return;
-    reportCronRunning = true;
-    const reportWeek = getPreviousWeek(getCurrentWeek());
-    const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+// ---------- Cron: weekly reports ----------
+// let reportCronRunning = false;
+// cron.schedule("55 12 * * *", async () => {
+//   const lockId = "weekly_kpi_report_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (reportCronRunning) return;
+//     reportCronRunning = true;
+//     const reportWeek = getPreviousWeek(getCurrentWeek());
+//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
 
-    for (const recipient of recipients) {
-      try {
-        await generateWeeklyReportEmail(recipient.people_id, reportWeek);
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      } catch (err) {
-        console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
-      }
-    }
+//     for (const recipient of recipients) {
+//       try {
+//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 1500));
+//       } catch (err) {
+//         console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
+//       }
+//     }
 
-    console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-  } catch (error) {
-    console.error("Report cron error:", error.message);
-  } finally {
-    reportCronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+//   } catch (error) {
+//     console.error("Report cron error:", error.message);
+//   } finally {
+//     reportCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
 // createIndividualKPIChart
