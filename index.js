@@ -30626,34 +30626,34 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ---------- Cron: weekly reports ----------
-// let reportCronRunning = false;
-// cron.schedule("55 12 * * *", async () => {
-//   const lockId = "weekly_kpi_report_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
-//   try {
-//     if (reportCronRunning) return;
-//     reportCronRunning = true;
-//     const reportWeek = getPreviousWeek(getCurrentWeek());
-//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+let reportCronRunning = false;
+cron.schedule("01 01 * * *", async () => {
+  const lockId = "weekly_kpi_report_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
+  try {
+    if (reportCronRunning) return;
+    reportCronRunning = true;
+    const reportWeek = getPreviousWeek(getCurrentWeek());
+    const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
 
-//     for (const recipient of recipients) {
-//       try {
-//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
-//         await new Promise((resolve) => setTimeout(resolve, 1500));
-//       } catch (err) {
-//         console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
-//       }
-//     }
+    for (const recipient of recipients) {
+      try {
+        await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      } catch (err) {
+        console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
+      }
+    }
 
-//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-//   } catch (error) {
-//     console.error("Report cron error:", error.message);
-//   } finally {
-//     reportCronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+    console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+  } catch (error) {
+    console.error("Report cron error:", error.message);
+  } finally {
+    reportCronRunning = false;
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+  }
+}, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
 // createIndividualKPIChart
