@@ -2968,6 +2968,16 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
     .join("|");
 };
 
+const getKpiTargetAllocationScopeIdentifier = (row = {}) => {
+  const normalizedZoneId = normalizeOptionalIntegerInput(row.zone_id);
+  if (normalizedZoneId) {
+    return `zone:${normalizedZoneId}`;
+  }
+
+  const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
+  return normalizedUnitId ? `unit:${normalizedUnitId}` : "";
+};
+
 const getKpiTargetAllocationGroupIds = async (allocationId) => {
   const normalizedAllocationId = normalizeOptionalIntegerInput(allocationId);
   if (!normalizedAllocationId) return [];
@@ -3100,6 +3110,28 @@ const loadKpiTargetAllocationFamilyRowsForUi = async (allocationId) => {
   const rowCollections = await Promise.all(
     familyIds.map((familyAllocationId) =>
       loadKpiTargetAllocationRowsForUi({ allocationId: familyAllocationId, responsibleId: null })
+    )
+  );
+
+  return rowCollections
+    .flat()
+    .filter(Boolean)
+    .sort((left, right) => Number(left.kpi_target_allocation_id) - Number(right.kpi_target_allocation_id));
+};
+
+const loadKpiTargetAllocationRowsByIdsForUi = async (allocationIds = []) => {
+  const normalizedAllocationIds = Array.from(
+    new Set(
+      (Array.isArray(allocationIds) ? allocationIds : [allocationIds])
+        .map((allocationId) => normalizeOptionalIntegerInput(allocationId))
+        .filter((allocationId) => Number.isInteger(allocationId) && allocationId > 0)
+    )
+  );
+  if (!normalizedAllocationIds.length) return [];
+
+  const rowCollections = await Promise.all(
+    normalizedAllocationIds.map((allocationId) =>
+      loadKpiTargetAllocationRowsForUi({ allocationId, responsibleId: null })
     )
   );
 
@@ -5851,6 +5883,22 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
     const anchorAllocationId = normalizeOptionalIntegerInput(kpiObjectId);
     const existingGroupRows = await loadKpiTargetAllocationGroupRowsForUi(Number(kpiObjectId));
     const existingFamilyRows = await loadKpiTargetAllocationFamilyRowsForUi(Number(kpiObjectId));
+    const requestedExistingAllocationIds = Array.from(
+      new Set(
+        [
+          anchorAllocationId,
+          ...(Array.isArray(req.body?.existing_allocation_ids) ? req.body.existing_allocation_ids : []),
+          ...(Array.isArray(req.body?.unit_allocations)
+            ? req.body.unit_allocations.map((row) => row?.kpi_target_allocation_id ?? row?.allocation_id)
+            : [])
+        ]
+          .map((allocationId) => normalizeOptionalIntegerInput(allocationId))
+          .filter((allocationId) => Number.isInteger(allocationId) && allocationId > 0)
+      )
+    );
+    const explicitExistingRows = requestedExistingAllocationIds.length
+      ? await loadKpiTargetAllocationRowsByIdsForUi(requestedExistingAllocationIds)
+      : [];
 
     if (!existingGroupRows.length) {
       return res.status(404).json({ error: "KPI target allocation not found" });
@@ -5872,9 +5920,17 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
     client = await pool.connect();
     await client.query("BEGIN");
 
-    const availableExistingRows = existingFamilyRows.length
-      ? existingFamilyRows
-      : existingGroupRows;
+    const availableExistingRows = Array.from(
+      new Map(
+        [
+          ...(existingFamilyRows.length ? existingFamilyRows : existingGroupRows),
+          ...explicitExistingRows,
+          ...existingGroupRows
+        ]
+          .map((row) => [normalizeOptionalIntegerInput(row?.kpi_target_allocation_id), row])
+          .filter(([allocationId]) => Number.isInteger(allocationId) && allocationId > 0)
+      ).values()
+    );
     const existingRowsByAllocationId = new Map(
       availableExistingRows
         .map((row) => [
@@ -5887,6 +5943,11 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
       availableExistingRows
         .map((row) => [getKpiTargetAllocationScopeKey(row), row])
         .filter(([scopeKey]) => Boolean(scopeKey))
+    );
+    const existingRowsByScopeIdentifier = new Map(
+      availableExistingRows
+        .map((row) => [getKpiTargetAllocationScopeIdentifier(row), row])
+        .filter(([scopeIdentifier]) => Boolean(scopeIdentifier))
     );
     const anchorExistingRow = anchorAllocationId
       ? existingRowsByAllocationId.get(anchorAllocationId) || null
@@ -5904,6 +5965,17 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
     const matchedExistingAllocationIds = new Set();
     const touchedKpiIds = new Set();
 
+    const pickAvailableExistingRow = (candidateRow) => {
+      const candidateAllocationId = normalizeOptionalIntegerInput(candidateRow?.kpi_target_allocation_id);
+      if (!candidateAllocationId) {
+        return null;
+      }
+
+      return matchedExistingAllocationIds.has(candidateAllocationId)
+        ? null
+        : candidateRow;
+    };
+
     existingFamilyRows.forEach((row) => {
       const existingKpiId = normalizeOptionalIntegerInput(row?.kpi_id);
       if (existingKpiId) {
@@ -5919,6 +5991,7 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
 
       const preparedAllocationId = normalizeOptionalIntegerInput(preparedRow.kpi_target_allocation_id);
       const scopeKey = getKpiTargetAllocationScopeKey(preparedRow);
+      const scopeIdentifier = getKpiTargetAllocationScopeIdentifier(preparedRow);
       const existingRow =
         (preparedAllocationId
           ? existingRowsByAllocationId.get(preparedAllocationId)
@@ -5926,7 +5999,10 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
         (!preparedAllocationId && preparedRows.length === 1 && anchorExistingRow
           ? anchorExistingRow
           : null) ||
-        (scopeKey ? existingRowsByScopeKey.get(scopeKey) : null);
+        (scopeKey ? pickAvailableExistingRow(existingRowsByScopeKey.get(scopeKey)) : null) ||
+        (scopeIdentifier
+          ? pickAvailableExistingRow(existingRowsByScopeIdentifier.get(scopeIdentifier))
+          : null);
       const existingAssignedPeopleId = normalizeOptionalIntegerInput(existingRow?.set_by_people_id);
       const preparedAssignedPeopleId = normalizeOptionalIntegerInput(preparedRow?.set_by_people_id);
       const existingKpiId = normalizeOptionalIntegerInput(existingRow?.kpi_id);
@@ -6125,7 +6201,22 @@ app.delete("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (r
   try {
     await ensureKpiRatioSchema();
     await ensureKpiObjectSchema();
-    const groupIds = await getKpiTargetAllocationGroupIds(kpiObjectId);
+    const requestedAllocationIds = Array.from(
+      new Set(
+        (Array.isArray(req.body?.allocation_ids) ? req.body.allocation_ids : [])
+          .map((allocationId) => normalizeOptionalIntegerInput(allocationId))
+          .filter((allocationId) => Number.isInteger(allocationId) && allocationId > 0)
+      )
+    );
+    const anchorAllocationId = normalizeOptionalIntegerInput(kpiObjectId);
+    const groupIds = requestedAllocationIds.length
+      ? Array.from(
+        new Set(
+          [anchorAllocationId, ...requestedAllocationIds]
+            .filter((allocationId) => Number.isInteger(allocationId) && allocationId > 0)
+        )
+      )
+      : await getKpiTargetAllocationGroupIds(kpiObjectId);
     if (!groupIds.length) {
       return res.status(404).json({ error: "KPI target allocation not found" });
     }
@@ -15120,7 +15211,7 @@ function getCurrentKpiRowById(kpiId) {
                           <button
                             type="button"
                             class="action-btn delete-btn parameter-action-btn"
-                            onclick="deleteParameterKpi(\${row.kpi_target_allocation_id})"
+                            onclick="deleteGroupedParameterKpi(\${row.kpi_target_allocation_id})"
                             aria-label="Delete allocation"
                             title="Delete allocation"
                           >
@@ -15168,6 +15259,57 @@ function getCurrentKpiRowById(kpiId) {
         );
       }
 
+      function normalizeParameterAllocationIdList(allocationIds = []) {
+        return Array.from(
+          new Set(
+            (Array.isArray(allocationIds) ? allocationIds : [allocationIds])
+              .map((allocationId) => String(allocationId || "").trim())
+              .filter(Boolean)
+          )
+        );
+      }
+
+      function getParameterAllocationIdsFromRows(rows = []) {
+        return normalizeParameterAllocationIdList(
+          (Array.isArray(rows) ? rows : []).map((row) => row?.kpi_target_allocation_id)
+        );
+      }
+
+      function findGroupedParameterRow(parameterObjectId) {
+        const normalizedParameterObjectId = String(parameterObjectId || "").trim();
+        if (!normalizedParameterObjectId) return null;
+
+        const candidateRows = [
+          ...(Array.isArray(currentParameterRows) ? currentParameterRows : []),
+          ...(Array.isArray(parameterSourceRows) ? parameterSourceRows : [])
+        ];
+
+        return candidateRows.find((row) =>
+          doesParameterRowMatchAllocationIds(row, normalizedParameterObjectId)
+        ) || null;
+      }
+
+      function getParameterAllocationIdsForDelete(parameterObjectId, { preferFormState = false } = {}) {
+        if (preferFormState) {
+          const stateAllocationIds = normalizeParameterAllocationIdList(
+            Object.values(parameterUnitTargetState || {}).map((state) => state?.kpi_target_allocation_id)
+          );
+          if (stateAllocationIds.length) {
+            return stateAllocationIds;
+          }
+        }
+
+        const matchedGroupedRow = findGroupedParameterRow(parameterObjectId);
+        if (Array.isArray(matchedGroupedRow?.related_allocations) && matchedGroupedRow.related_allocations.length) {
+          const relatedIds = getParameterAllocationIdsFromRows(matchedGroupedRow.related_allocations);
+          if (relatedIds.length) {
+            return relatedIds;
+          }
+        }
+
+        return normalizeParameterAllocationIdList(parameterObjectId);
+      }
+
       function removeParameterAllocationsFromUi(allocationIds) {
         parameterSourceRows = (Array.isArray(parameterSourceRows) ? parameterSourceRows : []).filter(
           (row) => !doesParameterRowMatchAllocationIds(row, allocationIds)
@@ -15177,31 +15319,13 @@ function getCurrentKpiRowById(kpiId) {
       }
 
       function getParameterAllocationIdsForUiRemoval(parameterObjectId, responseData = null) {
-        const responseIds = Array.isArray(responseData?.deleted_ids)
-          ? responseData.deleted_ids
-              .map((allocationId) => String(allocationId || "").trim())
-              .filter(Boolean)
-          : [];
+        const responseIds = normalizeParameterAllocationIdList(responseData?.deleted_ids || []);
 
         if (responseIds.length) {
           return responseIds;
         }
 
-        const matchedGroupedRow = (Array.isArray(parameterSourceRows) ? parameterSourceRows : []).find(
-          (row) => String(row?.kpi_target_allocation_id || "").trim() === String(parameterObjectId || "").trim()
-        );
-
-        if (Array.isArray(matchedGroupedRow?.related_allocations) && matchedGroupedRow.related_allocations.length) {
-          const relatedIds = matchedGroupedRow.related_allocations
-            .map((row) => String(row?.kpi_target_allocation_id || "").trim())
-            .filter(Boolean);
-
-          if (relatedIds.length) {
-            return relatedIds;
-          }
-        }
-
-        return [String(parameterObjectId || "").trim()].filter(Boolean);
+        return getParameterAllocationIdsForDelete(parameterObjectId);
       }
 
       async function loadParameterKpis(search = getParameterSearchValue()) {
@@ -17039,6 +17163,10 @@ function buildParameterPayload() {
   const scopeKind = getParameterScopeKind();
   const unitAllocations = getParameterUnitAllocationRows();
   const primaryAllocation = unitAllocations[0] || null;
+  const existingAllocationIds = getParameterAllocationIdsForDelete(
+    getParameterFieldValue("parameter_object_id"),
+    { preferFormState: true }
+  );
 
  const roleId = scopeKind === "zone" ? "" : getNormalizedParameterRoleId();
 
@@ -17073,6 +17201,7 @@ function buildParameterPayload() {
     set_by_people_id: getParameterFieldValue("parameter_set_by_people_id"),
     approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id"),
     comments: getParameterFieldValue("parameter_comments"),
+    existing_allocation_ids: existingAllocationIds,
     unit_allocations: unitAllocations
   };
   }
@@ -17205,19 +17334,40 @@ if (missingRow) {
         const parameterObjectId = getParameterFieldValue("parameter_object_id");
         if (!parameterObjectId) return;
 
-        const ok = confirm("Delete this KPI target allocation?");
+        const allocationIds = getParameterAllocationIdsForDelete(parameterObjectId, { preferFormState: true });
+        const ok = confirm(
+          allocationIds.length > 1
+            ? "Delete this KPI target allocation and all linked unit rows?"
+            : "Delete this KPI target allocation?"
+        );
         if (!ok) return;
 
-        await deleteParameterKpi(parameterObjectId, true);
+        await deleteParameterKpi(parameterObjectId, true, allocationIds);
       }
 
-      async function deleteParameterKpi(parameterObjectId, fromModal = false) {
-        const ok = fromModal ? true : confirm("Delete this KPI target allocation?");
+      async function deleteGroupedParameterKpi(parameterObjectId) {
+        const allocationIds = getParameterAllocationIdsForDelete(parameterObjectId);
+        await deleteParameterKpi(parameterObjectId, false, allocationIds);
+      }
+
+      async function deleteParameterKpi(parameterObjectId, fromModal = false, allocationIds = []) {
+        const normalizedAllocationIds = normalizeParameterAllocationIdList(allocationIds);
+        const ok = fromModal ? true : confirm(
+          normalizedAllocationIds.length > 1
+            ? "Delete this KPI target allocation and all linked unit rows?"
+            : "Delete this KPI target allocation?"
+        );
         if (!ok) return;
 
         try {
           const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId, {
-            method: "DELETE"
+            method: "DELETE",
+            headers: normalizedAllocationIds.length
+              ? { "Content-Type": "application/json" }
+              : undefined,
+            body: normalizedAllocationIds.length
+              ? JSON.stringify({ allocation_ids: normalizedAllocationIds })
+              : undefined
           });
           const responseData = await res.json().catch(() => null);
 
@@ -30626,34 +30776,34 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ---------- Cron: weekly reports ----------
-let reportCronRunning = false;
-cron.schedule("01 01 * * *", async () => {
-  const lockId = "weekly_kpi_report_job";
-  const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
-  try {
-    if (reportCronRunning) return;
-    reportCronRunning = true;
-    const reportWeek = getPreviousWeek(getCurrentWeek());
-    const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+// let reportCronRunning = false;
+// cron.schedule("55 12 * * *", async () => {
+//   const lockId = "weekly_kpi_report_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
+//   try {
+//     if (reportCronRunning) return;
+//     reportCronRunning = true;
+//     const reportWeek = getPreviousWeek(getCurrentWeek());
+//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
 
-    for (const recipient of recipients) {
-      try {
-        await generateWeeklyReportEmail(recipient.people_id, reportWeek);
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      } catch (err) {
-        console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
-      }
-    }
+//     for (const recipient of recipients) {
+//       try {
+//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 1500));
+//       } catch (err) {
+//         console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
+//       }
+//     }
 
-    console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-  } catch (error) {
-    console.error("Report cron error:", error.message);
-  } finally {
-    reportCronRunning = false;
-    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+//   } catch (error) {
+//     console.error("Report cron error:", error.message);
+//   } finally {
+//     reportCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
 // createIndividualKPIChart
