@@ -17474,7 +17474,7 @@ if (missingRow) {
       });
     }
 
-   const parameterRoleSelect = document.getElementById("parameter_role_id");
+const parameterRoleSelect = document.getElementById("parameter_role_id");
 if (parameterRoleSelect) {
   parameterRoleSelect.addEventListener("change", () => {
     syncParameterRoleDropdown();
@@ -17482,11 +17482,8 @@ if (parameterRoleSelect) {
       syncIndividualParameterFields();
       return;
     }
-    // For Zone scope: re-filter zones by the newly selected role,
-    // then reset any previously entered targets so stale rows are cleared
-    if (getParameterScopeKind() === "zone") {
-      resetParameterUnitTargetState();
-    }
+    // Keep the zone values keyed by zone id so filtering by role only changes
+    // which rows are visible, without wiping existing target values.
     renderMultisiteUnitMatrix();
   });
 
