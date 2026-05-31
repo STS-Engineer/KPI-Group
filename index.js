@@ -44,6 +44,8 @@ const openai = new OpenAI({
 
 const NUMERIC_TEXT_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 const KPI_KNOWLEDGE_BASE_MAX_DEPTH = 5;
+const KPI_KNOWLEDGE_REFRESH_BATCH_SIZE = 10;
+const KPI_KNOWLEDGE_REFRESH_INTERVAL_MS = 5000;
 const KPI_KNOWLEDGE_BASE_STOP_WORDS = new Set([
   "a",
   "an",
@@ -79,6 +81,9 @@ const KPI_KNOWLEDGE_BASE_STOP_WORDS = new Set([
   "une",
   "un"
 ]);
+
+let kpiKnowledgeRefreshWorkerTimer = null;
+let kpiKnowledgeRefreshWorkerRunning = false;
 
 const createHttpError = (statusCode, message) => {
   const error = new Error(message);
@@ -826,8 +831,465 @@ const ensureKpiRatioSchema = async () => {
       `);
 
       await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS kpi_knowledge_updated_date TIMESTAMPTZ
+      `);
+
+      await pool.query(`
         ALTER TABLE public.kpi_target_allocation
         ADD COLUMN IF NOT EXISTS created_by_people_id INTEGER
+      `);
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.kpi_knowledge_refresh_queue (
+          kpi_id INTEGER PRIMARY KEY
+            REFERENCES public.kpi (kpi_id)
+            ON DELETE CASCADE,
+          reason TEXT,
+          requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_knowledge_refresh_queue_requested_at
+        ON public.kpi_knowledge_refresh_queue (requested_at ASC, kpi_id ASC)
+      `);
+
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION public.enqueue_kpi_knowledge_refresh_target(
+          p_kpi_id INTEGER,
+          p_reason TEXT DEFAULT NULL
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          IF p_kpi_id IS NULL THEN
+            RETURN;
+          END IF;
+
+          INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+          VALUES (
+            p_kpi_id,
+            COALESCE(NULLIF(BTRIM(COALESCE(p_reason, '')), ''), 'source_change'),
+            NOW()
+          )
+          ON CONFLICT (kpi_id) DO UPDATE
+          SET
+            reason = EXCLUDED.reason,
+            requested_at = EXCLUDED.requested_at;
+        END;
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION public.enqueue_all_kpi_knowledge_refresh(
+          p_reason TEXT DEFAULT NULL
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+          SELECT
+            k.kpi_id,
+            COALESCE(NULLIF(BTRIM(COALESCE(p_reason, '')), ''), 'source_change'),
+            NOW()
+          FROM public.kpi k
+          ON CONFLICT (kpi_id) DO UPDATE
+          SET
+            reason = EXCLUDED.reason,
+            requested_at = EXCLUDED.requested_at;
+        END;
+        $$;
+      `);
+
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        AS $$
+        DECLARE
+          v_reason TEXT := LOWER(TG_TABLE_NAME) || '_' || LOWER(TG_OP);
+          v_role_id INTEGER;
+          v_people_id INTEGER;
+          v_unit_id INTEGER;
+          v_zone_id INTEGER;
+          v_unit_type_id INTEGER;
+          v_product_id INTEGER;
+          v_product_line_id INTEGER;
+          v_market_id INTEGER;
+          v_customer_id INTEGER;
+        BEGIN
+          IF TG_TABLE_NAME = 'kpi' THEN
+            IF TG_OP = 'INSERT' THEN
+              PERFORM public.enqueue_kpi_knowledge_refresh_target(NEW.kpi_id, v_reason);
+              RETURN NEW;
+            END IF;
+
+            IF TG_OP = 'UPDATE' THEN
+              IF
+                (to_jsonb(NEW) - 'kpi_knowledge_base' - 'kpi_knowledge_updated_date')
+                IS DISTINCT FROM
+                (to_jsonb(OLD) - 'kpi_knowledge_base' - 'kpi_knowledge_updated_date')
+              THEN
+                PERFORM public.enqueue_kpi_knowledge_refresh_target(NEW.kpi_id, v_reason);
+
+                INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+                SELECT DISTINCT
+                  ref.kpi_id,
+                  'reference_kpi_updated',
+                  NOW()
+                FROM public.kpi ref
+                WHERE ref.reference_kpi_id = NEW.kpi_id
+                  AND ref.kpi_id <> NEW.kpi_id
+                ON CONFLICT (kpi_id) DO UPDATE
+                SET
+                  reason = EXCLUDED.reason,
+                  requested_at = EXCLUDED.requested_at;
+              END IF;
+
+              RETURN NEW;
+            END IF;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'subject_kpi' THEN
+            PERFORM public.enqueue_kpi_knowledge_refresh_target(COALESCE(NEW.kpi_id, OLD.kpi_id), v_reason);
+
+            IF TG_OP = 'UPDATE' AND NEW.kpi_id IS DISTINCT FROM OLD.kpi_id THEN
+              PERFORM public.enqueue_kpi_knowledge_refresh_target(OLD.kpi_id, 'subject_kpi_relinked');
+            END IF;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'subject' THEN
+            PERFORM public.enqueue_all_kpi_knowledge_refresh(v_reason);
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'kpi_target_allocation' THEN
+            PERFORM public.enqueue_kpi_knowledge_refresh_target(COALESCE(NEW.kpi_id, OLD.kpi_id), v_reason);
+
+            IF TG_OP = 'UPDATE' AND NEW.kpi_id IS DISTINCT FROM OLD.kpi_id THEN
+              PERFORM public.enqueue_kpi_knowledge_refresh_target(OLD.kpi_id, 'kpi_target_allocation_relinked');
+            END IF;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'kpi_result' THEN
+            PERFORM public.enqueue_kpi_knowledge_refresh_target(COALESCE(NEW.kpi_id, OLD.kpi_id), v_reason);
+
+            IF TG_OP = 'UPDATE' AND NEW.kpi_id IS DISTINCT FROM OLD.kpi_id THEN
+              PERFORM public.enqueue_kpi_knowledge_refresh_target(OLD.kpi_id, 'kpi_result_relinked');
+            END IF;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'role' THEN
+            v_role_id := COALESCE(NEW.role_id, OLD.role_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              affected.kpi_id,
+              v_reason,
+              NOW()
+            FROM (
+              SELECT k.kpi_id
+              FROM public.kpi k
+              WHERE k.owner_role_id = v_role_id
+              UNION
+              SELECT a.kpi_id
+              FROM public.kpi_target_allocation a
+              WHERE a.role_id = v_role_id
+            ) affected
+            WHERE affected.kpi_id IS NOT NULL
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'people' THEN
+            v_people_id := COALESCE(NEW.people_id, OLD.people_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              affected.kpi_id,
+              v_reason,
+              NOW()
+            FROM (
+              SELECT k.kpi_id
+              FROM public.kpi k
+              WHERE k.created_by_people_id = v_people_id
+              UNION
+              SELECT a.kpi_id
+              FROM public.kpi_target_allocation a
+              WHERE a.set_by_people_id = v_people_id
+                 OR a.created_by_people_id = v_people_id
+                 OR a.approved_by_people_id = v_people_id
+              UNION
+              SELECT r.kpi_id
+              FROM public.kpi_result r
+              WHERE r.recorded_by_people_id = v_people_id
+            ) affected
+            WHERE affected.kpi_id IS NOT NULL
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'unit' THEN
+            v_unit_id := COALESCE(NEW.unit_id, OLD.unit_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.plant_id = v_unit_id
+               OR a.unit_id = v_unit_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'zone' THEN
+            v_zone_id := COALESCE(NEW.zone_id, OLD.zone_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.zone_id = v_zone_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'unit_type' THEN
+            v_unit_type_id := COALESCE(NEW.unit_type_id, OLD.unit_type_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.unit_type_id = v_unit_type_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'product' THEN
+            v_product_id := COALESCE(NEW.product_id, OLD.product_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.product_id = v_product_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'product_line' THEN
+            v_product_line_id := COALESCE(NEW.product_line_id, OLD.product_line_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.product_line_id = v_product_line_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'market' THEN
+            v_market_id := COALESCE(NEW.market_id, OLD.market_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.market_id = v_market_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          IF TG_TABLE_NAME = 'customer' THEN
+            v_customer_id := COALESCE(NEW.customer_id, OLD.customer_id);
+
+            INSERT INTO public.kpi_knowledge_refresh_queue (kpi_id, reason, requested_at)
+            SELECT DISTINCT
+              a.kpi_id,
+              v_reason,
+              NOW()
+            FROM public.kpi_target_allocation a
+            WHERE a.customer_id = v_customer_id
+            ON CONFLICT (kpi_id) DO UPDATE
+            SET
+              reason = EXCLUDED.reason,
+              requested_at = EXCLUDED.requested_at;
+
+            RETURN COALESCE(NEW, OLD);
+          END IF;
+
+          RETURN COALESCE(NEW, OLD);
+        END;
+        $$;
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_kpi ON public.kpi;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_kpi
+        AFTER INSERT OR UPDATE ON public.kpi
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_subject_kpi ON public.subject_kpi;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_subject_kpi
+        AFTER INSERT OR UPDATE OR DELETE ON public.subject_kpi
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_subject ON public.subject;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_subject
+        AFTER INSERT OR UPDATE OR DELETE ON public.subject
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_kpi_target_allocation ON public.kpi_target_allocation;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_kpi_target_allocation
+        AFTER INSERT OR UPDATE OR DELETE ON public.kpi_target_allocation
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_kpi_result ON public.kpi_result;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_kpi_result
+        AFTER INSERT OR UPDATE OR DELETE ON public.kpi_result
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_role ON public.role;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_role
+        AFTER INSERT OR UPDATE OR DELETE ON public.role
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_people ON public.people;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_people
+        AFTER INSERT OR UPDATE OR DELETE ON public.people
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_unit ON public.unit;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_unit
+        AFTER INSERT OR UPDATE OR DELETE ON public.unit
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_zone ON public.zone;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_zone
+        AFTER INSERT OR UPDATE OR DELETE ON public.zone
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_unit_type ON public.unit_type;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_unit_type
+        AFTER INSERT OR UPDATE OR DELETE ON public.unit_type
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_product ON public.product;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_product
+        AFTER INSERT OR UPDATE OR DELETE ON public.product
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_product_line ON public.product_line;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_product_line
+        AFTER INSERT OR UPDATE OR DELETE ON public.product_line
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_market ON public.market;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_market
+        AFTER INSERT OR UPDATE OR DELETE ON public.market
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
+      `);
+
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_kpi_knowledge_refresh_on_customer ON public.customer;
+        CREATE TRIGGER trg_kpi_knowledge_refresh_on_customer
+        AFTER INSERT OR UPDATE OR DELETE ON public.customer
+        FOR EACH ROW
+        EXECUTE FUNCTION public.enqueue_kpi_knowledge_refresh_for_change();
       `);
 
       await pool.query(`
@@ -872,6 +1334,8 @@ const ensureKpiRatioSchema = async () => {
         WHERE k.kpi_id = ownership.kpi_id
           AND k.created_by_people_id IS NULL
       `);
+
+      startKpiKnowledgeRefreshWorker();
     })().catch((error) => {
       kpiRatioSchemaPromise = null;
       throw error;
@@ -1637,6 +2101,64 @@ const buildKpiKnowledgeBaseAllocationEntry = (row = {}) => {
   };
 };
 
+const buildKpiKnowledgeBaseResultEntry = (row = {}, allocationScopeById = new Map()) => {
+  const allocationId = normalizeOptionalIntegerInput(row.kpi_target_allocation_id);
+  const allocationScope = allocationId ? allocationScopeById.get(allocationId) || null : null;
+  const recordedByName = row.recorded_by_people_id
+    ? getPeopleDisplayName({
+        name: row.recorded_by_people_name,
+        first_name: row.recorded_by_people_first_name
+      }) || ""
+    : "";
+
+  return {
+    result_id: row.kpi_result_id,
+    allocation_id: allocationId,
+    scope_label: allocationScope?.scope_label || (allocationId ? `Allocation ${allocationId}` : null),
+    period: {
+      result_date: row.result_date ? formatDateOnlyValue(row.result_date) : null,
+      week: row.week || null,
+      type: row.period_type || null,
+      label: row.period_label || null
+    },
+    value: {
+      raw_value: row.raw_value ?? null,
+      unit: row.unit || null,
+      status: row.result_status || null
+    },
+    targets: {
+      target_value: row.target_value ?? null,
+      best_new_target: row.best_new_target ?? null
+    },
+    thresholds: {
+      lower_limit: row.lower_limit ?? null,
+      upper_limit: row.upper_limit ?? null
+    },
+    source: {
+      data_source: row.data_source || null,
+      recorded_at: formatKnowledgeBaseTimestamp(row.recorded_at),
+      recorded_by: row.recorded_by_people_id
+        ? {
+            id: row.recorded_by_people_id,
+            name: recordedByName
+          }
+        : null
+    },
+    comments: normalizeOptionalTextInput(row.comments) || "",
+    keywords: buildKnowledgeBaseKeywordList([
+      allocationScope?.scope_label,
+      row.period_type,
+      row.period_label,
+      row.week,
+      row.result_status,
+      row.data_source,
+      row.comments,
+      recordedByName,
+      row.unit
+    ], 16)
+  };
+};
+
 const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
   const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
   if (!normalizedKpiId) return null;
@@ -1645,6 +2167,7 @@ const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
     kpiResult,
     subjectLinksResult,
     targetAllocationsResult,
+    recentResultsResult,
     subjectHierarchy
   ] = await Promise.all([
     db.query(
@@ -1796,6 +2319,41 @@ const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
       `,
       [normalizedKpiId]
     ),
+    db.query(
+      `
+      SELECT
+        kr.kpi_result_id,
+        kr.kpi_target_allocation_id,
+        kr.kpi_id,
+        kr.result_date,
+        kr.week,
+        kr.period_type,
+        kr.period_label,
+        kr.raw_value,
+        kr.lower_limit,
+        kr.upper_limit,
+        kr.target_value,
+        kr.best_new_target,
+        kr.unit,
+        kr.kpi_type,
+        kr.result_status,
+        kr.data_source,
+        kr.recorded_by_people_id,
+        kr.recorded_at,
+        kr.comments,
+        recorded_by_people.name AS recorded_by_people_name,
+        recorded_by_people.first_name AS recorded_by_people_first_name
+      FROM public.kpi_result kr
+      LEFT JOIN public.people recorded_by_people
+        ON recorded_by_people.people_id = kr.recorded_by_people_id
+      WHERE kr.kpi_id = $1
+      ORDER BY
+        COALESCE(kr.recorded_at, kr.result_date::timestamp) DESC,
+        kr.kpi_result_id DESC
+      LIMIT 12
+      `,
+      [normalizedKpiId]
+    ),
     loadSubjectHierarchyData(db)
   ]);
 
@@ -1821,16 +2379,27 @@ const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
         first_name: row.approved_by_people_first_name
       }
     })),
+    recent_results: recentResultsResult.rows,
     subject_hierarchy: subjectHierarchy
   };
 };
 
-const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = {}) => {
+const buildKpiKnowledgeBaseDocument = (
+  sourceData,
+  { reason = "manual_sync", generatedAt = null } = {}
+) => {
   if (!sourceData?.kpi) return null;
 
-  const { kpi, subject_links: subjectLinks, target_allocations: targetAllocations, subject_hierarchy: subjectHierarchy } = sourceData;
+  const {
+    kpi,
+    subject_links: subjectLinks,
+    target_allocations: targetAllocations,
+    recent_results: recentResults,
+    subject_hierarchy: subjectHierarchy
+  } = sourceData;
   const flatKnowledgeNodes = new Map();
   const causeEffectLinks = new Map();
+  const generatedAtIso = formatKnowledgeBaseTimestamp(generatedAt) || new Date().toISOString();
 
   const buildSubjectTree = (subjectNode, rootSubjectId, depthFromRoot = 0) => {
     if (!subjectNode || depthFromRoot > KPI_KNOWLEDGE_BASE_MAX_DEPTH) {
@@ -1948,6 +2517,14 @@ const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = 
 
   const primarySubject = linkedSubjects.find((entry) => entry.is_primary) || linkedSubjects[0] || null;
   const allocationEntries = targetAllocations.map((row) => buildKpiKnowledgeBaseAllocationEntry(row));
+  const allocationEntryById = new Map(
+    allocationEntries
+      .map((entry) => [normalizeOptionalIntegerInput(entry.allocation_id), entry])
+      .filter(([allocationId]) => Number.isInteger(allocationId) && allocationId > 0)
+  );
+  const recentResultEntries = (Array.isArray(recentResults) ? recentResults : [])
+    .map((row) => buildKpiKnowledgeBaseResultEntry(row, allocationEntryById));
+  const latestResultEntry = recentResultEntries[0] || null;
   const scopeSummary = {
     plants: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.plant?.name), 12),
     zones: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope?.zone?.name), 12),
@@ -1962,12 +2539,12 @@ const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = 
   };
 
   return {
-    schema_version: "1.0.0",
-    generated_at: new Date().toISOString(),
+    schema_version: "1.1.0",
+    generated_at: generatedAtIso,
     generation_context: {
       reason,
       max_subject_depth: KPI_KNOWLEDGE_BASE_MAX_DEPTH,
-      source_tables: ["kpi", "subject_kpi", "subject", "kpi_target_allocation"],
+      source_tables: ["kpi", "subject_kpi", "subject", "kpi_target_allocation", "kpi_result"],
       purpose: ["solution_search", "training", "rag", "diagnosis"]
     },
     kpi: {
@@ -2036,6 +2613,11 @@ const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = 
       }),
       cause_effect_links: Array.from(causeEffectLinks.values())
     },
+    performance: {
+      latest_result: latestResultEntry,
+      recent_results: recentResultEntries,
+      result_count: recentResultEntries.length
+    },
     target_allocations: allocationEntries,
     scope_summary: scopeSummary,
     search_index: {
@@ -2049,16 +2631,22 @@ const buildKpiKnowledgeBaseDocument = (sourceData, { reason = "manual_sync" } = 
         linkedSubjects.map((entry) => entry.subject_name),
         linkedSubjects.map((entry) => entry.subject_description),
         linkedSubjects.map((entry) => entry.subject_knowledge),
+        latestResultEntry?.period?.label,
+        latestResultEntry?.value?.status,
+        latestResultEntry?.comments,
+        recentResultEntries.map((entry) => entry.scope_label),
+        recentResultEntries.map((entry) => entry.comments),
         allocationEntries.map((entry) => entry.scope_label),
         allocationEntries.map((entry) => entry.comments),
         Object.values(scopeSummary)
       ], 80),
       subject_paths: uniqueKnowledgeBaseTexts(linkedSubjects.map((entry) => entry.path), 20),
-      allocation_scopes: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope_label), 20)
+      allocation_scopes: uniqueKnowledgeBaseTexts(allocationEntries.map((entry) => entry.scope_label), 20),
+      result_periods: uniqueKnowledgeBaseTexts(recentResultEntries.map((entry) => entry.period?.label), 20)
     },
     ai_usage: {
-      instructions: "Use KPI definition first, then the subject tree and cause-effect links, then target allocation scope and comments.",
-      preferred_order: ["kpi", "subject_context", "target_allocations", "scope_summary"]
+      instructions: "Use KPI definition first, then recent KPI results, then the subject tree and cause-effect links, then target allocation scope and comments.",
+      preferred_order: ["kpi", "performance", "subject_context", "target_allocations", "scope_summary"]
     }
   };
 };
@@ -2068,19 +2656,53 @@ const refreshKpiKnowledgeBaseForKpiId = async (db, kpiId, options = {}) => {
   if (!normalizedKpiId) return null;
 
   const sourceData = await loadKpiKnowledgeBaseSourceData(db, normalizedKpiId);
-  if (!sourceData) return null;
+  if (!sourceData) {
+    await db.query(
+      `
+      DELETE FROM public.kpi_knowledge_refresh_queue
+      WHERE kpi_id = $1
+      `,
+      [normalizedKpiId]
+    ).catch(() => {});
+    return null;
+  }
 
-  const knowledgeBase = buildKpiKnowledgeBaseDocument(sourceData, options);
-  if (!knowledgeBase) return null;
+  const refreshedAt = options.generatedAt instanceof Date
+    ? options.generatedAt
+    : new Date();
+  const knowledgeBase = buildKpiKnowledgeBaseDocument(sourceData, {
+    ...options,
+    generatedAt: refreshedAt
+  });
+  if (!knowledgeBase) {
+    await db.query(
+      `
+      DELETE FROM public.kpi_knowledge_refresh_queue
+      WHERE kpi_id = $1
+      `,
+      [normalizedKpiId]
+    ).catch(() => {});
+    return null;
+  }
 
   await db.query(
     `
     UPDATE public.kpi
-    SET kpi_knowledge_base = $2::jsonb
+    SET
+      kpi_knowledge_base = $2::jsonb,
+      kpi_knowledge_updated_date = $3::timestamptz
     WHERE kpi_id = $1
     `,
-    [normalizedKpiId, JSON.stringify(knowledgeBase)]
+    [normalizedKpiId, JSON.stringify(knowledgeBase), refreshedAt.toISOString()]
   );
+
+  await db.query(
+    `
+    DELETE FROM public.kpi_knowledge_refresh_queue
+    WHERE kpi_id = $1
+    `,
+    [normalizedKpiId]
+  ).catch(() => {});
 
   return knowledgeBase;
 };
@@ -2096,6 +2718,93 @@ const refreshKpiKnowledgeBases = async (db, kpiIds = [], options = {}) => {
     await refreshKpiKnowledgeBaseForKpiId(db, kpiId, options);
   }
 };
+
+async function processPendingKpiKnowledgeRefreshQueue() {
+  if (kpiKnowledgeRefreshWorkerRunning) {
+    return;
+  }
+
+  kpiKnowledgeRefreshWorkerRunning = true;
+  let client = null;
+  let lockAcquired = false;
+  const lockKey = Math.abs(
+    "kpi_knowledge_refresh_worker"
+      .split("")
+      .reduce((accumulator, character) => ((accumulator << 5) - accumulator) + character.charCodeAt(0), 0)
+  );
+
+  try {
+    client = await pool.connect();
+    const lockResult = await client.query(
+      `SELECT pg_try_advisory_lock($1) AS acquired`,
+      [lockKey]
+    );
+    lockAcquired = lockResult.rows[0]?.acquired === true;
+
+    if (!lockAcquired) {
+      return;
+    }
+
+    await client.query("BEGIN");
+
+    const queuedRowsResult = await client.query(
+      `
+      SELECT
+        q.kpi_id,
+        q.reason
+      FROM public.kpi_knowledge_refresh_queue q
+      ORDER BY q.requested_at ASC, q.kpi_id ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT $1
+      `,
+      [KPI_KNOWLEDGE_REFRESH_BATCH_SIZE]
+    );
+
+    if (!queuedRowsResult.rows.length) {
+      await client.query("COMMIT");
+      return;
+    }
+
+    for (const row of queuedRowsResult.rows) {
+      await refreshKpiKnowledgeBaseForKpiId(client, row.kpi_id, {
+        reason: normalizeOptionalTextInput(row.reason) || "queued_refresh"
+      });
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+    console.error("[KPI Knowledge Base] Refresh queue processing failed:", error.message);
+  } finally {
+    if (client && lockAcquired) {
+      await client.query(`SELECT pg_advisory_unlock($1)`, [lockKey]).catch(() => {});
+    }
+    if (client) {
+      client.release();
+    }
+    kpiKnowledgeRefreshWorkerRunning = false;
+  }
+}
+
+function startKpiKnowledgeRefreshWorker() {
+  if (kpiKnowledgeRefreshWorkerTimer) {
+    return;
+  }
+
+  const tick = () => {
+    processPendingKpiKnowledgeRefreshQueue().catch((error) => {
+      console.error("[KPI Knowledge Base] Refresh queue tick failed:", error.message);
+    });
+  };
+
+  tick();
+  kpiKnowledgeRefreshWorkerTimer = setInterval(tick, KPI_KNOWLEDGE_REFRESH_INTERVAL_MS);
+  if (typeof kpiKnowledgeRefreshWorkerTimer.unref === "function") {
+    kpiKnowledgeRefreshWorkerTimer.unref();
+  }
+}
 
 const buildKpiAssistantMessagesForOpenAI = ({
   kpiRow,
@@ -2464,6 +3173,7 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     comments: row.comments || "",
     created_at: row.created_at,
     updated_at: row.updated_at,
+    kpi_knowledge_updated_date: row.kpi_knowledge_updated_date ?? null,
     created_by_people_id: row.created_by_people_id ?? null,
     kpi_knowledge_base: row.kpi_knowledge_base ?? null,
     full_subject_path: subjectPath,
@@ -2535,6 +3245,7 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
       k.comments,
       k.created_at,
       k.updated_at,
+      k.kpi_knowledge_updated_date,
       k.created_by_people_id,
       k.kpi_knowledge_base,
       primary_subject.subject_id,
@@ -5476,6 +6187,9 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     }
 
     await upsertPrimarySubjectKpiLink(client, Number(kpiId), resolvedSubjectId);
+    await refreshKpiKnowledgeBaseForKpiId(client, Number(kpiId), {
+      reason: "responsible_kpi_updated"
+    });
     await client.query("COMMIT");
 
     const rows = await loadKpiRowsForUi({
@@ -30741,7 +31455,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 // ---------- Cron: weekly KPI submission email ----------
 // let cronRunning = false;
 
-// cron.schedule("15 02 * * *", async () => {
+// cron.schedule("02 10 * * *", async () => {
 //   const lockId = "send_kpi_weekly_email_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -30774,7 +31488,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
-// cron.schedule("16 02 * * *", async () => {
+// cron.schedule("55 12 * * *", async () => {
 //   const lockId = "weekly_kpi_report_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -32374,6 +33088,13 @@ async function sendKPIReportToHierarchy(responsiblePeopleId, currentWeek) {
 
 
 registerRecommendationRoutes(app, pool, createTransporter);
+ensureKpiRatioSchema()
+  .then(() => {
+    console.log("[KPI Knowledge Base] Sync infrastructure is ready.");
+  })
+  .catch((error) => {
+    console.error("[KPI Knowledge Base] Sync infrastructure setup failed:", error.message);
+  });
 ensureCorrectiveActionEscalationSchema()
   .then(() => {
     console.log("[Corrective Action Escalation] Tracking table is ready.");
