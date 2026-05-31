@@ -31453,9 +31453,9 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-// let cronRunning = false;
+let cronRunning = false;
 
-cron.schedule("24 21 * * *", async () => {
+cron.schedule("33 21 * * *", async () => {
   const lockId = "send_kpi_weekly_email_job";
   const lock = await acquireJobLock(lockId);
   if (!lock.acquired) return;
@@ -31488,7 +31488,7 @@ cron.schedule("24 21 * * *", async () => {
 
 // ---------- Cron: weekly reports ----------
 let reportCronRunning = false;
-cron.schedule("26 21 * * *", async () => {
+cron.schedule("35 21 * * *", async () => {
   const lockId = "weekly_kpi_report_job";
   const lock = await acquireJobLock(lockId);
   if (!lock.acquired) return;
