@@ -12219,7 +12219,6 @@ textarea {
     <div id="kpiSubjectFilter" class="kpi-filter-select"></div>
   </div>
 
-  <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
 </div>
 
             <div id="grid"></div>
