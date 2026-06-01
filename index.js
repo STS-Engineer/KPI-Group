@@ -10817,8 +10817,8 @@ textarea {
 /* Keep the subject dropdown usable without taking over the whole modal */
 .kpi-attributes-modal .tree-list {
   height: auto !important;
-  min-height: 320px !important;
-  max-height: min(42vh, 420px) !important;
+  min-height: 380px !important;
+  max-height: min(52vh, 520px) !important;
   overflow: auto !important;
 }
 
@@ -10850,7 +10850,7 @@ textarea {
 }
 
 .kpi-attributes-modal .tree-select-panel {
-  max-height: min(52vh, 520px) !important;
+  max-height: min(60vh, 620px) !important;
   overflow: hidden !important;
 }
 
