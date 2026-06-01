@@ -12058,7 +12058,7 @@ textarea {
             <div class="kpi-matrix-hero">
               <div class="kpi-matrix-title">
                 <h2>KPI Matrix</h2>
-                <p>View and manage all KPI definitions with direct visibility on KPI subject, KPI name, KPI code, unit, direction, and actions.</p>
+                <p>View and manage all KPI definitions with direct visibility on KPI name, KPI subject, KPI code, unit, direction, and actions.</p>
               </div>
               <button class="btn btn-primary kpi-matrix-add-btn" type="button" onclick="openCreateModal()">+ Add KPI</button>
             </div>
@@ -15563,8 +15563,8 @@ function getCurrentKpiRowById(kpiId) {
         <table class="kpi-matrix-table">
           <thead>
             <tr>
-              <th>KPI Subject</th>
               <th>KPI Name</th>
+              <th>KPI Subject</th>
               <th>Unit</th>
               <th>Direction</th>
               <th class="parameter-table-actions">Actions</th>
@@ -15606,10 +15606,6 @@ function getCurrentKpiRowById(kpiId) {
               return \`
               <tr>
                 <td>
-                  <div class="kpi-matrix-kpi-title">\${escapeHtml(getLastPathSegment(row.full_subject_path || row.subject || row.indicator_title) || "No subject")}</div>
-                  <div class="kpi-matrix-kpi-path">\${escapeHtml(row.full_subject_path || row.subject || "No KPI hierarchy attached")}</div>
-                </td>
-                <td>
                   <div class="kpi-matrix-kpi-title">\${escapeHtml(row.indicator_sub_title || "Untitled KPI")}</div>
                   <div class="kpi-matrix-cell-sub">\${escapeHtml([
                     row.status ? "Status: " + row.status : "",
@@ -15618,7 +15614,10 @@ function getCurrentKpiRowById(kpiId) {
                     !isOwnedByResponsible ? "Visible in consult mode" : ""
                   ].filter(Boolean).join(" • ") || "No KPI details")}</div>
                 </td>
-           
+                <td>
+                  <div class="kpi-matrix-kpi-title">\${escapeHtml(getLastPathSegment(row.full_subject_path || row.subject || row.indicator_title) || "No subject")}</div>
+                  <div class="kpi-matrix-kpi-path">\${escapeHtml(row.full_subject_path || row.subject || "No KPI hierarchy attached")}</div>
+                </td>
                 <td>
                   <div class="kpi-matrix-cell-main">\${escapeHtml(row.unit || "-")}</div>
                   <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target !== null && row.target !== undefined && String(row.target).trim() !== "" ? "Target: " + formatParameterDisplayValue(row.target) : "No unit target")}</div>
