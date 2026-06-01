@@ -12219,6 +12219,7 @@ textarea {
     <div id="kpiSubjectFilter" class="kpi-filter-select"></div>
   </div>
 
+  <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
 </div>
 
             <div id="grid"></div>
@@ -13972,7 +13973,7 @@ function getParameterUnitMetaText(unitEntry) {
 
 function getParameterUnitAllocationRows() {
   const kpiUnit             = getParameterSelectedKpiUnit();
-  const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || responsibleId || "";
+  const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || "";
   const sharedRoleId        = getParameterFieldValue("parameter_role_id");
   const sharedUnitTypeId    = getParameterFieldValue("parameter_unit_type_id");
   const fallbackSetupDate   =
@@ -14361,10 +14362,8 @@ function getParameterUnitAllocationRows() {
       const state = getParameterUnitState(scopeKind, scopeId);
       const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
       const rowResponsibleId = String(
-        scopeKind === "zone"
-          ? (resolvedResponsible?.people_id || "")
-          : (resolvedResponsible?.people_id || sharedSetByPeopleId || "")
-      ).trim();
+        resolvedResponsible?.people_id || ""
+        ).trim();
       const targetValue = String(state.target_value ?? "").trim();
       const targetSetupDate = normalizeParameterDateValue(state.target_setup_date) || fallbackSetupDate;
       if (!targetValue) return null;
@@ -14382,7 +14381,7 @@ function getParameterUnitAllocationRows() {
         target_setup_date: targetSetupDate,
         target_unit: kpiUnit,
         local_currency: scopeKind === "unit" ? (scopeEntry.local_currency || "") : "",
-        set_by_people_id: rowResponsibleId,
+        set_by_people_id: rowResponsibleId || null,
         last_best_target: String(state.last_best_target ?? "").trim(),
         approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
       };
