@@ -5324,6 +5324,9 @@ app.get("/kpi-admin", async (req, res) => {
 
     <script>
       let currentRows = [];
+      let kpiSourceRows = [];
+      let selectedKpiNameFilter = "";
+      let selectedKpiSubjectFilter = "";
       let selectedKpiId = null;
 
       function showToast(message) {
@@ -8217,26 +8220,230 @@ textarea {
         justify-content: center;
       }
 
-      .kpi-matrix-toolbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 14px;
-        flex-wrap: wrap;
-        padding: 0 14px 18px;
-      }
+    .kpi-matrix-toolbar {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.4fr) minmax(220px, 0.8fr) minmax(280px, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+  padding: 0 14px 20px;
+}
 
-      .kpi-matrix-search {
-        flex: 1;
-        min-width: 280px;
-        max-width: 440px;
-      }
+.kpi-filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
 
-      .kpi-results-meta {
-        font-size: 13px;
-        font-weight: 800;
-        color: #64748b;
-      }
+.kpi-filter-field label {
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #64748b;
+  padding-left: 4px;
+}
+
+.kpi-search-field {
+  min-width: 320px;
+}
+
+.kpi-search-field .search,
+.kpi-filter-trigger {
+  width: 100%;
+  min-height: 46px;
+  border: 1px solid rgba(148,163,184,0.28);
+  border-radius: 16px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  color: #0f172a;
+  padding: 0 15px;
+  font-size: 13px;
+  font-family: inherit;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.95),
+    0 10px 24px rgba(15,23,42,0.05);
+}
+
+.kpi-filter-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  text-align: left;
+  cursor: pointer;
+  color: #334155;
+}
+
+.kpi-filter-trigger::after {
+  content: "▾";
+  font-size: 11px;
+  color: #64748b;
+  margin-left: 12px;
+}
+
+.kpi-search-field .search:focus,
+.kpi-filter-select.is-open .kpi-filter-trigger {
+  outline: none;
+  border-color: rgba(37,99,235,0.55);
+  box-shadow:
+    0 0 0 4px rgba(37,99,235,0.10),
+    0 14px 30px rgba(15,23,42,0.08);
+}
+
+.kpi-filter-select {
+  position: relative;
+  width: 100%;
+}
+
+.kpi-filter-menu {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  right: 0;
+  z-index: 200;
+  display: none;
+  padding: 10px;
+  border-radius: 20px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  border: 1px solid rgba(148,163,184,0.22);
+  box-shadow: 0 24px 54px rgba(15,23,42,0.16);
+}
+
+.kpi-filter-select.is-open .kpi-filter-menu {
+  display: block;
+}
+
+.kpi-filter-search {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgba(37,99,235,0.30);
+  border-radius: 13px;
+  padding: 8px 11px;
+  outline: none;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.kpi-filter-options {
+  max-height: 250px;
+  overflow-y: auto;
+  padding-right: 3px;
+}
+
+.kpi-filter-option {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 10px 12px;
+  border-radius: 12px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+  color: #0f172a;
+}
+
+.kpi-filter-option:hover,
+.kpi-filter-option.is-selected {
+  background: linear-gradient(135deg, rgba(37,99,235,0.11), rgba(6,182,212,0.08));
+  color: #1d4ed8;
+  font-weight: 800;
+}
+
+.kpi-results-meta {
+  align-self: center;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 900;
+  color: #64748b;
+  padding-bottom: 13px;
+}
+
+@media (max-width: 1100px) {
+  .kpi-matrix-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .kpi-results-meta {
+    padding-bottom: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .kpi-matrix-toolbar {
+    grid-template-columns: 1fr;
+  }
+}
+
+      .kpi-filter-select {
+  position: relative;
+  width: 240px;
+}
+
+.kpi-filter-trigger {
+  width: 100%;
+  min-height: 48px;
+  border: 1px solid rgba(148,163,184,0.25);
+  background: rgba(255,255,255,0.95);
+  color: #64748b;
+  border-radius: 18px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+
+.kpi-filter-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 200;
+  display: none;
+  padding: 10px;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 22px 48px rgba(15,23,42,0.14);
+  border: 1px solid rgba(148,163,184,0.22);
+}
+
+.kpi-filter-select.is-open .kpi-filter-menu {
+  display: block;
+}
+
+.kpi-filter-search {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgba(37,99,235,0.35);
+  border-radius: 12px;
+  padding: 8px 10px;
+  outline: none;
+  margin-bottom: 8px;
+}
+
+.kpi-filter-options {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.kpi-filter-option {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 10px 12px;
+  border-radius: 12px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+  color: #0f172a;
+}
+
+.kpi-filter-option:hover,
+.kpi-filter-option.is-selected {
+  background: rgba(37,99,235,0.08);
+  color: #1d4ed8;
+  font-weight: 800;
+}
 
       .kpi-matrix-table-shell {
         background: rgba(255,255,255,0.96);
@@ -12063,12 +12270,25 @@ textarea {
               <button class="btn btn-primary kpi-matrix-add-btn" type="button" onclick="openCreateModal()">+ Add KPI</button>
             </div>
 
-            <div class="kpi-matrix-toolbar">
-              <div class="search-wrap kpi-matrix-search">
-                <input id="search" class="search" placeholder="Search KPI by subject, name, code, unit or direction..." />
-              </div>
-              <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
-            </div>
+<div class="kpi-matrix-toolbar">
+
+  <div class="kpi-filter-field kpi-search-field">
+    <label>Search KPI</label>
+    <input id="search" class="search" placeholder="Search by subject, name, code, unit or direction..." />
+  </div>
+
+  <div class="kpi-filter-field">
+    <label>KPI name</label>
+    <div id="kpiNameFilter" class="kpi-filter-select"></div>
+  </div>
+
+  <div class="kpi-filter-field">
+    <label>Subject</label>
+    <div id="kpiSubjectFilter" class="kpi-filter-select"></div>
+  </div>
+
+  <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
+</div>
 
             <div id="grid"></div>
           </div>
@@ -12647,6 +12867,9 @@ textarea {
       const roleOptions = ${JSON.stringify(roleOptions)};
       const allocationLookups = ${JSON.stringify(allocationLookups)};
       let currentRows = [];
+      let kpiSourceRows = [];
+      let selectedKpiNameFilter = "";
+      let selectedKpiSubjectFilter = ""; 
       let referenceKpiRows = [];
       let currentParameterRows = [];
       let parameterSourceRows = [];
@@ -16384,17 +16607,154 @@ function getCurrentKpiRowById(kpiId) {
         }
       };
 
-      async function loadKpis(search = "") {
-        try {
-          const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?include_all=1&search=' + encodeURIComponent(search));
-          const data = await res.json();
-          renderKpis(data);
-        } catch (error) {
-          updateKpiResultsMeta(0);
-          document.getElementById("grid").innerHTML =
-            '<div class="empty">Failed to load KPIs.</div>';
-        }
-      }
+
+      function getUniqueKpiFilterOptions(rows, getter) {
+  return Array.from(
+    new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map(getter)
+        .map(value => String(value || "").trim())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+}
+
+function createKpiFilterDropdown(containerId, placeholder, options, selectedValue, onChange) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  container.innerHTML =
+    '<button type="button" class="kpi-filter-trigger">' +
+      escapeHtml(selectedValue || placeholder) +
+    '</button>' +
+    '<div class="kpi-filter-menu">' +
+      '<input class="kpi-filter-search" placeholder="Type to filter..." />' +
+      '<div class="kpi-filter-options"></div>' +
+    '</div>';
+
+  const trigger = container.querySelector(".kpi-filter-trigger");
+  const search = container.querySelector(".kpi-filter-search");
+  const optionsBox = container.querySelector(".kpi-filter-options");
+
+  function render(filterText) {
+    const normalizedFilter = String(filterText || "").toLowerCase();
+
+    const visibleOptions = options.filter(option =>
+      option.toLowerCase().includes(normalizedFilter)
+    );
+
+    optionsBox.innerHTML =
+      '<button type="button" class="kpi-filter-option' +
+        (!selectedValue ? ' is-selected' : '') +
+        '" data-value="">All</button>' +
+      visibleOptions.map(option =>
+        '<button type="button" class="kpi-filter-option' +
+          (option === selectedValue ? ' is-selected' : '') +
+          '" data-value="' + escapeHtml(option) + '">' +
+          escapeHtml(option) +
+        '</button>'
+      ).join("");
+  }
+
+  trigger.addEventListener("click", () => {
+    container.classList.toggle("is-open");
+    render(search.value);
+    setTimeout(() => search.focus(), 0);
+  });
+
+  search.addEventListener("input", () => render(search.value));
+
+  optionsBox.addEventListener("click", event => {
+    const optionBtn = event.target.closest(".kpi-filter-option");
+    if (!optionBtn) return;
+
+    const value = optionBtn.dataset.value || "";
+    container.classList.remove("is-open");
+    onChange(value);
+  });
+
+  render("");
+}
+
+function initializeKpiConsultFilters(rows) {
+  const nameOptions = getUniqueKpiFilterOptions(
+    rows,
+    row => row.indicator_sub_title
+  );
+
+  const subjectOptions = getUniqueKpiFilterOptions(
+    rows,
+    row => row.full_subject_path || row.subject
+  );
+
+  if (selectedKpiNameFilter && !nameOptions.includes(selectedKpiNameFilter)) {
+    selectedKpiNameFilter = "";
+  }
+
+  if (selectedKpiSubjectFilter && !subjectOptions.includes(selectedKpiSubjectFilter)) {
+    selectedKpiSubjectFilter = "";
+  }
+
+  createKpiFilterDropdown(
+    "kpiNameFilter",
+    "Select KPI name",
+    nameOptions,
+    selectedKpiNameFilter,
+    value => {
+      selectedKpiNameFilter = value;
+      initializeKpiConsultFilters(kpiSourceRows);
+      applyKpiConsultFilters();
+    }
+  );
+
+  createKpiFilterDropdown(
+    "kpiSubjectFilter",
+    "Select KPI subject",
+    subjectOptions,
+    selectedKpiSubjectFilter,
+    value => {
+      selectedKpiSubjectFilter = value;
+      initializeKpiConsultFilters(kpiSourceRows);
+      applyKpiConsultFilters();
+    }
+  );
+}
+
+function applyKpiConsultFilters() {
+  let rows = Array.isArray(kpiSourceRows) ? kpiSourceRows.slice() : [];
+
+  if (selectedKpiNameFilter) {
+    rows = rows.filter(row =>
+      String(row.indicator_sub_title || "").trim() === selectedKpiNameFilter
+    );
+  }
+
+  if (selectedKpiSubjectFilter) {
+    rows = rows.filter(row =>
+      String(row.full_subject_path || row.subject || "").trim() === selectedKpiSubjectFilter
+    );
+  }
+
+  renderKpis(rows);
+}
+
+async function loadKpis(search = "") {
+  try {
+    const res = await fetch('/api/responsibles/' + responsibleId + '/kpis?include_all=1&search=' + encodeURIComponent(search));
+    const data = await res.json();
+
+    kpiSourceRows = Array.isArray(data) ? data : [];
+
+    initializeKpiConsultFilters(kpiSourceRows);
+    applyKpiConsultFilters();
+
+  } catch (error) {
+    kpiSourceRows = [];
+    updateKpiResultsMeta(0);
+    document.getElementById("grid").innerHTML =
+      '<div class="empty">Failed to load KPIs.</div>';
+  }
+}
 
       async function loadReferenceKpis() {
         try {
