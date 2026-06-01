@@ -9928,6 +9928,12 @@ textarea {
         cursor: not-allowed;
       }
 
+      .parameter-kpi-definition {
+        min-height: 84px;
+        resize: none;
+        line-height: 1.5;
+      }
+
       .modal-footer {
         flex-shrink: 0;
         display: flex;
@@ -11045,13 +11051,17 @@ textarea {
 }
 
 .parameter-modal .form-grid {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 24px;
-  column-gap: 36px; /* more horizontal space */
-  row-gap: 20px;
-  align-items: end;
+  display: grid !important;
+  grid-template-columns: repeat(12, minmax(0, 1fr)) !important;
+  gap: 16px !important;
+  align-items: end !important;
 }
+
+.parameter-modal .field.col-6 { grid-column: span 6 !important; }
+.parameter-modal .field.col-2 { grid-column: span 2 !important; }
+.parameter-modal .field.col-3 { grid-column: span 3 !important; }
+.parameter-modal .field.col-4 { grid-column: span 4 !important; }
+.parameter-modal .field.col-12 { grid-column: 1 / -1 !important; }
 
 .parameter-modal #parameterAllocationFieldsSection.is-individual-layout .form-grid {
   grid-template-columns: repeat(21, minmax(0, 1fr)) !important;
@@ -12666,6 +12676,15 @@ textarea {
                   <select id="parameter_role_id" class="parameter-role-native" tabindex="-1" aria-hidden="true"></select>
                 </div>
               </div>
+              <div class="field col-12">
+                <label><span>KPI Definition</span><span class="hint">Read only</span></label>
+                <textarea
+                  id="parameter_kpi_definition_display"
+                  class="readonly-input parameter-kpi-definition"
+                  readonly
+                  placeholder="Select a KPI name to display the KPI definition."
+                ></textarea>
+              </div>
 
               <div class="field col-3 is-hidden" id="parameter_zone_unit_field">
                 <label><span>Unit</span><span class="hint">Select unit first</span></label>
@@ -12824,6 +12843,7 @@ textarea {
         "parameter_kpi_type",
         "parameter_unit_type_id",
         "parameter_role_id",
+        "parameter_kpi_definition_display",
         "parameter_target_status",
         "parameter_plant_id",
         "parameter_zone_unit_id",
@@ -13139,9 +13159,19 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
       function updateParameterKpiSummary() {
         const selectedKpi = getParameterKpiById(getParameterFieldValue("parameter_kpi_id"));
         const targetUnitInput = document.getElementById("parameter_target_unit");
+        const definitionDisplay = document.getElementById("parameter_kpi_definition_display");
         if (selectedKpi && targetUnitInput) {
           ensureParameterTargetUnitOption(selectedKpi.unit || "");
           targetUnitInput.value = selectedKpi.unit || "";
+        } else if (targetUnitInput) {
+          targetUnitInput.value = "";
+        }
+        if (definitionDisplay) {
+          const definitionText = selectedKpi?.definition || "";
+          definitionDisplay.value = definitionText;
+          definitionDisplay.placeholder = selectedKpi
+            ? "No KPI definition available for this KPI."
+            : "Select a KPI name to display the KPI definition.";
         }
         if (isIndividualParameterScope()) {
           syncIndividualParameterFields();
@@ -14560,7 +14590,7 @@ function syncPrimaryParameterFieldsFromTable() {
   }
 
   if (setByInput) {
-    setByInput.value = primaryRow?.set_by_people_id || setByInput.value || "";
+    setByInput.value = primaryRow?.set_by_people_id || "";
   }
 
   if (approvedByInput) {
@@ -18481,6 +18511,7 @@ updateParameterKpiSummary();
 
 function buildParameterPayload() {
   const scopeKind = getParameterScopeKind();
+  const isIndividualScope = isIndividualParameterScope();
   const unitAllocations = getParameterUnitAllocationRows();
   const primaryAllocation = unitAllocations[0] || null;
   const existingAllocationIds = getParameterAllocationIdsForDelete(
@@ -18518,7 +18549,9 @@ function buildParameterPayload() {
     target_setup_date: normalizeParameterDateValue(primaryAllocation?.target_setup_date || getParameterFieldValue("parameter_target_setup_date")),
     target_start_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_start_date")),
     target_end_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_end_date")),
-    set_by_people_id: getParameterFieldValue("parameter_set_by_people_id"),
+    set_by_people_id: isIndividualScope
+      ? (getParameterFieldValue("parameter_set_by_people_id") || null)
+      : (primaryAllocation?.set_by_people_id || null),
     approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id"),
     comments: getParameterFieldValue("parameter_comments"),
     existing_allocation_ids: existingAllocationIds,
