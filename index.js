@@ -12219,11 +12219,10 @@ textarea {
     <div id="kpiSubjectFilter" class="kpi-filter-select"></div>
   </div>
 
-</div>
-
-            <div id="grid"></div>
-          </div>
-        </section>
+    </div>
+    <div id="grid"></div>
+     </div>
+    </section>
 
         <section id="myKpisSection" style="display:none;">
           <div class="section-head">
@@ -14250,6 +14249,105 @@ function getParameterResponsibleCellNote(scopeEntry, responsibleEntry) {
   return "";
 }
 
+function getParameterRoleResponsibleCandidates(roleId = getNormalizedParameterRoleId(), { unitId = "" } = {}) {
+  const normalizedRoleId = String(roleId || "").trim();
+  if (!normalizedRoleId) return [];
+
+  const normalizedUnitId = String(unitId || "").trim();
+  const candidateMap = new Map();
+
+  getParameterAllocationUnits().forEach((unitEntry) => {
+    if (!unitEntry || !Array.isArray(unitEntry.responsibles)) return;
+    if (normalizedUnitId && String(unitEntry.value || "").trim() !== normalizedUnitId) return;
+
+    unitEntry.responsibles.forEach((entry) => {
+      const entryPeopleId = String(entry?.people_id || "").trim();
+      if (!entryPeopleId) return;
+      if (String(entry?.role_id || "").trim() !== normalizedRoleId) return;
+
+      const existingEntry = candidateMap.get(entryPeopleId);
+      if (!existingEntry || (Boolean(entry?.is_primary) && !Boolean(existingEntry?.is_primary))) {
+        candidateMap.set(entryPeopleId, {
+          ...entry,
+          people_id: entryPeopleId,
+          label:
+            entry.label ||
+            getParameterPeopleLabel(entryPeopleId) ||
+            ("Person " + entryPeopleId)
+        });
+      }
+    });
+  });
+
+  return Array.from(candidateMap.values()).sort((left, right) => {
+    const primaryDiff = Number(Boolean(right?.is_primary)) - Number(Boolean(left?.is_primary));
+    if (primaryDiff !== 0) return primaryDiff;
+    return String(left?.label || "").localeCompare(String(right?.label || ""));
+  });
+}
+
+function getAutoResolvedIndividualResponsibleEntry() {
+  const normalizedRoleId = getNormalizedParameterRoleId();
+  if (!normalizedRoleId) return null;
+
+  const currentResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
+  const selectedUnitId = String(
+    getParameterFieldValue("parameter_plant_id") ||
+    parameterLockedUnitId ||
+    ""
+  ).trim();
+
+  if (selectedUnitId) {
+    const unitEntry = getParameterUnitById(selectedUnitId);
+    const unitMatch = getParameterMatchedResponsible(unitEntry, normalizedRoleId);
+    if (unitMatch?.people_id) {
+      return {
+        ...unitMatch,
+        people_id: String(unitMatch.people_id),
+        label:
+          unitMatch.label ||
+          getParameterPeopleLabel(unitMatch.people_id) ||
+          ("Person " + unitMatch.people_id),
+        source: "unit-role"
+      };
+    }
+  }
+
+  const fallbackCandidates = getParameterRoleResponsibleCandidates(normalizedRoleId);
+  if (!fallbackCandidates.length) {
+    return null;
+  }
+
+  if (currentResponsibleId) {
+    const currentCandidate = fallbackCandidates.find(
+      (entry) => String(entry?.people_id || "").trim() === currentResponsibleId
+    );
+    if (currentCandidate) {
+      return {
+        ...currentCandidate,
+        source: "role"
+      };
+    }
+  }
+
+  if (fallbackCandidates.length === 1) {
+    return {
+      ...fallbackCandidates[0],
+      source: "role"
+    };
+  }
+
+  const primaryCandidates = fallbackCandidates.filter((entry) => Boolean(entry?.is_primary));
+  if (primaryCandidates.length === 1) {
+    return {
+      ...primaryCandidates[0],
+      source: "role"
+    };
+  }
+
+  return null;
+}
+
 function syncIndividualParameterFields() {
   const setBySelect = document.getElementById("parameter_set_by_people_id");
   const setByHint = document.getElementById("parameter_set_by_people_hint");
@@ -14275,14 +14373,35 @@ function syncIndividualParameterFields() {
     setupDateInput.value = getLocalDateInputValue();
   }
 
+  const normalizedRoleId = getNormalizedParameterRoleId();
+  const autoResolvedResponsible = getAutoResolvedIndividualResponsibleEntry();
+  const currentResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
+
   if (setBySelect) {
     setBySelect.disabled = false;
     setBySelect.classList.remove("readonly-input");
-    setBySelect.dataset.autoResolved = "false";
+    if (autoResolvedResponsible?.people_id) {
+      setBySelect.value = String(autoResolvedResponsible.people_id);
+      setBySelect.dataset.autoResolved = "true";
+    } else {
+      setBySelect.dataset.autoResolved = "false";
+      if (normalizedRoleId) {
+        setBySelect.value = "";
+      } else if (!currentResponsibleId) {
+        setBySelect.value = "";
+      }
+    }
   }
 
   if (setByHint) {
-    setByHint.textContent = "Select the responsible person for this individual target.";
+    const roleLabel = getParameterRoleLabel(getParameterFieldValue("parameter_role_id"));
+    if (!roleLabel) {
+      setByHint.textContent = "Select the role to fetch the related responsible automatically.";
+    } else if (autoResolvedResponsible?.label) {
+      setByHint.textContent = roleLabel + " matched automatically to " + autoResolvedResponsible.label + ".";
+    } else {
+      setByHint.textContent = "No related responsible was found for the selected role.";
+    }
   }
 }
 
@@ -18774,10 +18893,7 @@ document.addEventListener("keydown", (event) => {
     const parameterSetBySelect = document.getElementById("parameter_set_by_people_id");
     if (parameterSetBySelect) {
       parameterSetBySelect.addEventListener("change", () => {
-        if (isIndividualParameterScope()) {
-          syncIndividualParameterFields();
-          return;
-        }
+        if (isIndividualParameterScope()) return;
         renderMultisiteUnitMatrix();
       });
     }
