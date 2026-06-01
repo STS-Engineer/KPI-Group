@@ -6538,7 +6538,10 @@ app.get("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
   const { responsibleId } = req.params;
   try {
     await ensureKpiObjectSchema();
-    const rows = await loadKpiTargetAllocationRowsForUi({ responsibleId });
+    const loadAllScope = String(req.query?.scope || "").trim().toLowerCase() === "all";
+    const rows = await loadKpiTargetAllocationRowsForUi({
+      responsibleId: loadAllScope ? null : responsibleId
+    });
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
     res.set("Pragma", "no-cache");
     res.set("Expires", "0");
@@ -6554,9 +6557,10 @@ app.get("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
 
   try {
     await ensureKpiObjectSchema();
+    const loadAllScope = String(req.query?.scope || "").trim().toLowerCase() === "all";
     const anchorRows = await loadKpiTargetAllocationRowsForUi({
       allocationId: Number(kpiObjectId),
-      responsibleId
+      responsibleId: loadAllScope ? null : responsibleId
     });
 
     if (!anchorRows.length) {
@@ -10604,6 +10608,39 @@ textarea {
   box-shadow: 0 16px 32px rgba(37,99,235,0.28) !important;
 }
 
+.kpi-attributes-modal #kpiSaveBtn {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 10px !important;
+  min-width: 160px;
+}
+
+.kpi-attributes-modal #kpiSaveBtn.is-loading {
+  cursor: wait !important;
+}
+
+.kpi-attributes-modal .kpi-save-spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.38);
+  border-top-color: #ffffff;
+  display: none;
+  animation: kpiButtonSpin 0.75s linear infinite;
+  flex-shrink: 0;
+}
+
+.kpi-attributes-modal #kpiSaveBtn.is-loading .kpi-save-spinner {
+  display: inline-block;
+}
+
+@keyframes kpiButtonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @keyframes modalSlideUp {
   from {
     opacity: 0;
@@ -12009,7 +12046,7 @@ textarea {
         <div class="topbar">
           <div class="topbar-left">
               <h1>Responsible KPI Dashboard</h1>
-            <p>Modern KPI workspace for ${escapeHtml(responsibleName)}. KPI creation and target allocation are locked to this responsible.</p>
+            <p>Modern KPI workspace for ${escapeHtml(responsibleName)}. KPI creation stays linked to this responsible, while target allocation consulting can review and manage all allocations.</p>
           </div>
 
         </div>
@@ -12052,15 +12089,15 @@ textarea {
           <div class="parameter-section-shell">
             <div class="parameter-matrix-hero">
               <div class="parameter-matrix-title">
-                <h2>KPI Matrix</h2>
-                <p>View and manage all KPI target allocations with direct visibility on KPI name, KPI type, role, KPI frequency, responsible, target status, and target value.</p>
+                <h2>Target Allocation Matrix</h2>
+                <p>View and manage every KPI target allocation with direct visibility on KPI name, type, role, frequency, and target value.</p>
               </div>
               <button class="btn btn-primary parameter-matrix-add-btn" type="button" onclick="openCreateParameterModal()">+ Add Target Allocation</button>
             </div>
 
             <div class="parameter-matrix-toolbar">
               <div class="search-wrap parameter-matrix-search">
-                <input id="parameterSearch" class="search" placeholder="Search KPI name, KPI type, role, frequency, responsible, target status or target value..." />
+                <input id="parameterSearch" class="search" placeholder="Filter by KPI name, role, type, or frequency..." />
               </div>
               <div class="parameter-results-meta" id="parameterResultsMeta">0 allocations</div>
             </div>
@@ -12081,7 +12118,7 @@ textarea {
             </div>
           </div>
 
-        <button class="btn btn-soft" onclick="dismissKpiModal()" style="width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:12px;font-size:20px;line-height:1;color:#64748b;">&times;</button>
+        <button id="kpiCloseBtn" class="btn btn-soft" onclick="dismissKpiModal()" style="width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:12px;font-size:20px;line-height:1;color:#64748b;">&times;</button>
         </div>
 
       <div class="modal-body">
@@ -12373,8 +12410,17 @@ textarea {
        <div class="modal-footer">
       <div class="footer-actions">
       <button id="deleteBtn" class="btn btn-danger" onclick="deleteCurrentKpi()">Delete KPI</button>
-     <button class="btn btn-primary" onclick="saveKpi()">Save KPI</button>
-     <button class="btn btn-soft" onclick="dismissKpiModal()">Cancel</button>
+     <button
+       id="kpiSaveBtn"
+       class="btn btn-primary"
+       type="button"
+       data-default-label="Save KPI"
+       onclick="saveKpi()"
+     >
+       <span class="kpi-save-spinner" aria-hidden="true"></span>
+       <span class="kpi-save-label">Save KPI</span>
+     </button>
+     <button id="kpiCancelBtn" class="btn btn-soft" type="button" onclick="dismissKpiModal()">Cancel</button>
       </div>
       </div>
         </div>
@@ -12611,6 +12657,7 @@ textarea {
       let parameterLockedZoneIds = [];
       let parameterResolvedZoneId = "";
       let parameterZoneLookupPending = false;
+      let kpiSavePending = false;
       let parameterSavePending = false;
       let parameterEditMode = false;
       let kpiCreateDraft = null;
@@ -15098,6 +15145,23 @@ function handleCalculationModeChange() {
   syncKpiRequiredState();
 }
 
+      const RESPONSIBLE_DASHBOARD_DEFAULT_VIEW = "dashboard";
+      const RESPONSIBLE_DASHBOARD_VIEW_STORAGE_KEY =
+        "responsible-dashboard-view:" + String(responsibleId || "");
+      const RESPONSIBLE_DASHBOARD_HASH_TO_VIEW = Object.freeze({
+        "#dashboard": "dashboard",
+        "#consult-kpi": "dashboard",
+        "#my-kpis": "my-kpis",
+        "#analytics": "my-kpis",
+        "#consult-target-allocation": "consult-target-allocation",
+        "#allocations": "consult-target-allocation"
+      });
+      const RESPONSIBLE_DASHBOARD_VIEW_TO_HASH = Object.freeze({
+        dashboard: "#dashboard",
+        "my-kpis": "#my-kpis",
+        "consult-target-allocation": "#consult-target-allocation"
+      });
+
      function setActiveNav(target) {
         ["navDashboard", "navMyKpis", "navConsultAllocations"].forEach(id => {
           const el = document.getElementById(id);
@@ -15107,18 +15171,71 @@ function handleCalculationModeChange() {
         if (activeEl) activeEl.classList.add("active");
       }
 
-      function showDashboard() {
+      function persistResponsibleDashboardView(viewName) {
+        const normalizedView = String(viewName || "").trim().toLowerCase();
+        const targetHash =
+          RESPONSIBLE_DASHBOARD_VIEW_TO_HASH[normalizedView] ||
+          RESPONSIBLE_DASHBOARD_VIEW_TO_HASH[RESPONSIBLE_DASHBOARD_DEFAULT_VIEW];
+
+        try {
+          window.localStorage.setItem(
+            RESPONSIBLE_DASHBOARD_VIEW_STORAGE_KEY,
+            normalizedView || RESPONSIBLE_DASHBOARD_DEFAULT_VIEW
+          );
+        } catch (error) {
+          console.warn("Unable to persist dashboard view:", error);
+        }
+
+        const nextUrl = new URL(window.location.href);
+        if (nextUrl.hash !== targetHash) {
+          nextUrl.hash = targetHash;
+          window.history.replaceState({}, "", nextUrl.pathname + nextUrl.search + nextUrl.hash);
+        }
+      }
+
+      function getStoredResponsibleDashboardView() {
+        const normalizedHash = String(window.location.hash || "").trim().toLowerCase();
+        if (RESPONSIBLE_DASHBOARD_HASH_TO_VIEW[normalizedHash]) {
+          return RESPONSIBLE_DASHBOARD_HASH_TO_VIEW[normalizedHash];
+        }
+
+        try {
+          const storedView = String(
+            window.localStorage.getItem(RESPONSIBLE_DASHBOARD_VIEW_STORAGE_KEY) || ""
+          )
+            .trim()
+            .toLowerCase();
+
+          if (RESPONSIBLE_DASHBOARD_VIEW_TO_HASH[storedView]) {
+            return storedView;
+          }
+        } catch (error) {
+          console.warn("Unable to read persisted dashboard view:", error);
+        }
+
+        return RESPONSIBLE_DASHBOARD_DEFAULT_VIEW;
+      }
+
+      function showDashboard(options = {}) {
+        const shouldPersist = options.persist !== false;
         document.getElementById("dashboardSection").style.display = "block";
         document.getElementById("myKpisSection").style.display = "none";
         document.getElementById("consultTargetAllocationsSection").style.display = "none";
         setActiveNav("navDashboard");
+        if (shouldPersist) {
+          persistResponsibleDashboardView("dashboard");
+        }
       }
 
-      async function showMyKpis() {
+      async function showMyKpis(options = {}) {
+        const shouldPersist = options.persist !== false;
         document.getElementById("dashboardSection").style.display = "none";
         document.getElementById("myKpisSection").style.display = "block";
         document.getElementById("consultTargetAllocationsSection").style.display = "none";
         setActiveNav("navMyKpis");
+        if (shouldPersist) {
+          persistResponsibleDashboardView("my-kpis");
+        }
 
         if (!chartsLoaded) {
           await loadKpiCharts();
@@ -15126,17 +15243,38 @@ function handleCalculationModeChange() {
         }
       }
 
-      async function showConsultTargetAllocations() {
+      async function showConsultTargetAllocations(options = {}) {
+        const shouldPersist = options.persist !== false;
         document.getElementById("dashboardSection").style.display = "none";
         document.getElementById("myKpisSection").style.display = "none";
         document.getElementById("consultTargetAllocationsSection").style.display = "block";
         setActiveNav("navConsultAllocations");
+        bindParameterSearchInput();
+        if (shouldPersist) {
+          persistResponsibleDashboardView("consult-target-allocation");
+        }
 
         if (!parameterSourceRows.length) {
           await loadParameterKpis();
         } else {
           applyParameterSearch();
         }
+      }
+
+      async function restoreResponsibleDashboardView() {
+        const currentView = getStoredResponsibleDashboardView();
+
+        if (currentView === "consult-target-allocation") {
+          await showConsultTargetAllocations({ persist: true });
+          return;
+        }
+
+        if (currentView === "my-kpis") {
+          await showMyKpis({ persist: true });
+          return;
+        }
+
+        showDashboard({ persist: true });
       }
 
       function updateStats(rows) {
@@ -15525,6 +15663,18 @@ function getCurrentKpiRowById(kpiId) {
         return searchEl ? String(searchEl.value || "") : "";
       }
 
+      function bindParameterSearchInput() {
+        const parameterSearchInput = document.getElementById("parameterSearch");
+        if (!parameterSearchInput || parameterSearchInput.dataset.bound === "true") {
+          return;
+        }
+
+        parameterSearchInput.addEventListener("input", (event) => {
+          applyParameterSearch(event.target.value);
+        });
+        parameterSearchInput.dataset.bound = "true";
+      }
+
       function buildParameterAllocationGroupKey(row) {
         return [
           row.kpi_id || "",
@@ -15652,45 +15802,45 @@ function getCurrentKpiRowById(kpiId) {
           });
       }
 
-      function buildParameterSearchIndex(row) {
-        return [
+      function buildParameterSearchFields(row) {
+        const primaryFields = [
           row.kpi_name,
-          row.kpi_subject,
           row.kpi_group,
-          row.kpi_type,
-          row.unit_type_name,
           row.role_name,
-          row.frequency,
-          row.target_status,
-          row.plant_name,
-          row.zone_name,
-          row.unit_name,
-          row.function,
-          row.product_line_name,
-          row.product_name,
-          row.market_name,
-          row.customer_name,
-          Array.isArray(row.group_scope_names) ? row.group_scope_names.join(" ") : "",
-          Array.isArray(row.group_responsible_names) ? row.group_responsible_names.join(" ") : "",
-          Array.isArray(row.group_target_values)
-            ? row.group_target_values.map((value) => formatParameterDisplayValue(value)).join(" ")
-            : "",
-          row.target_unit,
-          row.local_currency,
-          formatParameterDisplayValue(row.target_value),
-          formatParameterDisplayDate(row.target_setup_date)
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
+          row.kpi_type,
+          row.frequency
+        ];
+
+        const relatedFields = Array.isArray(row.related_allocations)
+          ? row.related_allocations.flatMap((allocationRow) => [
+              allocationRow?.kpi_name,
+              allocationRow?.kpi_group,
+              allocationRow?.role_name,
+              allocationRow?.kpi_type,
+              allocationRow?.frequency
+            ])
+          : [];
+
+        return [...primaryFields, ...relatedFields]
+          .map((value) => String(value || "").trim().toLowerCase())
+          .filter(Boolean);
       }
 
       function filterParameterRows(rows, search = "") {
         const sourceRows = Array.isArray(rows) ? rows : [];
-        const query = String(search || "").trim().toLowerCase();
-        if (!query) return sourceRows;
+        const tokens = String(search || "")
+          .trim()
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(Boolean);
+        if (!tokens.length) return sourceRows;
 
-        return sourceRows.filter((row) => buildParameterSearchIndex(row).includes(query));
+        return sourceRows.filter((row) => {
+          const searchFields = buildParameterSearchFields(row);
+          return tokens.every((token) =>
+            searchFields.some((fieldValue) => fieldValue.includes(token))
+          );
+        });
       }
 
       function formatParameterDisplayValue(value) {
@@ -16047,7 +16197,7 @@ function getCurrentKpiRowById(kpiId) {
 
         try {
           const res = await fetch(
-            '/api/responsibles/' + responsibleId + '/kpi-objects?_ts=' + Date.now(),
+            '/api/responsibles/' + responsibleId + '/kpi-objects?scope=all&_ts=' + Date.now(),
             { cache: "no-store" }
           );
           const data = await res.json();
@@ -16491,13 +16641,15 @@ function getCurrentKpiRowById(kpiId) {
       }
 
       function openModal() {
+        setKpiSaveLoading(kpiSavePending);
         document.getElementById("modalBackdrop").classList.add("open");
         requestAnimationFrame(() => {
           syncDefinitionTextareaHeight();
         });
       }
 
-      function closeModal() {
+      function closeModal(force = false) {
+        if (kpiSavePending && !force) return;
         document.getElementById("modalBackdrop").classList.remove("open");
       }
 
@@ -16511,6 +16663,31 @@ function getCurrentKpiRowById(kpiId) {
 
       function dismissKpiDetailsModal() {
         closeKpiDetailsModal();
+      }
+
+      function setKpiSaveLoading(isLoading) {
+        const saveBtn = document.getElementById("kpiSaveBtn");
+        const closeBtn = document.getElementById("kpiCloseBtn");
+        const cancelBtn = document.getElementById("kpiCancelBtn");
+        const deleteBtn = document.getElementById("deleteBtn");
+        const labelEl = saveBtn ? saveBtn.querySelector(".kpi-save-label") : null;
+        const defaultLabel = saveBtn?.dataset?.defaultLabel || "Save KPI";
+
+        if (saveBtn) {
+          saveBtn.disabled = Boolean(isLoading);
+          saveBtn.classList.toggle("is-loading", Boolean(isLoading));
+          saveBtn.setAttribute("aria-busy", isLoading ? "true" : "false");
+        }
+
+        [closeBtn, cancelBtn, deleteBtn].forEach((btn) => {
+          if (btn) {
+            btn.disabled = Boolean(isLoading);
+          }
+        });
+
+        if (labelEl) {
+          labelEl.textContent = isLoading ? "Saving..." : defaultLabel;
+        }
       }
 
       function openParameterModal() {
@@ -16620,6 +16797,7 @@ function getCurrentKpiRowById(kpiId) {
       }
 
       function dismissKpiModal() {
+        if (kpiSavePending) return;
         const isCreateMode = !getFieldValue("kpi_id");
         if (isCreateMode) {
           kpiCreateDraft = captureKpiCreateDraft();
@@ -17555,6 +17733,10 @@ function fillForm(data) {
       }
 
       async function saveKpi() {
+        if (kpiSavePending) {
+          return;
+        }
+
         if (!validateKpiForm()) {
           return;
         }
@@ -17567,6 +17749,9 @@ function fillForm(data) {
         : '/api/responsibles/' + responsibleId + '/kpis';
 
         try {
+          kpiSavePending = true;
+          setKpiSaveLoading(true);
+
           const res = await fetch(url, {
             method,
             headers: { "Content-Type": "application/json" },
@@ -17583,7 +17768,7 @@ function fillForm(data) {
        if (isCreateMode) {
          kpiCreateDraft = null;
        }
-       closeModal();
+       closeModal(true);
        if (isCreateMode) {
          resetForm();
        }
@@ -17597,6 +17782,9 @@ function fillForm(data) {
         } catch (error) {
           console.error("SAVE KPI ERROR:", error);
           showToast("Save failed: " + error.message);
+        } finally {
+          kpiSavePending = false;
+          setKpiSaveLoading(false);
         }
       }
 
@@ -17836,7 +18024,9 @@ updateParameterKpiSummary();
           const groupedAllocations = Array.isArray(groupedAllocationRow?.related_allocations)
             ? groupedAllocationRow.related_allocations
             : [];
-          const res = await fetch('/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId);
+          const res = await fetch(
+            '/api/responsibles/' + responsibleId + '/kpi-objects/' + parameterObjectId + '?scope=all'
+          );
           const data = await res.json();
 
           if (!res.ok) {
@@ -18109,6 +18299,8 @@ if (missingRow) {
         loadKpis(e.target.value);
       });
 
+      bindParameterSearchInput();
+
       document.getElementById("modalBackdrop").addEventListener("click", (e) => {
         if (e.target.id === "modalBackdrop") {
           e.preventDefault();
@@ -18310,6 +18502,7 @@ document.addEventListener("keydown", (event) => {
      (async () => {
        await loadKpis();
        await loadParameterKpis();
+       await restoreResponsibleDashboardView();
 
        const currentUrl = new URL(window.location.href);
        const editKpiId = currentUrl.searchParams.get("editKpi");
