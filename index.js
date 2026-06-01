@@ -12219,6 +12219,7 @@ textarea {
     <div id="kpiSubjectFilter" class="kpi-filter-select"></div>
   </div>
 
+  <div class="kpi-results-meta" id="kpiResultsMeta">0 KPIs</div>
 </div>
 
             <div id="grid"></div>
@@ -16607,16 +16608,25 @@ function createKpiFilterDropdown(containerId, placeholder, options, selectedValu
   render("");
 }
 
+function getLastSubjectName(subjectPath) {
+  const parts = String(subjectPath || "")
+    .split("/")
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
 function initializeKpiConsultFilters(rows) {
   const nameOptions = getUniqueKpiFilterOptions(
     rows,
     row => row.indicator_sub_title
   );
 
-  const subjectOptions = getUniqueKpiFilterOptions(
-    rows,
-    row => row.full_subject_path || row.subject
-  );
+const subjectOptions = getUniqueKpiFilterOptions(
+  rows,
+  row => getLastSubjectName(row.full_subject_path || row.subject)
+);
 
   if (selectedKpiNameFilter && !nameOptions.includes(selectedKpiNameFilter)) {
     selectedKpiNameFilter = "";
@@ -16661,9 +16671,9 @@ function applyKpiConsultFilters() {
   }
 
   if (selectedKpiSubjectFilter) {
-    rows = rows.filter(row =>
-      String(row.full_subject_path || row.subject || "").trim() === selectedKpiSubjectFilter
-    );
+rows = rows.filter(row =>
+  getLastSubjectName(row.full_subject_path || row.subject) === selectedKpiSubjectFilter
+);
   }
 
   renderKpis(rows);
