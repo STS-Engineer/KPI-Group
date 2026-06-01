@@ -8220,12 +8220,12 @@ textarea {
         justify-content: center;
       }
 
-    .kpi-matrix-toolbar {
+.kpi-matrix-toolbar {
   display: grid;
-  grid-template-columns: minmax(320px, 1.4fr) minmax(220px, 0.8fr) minmax(280px, 1fr) auto;
+  grid-template-columns: minmax(360px, 1fr) 240px 240px auto;
   align-items: end;
-  gap: 16px;
-  padding: 0 14px 20px;
+  gap: 14px;
+  padding: 0 10px 15px;
 }
 
 .kpi-filter-field {
@@ -8341,12 +8341,7 @@ textarea {
   color: #0f172a;
 }
 
-.kpi-filter-option:hover,
-.kpi-filter-option.is-selected {
-  background: linear-gradient(135deg, rgba(37,99,235,0.11), rgba(6,182,212,0.08));
-  color: #1d4ed8;
-  font-weight: 800;
-}
+
 
 .kpi-results-meta {
   align-self: center;
@@ -8373,70 +8368,7 @@ textarea {
   }
 }
 
-      .kpi-filter-select {
-  position: relative;
-  width: 240px;
-}
-
-.kpi-filter-trigger {
-  width: 100%;
-  min-height: 48px;
-  border: 1px solid rgba(148,163,184,0.25);
-  background: rgba(255,255,255,0.95);
-  color: #64748b;
-  border-radius: 18px;
-  padding: 0 14px;
-  font-size: 13px;
-  font-family: inherit;
-  text-align: left;
-  cursor: pointer;
-  box-shadow: var(--shadow-sm);
-}
-
-.kpi-filter-menu {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
-  right: 0;
-  z-index: 200;
-  display: none;
-  padding: 10px;
-  border-radius: 18px;
-  background: #ffffff;
-  box-shadow: 0 22px 48px rgba(15,23,42,0.14);
-  border: 1px solid rgba(148,163,184,0.22);
-}
-
-.kpi-filter-select.is-open .kpi-filter-menu {
-  display: block;
-}
-
-.kpi-filter-search {
-  width: 100%;
-  min-height: 40px;
-  border: 1px solid rgba(37,99,235,0.35);
-  border-radius: 12px;
-  padding: 8px 10px;
-  outline: none;
-  margin-bottom: 8px;
-}
-
-.kpi-filter-options {
-  max-height: 260px;
-  overflow-y: auto;
-}
-
-.kpi-filter-option {
-  width: 100%;
-  border: none;
-  background: transparent;
-  padding: 10px 12px;
-  border-radius: 12px;
-  text-align: left;
-  cursor: pointer;
-  font-size: 13px;
-  color: #0f172a;
-}
+ 
 
 .kpi-filter-option:hover,
 .kpi-filter-option.is-selected {
