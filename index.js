@@ -29026,12 +29026,14 @@ async function sendAssistantPrompt(message) {
     : false;
 
   if (input && !preserveDraftValue) {
-    const nextValue = data.currentValue !== null && data.currentValue !== undefined
-      ? String(data.currentValue)
-      : "";
-    input.value = nextValue;
-    setValueInputServerState(input, nextValue);
-  }
+   const latestValue = [...data.values].reverse().find(v =>
+    v !== null && v !== undefined && v !== "" && !isNaN(Number(v))
+    );
+
+   const nextValue = latestValue !== undefined ? String(latestValue) : "";
+     input.value = nextValue;
+     setValueInputServerState(input, nextValue);
+   }
 
   const chart = kpiCharts[kvId];
   if (!chart) {
@@ -29330,8 +29332,22 @@ async function sendAssistantPrompt(message) {
             const highLimit = parseFloat(card.dataset.highLimit);
             const target = parseFloat(card.dataset.target);
             const goodDirection = card.dataset.goodDirection || "up";
-            let labels = [], values = [];
-            try { labels = JSON.parse(card.dataset.historyLabels || "[]"); values = JSON.parse(card.dataset.historyValues || "[]"); } catch(e){}
+           let labels = [], values = [];
+
+            try {
+           labels = JSON.parse(card.dataset.historyLabels || "[]");
+           values = JSON.parse(card.dataset.historyValues || "[]");
+           } catch(e) {}
+
+           const input = document.getElementById("value_" + kvId);
+           const latestValue = [...values].reverse().find(v =>
+           v !== null && v !== undefined && v !== "" && !isNaN(Number(v))
+           );
+
+          if (input && latestValue !== undefined && !input.value) {
+          input.value = latestValue;
+          setValueInputServerState(input, latestValue);
+           }
             const colors = values.map(v => getPointColor(v, lowLimit, highLimit, goodDirection));
             const borderColors = values.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection));
             const bounds = computeBounds(values, lowLimit, target, highLimit);
