@@ -22833,47 +22833,6 @@ const generateEmailHtml = ({ responsible, week }) => {
   </body></html>`;
 };
 
-
-const checkAndTriggerCorrectiveActions = async (responsibleId, kpiId, week, newValue, histId) => {
-  try {
-    const kpiRes = await pool.query(
-      `SELECT target FROM public."Kpi" WHERE kpi_id = $1`, [kpiId]
-    );
-    if (!kpiRes.rows.length) return { targetUpdated: false };
-
-    const currentTarget = parseFloat(kpiRes.rows[0].target);
-    const numValue = parseFloat(newValue);
-    if (isNaN(numValue) || isNaN(currentTarget)) return { targetUpdated: false };
-
-    // â”€â”€ value exceeds current target â†’ queue it, touch NOTHING else â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (numValue > currentTarget) {
-      console.log(`ðŸ“Œ KPI ${kpiId}: ${numValue} > target ${currentTarget} â€” queuing pending update`);
-
-      await pool.query(
-        `INSERT INTO public.pending_target_updates
-           (kpi_id, responsible_id, week, new_target, applied)
-         VALUES ($1, $2, $3, $4, false)
-         ON CONFLICT (kpi_id, responsible_id, week)
-         DO UPDATE SET new_target = EXCLUDED.new_target, applied = false`,
-        [kpiId, responsibleId, week, String(numValue)]
-      );
-
-      console.log(`Pending target queued â€” KPI ${kpiId}: ${currentTarget} â†’ ${numValue}`);
-
-      return {
-        targetUpdated: true,
-        updateInfo: { kpiId, oldTarget: currentTarget, newTarget: numValue }
-      };
-    }
-
-    return { targetUpdated: false };
-
-  } catch (error) {
-    console.error('âŒ checkAndTriggerCorrectiveActions error:', error.message);
-    return { targetUpdated: false, error: error.message };
-  }
-};
-
 // ============================================================
 // upsertCorrectiveAction â€” saves root_cause, implemented_solution,
 // evidence into corrective_actions table for a given kpi/week
@@ -31992,7 +31951,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
               <table border="0" cellpadding="0" cellspacing="0" align="center"><tr>
       
                 <td style="padding:0 8px;">
-                  <a href="https://kpi-form.azurewebsites.net/dashboard?responsible_id=${responsibleLinkId}"
+                  <a href="http://localhost:5000/dashboard?responsible_id=${responsibleLinkId}"
                      style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
                             text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
                     View Dashboard</a>
@@ -32049,58 +32008,6 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
       attachments: pdfAttachment ? [pdfAttachment] : [],
     });
     console.log(`Email sent to ${responsible.email}`);
-
-    // â”€â”€ NOW apply all pending target updates for this responsible â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    // Email is already sent â€” safe to update Kpi.target and hist26.target
-    try {
-      const pending = await pool.query(
-        `SELECT p.id, p.kpi_id, p.week, p.new_target,
-                k.target AS current_kpi_target, k.subject
-         FROM public.pending_target_updates p
-         JOIN public."Kpi" k ON k.kpi_id = p.kpi_id
-         WHERE p.responsible_id = $1 AND p.applied = false`,
-        [responsible.people_id]
-      );
-
-      console.log(`ðŸ“‹ ${pending.rows.length} pending target update(s) to apply for ${responsible.name}`);
-
-      for (const row of pending.rows) {
-        const newVal = parseFloat(row.new_target);
-        const currVal = parseFloat(row.current_kpi_target);
-
-        if (isNaN(newVal)) {
-          console.warn(`âš ï¸ Skipping KPI ${row.kpi_id} â€” new_target "${row.new_target}" is not a number`);
-          continue;
-        }
-
-        // 1. Update Kpi.target
-        await pool.query(
-          `UPDATE public."Kpi" SET target = $1 WHERE kpi_id = $2`,
-          [String(newVal), row.kpi_id]
-        );
-        console.log(`ðŸŽ¯ Kpi.target updated: "${row.subject}" (${row.kpi_id}) ${currVal} â†’ ${newVal}`);
-
-        // 2. Update kpi_values_hist26.target for that week
-        await pool.query(
-          `UPDATE public.kpi_values_hist26
-           SET target = $1
-           WHERE responsible_id = $2 AND kpi_id = $3 AND week = $4`,
-          [newVal, responsible.people_id, row.kpi_id, row.week]
-        );
-        console.log(`ðŸ“ kpi_values_hist26.target updated: KPI ${row.kpi_id} week ${row.week} â†’ ${newVal}`);
-
-        // 3. Mark as applied
-        await pool.query(
-          `UPDATE public.pending_target_updates SET applied = true WHERE id = $1`,
-          [row.id]
-        );
-      }
-
-      console.log(`All pending target updates applied for ${responsible.name}`);
-
-    } catch (applyErr) {
-      console.error(`âŒ Failed to apply pending target updates for ${responsible.name}:`, applyErr.message);
-    }
 
   } catch (error) {
     console.error(`âŒ generateWeeklyReportEmail failed for responsible ${responsibleId}:`, error.message);
