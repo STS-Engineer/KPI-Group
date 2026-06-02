@@ -32143,7 +32143,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
-// ("35 21 * * *", async () => {
+// cron.schedule("35 21 * * *", async () => {
 //   const lockId = "weekly_kpi_report_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -33627,7 +33627,7 @@ app.post("/api/ceo-report/plants/:plantId/send", async (req, res) => {
 
 // ---------- Cron: corrective action escalation reminders ----------
 // let correctiveActionEscalationCronRunning = false;
-// ("35 9 * * *", async () => {
+// cron.schedule("35 9 * * *", async () => {
 //   const lockId = "corrective_action_escalation_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -33714,7 +33714,7 @@ async function sendKPIReportToHierarchy(responsiblePeopleId, currentWeek) {
 // ---------- Cron: weekly manager/plant report ----------
 // let managerCronRunning = false;
 
-// ("07 11 * * 1", async () => {
+// cron.schedule("07 11 * * 1", async () => {
 //   if (managerCronRunning) return;
 //   managerCronRunning = true;
 
