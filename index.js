@@ -22812,9 +22812,9 @@ const generateEmailHtml = ({ responsible, week }) => {
              alt="AVOCarbon Logo" style="width:90px;height:90px;object-fit:contain;">
       </div>
       
-      <!-- KPI codir with cadre/border - directly under logo and centered -->
+      <!-- KPI group with cadre/border - directly under logo and centered -->
       <div style="border:2px solid #0078D7;border-radius:8px;padding:6px 25px;display:inline-block;margin:0 auto 15px auto;">
-        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI codir</span>
+        <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI Group</span>
       </div>
       
       <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${monthYear}</h2>
@@ -32455,7 +32455,7 @@ const generateManagerReportHtml = (reportData) => {
 <body>
   <div style="padding:30px 20px;max-width:1400px;margin:0 auto;">
     <div style="background:white;border-radius:12px;padding:30px;box-shadow:0 4px 12px rgba(0,0,0,0.05);margin-bottom:30px;">
-      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI CODIR DASHBOARD</h1>
+      <h1 style="margin:0 0 8px;font-size:28px;font-weight:800;color:#2c3e50;">CEO KPI Group DASHBOARD</h1>
       <div style="font-size:14px;color:#6c757d;">
         <strong>${plant.plant_name}</strong>  Week: <strong>${week.replace('2026-Week', 'W')}</strong>
         Manager: <strong>${plant.manager || 'N/A'}</strong>
