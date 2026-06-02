@@ -12746,10 +12746,6 @@ textarea {
                 <label><span>KPI Unit</span></label>
                 <input id="parameter_target_unit" class="readonly-input" readonly />
               </div>
-              <div class="field col-3">
-                <label><span>Sell Currency</span></label>
-                <input id="parameter_local_currency" class="readonly-input" readonly />
-              </div>
           
               <div class="field col-3" id="parameter_previous_target_field">
                 <label><span>Previous Target</span></label>
@@ -12759,10 +12755,7 @@ textarea {
                 <label><span id="parameter_set_by_people_label">Responsible</span></label>
                 <select id="parameter_set_by_people_id"></select>
               </div>
-              <div class="field col-3">
-                <label><span>Approved By</span></label>
-                <select id="parameter_approved_by_people_id"></select>
-              </div>
+           
               <div class="field col-3" id="parameter_target_start_date_field">
                 <label><span>Target Start Date</span><span class="hint">Optional start</span></label>
                 <input id="parameter_target_start_date" type="date" />
