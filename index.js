@@ -11063,8 +11063,15 @@ textarea {
 .parameter-modal .field.col-4 { grid-column: span 4 !important; }
 .parameter-modal .field.col-12 { grid-column: 1 / -1 !important; }
 
-.parameter-modal #parameterAllocationFieldsSection.is-individual-layout .form-grid {
-  grid-template-columns: repeat(21, minmax(0, 1fr)) !important;
+.parameter-modal #parameterAllocationFieldsSection.is-individual-layout .form-grid,
+.parameter-modal #parameterAllocationFieldsSection .form-grid {
+  grid-template-columns: repeat(12, minmax(0, 1fr)) !important;
+  column-gap: 20px !important;
+  row-gap: 18px !important;
+}
+
+.parameter-modal #parameterAllocationFieldsSection .field.col-3 {
+  grid-column: span 3 !important;
 }
 
 .parameter-modal .field label {
