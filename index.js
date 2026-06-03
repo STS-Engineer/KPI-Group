@@ -19361,6 +19361,35 @@ const releaseJobLock = async (lockId, lockHashOrInstanceId, maybeLockHash) => {
   }
 };
 
+async function runWithJobLock(lockId, jobFn) {
+  const lockHash = Math.abs(
+    lockId.split("").reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0)
+  );
+
+  const client = await pool.connect();
+
+  try {
+    const result = await client.query(
+      "SELECT pg_try_advisory_lock($1) AS acquired",
+      [lockHash]
+    );
+
+    if (!result.rows[0].acquired) {
+      console.log(`[${lockId}] lock not acquired, skipping`);
+      return;
+    }
+
+    console.log(`[${lockId}] lock acquired`);
+
+    await jobFn();
+  } finally {
+    await client.query("SELECT pg_advisory_unlock($1)", [lockHash]).catch(() => {});
+    client.release();
+    console.log(`[${lockId}] lock released`);
+  }
+}
+
+
 // ---------- Nodemailer ----------
 const createTransporter = () =>
   nodemailer.createTransport({
