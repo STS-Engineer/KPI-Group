@@ -31998,17 +31998,19 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
       console.error(`âš ï¸ PDF generation failed for ${responsible.name}:`, pdfErr.message);
     }
 
+  const transporter = createTransporter();
     // â”€â”€ SEND EMAIL (with OLD target values in charts) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const transporter = createTransporter();
-    await transporter.sendMail({
-      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-      to: responsible.email,
-      subject: `KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
-      html: emailHtml,
-      attachments: pdfAttachment ? [pdfAttachment] : [],
-    });
-    console.log(`Email sent to ${responsible.email}`);
+  const info = await transporter.sendMail({
+  from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+  to: responsible.email,
+  subject: `KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
+  html: emailHtml,
+  attachments: pdfAttachment ? [pdfAttachment] : [],
+});
 
+console.log(`Email sent to ${responsible.email}`);
+console.log("Message ID:", info.messageId);
+console.log("SMTP Response:", info.response);
   } catch (error) {
     console.error(`âŒ generateWeeklyReportEmail failed for responsible ${responsibleId}:`, error.message);
     throw error;
