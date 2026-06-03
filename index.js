@@ -31951,7 +31951,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
               <table border="0" cellpadding="0" cellspacing="0" align="center"><tr>
       
                 <td style="padding:0 8px;">
-                  <a href="http://localhost:5000/dashboard?responsible_id=${responsibleLinkId}"
+                  <a href="https://kpi-codir.azurewebsites.net/dashboard?responsible_id=${responsibleLinkId}"
                      style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
                             text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
                     View Dashboard</a>
@@ -31981,36 +31981,58 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
     </body></html>`;
 
     // â”€â”€ Generate PDF attachment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let pdfAttachment = null;
-    try {
-      console.log(`ðŸ“„ Generating recommendations PDF for ${responsible.name}â€¦`);
-      const pdfBuffer = await generateKPIRecommendationsPDFBuffer(pool, responsible.people_id, reportWeek);
-      if (pdfBuffer) {
-        const weekLabel = reportWeek.replace('2026-Week', 'Week_');
-        pdfAttachment = {
-          filename: `KPI_Recommendations_${responsible.name.replace(/ /g, '_')}_${weekLabel}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf',
-        };
-        console.log(`ðŸ“„ PDF ready â€” ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
-      }
-    } catch (pdfErr) {
-      console.error(`âš ï¸ PDF generation failed for ${responsible.name}:`, pdfErr.message);
-    }
+let pdfAttachment = null;
 
-  const transporter = createTransporter();
-    // â”€â”€ SEND EMAIL (with OLD target values in charts) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const info = await transporter.sendMail({
+try {
+  console.log(`Generating recommendations PDF for ${responsible.name}...`);
+
+  const pdfBuffer = await generateKPIRecommendationsPDFBuffer(
+    pool,
+    responsible.people_id,
+    reportWeek
+  );
+
+  if (pdfBuffer) {
+    const weekLabel = String(reportWeek).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+    const safeName = String(responsible.name || "responsible")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-zA-Z0-9_-]/g, "_");
+
+    pdfAttachment = {
+      filename: `KPI_Recommendations_${safeName}_${weekLabel}.pdf`,
+      content: pdfBuffer,
+      contentType: "application/pdf",
+    };
+
+    console.log(`PDF ready - ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
+    console.log(`PDF filename: ${pdfAttachment.filename}`);
+  }
+} catch (pdfErr) {
+  console.error(`PDF generation failed for ${responsible.name}:`, pdfErr.message);
+}
+
+const transporter = createTransporter();
+
+const info = await transporter.sendMail({
   from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
   to: responsible.email,
-  subject: `KPI Performance Trends - ${reportWeek} | ${responsible.name}`,
+  subject: `KPI Weekly Report - ${reportWeek}`,
   html: emailHtml,
-  attachments: pdfAttachment ? [pdfAttachment] : [],
+  attachments: [] // test first without PDF
 });
 
-console.log(`Email sent to ${responsible.email}`);
-console.log("Message ID:", info.messageId);
-console.log("SMTP Response:", info.response);
+console.log("[Weekly Report] Mail result:", {
+  to: responsible.email,
+  accepted: info.accepted,
+  rejected: info.rejected,
+  response: info.response,
+  messageId: info.messageId,
+  hasPdf: false
+});
+
+
   } catch (error) {
     console.error(`âŒ generateWeeklyReportEmail failed for responsible ${responsibleId}:`, error.message);
     throw error;
@@ -32052,32 +32074,43 @@ console.log("SMTP Response:", info.response);
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
-// cron.schedule("35 21 * * *", async () => {
-//   const lockId = "weekly_kpi_report_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
-//   try {
-//     if (reportCronRunning) return;
-//     reportCronRunning = true;
-//     const reportWeek = getPreviousWeek(getCurrentWeek());
-//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
 
-//     for (const recipient of recipients) {
-//       try {
-//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
-//         await new Promise((resolve) => setTimeout(resolve, 1500));
-//       } catch (err) {
-//         console.error(`[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`, err.message);
-//       }
+// cron.schedule("20 22 * * *", async () => {
+//   await runWithJobLock("weekly_kpi_report_job", async () => {
+//     if (reportCronRunning) {
+//       console.log("[Weekly Report] already running");
+//       return;
 //     }
 
-//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-//   } catch (error) {
-//     console.error("Report cron error:", error.message);
-//   } finally {
-//     reportCronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//   }
+//     reportCronRunning = true;
+
+//     try {
+//       const reportWeek = getPreviousWeek(getCurrentWeek());
+//       console.log("[Weekly Report] week:", reportWeek);
+
+//       const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+//       console.log("[Weekly Report] recipients:", recipients.length);
+
+//       for (const recipient of recipients) {
+//         try {
+//           console.log("[Weekly Report] sending to:", recipient.email || recipient.people_id);
+
+//           await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+
+//           await new Promise(resolve => setTimeout(resolve, 1500));
+//         } catch (err) {
+//           console.error(
+//             `[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`,
+//             err.message
+//           );
+//         }
+//       }
+
+//       console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+//     } finally {
+//       reportCronRunning = false;
+//     }
+//   });
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
