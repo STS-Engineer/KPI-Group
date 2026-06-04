@@ -2861,19 +2861,21 @@ const loadKpiTargetAllocationLookups = async () => {
     peopleResult,
     multisiteAssignmentsResult
   ] = await Promise.all([
-    pool.query(`
-      SELECT
-        u.unit_id,
-        u.unit_name,
-        u.unit_type_id,
-        ut.unit_type_name,
-        u.selling_currency,
-        u.operating_currency
-      FROM public.unit u
-      LEFT JOIN public.unit_type ut
-        ON ut.unit_type_id = u.unit_type_id
-      ORDER BY ut.unit_type_name, u.unit_name, u.unit_id
-    `),
+pool.query(`
+  SELECT
+    u.unit_id,
+    u.unit_name,
+    u.unit_type_id,
+    ut.unit_type_name,
+    u.selling_currency,
+    u.operating_currency
+  FROM public.unit u
+  INNER JOIN public.unit_type ut
+    ON ut.unit_type_id = u.unit_type_id
+  WHERE u.status_id = 1
+    AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
+  ORDER BY u.unit_name, u.unit_id
+`),
     pool.query(`
       SELECT unit_type_id, unit_type_name
       FROM public.unit_type
@@ -2931,39 +2933,40 @@ const loadKpiTargetAllocationLookups = async () => {
       FROM public.people
       ORDER BY name, first_name, people_id
     `),
-    pool.query(`
-      SELECT
-        u.unit_id,
-        u.unit_name,
-        u.unit_type_id,
-        ut.unit_type_name,
-        u.selling_currency,
-        u.operating_currency,
-        p.people_id,
-        p.name,
-        p.first_name,
-        pra.role_id,
-        COALESCE(r.role_name, '') AS role_name,
-        COALESCE(pra.is_primary, false) AS is_primary
-      FROM public.unit u
-      LEFT JOIN public.unit_type ut
-        ON ut.unit_type_id = u.unit_type_id
-      LEFT JOIN public.people p
-        ON p.work_at_unit_id = u.unit_id
-      LEFT JOIN public.people_role_assignment pra
-        ON pra.people_id = p.people_id
-       AND pra.assignment_status = 'ACTIVE'
-      LEFT JOIN public.role r
-        ON r.role_id = pra.role_id
-      ORDER BY
-        ut.unit_type_name,
-        u.unit_name,
-        r.role_name,
-        pra.is_primary DESC,
-        p.name,
-        p.first_name,
-        p.people_id
-    `)
+pool.query(`
+  SELECT
+    u.unit_id,
+    u.unit_name,
+    u.unit_type_id,
+    ut.unit_type_name,
+    u.selling_currency,
+    u.operating_currency,
+    p.people_id,
+    p.name,
+    p.first_name,
+    pra.role_id,
+    COALESCE(r.role_name, '') AS role_name,
+    COALESCE(pra.is_primary, false) AS is_primary
+  FROM public.unit u
+  INNER JOIN public.unit_type ut
+    ON ut.unit_type_id = u.unit_type_id
+  LEFT JOIN public.people p
+    ON p.work_at_unit_id = u.unit_id
+  LEFT JOIN public.people_role_assignment pra
+    ON pra.people_id = p.people_id
+   AND pra.assignment_status = 'ACTIVE'
+  LEFT JOIN public.role r
+    ON r.role_id = pra.role_id
+  WHERE u.status_id = 1
+    AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
+  ORDER BY
+    u.unit_name,
+    r.role_name,
+    pra.is_primary DESC,
+    p.name,
+    p.first_name,
+    p.people_id
+`)
   ]);
 
   const unitOptions = unitsResult.rows.map((row) => ({
@@ -13884,10 +13887,9 @@ function renderMultisiteUnitMatrix() {
     return;
   }
  
-  if (scopeKind !== "zone" && !selectedUnitTypeId && !parameterLockedUnitId) {
-    renderParameterTableEmptyState("Select a unit type to display the units that should receive targets.");
-    return;
-  }
+if (scopeKind !== "zone" && !parameterLockedUnitId) {
+  // Factory units are loaded by default from backend.
+}
  
   const visibleRows = getParameterVisibleUnitRows();
   if (!visibleRows.length) {
@@ -14100,40 +14102,46 @@ function populateAllocationLookupOptions(values = {}) {
 }
 
 function getParameterVisibleUnitRows() {
-  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
-  const selectedUnitTypeLabel = getParameterSelectedUnitTypeLabel().toLowerCase();
-  const filteredUnits = getParameterAllocationUnits()
-    .filter((unitEntry) => String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group")
-    .filter((unitEntry) => {
-      if (!selectedUnitTypeId) return true;
+  const scopeKind = getParameterScopeKind();
 
-      const entryTypeId = String(unitEntry.unit_type_id || "").trim();
-      const entryTypeName = String(unitEntry.unit_type_name || "").trim().toLowerCase();
+  if (scopeKind === "zone") {
+    return (allocationLookups.zones || []).map(zoneEntry => ({
+      row_kind: "zone",
+      value: String(zoneEntry.value || zoneEntry.zone_id || ""),
+      label: zoneEntry.label || zoneEntry.zone_name || "",
+      local_currency: "",
+      responsable_zone: zoneEntry.responsable_zone || "",
+      responsible_people_id: zoneEntry.responsible_people_id || "",
+      responsibles: Array.isArray(zoneEntry.responsibles)
+        ? zoneEntry.responsibles.slice()
+        : [],
+      role: ""
+    }));
+  }
 
-      return (
-        entryTypeId === String(selectedUnitTypeId) ||
-        (selectedUnitTypeLabel && entryTypeName === selectedUnitTypeLabel)
-      );
-    });
+  const factoryUnits = getParameterAllocationUnits()
+    .filter(unitEntry =>
+      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
+    )
+    .filter(unitEntry =>
+      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
+    )
+    .map(unitEntry => ({
+      ...unitEntry,
+      row_kind: "unit",
+      local_currency:
+        unitEntry.selling_currency ||
+        unitEntry.operating_currency ||
+        ""
+    }));
 
   if (parameterLockedUnitId) {
-    return filteredUnits.filter(
-      (unitEntry) => String(unitEntry.value || "") === String(parameterLockedUnitId)
+    return factoryUnits.filter(
+      unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
 
-  if (parameterEditMode) {
-    const savedScopeKeys = new Set(Object.keys(parameterUnitTargetState || {}));
-    const scopedEditedUnits = filteredUnits.filter((unitEntry) =>
-      savedScopeKeys.has(getParameterRowStateKey("unit", unitEntry.value))
-    );
-
-    if (scopedEditedUnits.length) {
-      return scopedEditedUnits;
-    }
-  }
-
-  return filteredUnits;
+  return factoryUnits;
 }
 
 function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
@@ -14274,90 +14282,45 @@ function autoFillSetByFromUnit() {
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
-// AFTER — filter zones by the selected role:
-if (scopeKind === "zone") {
-
-  const selectedRole = String(
-    getParameterFieldValue("parameter_role_id") || "__all_roles__"
-  ).trim();
-
-  return (allocationLookups.zones || [])
-    .filter(zoneEntry => {
-
-      if (selectedRole === "__all_roles__") {
-        return true;
-      }
-
-      return Array.isArray(zoneEntry?.responsibles) && zoneEntry.responsibles.some(
-        (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === selectedRole
-      );
-    })
-    .map(zoneEntry => ({
+  if (scopeKind === "zone") {
+    return (allocationLookups.zones || []).map(zoneEntry => ({
       row_kind: "zone",
-
-      value: String(
-        zoneEntry.value || zoneEntry.zone_id || ""
-      ),
-
-      label:
-        zoneEntry.label ||
-        zoneEntry.zone_name ||
-        "",
-
+      value: String(zoneEntry.value || zoneEntry.zone_id || ""),
+      label: zoneEntry.label || zoneEntry.zone_name || "",
       local_currency: "",
-
-      responsable_zone:
-        zoneEntry.responsable_zone || "",
-
-      responsible_people_id:
-        zoneEntry.responsible_people_id || "",
-
-      responsibles:
-        Array.isArray(zoneEntry.responsibles) ? zoneEntry.responsibles.slice() : [],
-
+      responsable_zone: zoneEntry.responsable_zone || "",
+      responsible_people_id: zoneEntry.responsible_people_id || "",
+      responsibles: Array.isArray(zoneEntry.responsibles)
+        ? zoneEntry.responsibles.slice()
+        : [],
       role: ""
     }));
-}
+  }
 
-  const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
-  const selectedUnitTypeLabel = getParameterSelectedUnitTypeLabel().toLowerCase();
-  const filteredUnits = getParameterAllocationUnits()
-    .filter((unitEntry) => String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group")
-    .filter((unitEntry) => {
-      if (!selectedUnitTypeId) return true;
-
-      const entryTypeId = String(unitEntry.unit_type_id || "").trim();
-      const entryTypeName = String(unitEntry.unit_type_name || "").trim().toLowerCase();
-
-      return (
-        entryTypeId === String(selectedUnitTypeId) ||
-        (selectedUnitTypeLabel && entryTypeName === selectedUnitTypeLabel)
-      );
-    })
-    .map((unitEntry) => ({
+  const factoryUnits = getParameterAllocationUnits()
+    .filter(unitEntry =>
+      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory" ||
+      String(unitEntry.unit_type_id || "").trim() === "4"
+    )
+    .filter(unitEntry =>
+      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
+    )
+    .map(unitEntry => ({
       ...unitEntry,
       row_kind: "unit",
-      local_currency: unitEntry.selling_currency || unitEntry.operating_currency || ""
+      local_currency:
+        unitEntry.selling_currency ||
+        unitEntry.operating_currency ||
+        ""
     }));
 
   if (parameterLockedUnitId) {
-    return filteredUnits.filter(
-      (unitEntry) => String(unitEntry.value || "") === String(parameterLockedUnitId)
+    return factoryUnits.filter(
+      unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
 
-  if (parameterEditMode) {
-    const savedScopeKeys = new Set(Object.keys(parameterUnitTargetState || {}));
-    const scopedEditedUnits = filteredUnits.filter((unitEntry) =>
-      savedScopeKeys.has(getParameterRowStateKey("unit", unitEntry.value))
-    );
-
-    if (scopedEditedUnits.length) {
-      return scopedEditedUnits;
-    }
-  }
-
-  return filteredUnits;
+  return factoryUnits;
 }
 
 function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
@@ -16489,6 +16452,21 @@ function getCurrentKpiRowById(kpiId) {
           : shown + " of " + total + " allocations";
       }
 
+
+function getExpectedMultisiteTargetCount(row = {}) {
+  if (String(row.kpi_type || "").trim().toLowerCase() !== "multisite") {
+    return Number(row.group_row_count || 1);
+  }
+
+  return getParameterAllocationUnits()
+    .filter(unit =>
+      String(unit.unit_type_name || "").trim().toLowerCase() === "factory"
+    )
+    .filter(unit =>
+      String(unit.label || "").trim().toLowerCase() !== "avocarbon group"
+    ).length;
+}
+
       function renderParameterKpis(rows) {
         currentParameterRows = rows || [];
         const parameterGrid = document.getElementById("parameterGrid");
@@ -16549,10 +16527,20 @@ function getCurrentKpiRowById(kpiId) {
                         <div class="parameter-matrix-cell-sub">\${escapeHtml(row.frequency ? "Frequency from selected KPI" : "No frequency linked")}</div>
                       </td>
                       <td>
-                        <div class="parameter-matrix-target-main">\${escapeHtml(Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " " + getParameterGroupedScopeKindLabel(row, 1) + " targets" : (formatParameterDisplayValue(row.target_value) + (row.target_unit ? " " + row.target_unit : "")))}</div>
+               <div class="parameter-matrix-target-main">\${escapeHtml(
+              String(row.kpi_type || "").trim().toLowerCase() === "multisite"
+               ? String(getExpectedMultisiteTargetCount(row)) + " unit targets"
+                : (
+               Number(row.group_row_count || 0) > 1
+               ? String(row.group_row_count) + " " + getParameterGroupedScopeKindLabel(row, 1) + " targets"
+               : (formatParameterDisplayValue(row.target_value) + (row.target_unit ? " " + row.target_unit : ""))
+                )
+              )}</div>
                         <div class="parameter-matrix-target-sub">\${escapeHtml([
                           row.kpi_type,
-                          Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " linked rows" : '',
+                          String(row.kpi_type || "").trim().toLowerCase() === "multisite"
+                         ? String(getExpectedMultisiteTargetCount(row)) + " linked rows"
+                         : (Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " linked rows" : ''),
                           row.target_setup_date ? 'Setup ' + formatParameterDisplayDate(row.target_setup_date) : '',
                           row.target_start_date ? 'Start ' + formatParameterDisplayDate(row.target_start_date) : '',
                           row.target_end_date ? 'End ' + formatParameterDisplayDate(row.target_end_date) : ''
