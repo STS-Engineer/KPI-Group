@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const { Pool } = require("pg");
-const bodyParser = require("body-parser"); 
+const bodyParser = require("body-parser");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 const cron = require("node-cron");
@@ -27,7 +27,7 @@ const sharedPostgresConfig = {
 };
 
 const pool = new Pool({
-  ...sharedPostgresConfig, 
+  ...sharedPostgresConfig,
   database: "KPI_DB_Final",
 });
 
@@ -193,9 +193,9 @@ const buildStrictKpiKnowledgePrompt = (kpiRow, ragContext = null) => {
   const kb = sanitizeAssistantKnowledgeBaseValue(kpiRow?.kpi_knowledge_base) || {};
   const compactRagContext = ragContext?.available
     ? sanitizeAssistantKnowledgeBaseValue({
-        summary: ragContext.summary,
-        top_matches: ragContext.top_matches
-      })
+      summary: ragContext.summary,
+      top_matches: ragContext.top_matches
+    })
     : null;
 
   return `
@@ -2106,9 +2106,9 @@ const buildKpiKnowledgeBaseResultEntry = (row = {}, allocationScopeById = new Ma
   const allocationScope = allocationId ? allocationScopeById.get(allocationId) || null : null;
   const recordedByName = row.recorded_by_people_id
     ? getPeopleDisplayName({
-        name: row.recorded_by_people_name,
-        first_name: row.recorded_by_people_first_name
-      }) || ""
+      name: row.recorded_by_people_name,
+      first_name: row.recorded_by_people_first_name
+    }) || ""
     : "";
 
   return {
@@ -2139,9 +2139,9 @@ const buildKpiKnowledgeBaseResultEntry = (row = {}, allocationScopeById = new Ma
       recorded_at: formatKnowledgeBaseTimestamp(row.recorded_at),
       recorded_by: row.recorded_by_people_id
         ? {
-            id: row.recorded_by_people_id,
-            name: recordedByName
-          }
+          id: row.recorded_by_people_id,
+          name: recordedByName
+        }
         : null
     },
     comments: normalizeOptionalTextInput(row.comments) || "",
@@ -2593,9 +2593,9 @@ const buildKpiKnowledgeBaseDocument = (
       },
       reference_kpi: kpi.reference_kpi_id
         ? {
-            kpi_id: kpi.reference_kpi_id,
-            name: kpi.reference_kpi_name || ""
-          }
+          kpi_id: kpi.reference_kpi_id,
+          name: kpi.reference_kpi_name || ""
+        }
         : null,
       timestamps: {
         created_at: formatKnowledgeBaseTimestamp(kpi.created_at),
@@ -2663,7 +2663,7 @@ const refreshKpiKnowledgeBaseForKpiId = async (db, kpiId, options = {}) => {
       WHERE kpi_id = $1
       `,
       [normalizedKpiId]
-    ).catch(() => {});
+    ).catch(() => { });
     return null;
   }
 
@@ -2681,7 +2681,7 @@ const refreshKpiKnowledgeBaseForKpiId = async (db, kpiId, options = {}) => {
       WHERE kpi_id = $1
       `,
       [normalizedKpiId]
-    ).catch(() => {});
+    ).catch(() => { });
     return null;
   }
 
@@ -2702,7 +2702,7 @@ const refreshKpiKnowledgeBaseForKpiId = async (db, kpiId, options = {}) => {
     WHERE kpi_id = $1
     `,
     [normalizedKpiId]
-  ).catch(() => {});
+  ).catch(() => { });
 
   return knowledgeBase;
 };
@@ -2774,12 +2774,12 @@ async function processPendingKpiKnowledgeRefreshQueue() {
     await client.query("COMMIT");
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("[KPI Knowledge Base] Refresh queue processing failed:", error.message);
   } finally {
     if (client && lockAcquired) {
-      await client.query(`SELECT pg_advisory_unlock($1)`, [lockKey]).catch(() => {});
+      await client.query(`SELECT pg_advisory_unlock($1)`, [lockKey]).catch(() => { });
     }
     if (client) {
       client.release();
@@ -2859,28 +2859,31 @@ const loadKpiTargetAllocationLookups = async () => {
     marketsResult,
     customersResult,
     peopleResult,
-    multisiteAssignmentsResult
+    multisiteAssignmentsResult,
+    peopleRoleAssignmentsResult
   ] = await Promise.all([
-pool.query(`
-  SELECT
-    u.unit_id,
-    u.unit_name,
-    u.unit_type_id,
-    ut.unit_type_name,
-    u.selling_currency,
-    u.operating_currency
-  FROM public.unit u
-  INNER JOIN public.unit_type ut
-    ON ut.unit_type_id = u.unit_type_id
-  WHERE u.status_id = 1
-    AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
-  ORDER BY u.unit_name, u.unit_id
-`),
+    pool.query(`
+      SELECT
+        u.unit_id,
+        u.unit_name,
+        u.unit_type_id,
+        ut.unit_type_name,
+        u.selling_currency,
+        u.operating_currency
+      FROM public.unit u
+      INNER JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      WHERE u.status_id = 1
+        AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
+      ORDER BY u.unit_name, u.unit_id
+    `),
+
     pool.query(`
       SELECT unit_type_id, unit_type_name
       FROM public.unit_type
       ORDER BY unit_type_name, unit_type_id
     `),
+
     pool.query(`
       SELECT
         z.zone_id,
@@ -2908,65 +2911,99 @@ pool.query(`
         p.first_name,
         p.people_id
     `),
+
     pool.query(`
       SELECT product_line_id, product_line_name
       FROM public.product_line
       ORDER BY product_line_name, product_line_id
     `),
+
     pool.query(`
       SELECT product_id, product_name
       FROM public.product
       ORDER BY product_name, product_id
     `),
+
     pool.query(`
       SELECT market_id, market_name
       FROM public.market
       ORDER BY market_name, market_id
     `),
+
     pool.query(`
       SELECT customer_id, customer_name
       FROM public.customer
       ORDER BY customer_name, customer_id
     `),
+
     pool.query(`
       SELECT people_id, name, first_name
       FROM public.people
       ORDER BY name, first_name, people_id
     `),
-pool.query(`
-  SELECT
-    u.unit_id,
-    u.unit_name,
-    u.unit_type_id,
-    ut.unit_type_name,
-    u.selling_currency,
-    u.operating_currency,
-    p.people_id,
-    p.name,
-    p.first_name,
-    pra.role_id,
-    COALESCE(r.role_name, '') AS role_name,
-    COALESCE(pra.is_primary, false) AS is_primary
-  FROM public.unit u
-  INNER JOIN public.unit_type ut
-    ON ut.unit_type_id = u.unit_type_id
-  LEFT JOIN public.people p
-    ON p.work_at_unit_id = u.unit_id
-  LEFT JOIN public.people_role_assignment pra
-    ON pra.people_id = p.people_id
-   AND pra.assignment_status = 'ACTIVE'
-  LEFT JOIN public.role r
-    ON r.role_id = pra.role_id
-  WHERE u.status_id = 1
-    AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
-  ORDER BY
-    u.unit_name,
-    r.role_name,
-    pra.is_primary DESC,
-    p.name,
-    p.first_name,
-    p.people_id
-`)
+
+    pool.query(`
+      SELECT
+        u.unit_id,
+        u.unit_name,
+        u.unit_type_id,
+        ut.unit_type_name,
+        u.selling_currency,
+        u.operating_currency,
+        p.people_id,
+        p.name,
+        p.first_name,
+        pra.role_id,
+        COALESCE(r.role_name, '') AS role_name,
+        COALESCE(pra.is_primary, false) AS is_primary
+      FROM public.unit u
+      INNER JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      LEFT JOIN public.people p
+        ON p.work_at_unit_id = u.unit_id
+      LEFT JOIN public.people_role_assignment pra
+        ON pra.people_id = p.people_id
+       AND pra.assignment_status = 'ACTIVE'
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      WHERE u.status_id = 1
+        AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
+      ORDER BY
+        u.unit_name,
+        r.role_name,
+        pra.is_primary DESC,
+        p.name,
+        p.first_name,
+        p.people_id
+    `),
+
+    pool.query(`
+      SELECT
+        pra.assignment_id,
+        pra.people_id,
+        pra.role_id,
+        pra.unit_id,
+        pra.zone_id,
+        pra.market_id,
+        pra.is_primary,
+        pra.assignment_status,
+        p.name,
+        p.first_name,
+        COALESCE(r.role_name, '') AS role_name
+      FROM public.people_role_assignment pra
+      JOIN public.people p
+        ON p.people_id = pra.people_id
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      WHERE pra.assignment_status = 'ACTIVE'
+        AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      ORDER BY
+        pra.role_id,
+        pra.is_primary DESC,
+        p.name,
+        p.first_name,
+        pra.people_id
+    `)
   ]);
 
   const unitOptions = unitsResult.rows.map((row) => ({
@@ -2977,6 +3014,7 @@ pool.query(`
     selling_currency: normalizeOptionalTextInput(row.selling_currency) || "",
     operating_currency: normalizeOptionalTextInput(row.operating_currency) || ""
   }));
+
   const multisiteAssignmentsMap = new Map(
     unitOptions.map((unit) => [
       String(unit.value),
@@ -2997,6 +3035,7 @@ pool.query(`
     if (!unitId) return;
 
     const unitKey = String(unitId);
+
     if (!multisiteAssignmentsMap.has(unitKey)) {
       multisiteAssignmentsMap.set(unitKey, {
         value: unitKey,
@@ -3021,11 +3060,13 @@ pool.query(`
   });
 
   const zoneAssignmentsMap = new Map();
+
   zonesResult.rows.forEach((row) => {
     const zoneId = normalizeOptionalIntegerInput(row.zone_id);
     if (!zoneId) return;
 
     const zoneKey = String(zoneId);
+
     if (!zoneAssignmentsMap.has(zoneKey)) {
       zoneAssignmentsMap.set(zoneKey, {
         value: zoneKey,
@@ -3053,11 +3094,13 @@ pool.query(`
       normalizeOptionalIntegerInput(row.responsible_role_id) || ""
     ).trim();
 
-    if (!zoneEntry.responsibles.some(
-      (entry) =>
-        String(entry.people_id || "") === normalizedPeopleId &&
-        String(entry.role_id || "") === normalizedRoleId
-    )) {
+    if (
+      !zoneEntry.responsibles.some(
+        (entry) =>
+          String(entry.people_id || "") === normalizedPeopleId &&
+          String(entry.role_id || "") === normalizedRoleId
+      )
+    ) {
       zoneEntry.responsibles.push({
         people_id: normalizedPeopleId,
         label: responsibleLabel,
@@ -3076,35 +3119,65 @@ pool.query(`
   return {
     plants: unitOptions,
     units: unitOptions,
+
     unitTypes: unitTypesResult.rows.map((row) => ({
       value: String(row.unit_type_id),
-      label: normalizeOptionalTextInput(row.unit_type_name) || `Unit type ${row.unit_type_id}`
+      label:
+        normalizeOptionalTextInput(row.unit_type_name) ||
+        `Unit type ${row.unit_type_id}`
     })),
+
     multisiteAssignments: Array.from(multisiteAssignmentsMap.values()),
     zones: Array.from(zoneAssignmentsMap.values()),
+
     productLines: productLinesResult.rows.map((row) => ({
       value: String(row.product_line_id),
-      label: normalizeOptionalTextInput(row.product_line_name) || `Product line ${row.product_line_id}`
+      label:
+        normalizeOptionalTextInput(row.product_line_name) ||
+        `Product line ${row.product_line_id}`
     })),
+
     products: productsResult.rows.map((row) => ({
       value: String(row.product_id),
-      label: normalizeOptionalTextInput(row.product_name) || `Product ${row.product_id}`
+      label:
+        normalizeOptionalTextInput(row.product_name) ||
+        `Product ${row.product_id}`
     })),
+
     markets: marketsResult.rows.map((row) => ({
       value: String(row.market_id),
-      label: normalizeOptionalTextInput(row.market_name) || `Market ${row.market_id}`
+      label:
+        normalizeOptionalTextInput(row.market_name) ||
+        `Market ${row.market_id}`
     })),
+
     customers: customersResult.rows.map((row) => ({
       value: String(row.customer_id),
-      label: normalizeOptionalTextInput(row.customer_name) || `Customer ${row.customer_id}`
+      label:
+        normalizeOptionalTextInput(row.customer_name) ||
+        `Customer ${row.customer_id}`
     })),
+
     people: peopleResult.rows.map((row) => ({
       value: String(row.people_id),
+      label: getPeopleDisplayName(row) || `Person ${row.people_id}`
+    })),
+
+    peopleRoleAssignments: peopleRoleAssignmentsResult.rows.map((row) => ({
+      assignment_id: row.assignment_id,
+      people_id: String(row.people_id),
+      value: String(row.people_id),
+      role_id: normalizeOptionalIntegerInput(row.role_id),
+      unit_id: normalizeOptionalIntegerInput(row.unit_id),
+      zone_id: normalizeOptionalIntegerInput(row.zone_id),
+      market_id: normalizeOptionalIntegerInput(row.market_id),
+      is_primary: Boolean(row.is_primary),
+      assignment_status: normalizeOptionalTextInput(row.assignment_status) || "",
+      role_name: normalizeOptionalTextInput(row.role_name) || "",
       label: getPeopleDisplayName(row) || `Person ${row.people_id}`
     }))
   };
 };
-
 const loadFormResponsibleContext = async (responsibleId) => {
   const normalizedResponsibleId =
     normalizeOptionalIntegerInput(responsibleId);
@@ -3310,9 +3383,9 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
   const searchText = normalizeOptionalTextInput(search) || "";
   const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
   const params =
-  normalizedResponsibleId === null
-    ? [searchText, `%${searchText}%`, kpiId]
-    : [searchText, `%${searchText}%`, kpiId, normalizedResponsibleId];
+    normalizedResponsibleId === null
+      ? [searchText, `%${searchText}%`, kpiId]
+      : [searchText, `%${searchText}%`, kpiId, normalizedResponsibleId];
 
   const result = await pool.query(
     `
@@ -3688,9 +3761,9 @@ const buildPreparedKpiObjectRows = (
     return [
       baseAllocationId
         ? {
-            ...preparedPayload,
-            kpi_target_allocation_id: baseAllocationId
-          }
+          ...preparedPayload,
+          kpi_target_allocation_id: baseAllocationId
+        }
         : preparedPayload
     ];
   }
@@ -3736,9 +3809,9 @@ const buildPreparedKpiObjectRows = (
 
     return rowAllocationId
       ? {
-          ...preparedPayload,
-          kpi_target_allocation_id: rowAllocationId
-        }
+        ...preparedPayload,
+        kpi_target_allocation_id: rowAllocationId
+      }
       : preparedPayload;
   });
 };
@@ -4244,7 +4317,7 @@ app.post("/api/kpis/:id/ai-support", async (req, res) => {
     });
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
 
     console.error("POST /api/kpis/:id/ai-support error:", error);
@@ -4439,7 +4512,7 @@ app.post("/api/kpis", async (req, res) => {
     res.status(201).json(rows[0] || newKpi);
   } catch (err) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("POST /api/kpis error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to create KPI" });
@@ -4569,7 +4642,7 @@ app.put("/api/kpis/:id", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI not found" });
     }
 
@@ -4583,7 +4656,7 @@ app.put("/api/kpis/:id", async (req, res) => {
     res.json(rows[0] || result.rows[0]);
   } catch (err) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("PUT /api/kpis/:id error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to update KPI" });
@@ -4668,7 +4741,7 @@ app.delete("/api/kpis/:id", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI not found" });
     }
 
@@ -4676,7 +4749,7 @@ app.delete("/api/kpis/:id", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("DELETE /api/kpis/:id error:", err.message);
     res.status(500).json({ error: err.message });
@@ -6323,7 +6396,7 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI not found" });
     }
 
@@ -6340,7 +6413,7 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     res.json(rows[0] || result.rows[0]);
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error(error);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to update KPI" });
@@ -6379,7 +6452,7 @@ app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     );
 
     if (!ownedKpiResult.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI not found" });
     }
 
@@ -6396,7 +6469,7 @@ app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI not found" });
     }
 
@@ -6404,7 +6477,7 @@ app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error(error);
     res.status(error.statusCode || 500).json({
@@ -6662,7 +6735,7 @@ app.post("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
     res.status(201).json(createdRows.length === 1 ? createdRows[0] : createdRows);
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("POST KPI object error:", error);
     res.status(error.statusCode || 500).json({
@@ -6982,15 +7055,15 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
 
     const rowsToPrune =
       preparedRows.length === 1 &&
-      existingFamilyRows.length > existingGroupRows.length &&
-      (
-        normalizedRequestedKpiType === "individual" ||
+        existingFamilyRows.length > existingGroupRows.length &&
         (
-          Boolean(normalizedAnchorKpiType) &&
-          Boolean(normalizedRequestedKpiType) &&
-          normalizedAnchorKpiType !== normalizedRequestedKpiType
+          normalizedRequestedKpiType === "individual" ||
+          (
+            Boolean(normalizedAnchorKpiType) &&
+            Boolean(normalizedRequestedKpiType) &&
+            normalizedAnchorKpiType !== normalizedRequestedKpiType
+          )
         )
-      )
         ? existingFamilyRows
         : existingGroupRows;
 
@@ -7062,7 +7135,7 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
   } finally {
     if (client) {
       if (!transactionCompleted) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
       }
       client.release();
     }
@@ -7111,7 +7184,7 @@ app.delete("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (r
     );
 
     if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
       return res.status(404).json({ error: "KPI target allocation not found" });
     }
 
@@ -7130,7 +7203,7 @@ app.delete("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (r
     });
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK").catch(() => {});
+      await client.query("ROLLBACK").catch(() => { });
     }
     console.error("DELETE KPI object error:", error);
     res.status(500).json({ error: "Failed to delete KPI target allocation" });
@@ -7376,7 +7449,7 @@ app.get("/api/manufacturing-strategy/zone", async (req, res) => {
 });
 
 
-    
+
 app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
   const { responsibleId } = req.params;
   const [
@@ -14105,18 +14178,26 @@ function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
   if (scopeKind === "zone") {
-    return (allocationLookups.zones || []).map(zoneEntry => ({
-      row_kind: "zone",
-      value: String(zoneEntry.value || zoneEntry.zone_id || ""),
-      label: zoneEntry.label || zoneEntry.zone_name || "",
-      local_currency: "",
-      responsable_zone: zoneEntry.responsable_zone || "",
-      responsible_people_id: zoneEntry.responsible_people_id || "",
-      responsibles: Array.isArray(zoneEntry.responsibles)
-        ? zoneEntry.responsibles.slice()
-        : [],
-      role: ""
-    }));
+    const normalizedRoleId = getNormalizedParameterRoleId();
+    return (allocationLookups.zones || [])
+      .map(zoneEntry => ({
+        row_kind: "zone",
+        value: String(zoneEntry.value || zoneEntry.zone_id || ""),
+        label: zoneEntry.label || zoneEntry.zone_name || "",
+        local_currency: "",
+        responsable_zone: zoneEntry.responsable_zone || "",
+        responsible_people_id: zoneEntry.responsible_people_id || "",
+        responsibles: Array.isArray(zoneEntry.responsibles)
+          ? zoneEntry.responsibles.slice()
+          : [],
+        role: ""
+      }))
+      .filter((zoneEntry) => {
+        if (!normalizedRoleId) return true;
+        return zoneEntry.responsibles.some(
+          (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === normalizedRoleId
+        );
+      });
   }
 
   const factoryUnits = getParameterAllocationUnits()
@@ -14283,18 +14364,26 @@ function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
   if (scopeKind === "zone") {
-    return (allocationLookups.zones || []).map(zoneEntry => ({
-      row_kind: "zone",
-      value: String(zoneEntry.value || zoneEntry.zone_id || ""),
-      label: zoneEntry.label || zoneEntry.zone_name || "",
-      local_currency: "",
-      responsable_zone: zoneEntry.responsable_zone || "",
-      responsible_people_id: zoneEntry.responsible_people_id || "",
-      responsibles: Array.isArray(zoneEntry.responsibles)
-        ? zoneEntry.responsibles.slice()
-        : [],
-      role: ""
-    }));
+    const normalizedRoleId = getNormalizedParameterRoleId();
+    return (allocationLookups.zones || [])
+      .map(zoneEntry => ({
+        row_kind: "zone",
+        value: String(zoneEntry.value || zoneEntry.zone_id || ""),
+        label: zoneEntry.label || zoneEntry.zone_name || "",
+        local_currency: "",
+        responsable_zone: zoneEntry.responsable_zone || "",
+        responsible_people_id: zoneEntry.responsible_people_id || "",
+        responsibles: Array.isArray(zoneEntry.responsibles)
+          ? zoneEntry.responsibles.slice()
+          : [],
+        role: ""
+      }))
+      .filter((zoneEntry) => {
+        if (!normalizedRoleId) return true;
+        return zoneEntry.responsibles.some(
+          (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === normalizedRoleId
+        );
+      });
   }
 
   const factoryUnits = getParameterAllocationUnits()
@@ -14340,6 +14429,8 @@ function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldVal
   ) || null;
 }
 
+
+
 function getParameterPeopleLabel(peopleId) {
   const normalizedPeopleId = String(peopleId || "").trim();
   if (!normalizedPeopleId) return "";
@@ -14349,6 +14440,54 @@ function getParameterPeopleLabel(peopleId) {
   );
 
   return String(matchedPerson?.label || ("Person " + normalizedPeopleId)).trim();
+}
+
+function getIndividualResponsibleOptionsByRole(roleId) {
+  const normalizedRoleId = String(roleId || "").trim();
+  if (!normalizedRoleId) return [];
+
+  const seen = new Set();
+
+  return (allocationLookups.peopleRoleAssignments || [])
+    .filter(assignment =>
+      String(assignment.role_id || "").trim() === normalizedRoleId
+    )
+    .filter(assignment => {
+      const peopleId = String(assignment.people_id || assignment.value || "").trim();
+      if (!peopleId || seen.has(peopleId)) return false;
+      seen.add(peopleId);
+      return true;
+    })
+    .map(assignment => ({
+      value: String(assignment.people_id || assignment.value || ""),
+      label:
+        assignment.label ||
+        getParameterPeopleLabel(assignment.people_id) ||
+        ("Person " + assignment.people_id)
+    }));
+}
+
+function syncIndividualResponsibleOptions(preferredValue = "") {
+  const roleId = getNormalizedParameterRoleId();
+
+  if (!roleId) {
+    setLookupSelectOptions(
+      "parameter_set_by_people_id",
+      [],
+      "Select role first",
+      ""
+    );
+    return;
+  }
+
+  const relatedPeople = getIndividualResponsibleOptionsByRole(roleId);
+
+  setLookupSelectOptions(
+    "parameter_set_by_people_id",
+    relatedPeople,
+    relatedPeople.length ? "Select related responsible" : "No responsible for selected role",
+    preferredValue
+  );
 }
 
 function resolveParameterResponsibleEntry(scopeEntry, state = null) {
@@ -14441,43 +14580,76 @@ function getParameterResponsibleCellNote(scopeEntry, responsibleEntry) {
 
   return "";
 }
-
 function getParameterRoleResponsibleCandidates(roleId = getNormalizedParameterRoleId(), { unitId = "" } = {}) {
   const normalizedRoleId = String(roleId || "").trim();
   if (!normalizedRoleId) return [];
 
-  const normalizedUnitId = String(unitId || "").trim();
   const candidateMap = new Map();
 
-  getParameterAllocationUnits().forEach((unitEntry) => {
-    if (!unitEntry || !Array.isArray(unitEntry.responsibles)) return;
-    if (normalizedUnitId && String(unitEntry.value || "").trim() !== normalizedUnitId) return;
+  (allocationLookups.peopleRoleAssignments || []).forEach((assignment) => {
+    const assignmentRoleId = String(assignment.role_id || "").trim();
+    const peopleId = String(assignment.people_id || assignment.value || "").trim();
 
-    unitEntry.responsibles.forEach((entry) => {
-      const entryPeopleId = String(entry?.people_id || "").trim();
-      if (!entryPeopleId) return;
-      if (String(entry?.role_id || "").trim() !== normalizedRoleId) return;
+    if (!peopleId) return;
+    if (assignmentRoleId !== normalizedRoleId) return;
 
-      const existingEntry = candidateMap.get(entryPeopleId);
-      if (!existingEntry || (Boolean(entry?.is_primary) && !Boolean(existingEntry?.is_primary))) {
-        candidateMap.set(entryPeopleId, {
-          ...entry,
-          people_id: entryPeopleId,
-          label:
-            entry.label ||
-            getParameterPeopleLabel(entryPeopleId) ||
-            ("Person " + entryPeopleId)
-        });
-      }
-    });
+    const existingEntry = candidateMap.get(peopleId);
+
+    if (!existingEntry || (Boolean(assignment.is_primary) && !Boolean(existingEntry.is_primary))) {
+      candidateMap.set(peopleId, {
+        people_id: peopleId,
+        value: peopleId,
+        label:
+          assignment.label ||
+          getParameterPeopleLabel(peopleId) ||
+          "Person " + peopleId,
+        role_id: assignment.role_id,
+        role_name: assignment.role_name || "",
+        is_primary: Boolean(assignment.is_primary)
+      });
+    }
   });
 
   return Array.from(candidateMap.values()).sort((left, right) => {
-    const primaryDiff = Number(Boolean(right?.is_primary)) - Number(Boolean(left?.is_primary));
+    const primaryDiff = Number(Boolean(right.is_primary)) - Number(Boolean(left.is_primary));
     if (primaryDiff !== 0) return primaryDiff;
-    return String(left?.label || "").localeCompare(String(right?.label || ""));
+    return String(left.label || "").localeCompare(String(right.label || ""));
   });
 }
+
+function syncIndividualResponsibleOptions(preferredValue = "") {
+  const roleId = getNormalizedParameterRoleId();
+
+  if (!isIndividualParameterScope()) {
+    setLookupSelectOptions(
+      "parameter_set_by_people_id",
+      allocationLookups.people || [],
+      "Select person",
+      preferredValue
+    );
+    return;
+  }
+
+  if (!roleId) {
+    setLookupSelectOptions(
+      "parameter_set_by_people_id",
+      [],
+      "Select role first",
+      ""
+    );
+    return;
+  }
+
+  const relatedPeople = getParameterRoleResponsibleCandidates(roleId);
+
+  setLookupSelectOptions(
+    "parameter_set_by_people_id",
+    relatedPeople,
+    relatedPeople.length ? "Select related responsible" : "No responsible for this role",
+    preferredValue
+  );
+}
+
 
 function getAutoResolvedIndividualResponsibleEntry() {
   const normalizedRoleId = getNormalizedParameterRoleId();
@@ -14541,6 +14713,46 @@ function getAutoResolvedIndividualResponsibleEntry() {
   return null;
 }
 
+
+
+function syncIndividualResponsibleOptions(preferredValue = "") {
+  const normalizedRoleId = getNormalizedParameterRoleId();
+
+  if (!isIndividualParameterScope()) {
+    setLookupSelectOptions(
+      "parameter_set_by_people_id",
+      allocationLookups.people,
+      "Select person",
+      preferredValue
+    );
+    return;
+  }
+
+  if (!normalizedRoleId) {
+    setLookupSelectOptions(
+      "parameter_set_by_people_id",
+      [],
+      "Select role first",
+      ""
+    );
+    return;
+  }
+
+  const relatedPeople = getParameterRoleResponsibleCandidates(normalizedRoleId)
+    .map(person => ({
+      value: String(person.people_id || ""),
+      label: person.label || getParameterPeopleLabel(person.people_id) || ""
+    }))
+    .filter(person => person.value);
+
+  setLookupSelectOptions(
+    "parameter_set_by_people_id",
+    relatedPeople,
+    relatedPeople.length ? "Select related responsible" : "No responsible for this role",
+    preferredValue
+  );
+}
+
 function syncIndividualParameterFields() {
   const setBySelect = document.getElementById("parameter_set_by_people_id");
   const setByHint = document.getElementById("parameter_set_by_people_hint");
@@ -14570,21 +14782,23 @@ function syncIndividualParameterFields() {
   const autoResolvedResponsible = getAutoResolvedIndividualResponsibleEntry();
   const currentResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
 
-  if (setBySelect) {
-    setBySelect.disabled = false;
-    setBySelect.classList.remove("readonly-input");
-    if (autoResolvedResponsible?.people_id) {
-      setBySelect.value = String(autoResolvedResponsible.people_id);
-      setBySelect.dataset.autoResolved = "true";
-    } else {
-      setBySelect.dataset.autoResolved = "false";
-      if (normalizedRoleId) {
-        setBySelect.value = "";
-      } else if (!currentResponsibleId) {
-        setBySelect.value = "";
-      }
-    }
+const preferredResponsibleId = autoResolvedResponsible?.people_id
+  ? String(autoResolvedResponsible.people_id)
+  : currentResponsibleId;
+
+syncIndividualResponsibleOptions(preferredResponsibleId);
+
+if (setBySelect) {
+  setBySelect.disabled = false;
+  setBySelect.classList.remove("readonly-input");
+
+  if (autoResolvedResponsible?.people_id) {
+    setBySelect.value = String(autoResolvedResponsible.people_id);
+    setBySelect.dataset.autoResolved = "true";
+  } else {
+    setBySelect.dataset.autoResolved = "false";
   }
+}
 
   if (setByHint) {
     const roleLabel = getParameterRoleLabel(getParameterFieldValue("parameter_role_id"));
@@ -19576,7 +19790,7 @@ async function runWithJobLock(lockId, jobFn) {
 
     await jobFn();
   } finally {
-    await client.query("SELECT pg_advisory_unlock($1)", [lockHash]).catch(() => {});
+    await client.query("SELECT pg_advisory_unlock($1)", [lockHash]).catch(() => { });
     client.release();
     console.log(`[${lockId}] lock released`);
   }
@@ -20703,8 +20917,8 @@ const flattenStoredKpiKnowledgeBaseItems = (knowledgeBase = null) => {
   const fallbackKnowledgeNodes = storedKnowledgeNodes.length
     ? []
     : linkedSubjects.flatMap((entry) =>
-        collectStoredKpiKnowledgeTreeNodes(entry?.knowledge_tree, [])
-      );
+      collectStoredKpiKnowledgeTreeNodes(entry?.knowledge_tree, [])
+    );
   const knowledgeNodes = storedKnowledgeNodes.length
     ? storedKnowledgeNodes
     : fallbackKnowledgeNodes;
@@ -20748,13 +20962,13 @@ const flattenStoredKpiKnowledgeBaseItems = (knowledgeBase = null) => {
       keywords: Array.isArray(node.keywords)
         ? node.keywords.slice(0, 18)
         : buildKnowledgeBaseKeywordList([
-            node.name,
-            node.path,
-            node.knowledge,
-            node.description,
-            node.example,
-            node.comments
-          ], 18),
+          node.name,
+          node.path,
+          node.knowledge,
+          node.description,
+          node.example,
+          node.comments
+        ], 18),
       relation_context: Array.isArray(node.children_ids)
         ? node.children_ids.slice(0, 5)
         : []
@@ -20781,12 +20995,12 @@ const flattenStoredKpiKnowledgeBaseItems = (knowledgeBase = null) => {
       keywords: Array.isArray(allocation.keywords)
         ? allocation.keywords.slice(0, 18)
         : buildKnowledgeBaseKeywordList([
-            allocation.scope_label,
-            allocation.comments,
-            allocationTarget.type,
-            allocationTarget.status,
-            allocationScope?.function_name
-          ], 18),
+          allocation.scope_label,
+          allocation.comments,
+          allocationTarget.type,
+          allocationTarget.status,
+          allocationScope?.function_name
+        ], 18),
       relation_context: uniqueKnowledgeBaseTexts([
         allocationScope?.plant?.name,
         allocationScope?.zone?.name,
@@ -22987,8 +23201,8 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     currentByAllocationId,
     historyByAllocationId
   } = correctiveActionsEnabled
-    ? await loadActionPlanCorrectiveActionMaps(kpiRes.rows, normalizedWeek)
-    : { currentByAllocationId: {}, historyByAllocationId: {} };
+      ? await loadActionPlanCorrectiveActionMaps(kpiRes.rows, normalizedWeek)
+      : { currentByAllocationId: {}, historyByAllocationId: {} };
 
   Object.values(historyByAllocationId).forEach((rows) => {
     (rows || []).forEach((action) => {
@@ -23076,7 +23290,7 @@ const generateEmailHtml = ({ responsible, week }) => {
         <span style="color:#0078D7;font-size:16px;font-weight:500;display:inline-block;">KPI Group</span>
       </div>
       
-      <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission - ${monthYear}</h2>
+      <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission </h2>
       
       <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsible.plant_name}</h3>
       
@@ -23330,30 +23544,30 @@ app.post("/kpi-ai-assistant", async (req, res) => {
       return res.status(404).json({ error: "Responsible person not found" });
     }
 
-// Try to find a role assignment, but don't block if none exists
-const assignmentRes = await client.query(
-  `SELECT assignment_id
+    // Try to find a role assignment, but don't block if none exists
+    const assignmentRes = await client.query(
+      `SELECT assignment_id
    FROM public.people_role_assignment
    WHERE people_id = $1
      AND assignment_status = 'ACTIVE'
    ORDER BY is_primary DESC, assignment_id DESC
    LIMIT 1`,
-  [responsible_id]
-);
+      [responsible_id]
+    );
 
-// Fall back to using people_id directly as the conversation key
-const assignment = assignmentRes.rows[0];
-const assignmentId = normalizeOptionalIntegerInput(assignment?.assignment_id);
-const peopleId =
-  normalizeOptionalIntegerInput(responsible?.responsible_id) ||
-  normalizeOptionalIntegerInput(responsible_id);
+    // Fall back to using people_id directly as the conversation key
+    const assignment = assignmentRes.rows[0];
+    const assignmentId = normalizeOptionalIntegerInput(assignment?.assignment_id);
+    const peopleId =
+      normalizeOptionalIntegerInput(responsible?.responsible_id) ||
+      normalizeOptionalIntegerInput(responsible_id);
 
-if (!assignmentId && !peopleId) {
-  await client.query("ROLLBACK");
-  return res.status(400).json({
-    error: "Responsible conversation identity is invalid"
-  });
-}
+    if (!assignmentId && !peopleId) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "Responsible conversation identity is invalid"
+      });
+    }
 
     const selectedId = selected_kpi_id ? Number(selected_kpi_id) : null;
 
@@ -23361,21 +23575,21 @@ if (!assignmentId && !peopleId) {
     let selectedKpiKnowledgeBase = null;
 
     if (selectedId) {
-    const kpiLookupRes = await client.query(
-    `SELECT kpi_id FROM public.kpi_target_allocation
+      const kpiLookupRes = await client.query(
+        `SELECT kpi_id FROM public.kpi_target_allocation
      WHERE kpi_target_allocation_id = $1 LIMIT 1`,
-     [selectedId]
-     );
-     kpiId = kpiLookupRes.rows[0]?.kpi_id ?? selectedId;
+        [selectedId]
+      );
+      kpiId = kpiLookupRes.rows[0]?.kpi_id ?? selectedId;
 
-    const kpiKnowledgeBaseRes = await client.query(
-    `SELECT kpi_knowledge_base
+      const kpiKnowledgeBaseRes = await client.query(
+        `SELECT kpi_knowledge_base
        FROM public.kpi
       WHERE kpi_id = $1
       LIMIT 1`,
-     [kpiId]
-     );
-     selectedKpiKnowledgeBase = kpiKnowledgeBaseRes.rows[0]?.kpi_knowledge_base ?? null;
+        [kpiId]
+      );
+      selectedKpiKnowledgeBase = kpiKnowledgeBaseRes.rows[0]?.kpi_knowledge_base ?? null;
 
     }
 
@@ -23470,8 +23684,8 @@ app.get("/kpi-ai-assistant/conversation", async (req, res) => {
   try {
     await ensureKpiAssistantConversationSchema();
 
-const assignmentRes = await pool.query(
-  `
+    const assignmentRes = await pool.query(
+      `
   SELECT 
     pra.assignment_id,
     pra.role_id,
@@ -23487,8 +23701,8 @@ const assignmentRes = await pool.query(
   ORDER BY pra.is_primary DESC, pra.assignment_id DESC
   LIMIT 1
   `,
-  [Number(responsible_id)]
-);
+      [Number(responsible_id)]
+    );
 
     const assignment = assignmentRes.rows[0];
     const assignmentId = normalizeOptionalIntegerInput(assignment?.assignment_id);
@@ -25247,16 +25461,19 @@ app.get("/api/kpi-chart-data", async (req, res) => {
 // ---------- Form page ----------
 app.get("/form", async (req, res) => {
   try {
-    const { responsible_id, week } = req.query;
-  const peopleRes = await pool.query(
-  `SELECT people_id,
+    const { responsible_id, week: requestedWeek } = req.query;
+    const week =
+      normalizeOptionalTextInput(requestedWeek) ||
+      getCurrentFormWeek();
+    const peopleRes = await pool.query(
+      `SELECT people_id,
           TRIM(first_name || ' ' || name) AS display_name
    FROM public.people
    WHERE status = 'Active'
    ORDER BY first_name ASC, name ASC`
-  );
+    );
 
-const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_name);
+    const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_name);
     const {
       responsible,
       kpis,
@@ -25492,8 +25709,8 @@ const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_nam
       const safeCaStatusClass = String(caStatus || "").toLowerCase().replace(/\s+/g, "-");
       const correctiveActionsToRender = correctiveActionsEnabled
         ? (correctiveActions.length ? correctiveActions : [{
-        responsible: responsible.name || ""
-      }])
+          responsible: responsible.name || ""
+        }])
         : [];
       const correctiveActionsHtml = correctiveActionsToRender
         .map((action, actionIndex) => buildCorrectiveActionEntryHtml({
@@ -25648,8 +25865,8 @@ const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_nam
                 <div class="kpi-history-panel ${hasHistoryDetails ? "history-available" : "history-empty"}">
                   <div class="kpi-history-copy">
                     ${correctiveActionsEnabled
-                      ? ""
-                      : '<div class="view-ca-note">Enter the KPI value for this period. The form will save it directly into the <strong>kpi_result</strong> table.</div>'}
+          ? ""
+          : '<div class="view-ca-note">Enter the KPI value for this period. The form will save it directly into the <strong>kpi_result</strong> table.</div>'}
                   </div>
                   ${correctiveActionsEnabled ? `<button
                     type="button"
@@ -25715,14 +25932,14 @@ const correctiveActionResponsibleOptions = peopleRes.rows.map(r => r.display_nam
       `;
     });
 
- const responsibleFullName = [
-  String(responsibleContext?.name || "").trim(),
-  String(responsibleContext?.first_name || "").trim()
-].filter(Boolean).join(" ");
+    const responsibleFullName = [
+      String(responsibleContext?.name || "").trim(),
+      String(responsibleContext?.first_name || "").trim()
+    ].filter(Boolean).join(" ");
 
-const defaultCorrectiveActionResponsible = correctiveActionResponsibleOptions.find(
-  opt => opt.toLowerCase() === responsibleFullName.toLowerCase()
-) || correctiveActionResponsibleOptions[0] || "";
+    const defaultCorrectiveActionResponsible = correctiveActionResponsibleOptions.find(
+      opt => opt.toLowerCase() === responsibleFullName.toLowerCase()
+    ) || correctiveActionResponsibleOptions[0] || "";
     const correctiveActionResponsibleOptionsHtml = correctiveActionResponsibleOptions
       .map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
       .join("");
@@ -31589,11 +31806,11 @@ const buildWeeklyReportChartModel = (chartData = {}) => {
         evidence: truncateWeeklyReportText(entry?.evidence || "", 180),
         dueDate: entry?.due_date
           ? (() => {
-              const parsed = new Date(entry.due_date);
-              return Number.isNaN(parsed.getTime())
-                ? truncateWeeklyReportText(entry.due_date, 40)
-                : parsed.toLocaleDateString("en-GB");
-            })()
+            const parsed = new Date(entry.due_date);
+            return Number.isNaN(parsed.getTime())
+              ? truncateWeeklyReportText(entry.due_date, 40)
+              : parsed.toLocaleDateString("en-GB");
+          })()
           : ""
       }))
       .filter((entry) => entry.rootCause || entry.implementedSolution || entry.responsible || entry.evidence || entry.dueDate)
@@ -32532,13 +32749,23 @@ const generateWeeklyReportData = async (responsibleId, reportWeek) => {
   }
 };
 
-function getCurrentWeek() {
-  const now = new Date();
+function getCurrentWeek(date = new Date()) {
+  const now = new Date(date);
   const year = now.getFullYear();
   const startDate = new Date(year, 0, 1);
   const days = Math.floor((now - startDate) / (24 * 60 * 60 * 1000));
   const weekNumber = Math.ceil((days + startDate.getDay() + 1) / 7);
   return `${year}-Week${weekNumber}`;
+}
+
+function getCurrentFormWeek(date = new Date()) {
+  const dayOfWeek = date.getDay();
+  const currentWeek = getCurrentWeek(date);
+  const fridayCutoverReached = dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0;
+
+  return fridayCutoverReached
+    ? currentWeek
+    : getPreviousWeek(currentWeek);
 }
 
 const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOverride = null) => {
@@ -32903,7 +33130,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
 // ---------- Cron: weekly KPI submission email ----------
 // let cronRunning = false;
 
-// cron.schedule("31 09 * * *", async () => {
+// cron.schedule("49 00 * * *", async () => {
 //   const lockId = "send_kpi_weekly_email_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -32912,7 +33139,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
 //     if (cronRunning) return;
 //     cronRunning = true;
 
-//     const currentWeek = getPreviousWeek(getCurrentWeek());
+//     const currentWeek = getCurrentFormWeek();
 
 //     const recipients = await loadKpiSubmissionEmailRecipients();
 
@@ -33451,7 +33678,7 @@ app.get("/kpi-trends", async (req, res) => {
                       text-align:center;max-width:500px;">
             <h1 style="color:#2c3e50;font-size:28px;">No KPI Trends Available</h1>
             <p style="color:#666;font-size:16px;">Start filling KPI forms to see trend charts.</p>
-            <a href="/form?responsible_id=${responsible_id}&week=${getCurrentWeek()}"
+            <a href="/form?responsible_id=${responsible_id}&week=${getCurrentFormWeek()}"
                style="display:inline-block;margin-top:20px;padding:15px 30px;
                       background:linear-gradient(135deg,#667eea,#764ba2);color:white;
                       text-decoration:none;border-radius:12px;font-weight:600;">
@@ -34376,7 +34603,7 @@ async function runHierarchyKpiReports(frequency, options = {}) {
   const responsiblesRes = targetResponsiblePeopleId
     ? { rows: [{ responsible_people_id: targetResponsiblePeopleId }] }
     : await pool.query(
-        `
+      `
         SELECT DISTINCT
           COALESCE(kta.created_by_people_id, kta.set_by_people_id) AS responsible_people_id
         FROM public.kpi_target_allocation kta
@@ -34385,8 +34612,8 @@ async function runHierarchyKpiReports(frequency, options = {}) {
         WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) IS NOT NULL
           AND LOWER(k.frequency) = LOWER($1)
         `,
-        [normalizedFrequency]
-      );
+      [normalizedFrequency]
+    );
 
   const responsibles = [];
 
