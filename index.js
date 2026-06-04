@@ -27,8 +27,8 @@ const sharedPostgresConfig = {
 };
 
 const pool = new Pool({
-  ...sharedPostgresConfig,
-  database: "KPI_Test",
+  ...sharedPostgresConfig, 
+  database: "KPI_DB_Final",
 });
 
 const actionPlanPool = new Pool({
@@ -2881,12 +2881,30 @@ const loadKpiTargetAllocationLookups = async () => {
     `),
     pool.query(`
       SELECT
-        zone_id,
-        zone_name,
-        responsable_zone,
-        role
-      FROM public.zone
-      ORDER BY zone_name, zone_id
+        z.zone_id,
+        z.zone_name,
+        pra.people_id AS responsible_people_id,
+        pra.role_id AS responsible_role_id,
+        COALESCE(r.role_name, '') AS responsible_role_name,
+        COALESCE(pra.is_primary, false) AS responsible_is_primary,
+        p.name AS responsible_name,
+        p.first_name AS responsible_first_name
+      FROM public.zone z
+      LEFT JOIN public.people_role_assignment pra
+        ON pra.zone_id = z.zone_id
+       AND pra.assignment_status = 'ACTIVE'
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      ORDER BY
+        z.zone_name,
+        z.zone_id,
+        COALESCE(pra.is_primary, false) DESC,
+        pra.assignment_id DESC,
+        p.name,
+        p.first_name,
+        p.people_id
     `),
     pool.query(`
       SELECT product_line_id, product_line_name
@@ -2999,6 +3017,59 @@ const loadKpiTargetAllocationLookups = async () => {
     });
   });
 
+  const zoneAssignmentsMap = new Map();
+  zonesResult.rows.forEach((row) => {
+    const zoneId = normalizeOptionalIntegerInput(row.zone_id);
+    if (!zoneId) return;
+
+    const zoneKey = String(zoneId);
+    if (!zoneAssignmentsMap.has(zoneKey)) {
+      zoneAssignmentsMap.set(zoneKey, {
+        value: zoneKey,
+        zone_id: zoneKey,
+        label: normalizeOptionalTextInput(row.zone_name) || `Zone ${zoneKey}`,
+        zone_name: normalizeOptionalTextInput(row.zone_name) || "",
+        responsable_zone: "",
+        responsible_people_id: "",
+        responsibles: []
+      });
+    }
+
+    const zoneEntry = zoneAssignmentsMap.get(zoneKey);
+    const peopleId = normalizeOptionalIntegerInput(row.responsible_people_id);
+    if (!peopleId) return;
+
+    const normalizedPeopleId = String(peopleId);
+    const responsibleLabel =
+      getPeopleDisplayName({
+        name: row.responsible_name,
+        first_name: row.responsible_first_name
+      }) || `Person ${normalizedPeopleId}`;
+
+    const normalizedRoleId = String(
+      normalizeOptionalIntegerInput(row.responsible_role_id) || ""
+    ).trim();
+
+    if (!zoneEntry.responsibles.some(
+      (entry) =>
+        String(entry.people_id || "") === normalizedPeopleId &&
+        String(entry.role_id || "") === normalizedRoleId
+    )) {
+      zoneEntry.responsibles.push({
+        people_id: normalizedPeopleId,
+        label: responsibleLabel,
+        role_id: normalizeOptionalIntegerInput(row.responsible_role_id),
+        role_name: normalizeOptionalTextInput(row.responsible_role_name) || "",
+        is_primary: Boolean(row.responsible_is_primary)
+      });
+    }
+
+    if (!zoneEntry.responsible_people_id) {
+      zoneEntry.responsible_people_id = normalizedPeopleId;
+      zoneEntry.responsable_zone = responsibleLabel;
+    }
+  });
+
   return {
     plants: unitOptions,
     units: unitOptions,
@@ -3007,23 +3078,7 @@ const loadKpiTargetAllocationLookups = async () => {
       label: normalizeOptionalTextInput(row.unit_type_name) || `Unit type ${row.unit_type_id}`
     })),
     multisiteAssignments: Array.from(multisiteAssignmentsMap.values()),
-   zones: zonesResult.rows.map((row) => ({
-    value: String(row.zone_id),
-    zone_id: String(row.zone_id),
-
-    label:
-     normalizeOptionalTextInput(row.zone_name) ||
-    `Zone ${row.zone_id}`,
-
-    zone_name:
-    normalizeOptionalTextInput(row.zone_name) || "",
-
-    responsable_zone:
-    normalizeOptionalTextInput(row.responsable_zone) || "",
-
-    role:
-     normalizeOptionalTextInput(row.role) || ""
-   })),
+    zones: Array.from(zoneAssignmentsMap.values()),
     productLines: productLinesResult.rows.map((row) => ({
       value: String(row.product_line_id),
       label: normalizeOptionalTextInput(row.product_line_name) || `Product line ${row.product_line_id}`
@@ -3119,14 +3174,59 @@ const getDashboardOwnerDisplayName = async (responsibleId) => {
   return (await loadFormResponsibleContext(responsibleId))?.name || "KPI Workspace";
 };
 
-const resolveResponsiblePeopleId = async (responsibleId) => {
+const resolveResponsibleOwnerContext = async (responsibleId) => {
   const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
   if (!normalizedResponsibleId) return null;
 
-  const responsibleContext = await loadFormResponsibleContext(normalizedResponsibleId);
-  return normalizeOptionalIntegerInput(
-    responsibleContext?.people_id ?? normalizedResponsibleId
-  );
+  const directContext = await loadFormResponsibleContext(normalizedResponsibleId);
+  if (directContext?.people_id) {
+    return directContext;
+  }
+
+  const legacyResponsible = await loadLegacyResponsibleIdentity(normalizedResponsibleId);
+  if (!legacyResponsible) {
+    return null;
+  }
+
+  const matchedPeopleContext = await findPeopleContextForLegacyResponsible(legacyResponsible);
+  if (!matchedPeopleContext?.people_id) {
+    return null;
+  }
+
+  const enrichedContext = await loadFormResponsibleContext(matchedPeopleContext.people_id);
+  return {
+    ...matchedPeopleContext,
+    ...enrichedContext,
+    people_id: normalizeOptionalIntegerInput(
+      enrichedContext?.people_id ?? matchedPeopleContext.people_id
+    ),
+    name:
+      normalizeOptionalTextInput(enrichedContext?.name) ||
+      normalizeOptionalTextInput(matchedPeopleContext.name) ||
+      normalizeOptionalTextInput(legacyResponsible.name) ||
+      `People #${matchedPeopleContext.people_id}`,
+    email:
+      normalizeOptionalTextInput(enrichedContext?.email) ||
+      normalizeOptionalTextInput(matchedPeopleContext.email) ||
+      normalizeOptionalTextInput(legacyResponsible.email),
+    plant_name:
+      normalizeOptionalTextInput(enrichedContext?.plant_name) ||
+      normalizeOptionalTextInput(matchedPeopleContext.plant_name) ||
+      "Allocated scope",
+    department_name:
+      normalizeOptionalTextInput(enrichedContext?.department_name) ||
+      normalizeOptionalTextInput(matchedPeopleContext.department_name) ||
+      "",
+    role_name:
+      normalizeOptionalTextInput(enrichedContext?.role_name) ||
+      normalizeOptionalTextInput(matchedPeopleContext.role_name) ||
+      ""
+  };
+};
+
+const resolveResponsiblePeopleId = async (responsibleId) => {
+  const responsibleContext = await resolveResponsibleOwnerContext(responsibleId);
+  return normalizeOptionalIntegerInput(responsibleContext?.people_id);
 };
 
 const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
@@ -3417,7 +3517,9 @@ const loadKpiTargetAllocationRowsForUi = async ({ allocationId = null, responsib
       plant.unit_type_id AS plant_unit_type_id,
       a.zone_id,
       zone.zone_name,
-      zone.responsable_zone,
+      zone_responsible.people_id AS zone_responsible_people_id,
+      zone_responsible.name AS zone_responsible_name,
+      zone_responsible.first_name AS zone_responsible_first_name,
       a.unit_id,
       unit_scope.unit_name AS unit_name,
       a.unit_type_id,
@@ -3468,6 +3570,19 @@ const loadKpiTargetAllocationRowsForUi = async ({ allocationId = null, responsib
       ON unit_type.unit_type_id = a.unit_type_id
     LEFT JOIN public.zone zone
       ON zone.zone_id = a.zone_id
+    LEFT JOIN LATERAL (
+      SELECT
+        pra.people_id,
+        p.name,
+        p.first_name
+      FROM public.people_role_assignment pra
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
+      WHERE pra.zone_id = a.zone_id
+        AND pra.assignment_status = 'ACTIVE'
+      ORDER BY COALESCE(pra.is_primary, false) DESC, pra.assignment_id DESC
+      LIMIT 1
+    ) zone_responsible ON TRUE
     LEFT JOIN public.unit unit_scope
       ON unit_scope.unit_id = a.unit_id
     LEFT JOIN public.role role
@@ -3504,28 +3619,39 @@ const loadKpiTargetAllocationRowsForUi = async ({ allocationId = null, responsib
     [allocationId, normalizedResponsibleId]
   );
 
-  return result.rows.map((row) => ({
-    ...row,
-    unit_type_id: row.unit_type_id ?? row.plant_unit_type_id ?? null,
-    unit_type_name: row.unit_type_name || "",
-    role_name: row.role_name || "",
-    frequency: row.frequency || "",
-    responsable_zone: normalizeOptionalTextInput(row.responsable_zone) || "",
-    kpi_subject: row.subject_id ? subjectHierarchy.pathById.get(String(row.subject_id)) || "" : "",
-    kpi_group: row.kpi_sub_title || "",
-    set_by_people_display_name: getPeopleDisplayName({
-      name: row.set_by_people_name,
-      first_name: row.set_by_people_first_name
-    }) || normalizeOptionalTextInput(row.responsable_zone) || "",
-    created_by_people_display_name: getPeopleDisplayName({
-      name: row.created_by_people_name,
-      first_name: row.created_by_people_first_name
-    }) || "",
-    approved_by_people_display_name: getPeopleDisplayName({
-      name: row.approved_by_people_name,
-      first_name: row.approved_by_people_first_name
-    }) || ""
-  }));
+  return result.rows.map((row) => {
+    const zoneResponsibleLabel =
+      getPeopleDisplayName({
+        name: row.zone_responsible_name,
+        first_name: row.zone_responsible_first_name
+      }) || getPeopleDisplayName({
+        name: row.set_by_people_name,
+        first_name: row.set_by_people_first_name
+      }) || "";
+
+    return {
+      ...row,
+      unit_type_id: row.unit_type_id ?? row.plant_unit_type_id ?? null,
+      unit_type_name: row.unit_type_name || "",
+      role_name: row.role_name || "",
+      frequency: row.frequency || "",
+      responsable_zone: zoneResponsibleLabel,
+      kpi_subject: row.subject_id ? subjectHierarchy.pathById.get(String(row.subject_id)) || "" : "",
+      kpi_group: row.kpi_sub_title || "",
+      set_by_people_display_name: getPeopleDisplayName({
+        name: row.set_by_people_name,
+        first_name: row.set_by_people_first_name
+      }) || zoneResponsibleLabel || "",
+      created_by_people_display_name: getPeopleDisplayName({
+        name: row.created_by_people_name,
+        first_name: row.created_by_people_first_name
+      }) || "",
+      approved_by_people_display_name: getPeopleDisplayName({
+        name: row.approved_by_people_name,
+        first_name: row.approved_by_people_first_name
+      }) || ""
+    };
+  });
 };
 
 const buildPreparedKpiObjectRows = (
@@ -5872,10 +5998,9 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   try {
     await ensureKpiRatioSchema();
     const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
-
-    if (!responsiblePeopleId) {
-      throw createHttpError(400, "Responsible owner is invalid.");
-    }
+    const createdByPeopleId =
+      normalizeOptionalIntegerInput(req.body.created_by_people_id) ||
+      responsiblePeopleId;
 
     const {
       subject_id,
@@ -5988,7 +6113,7 @@ VALUES (
         comments,
         high_limit,
         low_limit,
-        responsiblePeopleId
+        createdByPeopleId
       ]
     );
 
@@ -6002,7 +6127,7 @@ VALUES (
     await client.query("COMMIT");
     const rows = await loadKpiRowsForUi({
       kpiId: newKpi.kpi_id,
-      responsibleId: responsiblePeopleId
+      responsibleId: createdByPeopleId
     });
     res.status(201).json(rows[0] || newKpi);
   } catch (error) {
@@ -6024,14 +6149,19 @@ app.get("/api/responsibles/:responsibleId/kpis", async (req, res) => {
     await ensureKpiRatioSchema();
     const includeAll = String(req.query.include_all || "").trim() === "1";
     const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    if (!includeAll && !responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
+    }
     const rows = await loadKpiRowsForUi({
       search: req.query.search || "",
-      responsibleId: includeAll ? null : responsibleId
+      responsibleId: includeAll ? null : responsiblePeopleId
     });
     res.json(annotateOwnedKpisForResponsible(rows, responsiblePeopleId));
   } catch (error) {
     console.error("GET /api/responsibles/:responsibleId/kpis error:", error);
-    res.status(500).json({ error: "Failed to load KPIs" });
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to load KPIs"
+    });
   }
 });
 
@@ -6042,9 +6172,12 @@ app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     await ensureKpiRatioSchema();
     const includeAll = String(req.query.include_all || "").trim() === "1";
     const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    if (!includeAll && !responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
+    }
     const rows = await loadKpiRowsForUi({
       kpiId: Number(kpiId),
-      responsibleId: includeAll ? null : responsibleId
+      responsibleId: includeAll ? null : responsiblePeopleId
     });
 
     if (!rows.length) {
@@ -6054,7 +6187,9 @@ app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
     res.json(annotateOwnedKpisForResponsible(rows, responsiblePeopleId)[0]);
   } catch (error) {
     console.error("GET one KPI error:", error);
-    res.status(500).json({ error: "Failed to load KPI" });
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to load KPI"
+    });
   }
 });
 
@@ -6429,10 +6564,10 @@ app.post("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
   try {
     await ensureKpiRatioSchema();
     await ensureKpiObjectSchema();
-    const responsiblePeopleContext = await loadPeopleContextByPeopleId(responsibleId);
+    const responsiblePeopleContext = await resolveResponsibleOwnerContext(responsibleId);
     const normalizedResponsiblePeopleId =
-      responsiblePeopleContext?.people_id ||
-      normalizeOptionalIntegerInput(responsibleId);
+      normalizeOptionalIntegerInput(responsiblePeopleContext?.people_id);
+
     const createdByPeopleId =
       normalizeOptionalIntegerInput(req.body.created_by_people_id) ||
       normalizedResponsiblePeopleId;
@@ -6515,7 +6650,7 @@ app.post("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
       insertedIds.map((allocationId) =>
         loadKpiTargetAllocationRowsForUi({
           allocationId,
-          responsibleId: normalizedResponsiblePeopleId || responsibleId
+          responsibleId: createdByPeopleId || normalizedResponsiblePeopleId || null
         })
       )
     );
@@ -6542,8 +6677,12 @@ app.get("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
   try {
     await ensureKpiObjectSchema();
     const loadAllScope = String(req.query?.scope || "").trim().toLowerCase() === "all";
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    if (!loadAllScope && !responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
+    }
     const rows = await loadKpiTargetAllocationRowsForUi({
-      responsibleId: loadAllScope ? null : responsibleId
+      responsibleId: loadAllScope ? null : responsiblePeopleId
     });
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
     res.set("Pragma", "no-cache");
@@ -6551,7 +6690,9 @@ app.get("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
     res.json(rows);
   } catch (error) {
     console.error("GET KPI objects error:", error);
-    res.status(500).json({ error: "Failed to load KPI target allocations" });
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to load KPI target allocations"
+    });
   }
 });
 
@@ -6561,9 +6702,13 @@ app.get("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
   try {
     await ensureKpiObjectSchema();
     const loadAllScope = String(req.query?.scope || "").trim().toLowerCase() === "all";
+    const responsiblePeopleId = await resolveResponsiblePeopleId(responsibleId);
+    if (!loadAllScope && !responsiblePeopleId) {
+      throw createHttpError(400, "Responsible owner is invalid.");
+    }
     const anchorRows = await loadKpiTargetAllocationRowsForUi({
       allocationId: Number(kpiObjectId),
-      responsibleId: loadAllScope ? null : responsibleId
+      responsibleId: loadAllScope ? null : responsiblePeopleId
     });
 
     if (!anchorRows.length) {
@@ -6585,7 +6730,9 @@ app.get("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
     });
   } catch (error) {
     console.error("GET one KPI object error:", error);
-    res.status(500).json({ error: "Failed to load KPI target allocation" });
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : "Failed to load KPI target allocation"
+    });
   }
 });
 
@@ -6597,10 +6744,10 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
   try {
     await ensureKpiRatioSchema();
     await ensureKpiObjectSchema();
-    const responsiblePeopleContext = await loadPeopleContextByPeopleId(responsibleId);
+    const responsiblePeopleContext = await resolveResponsibleOwnerContext(responsibleId);
     const normalizedResponsiblePeopleId =
-      responsiblePeopleContext?.people_id ||
-      normalizeOptionalIntegerInput(responsibleId);
+      normalizeOptionalIntegerInput(responsiblePeopleContext?.people_id);
+
     const anchorAllocationId = normalizeOptionalIntegerInput(kpiObjectId);
     const existingGroupRows = await loadKpiTargetAllocationGroupRowsForUi(Number(kpiObjectId));
     const existingFamilyRows = await loadKpiTargetAllocationFamilyRowsForUi(Number(kpiObjectId));
@@ -6629,12 +6776,16 @@ app.put("/api/responsibles/:responsibleId/kpi-objects/:kpiObjectId", async (req,
       normalizeOptionalIntegerInput(req.body.created_by_people_id) ||
       normalizeOptionalIntegerInput(existingGroupRows[0]?.created_by_people_id) ||
       normalizedResponsiblePeopleId;
+    const preservedSetByPeopleId =
+      normalizeOptionalIntegerInput(req.body.set_by_people_id) ||
+      normalizeOptionalIntegerInput(existingGroupRows[0]?.set_by_people_id) ||
+      normalizedResponsiblePeopleId;
     const preservedGroupCreatedAt =
       existingGroupRows[0]?.created_at || new Date().toISOString();
     const preparedRows = buildPreparedKpiObjectRows({
       ...req.body,
       kpi_target_allocation_id: req.body.kpi_target_allocation_id || kpiObjectId,
-      set_by_people_id: req.body.set_by_people_id || normalizedResponsiblePeopleId,
+      set_by_people_id: req.body.set_by_people_id || preservedSetByPeopleId,
       created_by_people_id: req.body.created_by_people_id || preservedCreatedByPeopleId
     }, normalizedResponsiblePeopleId, preservedCreatedByPeopleId);
 
@@ -7176,10 +7327,25 @@ app.get("/api/manufacturing-strategy/zone", async (req, res) => {
       SELECT DISTINCT
         ms.zone_id,
         z.zone_name,
-        z.responsable_zone
+        zone_responsible.people_id AS responsible_people_id,
+        zone_responsible.name AS responsible_name,
+        zone_responsible.first_name AS responsible_first_name
       FROM public.manufacturing_strategy ms
       LEFT JOIN public.zone z
         ON z.zone_id = ms.zone_id
+      LEFT JOIN LATERAL (
+        SELECT
+          pra.people_id,
+          p.name,
+          p.first_name
+        FROM public.people_role_assignment pra
+        LEFT JOIN public.people p
+          ON p.people_id = pra.people_id
+        WHERE pra.zone_id = ms.zone_id
+          AND pra.assignment_status = 'ACTIVE'
+        ORDER BY COALESCE(pra.is_primary, false) DESC, pra.assignment_id DESC
+        LIMIT 1
+      ) zone_responsible ON TRUE
       WHERE ms.plant_id = $1
         AND ms.product_id = $2
         AND ms.strategy_status = 'active'
@@ -7193,7 +7359,11 @@ app.get("/api/manufacturing-strategy/zone", async (req, res) => {
       zones: result.rows.map((row) => ({
         zone_id: row.zone_id,
         zone_name: row.zone_name || `Zone ${row.zone_id}`,
-        responsable_zone: normalizeOptionalTextInput(row.responsable_zone) || ""
+        responsible_people_id: normalizeOptionalIntegerInput(row.responsible_people_id),
+        responsable_zone: getPeopleDisplayName({
+          name: row.responsible_name,
+          first_name: row.responsible_first_name
+        }) || ""
       }))
     });
   } catch (err) {
@@ -12993,24 +13163,34 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
 
   if (scopeKind === "zone") {
 
-    const zoneRoles = Array.from(
-      new Set(
-        (allocationLookups.zones || [])
-          .map(z => String(z.role || "").trim())
-          .filter(Boolean)
-      )
-    )
-      .sort((a, b) => a.localeCompare(b));
+    const zoneRoleMap = new Map();
+
+    (allocationLookups.zones || []).forEach((zoneEntry) => {
+      if (!Array.isArray(zoneEntry?.responsibles)) return;
+
+      zoneEntry.responsibles.forEach((responsibleEntry) => {
+        const roleId = String(responsibleEntry?.role_id || "").trim();
+        if (!roleId) return;
+
+        if (!zoneRoleMap.has(roleId)) {
+          zoneRoleMap.set(roleId, {
+            value: roleId,
+            label:
+              String(responsibleEntry?.role_name || "").trim() ||
+              ("Role " + roleId)
+          });
+        }
+      });
+    });
 
     const roleOptionsForZone = [
       {
         value: "__all_roles__",
         label: "All roles"
       },
-      ...zoneRoles.map(role => ({
-        value: role,
-        label: role
-      }))
+      ...Array.from(zoneRoleMap.values()).sort((left, right) =>
+        String(left.label || "").localeCompare(String(right.label || ""))
+      )
     ];
 
     setLookupSelectOptions(
@@ -14108,8 +14288,8 @@ if (scopeKind === "zone") {
         return true;
       }
 
-      return (
-        String(zoneEntry.role || "").trim() === selectedRole
+      return Array.isArray(zoneEntry?.responsibles) && zoneEntry.responsibles.some(
+        (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === selectedRole
       );
     })
     .map(zoneEntry => ({
@@ -14128,9 +14308,14 @@ if (scopeKind === "zone") {
 
       responsable_zone:
         zoneEntry.responsable_zone || "",
- 
-      role:
-        String(zoneEntry.role || "").trim()
+
+      responsible_people_id:
+        zoneEntry.responsible_people_id || "",
+
+      responsibles:
+        Array.isArray(zoneEntry.responsibles) ? zoneEntry.responsibles.slice() : [],
+
+      role: ""
     }));
 }
 
@@ -14176,7 +14361,7 @@ if (scopeKind === "zone") {
 }
 
 function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
-  if (!unitEntry || unitEntry.row_kind === "zone" || !Array.isArray(unitEntry.responsibles)) return null;
+  if (!unitEntry || !Array.isArray(unitEntry.responsibles)) return null;
 
   const normalizedRoleId = String(roleId || "").trim();
   const responsibles = unitEntry.responsibles
@@ -14225,35 +14410,50 @@ function resolveParameterResponsibleEntry(scopeEntry, state = null) {
   }
 
   if (scopeKind === "zone") {
-    const zoneResponsibleLabel = String(
-      scopeEntry.responsable_zone ||
-      rowState?.responsable_zone ||
-      ""
-    ).trim();
-
-    if (zoneResponsibleLabel) {
-      return {
-        people_id: "",
-        label: zoneResponsibleLabel,
-        source: "zone-table"
-      };
-    }
-
     const explicitPeopleId = String(
       rowState?.set_by_people_id ||
       rowState?.responsible_id ||
       ""
     ).trim();
 
-    if (!explicitPeopleId) {
-      return null;
+    if (explicitPeopleId) {
+      return {
+        people_id: explicitPeopleId,
+        label: getParameterPeopleLabel(explicitPeopleId) || ("Person " + explicitPeopleId),
+        source: "zone-explicit"
+      };
     }
 
-    return {
-      people_id: explicitPeopleId,
-      label: getParameterPeopleLabel(explicitPeopleId) || ("Person " + explicitPeopleId),
-      source: "zone-explicit"
-    };
+    const zoneResponsiblePeopleId = String(
+      scopeEntry.responsible_people_id ||
+      rowState?.responsible_people_id ||
+      ""
+    ).trim();
+
+    const zoneResponsibleLabel = String(
+      scopeEntry.responsable_zone ||
+      rowState?.responsable_zone ||
+      ""
+    ).trim();
+
+    if (zoneResponsiblePeopleId) {
+      return {
+        people_id: zoneResponsiblePeopleId,
+        label:
+          zoneResponsibleLabel ||
+          getParameterPeopleLabel(zoneResponsiblePeopleId) ||
+          ("Person " + zoneResponsiblePeopleId),
+        source: "zone-assignment"
+      };
+    }
+
+    if (zoneResponsibleLabel) {
+      return {
+        people_id: "",
+        label: zoneResponsibleLabel,
+        source: "zone-assignment-label"
+      };
+    }
   }
 
   return null;
@@ -14774,9 +14974,9 @@ if (isZoneScope) {
     toggleScopedParameterField("parameter_zone_resolved_field", false);
 
     if (tableLabel) tableLabel.textContent = "Zone Target Table";
-    if (tableHint)  tableHint.textContent  = "Enter a target for each zone. The responsible is loaded automatically from the zone table.";
+    if (tableHint)  tableHint.textContent  = "Enter a target for each zone. The responsible is loaded automatically from people_role_assignment using the zone assignment.";
     if (tableCopy)  tableCopy.textContent  =
-      "Choose a KPI and set the KPI type to Zone. The table below will list the zones from the zone table, then you can enter a target for each zone while keeping the responsible synced from the zone table.";
+      "Choose a KPI and set the KPI type to Zone. The table below will list the zones from the zone table, then resolve the responsible from people_role_assignment for each zone while you enter the target values.";
     if (tableBadge) tableBadge.textContent = "Zone View";
     return;
   }
@@ -18439,11 +18639,16 @@ updateParameterKpiSummary();
         } else {
           await loadKpiNames(defaults.kpi_id || "");
           resetParameterForm();
+          const defaultResponsiblePeopleId = (allocationLookups.people || []).some(
+            (option) => String(option?.value || "") === String(responsibleId || "")
+          )
+            ? responsibleId
+            : "";
           const parameterDefaults = {
             parameter_kpi_id: defaults.kpi_id || "",
             parameter_target_value: defaults.target_value ?? "",
             parameter_target_unit: defaults.target_unit || "",
-            parameter_set_by_people_id: defaults.set_by_people_id || responsibleId || ""
+            parameter_set_by_people_id: defaults.set_by_people_id || defaultResponsiblePeopleId || ""
           };
           populateAllocationLookupOptions(parameterDefaults);
           Object.keys(parameterDefaults).forEach((id) => {
@@ -19391,16 +19596,53 @@ async function runWithJobLock(lockId, jobFn) {
 
 
 // ---------- Nodemailer ----------
-const createTransporter = () =>
-  nodemailer.createTransport({
-    host: "avocarbon-com.mail.protection.outlook.com",
-    port: 25,
-    secure: false,
-    auth: {
-      user: "administration.STS@avocarbon.com",
-      pass: "shnlgdyfbcztbhxn",
-    },
-  });
+const parseBooleanEnv = (value, fallback = false) => {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
+
+const createTransporter = () => {
+  const host = normalizeOptionalTextInput(process.env.SMTP_HOST) || "avocarbon-com.mail.protection.outlook.com";
+  const parsedPort = Number.parseInt(String(process.env.SMTP_PORT || "25"), 10);
+  const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 25;
+  const secure = parseBooleanEnv(process.env.SMTP_SECURE, port === 465);
+  const authMode = String(
+    process.env.SMTP_AUTH_MODE || "basic"
+  ).trim().toLowerCase();
+  const smtpUser = normalizeOptionalTextInput(process.env.SMTP_USER) || "administration.STS@avocarbon.com";
+  const smtpPass = normalizeOptionalTextInput(process.env.SMTP_PASS) || "shnlgdyfbcztbhxn";
+
+  const transporterOptions = {
+    host,
+    port,
+    secure,
+    pool: true,
+    maxConnections: 2,
+    maxMessages: 100,
+    connectionTimeout: 20000,
+    greetingTimeout: 15000,
+    socketTimeout: 60000,
+    tls: {
+      servername: host
+    }
+  };
+
+  if (parseBooleanEnv(process.env.SMTP_REQUIRE_TLS, false)) {
+    transporterOptions.requireTLS = true;
+  }
+
+  if (authMode !== "none" && smtpUser && smtpPass) {
+    transporterOptions.auth = {
+      user: smtpUser,
+      pass: smtpPass
+    };
+  }
+
+  return nodemailer.createTransport(transporterOptions);
+};
 
 const getOpenAIClient = () => {
   if (!process.env.SECRET_KEY) {
@@ -31164,10 +31406,392 @@ const formatNumber = (num) => {
   return n.toFixed(1);
 };
 
+const WEEKLY_REPORT_MAX_CHARTS = Math.max(
+  1,
+  Number.parseInt(String(process.env.WEEKLY_REPORT_MAX_CHARTS || "3"), 10) || 3
+);
+const WEEKLY_REPORT_MAX_COMMENTS = 1;
+const WEEKLY_REPORT_MAX_CORRECTIVE_ACTIONS = 2;
+
+const truncateWeeklyReportText = (value, maxLength = 240) => {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (!Number.isFinite(maxLength) || maxLength <= 0 || normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(1, maxLength - 1)).trim()}…`;
+};
+
+const escapeWeeklyReportText = (value, maxLength) =>
+  escapeHtml(truncateWeeklyReportText(value, maxLength));
+
+const escapeWeeklyReportMultilineText = (value, maxLength) =>
+  escapeWeeklyReportText(String(value ?? "").replace(/\r\n/g, "\n"), maxLength).replace(/\n/g, "<br />");
+
+const formatWeeklyReportWeekLabel = (week) => {
+  const normalized = String(week || "").trim();
+  if (!normalized) return "";
+  return normalized.includes("-Week")
+    ? normalized.replace(/^\d{4}-Week/, "Week ")
+    : normalized;
+};
+
+const buildWeeklyReportChartModel = (chartData = {}) => {
+  const title = truncateWeeklyReportText(chartData.title || "Untitled KPI", 120);
+  const subtitle = truncateWeeklyReportText(chartData.subtitle || "", 160);
+  const unit = truncateWeeklyReportText(chartData.unit || "", 30);
+  const frequency = truncateWeeklyReportText(chartData.frequency || "Monthly", 40);
+  const currentWeekLabel = formatWeeklyReportWeekLabel(
+    chartData.currentWeek || chartData.week || ""
+  );
+
+  const cleanHigh = Number.isFinite(parseFloat(chartData.high_limit))
+    ? parseFloat(chartData.high_limit)
+    : null;
+  const cleanLow = Number.isFinite(parseFloat(chartData.low_limit))
+    ? parseFloat(chartData.low_limit)
+    : null;
+  const cleanTarget = Number.isFinite(parseFloat(chartData.target))
+    ? parseFloat(chartData.target)
+    : null;
+  const thresholdLineValues = getReadableThresholdLineValues(cleanLow, cleanTarget, cleanHigh);
+  const displayHigh = thresholdLineValues.displayHigh;
+  const displayLow = thresholdLineValues.displayLow;
+  const displayTarget = thresholdLineValues.displayTarget;
+
+  const values = (Array.isArray(chartData.data) ? chartData.data : [])
+    .slice(0, 12)
+    .map((value) => {
+      const numericValue = Number(value);
+      return Number.isFinite(numericValue) ? numericValue : 0;
+    });
+
+  const safeValues = values.length ? values : [0];
+  const labels = (Array.isArray(chartData.weekLabels) ? chartData.weekLabels : safeValues.map((_, index) => `P${index + 1}`))
+    .slice(0, 12)
+    .map((label, index) => truncateWeeklyReportText(label || `P${index + 1}`, 24));
+  const axisRange = getAutoChartAxisRange(safeValues, displayLow, displayTarget, displayHigh);
+  const resolvedDirection = normalizeKpiDirection(chartData.direction) || "up";
+  const currentValue = safeValues[safeValues.length - 1] || 0;
+  const currentStatus = getKpiStatus(currentValue, cleanLow, cleanHigh, resolvedDirection);
+  const pointColors = safeValues.map((value) => getDotColor(value, cleanLow, cleanHigh, resolvedDirection));
+
+  const datasets = [
+    {
+      label: subtitle || title,
+      data: safeValues,
+      borderColor: "#94a3b8",
+      borderWidth: 2,
+      lineTension: 0,
+      fill: false,
+      pointBackgroundColor: pointColors,
+      pointBorderColor: "#ffffff",
+      pointBorderWidth: 2,
+      pointRadius: 5
+    }
+  ];
+
+  if (cleanHigh !== null) {
+    datasets.push({
+      label: `High Limit (${formatNumber(cleanHigh)})`,
+      data: new Array(safeValues.length).fill(displayHigh),
+      borderColor: "#f97316",
+      borderWidth: 2.25,
+      borderDash: [10, 4],
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  if (cleanLow !== null) {
+    datasets.push({
+      label: `Low Limit (${formatNumber(cleanLow)})`,
+      data: new Array(safeValues.length).fill(displayLow),
+      borderColor: "#dc2626",
+      borderWidth: 2.25,
+      borderDash: [4, 6],
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  if (cleanTarget !== null) {
+    datasets.push({
+      label: `Target (${formatNumber(cleanTarget)})`,
+      data: new Array(safeValues.length).fill(displayTarget),
+      borderColor: "#16a34a",
+      borderWidth: 2.5,
+      pointRadius: 0,
+      fill: false
+    });
+  }
+
+  const chartHeightPx = thresholdLineValues.hasTightCluster ? 300 : 250;
+  const chartConfig = {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      legend: { display: false },
+      layout: { padding: { top: 8, right: 10, bottom: 4, left: 4 } },
+      scales: {
+        xAxes: [{
+          ticks: { fontSize: 10 },
+          gridLines: { color: "rgba(0,0,0,0.05)" }
+        }],
+        yAxes: [{
+          ticks: {
+            fontSize: 10,
+            beginAtZero: false,
+            min: axisRange.min,
+            max: axisRange.max
+          },
+          gridLines: { color: "rgba(0,0,0,0.05)" }
+        }]
+      }
+    }
+  };
+
+  const chartUrl =
+    `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}` +
+    `&w=480&h=${chartHeightPx}&bkg=white&format=png&devicePixelRatio=2`;
+
+  return {
+    title,
+    subtitle,
+    unit,
+    frequency,
+    currentWeekLabel,
+    chartUrl,
+    chartHeightPx,
+    chartAlt: truncateWeeklyReportText(`${title} trend chart`, 120),
+    currentColor: getDotColor(currentValue, cleanLow, cleanHigh, resolvedDirection),
+    currentValue: truncateWeeklyReportText(chartData?.stats?.current ?? formatNumber(currentValue), 40),
+    averageValue: truncateWeeklyReportText(chartData?.stats?.average ?? "N/A", 40),
+    periodsLabel: truncateWeeklyReportText(`${chartData?.stats?.dataPoints || safeValues.length} periods`, 40),
+    directionArrow: currentStatus.isGood === false
+      ? (resolvedDirection === "down" ? "↑" : "↓")
+      : (resolvedDirection === "down" ? "↓" : "↑"),
+    directionColor: currentStatus.isGood === false ? "#dc2626" : "#16a34a",
+    thresholdBadges: [
+      cleanTarget !== null ? { label: "Target", value: formatNumber(cleanTarget), color: "#16a34a" } : null,
+      cleanHigh !== null ? { label: "High Limit", value: formatNumber(cleanHigh), color: "#ea580c" } : null,
+      cleanLow !== null ? { label: "Low Limit", value: formatNumber(cleanLow), color: "#dc2626" } : null
+    ].filter(Boolean),
+    comments: (Array.isArray(chartData.comments) ? chartData.comments : [])
+      .slice(0, WEEKLY_REPORT_MAX_COMMENTS)
+      .map((entry) => ({
+        weekLabel:
+          weekToMonthLabel(entry?.week || "") ||
+          formatWeeklyReportWeekLabel(entry?.week || "") ||
+          "Period",
+        text: truncateWeeklyReportText(entry?.text || "", 280)
+      }))
+      .filter((entry) => entry.text),
+    correctiveActions: (Array.isArray(chartData.correctiveActions) ? chartData.correctiveActions : [])
+      .slice(0, WEEKLY_REPORT_MAX_CORRECTIVE_ACTIONS)
+      .map((entry) => ({
+        weekLabel:
+          weekToMonthLabel(entry?.week || "") ||
+          formatWeeklyReportWeekLabel(entry?.week || "") ||
+          "Period",
+        status: truncateWeeklyReportText(entry?.status || "Open", 60),
+        rootCause: truncateWeeklyReportText(entry?.root_cause || "", 220),
+        implementedSolution: truncateWeeklyReportText(entry?.implemented_solution || "", 220),
+        responsible: truncateWeeklyReportText(entry?.responsible || "", 120),
+        evidence: truncateWeeklyReportText(entry?.evidence || "", 180),
+        dueDate: entry?.due_date
+          ? (() => {
+              const parsed = new Date(entry.due_date);
+              return Number.isNaN(parsed.getTime())
+                ? truncateWeeklyReportText(entry.due_date, 40)
+                : parsed.toLocaleDateString("en-GB");
+            })()
+          : ""
+      }))
+      .filter((entry) => entry.rootCause || entry.implementedSolution || entry.responsible || entry.evidence || entry.dueDate)
+  };
+};
+
+const fetchWeeklyReportInlineChartAttachment = async (chartModel, chartIndex) => {
+  const chartLabel = truncateWeeklyReportText(chartModel?.title || `chart_${chartIndex + 1}`, 50)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "") || `chart_${chartIndex + 1}`;
+  const cid = `weekly-report-chart-${Date.now()}-${chartIndex}@avocarbon.local`;
+
+  try {
+    if (typeof fetch !== "function") {
+      throw new Error("Global fetch is not available");
+    }
+
+    const response = await fetch(chartModel.chartUrl, {
+      headers: { Accept: "image/png" }
+    });
+
+    if (!response.ok) {
+      throw new Error(`QuickChart responded with ${response.status}`);
+    }
+
+    return {
+      cid,
+      attachment: {
+        filename: `${chartLabel}.png`,
+        content: Buffer.from(await response.arrayBuffer()),
+        contentType: "image/png",
+        contentDisposition: "inline",
+        cid
+      }
+    };
+  } catch (error) {
+    console.error(`[Weekly Report] Inline chart ${chartIndex + 1} failed:`, error.message);
+    return { cid: "", attachment: null };
+  }
+};
+
+const renderWeeklyReportChartCard = (chartModel, { imageSrc = "" } = {}) => {
+  const thresholdOrder = ["High Limit", "Target", "Low Limit"];
+  const orderedThresholds = thresholdOrder
+    .map((label) => chartModel.thresholdBadges.find((badge) => badge.label === label))
+    .filter(Boolean);
+
+  const thresholdCardsHtml = orderedThresholds.length
+    ? `
+      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin:18px 0 0;">
+        <tr>
+          ${orderedThresholds.map((badge, index) => `
+            <td valign="top" width="${Math.round(100 / orderedThresholds.length)}%"
+                ${index < orderedThresholds.length - 1 ? 'style="padding-right:10px;"' : ""}>
+              <table border="0" cellpadding="0" cellspacing="0" width="100%"
+                     style="background:#ffffff;border:1px solid #dbe4ef;border-radius:12px;">
+                <tr>
+                  <td align="center" style="padding:14px 10px 12px;">
+                    <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:5px;">
+                      ${escapeWeeklyReportText(badge.label, 40)}
+                    </div>
+                    <div style="font-size:20px;font-weight:700;color:${badge.color};line-height:1.2;">
+                      ${escapeWeeklyReportText(badge.value, 40)}
+                    </div>
+                    <div style="font-size:10px;color:#94a3b8;margin-top:4px;">
+                      ${escapeWeeklyReportText(chartModel.unit || "-", 20)}
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          `).join("")}
+        </tr>
+      </table>`
+    : "";
+
+  const correctiveActionsPanelHtml = chartModel.correctiveActions.length
+    ? chartModel.correctiveActions.map((entry) => `
+        <div style="margin-bottom:10px;padding:12px 12px;background:#fff4f4;border:1px solid #ffd6d6;border-left:4px solid #ef4444;border-radius:10px;">
+          <div style="font-size:11px;font-weight:700;color:#7f1d1d;margin-bottom:6px;">
+            ${escapeWeeklyReportText(entry.weekLabel, 40)}
+            ${entry.status ? `<span style="margin-left:8px;color:#dc2626;">${escapeWeeklyReportText(entry.status, 50)}</span>` : ""}
+          </div>
+          ${entry.rootCause ? `<div style="font-size:12px;color:#374151;line-height:1.45;margin-bottom:5px;"><strong>Root Cause</strong><br />${escapeWeeklyReportMultilineText(entry.rootCause, 220)}</div>` : ""}
+          ${entry.implementedSolution ? `<div style="font-size:12px;color:#374151;line-height:1.45;margin-bottom:5px;"><strong>Implemented Solution</strong><br />${escapeWeeklyReportMultilineText(entry.implementedSolution, 220)}</div>` : ""}
+          ${entry.dueDate ? `<div style="font-size:11px;color:#475569;margin-bottom:4px;"><strong>Due Date</strong><br />${escapeWeeklyReportText(entry.dueDate, 40)}</div>` : ""}
+          ${entry.responsible ? `<div style="font-size:11px;color:#475569;"><strong>Responsible</strong><br />${escapeWeeklyReportText(entry.responsible, 120)}</div>` : ""}
+        </div>
+      `).join("")
+    : `<div style="padding:24px 16px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px;text-align:center;color:#64748b;font-size:12px;line-height:1.5;">
+         No corrective actions were recorded for this KPI in the selected period.
+       </div>`;
+
+  const commentsHtml = chartModel.comments.length
+    ? `
+      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top:16px;">
+        <tr>
+          <td style="padding:0;">
+            <div style="font-size:11px;font-weight:700;color:#0f6cbd;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;">Latest Comment</div>
+            ${chartModel.comments.map((entry) => `
+              <div style="padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;">
+                <div style="font-size:11px;font-weight:700;color:#1d4ed8;margin-bottom:5px;">${escapeWeeklyReportText(entry.weekLabel, 40)}</div>
+                <div style="font-size:13px;color:#334155;line-height:1.5;">${escapeWeeklyReportMultilineText(entry.text, 280)}</div>
+              </div>
+            `).join("")}
+          </td>
+        </tr>
+      </table>`
+    : "";
+
+  const chartImageHtml = imageSrc
+    ? `<img src="${escapeHtml(imageSrc)}"
+            width="520"
+            height="${chartModel.chartHeightPx}"
+            alt="${escapeWeeklyReportText(chartModel.chartAlt, 120)}"
+            style="display:block;width:100%;max-width:520px;height:auto;border:1px solid #e5e7eb;border-radius:12px;background:#ffffff;" />`
+    : `<div style="padding:34px 20px;text-align:center;color:#64748b;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:12px;font-size:13px;line-height:1.5;">
+         Chart preview is unavailable in this email.<br />Use the dashboard link for the full KPI trend view.
+       </div>`;
+
+  return `
+    <table border="0" cellpadding="0" cellspacing="0" width="100%"
+           style="margin:22px 0 0;background:#ffffff;border:1px solid #d9e5f1;border-radius:16px;font-family:Arial,sans-serif;">
+      <tr>
+        <td style="padding:26px 26px 24px;">
+          <div style="font-size:18px;font-weight:700;color:#111827;line-height:1.3;margin:0 0 4px;">
+            ${escapeWeeklyReportText(chartModel.title, 120)}
+          </div>
+          ${chartModel.subtitle ? `<div style="font-size:14px;color:#475569;line-height:1.4;margin:0 0 4px;">${escapeWeeklyReportText(chartModel.subtitle, 160)}</div>` : ""}
+          <div style="font-size:12px;color:#64748b;line-height:1.4;">
+            Unit: ${escapeWeeklyReportText(chartModel.unit || "-", 20)} | Frequency: ${escapeWeeklyReportText(chartModel.frequency || "Monthly", 40)}
+          </div>
+
+          <table border="0" cellpadding="0" cellspacing="0" width="100%"
+                 style="margin:18px 0 0;background:#ffffff;border:1px solid #dbe4ef;border-radius:12px;">
+            <tr>
+              <td align="center" width="33.33%" style="padding:16px 8px;">
+                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Current</div>
+                <div style="font-size:22px;font-weight:700;color:${chartModel.currentColor};line-height:1.2;">${escapeWeeklyReportText(chartModel.currentValue, 40)}</div>
+                ${chartModel.currentWeekLabel ? `<div style="font-size:10px;color:#94a3b8;margin-top:4px;">${escapeWeeklyReportText(chartModel.currentWeekLabel, 40)}</div>` : ""}
+              </td>
+              <td align="center" width="33.33%" style="padding:16px 8px;border-left:1px solid #eef2f7;border-right:1px solid #eef2f7;">
+                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Direction</div>
+                <div style="font-size:34px;font-weight:700;color:${chartModel.directionColor};line-height:1;">${escapeWeeklyReportText(chartModel.directionArrow, 4)}</div>
+              </td>
+              <td align="center" width="33.33%" style="padding:16px 8px;">
+                <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Average</div>
+                <div style="font-size:22px;font-weight:700;color:#0f6cbd;line-height:1.2;">${escapeWeeklyReportText(chartModel.averageValue || "N/A", 40)}</div>
+                <div style="font-size:10px;color:#94a3b8;margin-top:4px;">${escapeWeeklyReportText(chartModel.periodsLabel, 40)}</div>
+              </td>
+            </tr>
+          </table>
+
+          <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-top:16px;">
+            <tr>
+              <td valign="top" width="58%" style="padding-right:16px;">
+                ${chartImageHtml}
+              </td>
+              <td valign="top" width="42%">
+                <div style="font-size:12px;font-weight:700;color:#111827;line-height:1.3;margin-bottom:10px;">
+                  Corrective Actions
+                </div>
+                ${correctiveActionsPanelHtml}
+              </td>
+            </tr>
+          </table>
+
+          ${thresholdCardsHtml}
+          ${commentsHtml}
+        </td>
+      </tr>
+    </table>`;
+};
+
 // ============================================================
 // generateVerticalBarChart â€” DOTS + HIGH/LOW LIMIT LINES
 // ============================================================
-const generateVerticalBarChart = (chartData) => {
+const generateVerticalBarChart = (chartData, options = {}) => {
+  return renderWeeklyReportChartCard(
+    chartData?.chartUrl ? chartData : buildWeeklyReportChartModel(chartData),
+    options
+  );
+
   const {
     title, subtitle, unit, data, weekLabels, currentWeek,
     stats, target, low_limit, high_limit,
@@ -31929,7 +32553,7 @@ function getCurrentWeek() {
   return `${year}-Week${weekNumber}`;
 }
 
-const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
+const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOverride = null) => {
   try {
     const responsibleContext = await loadFormResponsibleContext(responsibleId);
     const responsiblePeopleId = normalizeOptionalIntegerInput(
@@ -31950,116 +32574,337 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek) => {
       role_name: normalizeOptionalTextInput(responsibleContext?.role_name) || ""
     };
 
-    if (!responsible.email) {
-      throw new Error(`No email defined for responsible ${responsible.name}`);
+    const reportWeekLabel = formatWeeklyReportWeekLabel(reportWeek);
+    const deliveryRecipient = normalizeOptionalTextInput(deliveryOverride?.recipientEmail) || responsible.email;
+    const deliveryRecipientName = normalizeOptionalTextInput(deliveryOverride?.recipientName) || responsible.name;
+    const deliveryRoleName = normalizeOptionalTextInput(deliveryOverride?.recipientRoleName) || "";
+    const isManagerCopy = Boolean(deliveryOverride?.recipientEmail) && deliveryRecipient !== responsible.email;
+    if (!deliveryRecipient) {
+      throw new Error(`No email defined for weekly report delivery for ${responsible.name}`);
     }
-
-    const responsibleLinkId = encodeURIComponent(responsible.people_id);
+    const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-codir.azurewebsites.net")
+      .replace(/\/+$/, "");
+    const dashboardUrl = `${appBaseUrl}/dashboard?responsible_id=${encodeURIComponent(responsible.people_id)}`;
     const chartsData = await generateWeeklyReportData(responsible.people_id, reportWeek);
-    let chartsHtml = '';
+    const chartsForEmail = Array.isArray(chartsData)
+      ? chartsData.slice(0, WEEKLY_REPORT_MAX_CHARTS)
+      : [];
+    const omittedChartsCount = Array.isArray(chartsData) && chartsData.length > chartsForEmail.length
+      ? chartsData.length - chartsForEmail.length
+      : 0;
+    let chartsHtml = "";
+    let inlineChartAttachments = [];
+    const reportWarnings = [];
 
-    if (chartsData && chartsData.length > 0) {
-      chartsData.forEach(chart => { chartsHtml += generateVerticalBarChart(chart); });
+    if (chartsForEmail.length > 0) {
+      const chartModels = chartsForEmail.map((chart) => buildWeeklyReportChartModel(chart));
+      const inlineChartResults = await Promise.all(
+        chartModels.map((chartModel, index) => fetchWeeklyReportInlineChartAttachment(chartModel, index))
+      );
+
+      chartsHtml = chartModels.map((chartModel, index) =>
+        generateVerticalBarChart(chartModel, {
+          imageSrc: inlineChartResults[index]?.cid ? `cid:${inlineChartResults[index].cid}` : ""
+        })
+      ).join("");
+
+      inlineChartAttachments = inlineChartResults
+        .map((entry) => entry?.attachment)
+        .filter(Boolean)
+        .map((attachment) => ({
+          ...attachment,
+          contentDisposition: "inline"
+        }));
+
+      const missingInlineChartsCount = Math.max(0, chartModels.length - inlineChartAttachments.length);
+      if (missingInlineChartsCount > 0) {
+        reportWarnings.push(`${missingInlineChartsCount} chart image(s) were replaced with placeholders.`);
+      }
+
+      if (omittedChartsCount > 0) {
+        chartsHtml += `
+          <div style="margin:16px 0 0;padding:16px 18px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;color:#1e3a8a;font-size:13px;line-height:1.5;">
+            ${escapeWeeklyReportText(`${omittedChartsCount} additional KPI chart(s) are available in the dashboard to keep this email lightweight and reliable.`, 180)}
+          </div>`;
+      }
     } else {
+      reportWarnings.push("No KPI chart data was available for this report period.");
       chartsHtml = `
-        <div style="text-align:center;padding:60px;background:#f8f9fa;border-radius:12px;">
-          <p style="color:#495057;margin:0;font-size:18px;">No KPI Data Available</p>
+        <div style="text-align:center;padding:60px;background:#ffffff;border:1px solid #dbe4ef;border-radius:16px;">
+          <p style="color:#334155;margin:0;font-size:18px;font-weight:700;">No KPI Data Available</p>
+          <p style="color:#64748b;margin:10px 0 0;font-size:13px;">Use the dashboard link below to review the current allocation scope.</p>
         </div>`;
     }
 
-    const emailHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-    <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f6f9;">
-      <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#f4f6f9;">
-        <tr><td align="center" style="padding:20px;">
-          <table border="0" cellpadding="0" cellspacing="0" width="100%">
-            <tr><td style="background:#0078D7;padding:30px;text-align:center;border-radius:8px 8px 0 0;">
-              <h1 style="margin:0;color:white;font-size:24px;">KPI Performance Report</h1>
-              <p style="margin:10px 0 20px;color:rgba(255,255,255,0.9);">
-                ${reportWeek.replace('2026-Week', 'Week ')} | ${responsible.name} | ${responsible.plant_name}
-              </p>
-              <table border="0" cellpadding="0" cellspacing="0" align="center"><tr>
-      
-                <td style="padding:0 8px;">
-                  <a href="https://kpi-codir.azurewebsites.net/dashboard?responsible_id=${responsibleLinkId}"
-                     style="display:inline-block;padding:12px 24px;background:#38bdf8;color:white;
-                            text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">
-                    View Dashboard</a>
-                </td>
-              </tr></table>
-            </td></tr>
+    let pdfAttachment = null;
 
-            <tr><td style="padding:20px 30px 0;">
-              <div style="background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:14px 18px;">
-                <span style="font-size:14px;color:#5f4200;">
-                  <strong>AI Recommendations PDF is attached</strong> - open it for root-cause analysis,
-                  action plans and improvement roadmaps for each KPI.
-                </span>
-              </div>
-            </td></tr>
+    try {
+      console.log(`Generating recommendations PDF for ${responsible.name}...`);
 
-        
-            <tr><td style="padding:30px;">${chartsHtml}</td></tr>
+      const pdfBuffer = await generateKPIRecommendationsPDFBuffer(
+        pool,
+        responsible.people_id,
+        reportWeek
+      );
 
-            <tr><td style="padding:20px;background:#f8f9fa;border-top:1px solid #e9ecef;
-                            text-align:center;font-size:12px;color:#666;">
-              AVOCarbon KPI System | Generated ${new Date().toLocaleDateString('en-GB')}
-            </td></tr>
+      if (pdfBuffer) {
+        const weekLabel = String(reportWeek).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+        const safeName = String(responsible.name || "responsible")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-zA-Z0-9_-]/g, "_");
+
+        pdfAttachment = {
+          filename: `KPI_Recommendations_${safeName}_${weekLabel}.pdf`,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        };
+
+        console.log(`PDF ready - ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
+        console.log(`PDF filename: ${pdfAttachment.filename}`);
+      } else {
+        reportWarnings.push("The AI recommendations PDF was not generated for this run.");
+      }
+    } catch (pdfErr) {
+      reportWarnings.push(`The AI recommendations PDF could not be attached: ${pdfErr.message}`);
+      console.error(`PDF generation failed for ${responsible.name}:`, pdfErr.message);
+    }
+
+    const pdfBannerHtml = pdfAttachment
+      ? `<strong>AI Recommendations PDF is attached</strong> - open it for root-cause analysis, action plans and improvement roadmaps for each KPI.`
+      : `<strong>AI Recommendations PDF is unavailable for this run</strong> - use the dashboard for the latest analysis while the report remains available in this email.`;
+    const managerCopyHtml = isManagerCopy
+      ? `
+        <tr>
+          <td style="padding:14px 32px 0;">
+            <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 14px;color:#1d4ed8;font-size:12px;line-height:1.5;">
+              This manager copy was sent to <strong>${escapeWeeklyReportText(deliveryRecipientName, 80)}</strong>${deliveryRoleName ? ` (${escapeWeeklyReportText(deliveryRoleName, 80)})` : ""} for KPI follow-up on <strong>${escapeWeeklyReportText(responsible.name, 80)}</strong>.
+            </div>
+          </td>
+        </tr>`
+      : "";
+
+    const reportWarningsHtml = reportWarnings.length
+      ? `
+        <tr>
+          <td style="padding:14px 32px 0;">
+            <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:12px 14px;color:#9a3412;font-size:12px;line-height:1.5;">
+              ${reportWarnings.map((warning) => escapeWeeklyReportText(warning, 200)).join("<br />")}
+            </div>
+          </td>
+        </tr>`
+      : "";
+
+    const emailText = [
+      `KPI Performance Report - ${reportWeekLabel}`,
+      ``,
+      `Responsible: ${responsible.name}`,
+      `Scope: ${responsible.plant_name}`,
+      `Dashboard: ${dashboardUrl}`,
+      isManagerCopy
+        ? `Manager copy recipient: ${deliveryRecipientName}${deliveryRoleName ? ` (${deliveryRoleName})` : ""}`
+        : null,
+      ``,
+      chartsForEmail.length
+        ? `Included KPI charts: ${chartsForEmail.map((chart) => truncateWeeklyReportText(chart.title || chart.subtitle || "KPI", 50)).join(", ")}`
+        : `No KPI chart data was available for this period.`,
+      pdfAttachment
+        ? `AI recommendations PDF: attached`
+        : `AI recommendations PDF: unavailable for this run`,
+      omittedChartsCount > 0
+        ? `${omittedChartsCount} additional KPI chart(s) are available in the dashboard.`
+        : null,
+      reportWarnings.length
+        ? `Warnings: ${reportWarnings.join(" | ")}`
+        : null
+    ].filter(Boolean).join("\n");
+
+    const emailHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  </head>
+  <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#edf3fb;color:#0f172a;">
+    <div style="display:none;font-size:1px;color:#edf3fb;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+      KPI Performance Report ${escapeWeeklyReportText(reportWeekLabel, 40)} for ${escapeWeeklyReportText(responsible.name, 80)}.
+    </div>
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#edf3fb;">
+      <tr>
+        <td align="center" style="padding:28px 18px;">
+          <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:1040px;background:#f8fbff;border-radius:18px;">
+            <tr>
+              <td style="padding:30px 30px 22px;">
+                <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#127bd8;border-radius:10px;">
+                  <tr>
+                    <td align="center" style="padding:26px 20px;">
+                      <div style="font-size:20px;font-weight:700;color:#ffffff;line-height:1.25;margin:0 0 8px;">
+                        KPI Performance Report
+                      </div>
+                      <div style="font-size:14px;color:#e0f2fe;line-height:1.5;margin:0 0 14px;">
+                        ${escapeWeeklyReportText(reportWeekLabel, 40)} | ${escapeWeeklyReportText(responsible.name, 80)} | ${escapeWeeklyReportText(responsible.plant_name, 80)}
+                      </div>
+                      <a href="${escapeHtml(dashboardUrl)}"
+                         style="display:inline-block;padding:11px 24px;background:#38bdf8;color:#ffffff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:700;">
+                        View Dashboard
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:0 30px;">
+                <div style="background:#fff8e1;border:1px solid #f6d365;border-radius:10px;padding:14px 16px;font-size:13px;line-height:1.5;color:#7c4a03;">
+                  ${pdfBannerHtml}
+                </div>
+              </td>
+            </tr>
+
+            ${managerCopyHtml}
+            ${reportWarningsHtml}
+
+            <tr>
+              <td style="padding:16px 30px 30px;">
+                ${chartsHtml}
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:18px 24px 26px;text-align:center;font-size:12px;color:#64748b;border-top:1px solid #dbe4ef;">
+                AVOCarbon KPI System | Generated ${new Date().toLocaleDateString("en-GB")}
+              </td>
+            </tr>
           </table>
-        </td></tr>
-      </table>
-    </body></html>`;
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
 
-    // â”€â”€ Generate PDF attachment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-let pdfAttachment = null;
+    const fallbackHtml = `<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8"></head>
+  <body style="margin:0;padding:24px;font-family:Arial,sans-serif;background:#f4f6f9;color:#0f172a;">
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:760px;margin:0 auto;background:#ffffff;border:1px solid #dbe4ef;border-radius:14px;">
+      <tr>
+        <td style="padding:26px 28px 18px;background:#127bd8;border-radius:14px 14px 0 0;text-align:center;">
+          <div style="font-size:22px;font-weight:700;color:#ffffff;">KPI Performance Report</div>
+          <div style="margin-top:8px;font-size:14px;color:#e0f2fe;">
+            ${escapeWeeklyReportText(reportWeekLabel, 40)} | ${escapeWeeklyReportText(responsible.name, 80)} | ${escapeWeeklyReportText(responsible.plant_name, 80)}
+          </div>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:22px 28px;">
+          <p style="margin:0 0 16px;font-size:14px;line-height:1.6;">
+            Your weekly KPI report is available. Open the dashboard for the full chart experience.
+          </p>
+          <p style="margin:0 0 16px;font-size:14px;line-height:1.6;">
+            Included KPI summary: ${escapeWeeklyReportText(chartsForEmail.map((chart) => chart.title || chart.subtitle || "KPI").join(", ") || "No KPI data available", 260)}
+          </p>
+          <p style="margin:0 0 20px;font-size:14px;line-height:1.6;">
+            ${escapeWeeklyReportText(pdfAttachment ? "The AI recommendations PDF is attached to this message." : "The AI recommendations PDF was not available in this run.", 160)}
+          </p>
+          <a href="${escapeHtml(dashboardUrl)}"
+             style="display:inline-block;padding:12px 22px;background:#127bd8;color:#ffffff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:700;">
+            View Dashboard
+          </a>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:16px 28px 22px;font-size:12px;color:#64748b;border-top:1px solid #dbe4ef;text-align:center;">
+          AVOCarbon KPI System | Generated ${new Date().toLocaleDateString("en-GB")}
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
 
-try {
-  console.log(`Generating recommendations PDF for ${responsible.name}...`);
+    const transporter = createTransporter();
+    const weeklyReportMessageToken = [
+      "weekly-report",
+      responsible.people_id,
+      String(reportWeek || "week").replace(/[^a-zA-Z0-9_-]/g, "_"),
+      Date.now()
+    ].join("-");
 
-  const pdfBuffer = await generateKPIRecommendationsPDFBuffer(
-    pool,
-    responsible.people_id,
-    reportWeek
-  );
-
-  if (pdfBuffer) {
-    const weekLabel = String(reportWeek).replace(/[^a-zA-Z0-9_-]/g, "_");
-
-    const safeName = String(responsible.name || "responsible")
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-zA-Z0-9_-]/g, "_");
-
-    pdfAttachment = {
-      filename: `KPI_Recommendations_${safeName}_${weekLabel}.pdf`,
-      content: pdfBuffer,
-      contentType: "application/pdf",
+    const baseMailOptions = {
+      from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+      sender: "administration.STS@avocarbon.com",
+      replyTo: "administration.STS@avocarbon.com",
+      to: responsible.email,
+      envelope: {
+        from: "administration.STS@avocarbon.com",
+        to: [deliveryRecipient]
+      },
+      subject: `KPI Performance Report - ${reportWeekLabel} | ${responsible.name}`,
+      text: emailText,
+      headers: {
+        "X-Auto-Response-Suppress": "OOF, AutoReply",
+        "X-Weekly-Report-Id": weeklyReportMessageToken,
+        ...(isManagerCopy ? { "X-Weekly-Report-Delivery": "manager-hierarchy-copy" } : {})
+      },
+      date: new Date(),
+      messageId: `<${weeklyReportMessageToken}@avocarbon.com>`
     };
 
-    console.log(`PDF ready - ${(pdfBuffer.length / 1024).toFixed(1)} KB`);
-    console.log(`PDF filename: ${pdfAttachment.filename}`);
-  }
-} catch (pdfErr) {
-  console.error(`PDF generation failed for ${responsible.name}:`, pdfErr.message);
-}
+    const attachments = [
+      ...inlineChartAttachments,
+      ...(pdfAttachment ? [{
+        ...pdfAttachment,
+        contentDisposition: "attachment"
+      }] : [])
+    ];
 
-const transporter = createTransporter();
+    let info;
+    let fallbackUsed = false;
 
-const info = await transporter.sendMail({
-  from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
-  to: responsible.email,
-  subject: `KPI Weekly Report - ${reportWeek}`,
-  html: emailHtml,
-  attachments: [] // test first without PDF
-});
+    try {
+      info = await transporter.sendMail({
+        ...baseMailOptions,
+        to: deliveryRecipient,
+        html: emailHtml,
+        attachments
+      });
+    } catch (primarySendError) {
+      fallbackUsed = true;
+      reportWarnings.push(`Rich email fallback used because the primary send failed: ${primarySendError.message}`);
+      console.error(`[Weekly Report] Rich email send failed for ${responsible.email}:`, primarySendError.message);
 
-console.log("[Weekly Report] Mail result:", {
-  to: responsible.email,
-  accepted: info.accepted,
-  rejected: info.rejected,
-  response: info.response,
-  messageId: info.messageId,
-  hasPdf: false
-});
+      info = await transporter.sendMail({
+        ...baseMailOptions,
+        to: deliveryRecipient,
+        subject: `${baseMailOptions.subject} [Fallback]`,
+        html: fallbackHtml,
+        attachments: pdfAttachment ? [{
+          ...pdfAttachment,
+          contentDisposition: "attachment"
+        }] : [],
+        headers: {
+          ...baseMailOptions.headers,
+          "X-Weekly-Report-Fallback": "1"
+        },
+        messageId: `<${weeklyReportMessageToken}-fallback@avocarbon.com>`
+      });
+    }
+
+    console.log("[Weekly Report] Mail result:", {
+      responsible: responsible.email,
+      to: deliveryRecipient,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      response: info.response,
+      messageId: info.messageId,
+      hasPdf: Boolean(pdfAttachment),
+      inlineCharts: inlineChartAttachments.length,
+      renderedCharts: chartsForEmail.length,
+      omittedCharts: omittedChartsCount,
+      fallbackUsed,
+      warnings: reportWarnings
+    });
 
 
   } catch (error) {
@@ -32070,7 +32915,7 @@ console.log("[Weekly Report] Mail result:", {
 // ---------- Cron: weekly KPI submission email ----------
 // let cronRunning = false;
 
-// cron.schedule("33 21 * * *", async () => {
+// cron.schedule("31 09 * * *", async () => {
 //   const lockId = "send_kpi_weekly_email_job";
 //   const lock = await acquireJobLock(lockId);
 //   if (!lock.acquired) return;
@@ -32104,8 +32949,16 @@ console.log("[Weekly Report] Mail result:", {
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
 
-// cron.schedule("20 22 * * *", async () => {
-//   await runWithJobLock("weekly_kpi_report_job", async () => {
+// cron.schedule("50 15 * * *", async () => {
+//   const lockId = "weekly_kpi_report_job";
+//   const lock = await acquireJobLock(lockId);
+
+//   if (!lock.acquired) {
+//     console.log("[Weekly Report] lock not acquired");
+//     return;
+//   }
+
+//   try {
 //     if (reportCronRunning) {
 //       console.log("[Weekly Report] already running");
 //       return;
@@ -32113,33 +32966,37 @@ console.log("[Weekly Report] Mail result:", {
 
 //     reportCronRunning = true;
 
-//     try {
-//       const reportWeek = getPreviousWeek(getCurrentWeek());
-//       console.log("[Weekly Report] week:", reportWeek);
+//     const reportWeek = getPreviousWeek(getCurrentWeek());
+//     console.log("[Weekly Report] week:", reportWeek);
 
-//       const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
-//       console.log("[Weekly Report] recipients:", recipients.length);
+//     const recipients = await loadWeeklyReportRecipientsForWeek(reportWeek);
+//     console.log("[Weekly Report] recipients:", recipients.length);
 
-//       for (const recipient of recipients) {
-//         try {
-//           console.log("[Weekly Report] sending to:", recipient.email || recipient.people_id);
+//     for (const recipient of recipients) {
+//       try {
+//         console.log("[Weekly Report] sending to:", recipient.email || recipient.people_id);
 
-//           await generateWeeklyReportEmail(recipient.people_id, reportWeek);
+//         await generateWeeklyReportEmail(recipient.people_id, reportWeek);
 
-//           await new Promise(resolve => setTimeout(resolve, 1500));
-//         } catch (err) {
-//           console.error(
-//             `[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`,
-//             err.message
-//           );
-//         }
+//         console.log("[Weekly Report] sent to:", recipient.email || recipient.people_id);
+
+//         await new Promise((resolve) => setTimeout(resolve, 1500));
+//       } catch (error) {
+//         console.error(
+//           `[Weekly Report] Failed for ${recipient.name || recipient.people_id}:`,
+//           error.message
+//         );
 //       }
-
-//       console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
-//     } finally {
-//       reportCronRunning = false;
 //     }
-//   });
+
+//     console.log(`[Weekly Report] Emails processed for ${recipients.length} people for ${reportWeek}`);
+//   } catch (err) {
+//     console.error("[Weekly Report] Scheduled error:", err.message);
+//   } finally {
+//     reportCronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//     console.log("[Weekly Report] lock released");
+//   }
 // }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ============================================================
@@ -33451,16 +34308,19 @@ const getDepartmentKPIReport = async (plantId, week) => {
   }
 };
 
-async function sendDepartmentKPIReportEmail(responsiblePeopleId, currentWeek, recipientOverride = null) {
+async function sendDepartmentKPIReportEmail(plantId, currentWeek, recipientOverride = null) {
   try {
-    const recipientEmail = recipientOverride?.recipientEmail;
-    const recipientName = recipientOverride?.recipientName;
     const reportWeek = currentWeek;
     const reportData = await getDepartmentKPIReport(plantId, reportWeek);
     if (!reportData || reportData.stats.totalKPIs === 0) return null;
     const deliveryRecipient =
+      normalizeOptionalTextInput(recipientOverride?.recipientEmail) ||
       normalizeOptionalTextInput(CEO_REPORT_RECIPIENT_EMAIL) ||
       normalizeOptionalTextInput(reportData.plant?.manager_email);
+
+    if (!deliveryRecipient) {
+      throw new Error(`No delivery recipient found for plant ${plantId}`);
+    }
 
     const emailHtml = generateManagerReportHtml({
       ...reportData,
@@ -33488,14 +34348,26 @@ async function sendDepartmentKPIReportEmail(responsiblePeopleId, currentWeek, re
 
     // â”€â”€ Send email with optional PDF attachment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const transporter = createTransporter();
-    await transporter.sendMail({
+    const info = await transporter.sendMail({
       from: '"AVOCarbon Plant Analytics" <administration.STS@avocarbon.com>',
-      to: recipientEmail,
+      to: deliveryRecipient,
       subject: `Weekly KPI Dashboard - ${reportData.plant.plant_name} - Week ${reportWeek.replace('2026-Week', '')}`,
       html: emailHtml,
-      attachments: pdfAttachment ? [pdfAttachment] : [],
+      attachments: pdfAttachment ? [{
+        ...pdfAttachment,
+        contentDisposition: "attachment"
+      }] : []
     });
 
+    console.log("[Plant KPI Report] Mail result:", {
+      plantId,
+      to: deliveryRecipient,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      response: info.response,
+      messageId: info.messageId,
+      hasPdf: Boolean(pdfAttachment)
+    });
     console.log(`KPI report${pdfAttachment ? ' + recommendations PDF' : ''} sent to ${deliveryRecipient}`);
     return {
       plant: reportData.plant,
@@ -33508,37 +34380,44 @@ async function sendDepartmentKPIReportEmail(responsiblePeopleId, currentWeek, re
   }
 };
 
-async function runHierarchyKpiReports(frequency) {
-  const now = new Date();
-  const year = now.getFullYear();
+async function runHierarchyKpiReports(frequency, options = {}) {
+  const normalizedFrequency = normalizeOptionalTextInput(frequency) || "Weekly";
+  const currentWeek =
+    normalizeOptionalTextInput(options.reportWeek) || getPreviousWeek(getCurrentWeek());
+  const targetResponsiblePeopleId = normalizeOptionalIntegerInput(options.responsiblePeopleId);
+  const responsiblesRes = targetResponsiblePeopleId
+    ? { rows: [{ responsible_people_id: targetResponsiblePeopleId }] }
+    : await pool.query(
+        `
+        SELECT DISTINCT
+          COALESCE(kta.created_by_people_id, kta.set_by_people_id) AS responsible_people_id
+        FROM public.kpi_target_allocation kta
+        JOIN public.kpi k
+          ON k.kpi_id = kta.kpi_id
+        WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) IS NOT NULL
+          AND LOWER(k.frequency) = LOWER($1)
+        `,
+        [normalizedFrequency]
+      );
 
-  const getWeekNumber = (date) => {
-    const d = new Date(date);
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-    const yearStart = new Date(d.getFullYear(), 0, 1);
-    return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-  };
-
-  const weekNumber = getWeekNumber(now);
-  const currentWeek = `${year}-Week${weekNumber}`;
-
-  const responsiblesRes = await pool.query(
-    `
-    SELECT DISTINCT
-      COALESCE(kta.created_by_people_id, kta.set_by_people_id) AS responsible_people_id
-    FROM public.kpi_target_allocation kta
-    JOIN public.kpi k
-      ON k.kpi_id = kta.kpi_id
-    WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) IS NOT NULL
-      AND LOWER(k.frequency) = LOWER($1)
-    `,
-    [frequency]
-  );
+  const responsibles = [];
 
   for (const row of responsiblesRes.rows) {
-    await sendKPIReportToHierarchy(row.responsible_people_id, currentWeek);
+    const responsiblePeopleId = normalizeOptionalIntegerInput(row.responsible_people_id);
+    if (!responsiblePeopleId) continue;
+    responsibles.push(await sendKPIReportToHierarchy(responsiblePeopleId, currentWeek));
   }
+
+  return {
+    frequency: normalizedFrequency,
+    week: currentWeek,
+    responsiblesProcessed: responsibles.length,
+    deliveriesAttempted: responsibles.reduce(
+      (sum, entry) => sum + (Array.isArray(entry?.managerResults) ? entry.managerResults.length : 0),
+      0
+    ),
+    responsibles
+  };
 }
 
 app.get("/ceo-report/plants/:plantId", async (req, res) => {
@@ -33624,28 +34503,100 @@ async function getPeopleHierarchy(peopleId) {
     `
     WITH RECURSIVE hierarchy AS (
       SELECT
-        p.people_id,
-        p.first_name,
-        p.name,
-        p.email,
-        p.direct_boss_people_id,
-        0 AS level
-      FROM public.people p
-      WHERE p.people_id = $1
+        seed.assignment_id,
+        seed.people_id,
+        seed.first_name,
+        seed.name,
+        seed.email,
+        seed.role_id,
+        seed.role_name,
+        seed.parent_role_id,
+        seed.unit_id,
+        seed.zone_id,
+        seed.market_id,
+        0 AS level,
+        ARRAY[seed.people_id::bigint] AS people_path
+      FROM (
+        SELECT
+          pra.assignment_id,
+          p.people_id,
+          p.first_name,
+          p.name,
+          p.email,
+          pra.role_id,
+          role.role_name,
+          role.parent_role_id,
+          pra.unit_id,
+          pra.zone_id,
+          pra.market_id
+        FROM public.people_role_assignment pra
+        JOIN public.role role
+          ON role.role_id = pra.role_id
+        JOIN public.people p
+          ON p.people_id = pra.people_id
+        WHERE pra.people_id = $1
+          AND COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+          AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+        ORDER BY
+          COALESCE(pra.is_primary, false) DESC,
+          pra.allocation_percentage DESC NULLS LAST,
+          pra.start_date DESC NULLS LAST,
+          pra.assignment_id DESC
+        LIMIT 1
+      ) seed
 
       UNION ALL
 
       SELECT
-        boss.people_id,
-        boss.first_name,
-        boss.name,
-        boss.email,
-        boss.direct_boss_people_id,
-        h.level + 1
-      FROM public.people boss
-      JOIN hierarchy h
-        ON boss.people_id = h.direct_boss_people_id
+        manager_assignment.assignment_id,
+        manager.people_id,
+        manager.first_name,
+        manager.name,
+        manager.email,
+        manager_assignment.role_id,
+        manager_role.role_name,
+        manager_role.parent_role_id,
+        manager_assignment.unit_id,
+        manager_assignment.zone_id,
+        manager_assignment.market_id,
+        h.level + 1,
+        h.people_path || manager.people_id::bigint
+      FROM hierarchy h
+      JOIN LATERAL (
+        SELECT pra.*
+        FROM public.people_role_assignment pra
+        WHERE pra.role_id = h.parent_role_id
+          AND COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+          AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+          AND NOT (pra.people_id = ANY(h.people_path))
+        ORDER BY
+          CASE
+            WHEN h.zone_id IS NOT NULL AND pra.zone_id = h.zone_id THEN 0
+            WHEN h.zone_id IS NOT NULL AND pra.zone_id IS NULL THEN 1
+            ELSE 2
+          END,
+          CASE
+            WHEN h.unit_id IS NOT NULL AND pra.unit_id = h.unit_id THEN 0
+            WHEN h.unit_id IS NOT NULL AND pra.unit_id IS NULL THEN 1
+            ELSE 2
+          END,
+          CASE
+            WHEN h.market_id IS NOT NULL AND pra.market_id = h.market_id THEN 0
+            WHEN h.market_id IS NOT NULL AND pra.market_id IS NULL THEN 1
+            ELSE 2
+          END,
+          CASE WHEN COALESCE(pra.is_primary, false) THEN 0 ELSE 1 END,
+          pra.allocation_percentage DESC NULLS LAST,
+          pra.start_date DESC NULLS LAST,
+          pra.assignment_id DESC
+        LIMIT 1
+      ) manager_assignment ON TRUE
+      JOIN public.role manager_role
+        ON manager_role.role_id = manager_assignment.role_id
+      JOIN public.people manager
+        ON manager.people_id = manager_assignment.people_id
       WHERE h.level < 20
+        AND h.parent_role_id IS NOT NULL
     )
     SELECT *
     FROM hierarchy
@@ -33659,33 +34610,124 @@ async function getPeopleHierarchy(peopleId) {
 async function sendKPIReportToHierarchy(responsiblePeopleId, currentWeek) {
   const hierarchy = await getPeopleHierarchy(responsiblePeopleId);
 
-  if (!hierarchy.length) return;
+  if (!hierarchy.length) {
+    return {
+      responsiblePeopleId: normalizeOptionalIntegerInput(responsiblePeopleId),
+      responsibleName: "",
+      managerResults: [],
+      skippedReason: "No active hierarchy assignment found"
+    };
+  }
 
   const responsible = hierarchy[0];
   const managers = hierarchy.slice(1).filter(manager => manager.email);
+  const responsibleName =
+    getPeopleDisplayName(responsible) || String(responsible.people_id || responsiblePeopleId);
+  const managerResults = [];
+
+  if (!managers.length) {
+    return {
+      responsiblePeopleId: normalizeOptionalIntegerInput(responsiblePeopleId),
+      responsibleName,
+      managerResults,
+      skippedReason: "No managers with email found in the role hierarchy"
+    };
+  }
 
   for (const manager of managers) {
-    await sendDepartmentKPIReportEmail(
-      responsiblePeopleId,
-      currentWeek,
-      {
-        recipientEmail: manager.email,
-        recipientPeopleId: manager.people_id,
-        recipientName: `${manager.first_name || ""} ${manager.name || ""}`.trim()
-      }
-    );
+    const managerName =
+      getPeopleDisplayName(manager) || `${manager.first_name || ""} ${manager.name || ""}`.trim();
+    try {
+      await generateWeeklyReportEmail(
+        responsiblePeopleId,
+        currentWeek,
+        {
+          recipientEmail: manager.email,
+          recipientPeopleId: manager.people_id,
+          recipientName: managerName,
+          recipientRoleName: normalizeOptionalTextInput(manager.role_name) || "Manager"
+        }
+      );
 
-    console.log(
-      `Report for ${responsible.first_name || ""} ${responsible.name || ""} sent to ${manager.email}`
-    );
+      console.log(
+        `[Hierarchy Report] Report for ${responsibleName} sent to ${manager.email}${manager.role_name ? ` (${manager.role_name})` : ""}`
+      );
+
+      managerResults.push({
+        peopleId: normalizeOptionalIntegerInput(manager.people_id),
+        name: managerName,
+        email: manager.email,
+        roleName: normalizeOptionalTextInput(manager.role_name) || "",
+        status: "sent"
+      });
+    } catch (error) {
+      console.error(
+        `[Hierarchy Report] Failed for ${responsibleName} -> ${manager.email}:`,
+        error.message
+      );
+      managerResults.push({
+        peopleId: normalizeOptionalIntegerInput(manager.people_id),
+        name: managerName,
+        email: manager.email,
+        roleName: normalizeOptionalTextInput(manager.role_name) || "",
+        status: "failed",
+        error: error.message
+      });
+    }
 
     await new Promise(resolve => setTimeout(resolve, 1500));
   }
+
+  return {
+    responsiblePeopleId: normalizeOptionalIntegerInput(responsiblePeopleId),
+    responsibleName,
+    managerResults
+  };
 }
+
+const triggerHierarchyReportNow = async (req, res) => {
+  if (managerCronRunning) {
+    return res.status(409).json({ error: "Hierarchy report job is already running." });
+  }
+
+  const frequency = normalizeOptionalTextInput(req.body?.frequency ?? req.query?.frequency) || "Weekly";
+  const reportWeek =
+    normalizeOptionalTextInput(req.body?.week ?? req.query?.week) ||
+    getPreviousWeek(getCurrentWeek());
+  const responsiblePeopleId = normalizeOptionalIntegerInput(
+    req.body?.responsible_people_id ??
+    req.body?.responsibleId ??
+    req.query?.responsible_people_id ??
+    req.query?.responsibleId
+  );
+
+  managerCronRunning = true;
+
+  try {
+    const result = await runHierarchyKpiReports(frequency, {
+      reportWeek,
+      responsiblePeopleId
+    });
+
+    return res.json({
+      success: true,
+      ...result
+    });
+  } catch (error) {
+    console.error("[Hierarchy Report] Manual trigger error:", error.message);
+    return res.status(500).json({ error: error.message || "Failed to trigger hierarchy report." });
+  } finally {
+    managerCronRunning = false;
+  }
+};
+
+app.get("/api/hierarchy-report/send", triggerHierarchyReportNow);
+app.post("/api/hierarchy-report/send", triggerHierarchyReportNow);
+
 // ---------- Cron: weekly manager/plant report ----------
 // let managerCronRunning = false;
 
-// cron.schedule("07 11 * * 1", async () => {
+// cron.schedule("56 16 * * *", async () => {
 //   if (managerCronRunning) return;
 //   managerCronRunning = true;
 
