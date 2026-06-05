@@ -19436,6 +19436,42 @@ const normalizeMetricNumberByUnit = (value, unit) => {
   return Math.abs(parsed) < 1 ? Number((parsed * 100).toFixed(4)) : parsed;
 };
 
+const isRelativeToleranceTypeValue = (value) =>
+  String(value ?? "").trim().toLowerCase() === "relative";
+
+const parseToleranceDeltaValue = (value, toleranceType, direction = "up") => {
+  if (value === null || value === undefined || value === "" || value === "None") {
+    return null;
+  }
+
+  const text = String(value).trim();
+  if (!text) return null;
+
+  const hasPercent = text.includes("%");
+  const numeric = parseMetricNumber(text.replace(/%/g, ""));
+  if (!Number.isFinite(numeric)) return null;
+
+  let delta = numeric;
+  if (isRelativeToleranceTypeValue(toleranceType)) {
+    delta = hasPercent || Math.abs(delta) > 1 ? delta / 100 : delta;
+  }
+
+  if (direction === "up") {
+    return Math.abs(delta);
+  }
+
+  return delta > 0 ? -delta : delta;
+};
+
+const applyToleranceToTargetValue = (targetValue, toleranceDelta, toleranceType) => {
+  if (!Number.isFinite(targetValue)) return null;
+  if (!Number.isFinite(toleranceDelta)) return targetValue;
+  if (isRelativeToleranceTypeValue(toleranceType)) {
+    return targetValue * (1 + toleranceDelta);
+  }
+  return targetValue + toleranceDelta;
+};
+
 const normalizeKpiDirection = (value) => {
   const text = String(value ?? '').trim().toLowerCase();
   if (!text) return null;
@@ -19739,6 +19775,51 @@ const needsCorrectiveAction = (value, lowLimit, highLimit, direction = 'up') =>
 
 const getDotColor = (value, lowLimit, highLimit, direction = 'up') =>
   getKpiStatus(value, lowLimit, highLimit, direction).color;
+
+const getDashboardSubmissionStatus = (kpi) => {
+  const currentValue = parseMetricNumber(kpi?.value);
+  const targetValue = parseMetricNumber(kpi?.target);
+
+  if (currentValue === null) {
+    return {
+      color: "#6c757d",
+      isGood: null,
+      minimumTargetValue: null,
+      targetValue,
+      mode: "pending"
+    };
+  }
+
+  if (targetValue !== null) {
+    const minimumTargetValue = applyToleranceToTargetValue(
+      targetValue,
+      parseToleranceDeltaValue(kpi?.low_tolerance, kpi?.tolerance_type, "low"),
+      kpi?.tolerance_type
+    );
+
+    return {
+      color: currentValue < minimumTargetValue ? "#dc3545" : "#28a745",
+      isGood: currentValue >= minimumTargetValue,
+      minimumTargetValue,
+      targetValue,
+      mode: "target"
+    };
+  }
+
+  const fallbackStatus = getKpiStatus(
+    currentValue,
+    parseMetricNumber(kpi?.low_limit),
+    parseMetricNumber(kpi?.high_limit),
+    inferKpiDirection(kpi)
+  );
+
+  return {
+    ...fallbackStatus,
+    minimumTargetValue: null,
+    targetValue: null,
+    mode: "limit"
+  };
+};
 
 // ---------- IMPROVED Job Lock Helper with PostgreSQL Advisory Locks ----------
 const acquireJobLock = async (lockId, ttlMinutes = 9) => {
@@ -30794,9 +30875,7 @@ app.get("/dashboard", async (req, res) => {
 
       items.forEach((kpi) => {
         const currentValue = normalizeMetricNumberByUnit(kpi.value, kpi.unit);
-        const lowLimit = normalizeMetricNumberByUnit(kpi.low_limit, kpi.unit);
-        const highLimit = normalizeMetricNumberByUnit(kpi.high_limit, kpi.unit);
-        const statusInfo = getKpiStatus(currentValue, lowLimit, highLimit, inferKpiDirection(kpi));
+        const statusInfo = getDashboardSubmissionStatus(kpi);
 
         if (currentValue === null) missingCount += 1;
         else if (statusInfo.isGood === false) alertCount += 1;
@@ -31383,7 +31462,7 @@ app.get("/dashboard", async (req, res) => {
           const targetValue = normalizeMetricNumberByUnit(kpi.target, kpi.unit);
           const lowLimit = normalizeMetricNumberByUnit(kpi.low_limit, kpi.unit);
           const highLimit = normalizeMetricNumberByUnit(kpi.high_limit, kpi.unit);
-          const statusInfo = getKpiStatus(currentValue, lowLimit, highLimit, inferKpiDirection(kpi));
+          const statusInfo = getDashboardSubmissionStatus(kpi);
           const hasValue = currentValue !== null;
           const statusLabel = !hasValue
             ? "Pending update"
