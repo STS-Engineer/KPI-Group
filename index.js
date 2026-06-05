@@ -33128,66 +33128,38 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-let cronRunning = false;
+// let cronRunning = false;
 
-cron.schedule(
-  "31 12 * * *",
-  async () => {
-    const lockId = "send_kpi_weekly_email_job";
-    const lock = await acquireJobLock(lockId);
+// cron.schedule("30 11 * * *", async () => {
+//   const lockId = "send_kpi_weekly_email_job";
+//   const lock = await acquireJobLock(lockId);
+//   if (!lock.acquired) return;
 
-    if (!lock.acquired) return;
+//   try {
+//     if (cronRunning) return;
+//     cronRunning = true;
 
-    try {
-      if (cronRunning) return;
-      cronRunning = true;
+//     const currentWeek = getCurrentFormWeek();
 
-      const currentWeek = getCurrentFormWeek();
+//     const recipients = await loadKpiSubmissionEmailRecipients();
 
-      // Load all recipients
-      const recipients = await loadKpiSubmissionEmailRecipients();
+//     for (const recipient of recipients) {
+//       try {
+//         await sendKPIEmail(recipient.people_id, currentWeek);
+//         await new Promise((resolve) => setTimeout(resolve, 750));
+//       } catch (error) {
+//         console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
+//       }
+//     }
 
-      // ONLY send to Mohamed Naili
-      const filteredRecipients = recipients.filter(
-        (recipient) =>
-          (recipient.email || "").toLowerCase() ===
-          "mohamed.naili@avocarbon.com"
-      );
-
-      for (const recipient of filteredRecipients) {
-        try {
-          await sendKPIEmail(recipient.people_id, currentWeek);
-
-          await new Promise((resolve) => setTimeout(resolve, 750));
-
-          console.log(
-            `[KPI Reminder] Sent to ${recipient.email} (${recipient.people_id})`
-          );
-        } catch (error) {
-          console.error(
-            `[KPI Reminder] Failed for ${
-              recipient.name || recipient.people_id
-            }:`,
-            error.message
-          );
-        }
-      }
-
-      console.log(
-        `[KPI Reminder] Emails processed for ${filteredRecipients.length} recipient(s) for ${currentWeek}`
-      );
-    } catch (err) {
-      console.error("Scheduled email error:", err.message);
-    } finally {
-      cronRunning = false;
-      await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-    }
-  },
-  {
-    scheduled: true,
-    timezone: "Africa/Tunis",
-  }
-);
+//     console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
+//   } catch (err) {
+//     console.error("Scheduled email error:", err.message);
+//   } finally {
+//     cronRunning = false;
+//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
