@@ -35007,7 +35007,7 @@ const triggerHierarchyReportNow = async (req, res) => {
       success: true,
       ...result
     });
-  } catch (error) {
+  } catch (error) {   
     console.error("[Hierarchy Report] Manual trigger error:", error.message);
     return res.status(500).json({ error: error.message || "Failed to trigger hierarchy report." });
   } finally {
