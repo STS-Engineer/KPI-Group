@@ -1,0 +1,1474 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KPI Training Control Tower | AVOCarbon</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #f4f7fb;
+            --bg-soft: #eef4fb;
+            --surface: rgba(255, 255, 255, .86);
+            --surface-solid: #ffffff;
+            --card: #ffffff;
+            --card2: #f8fafc;
+            --border: #e2e8f0;
+            --border-soft: rgba(148, 163, 184, .22);
+            --blue: #2563eb;
+            --blue-light: #3b82f6;
+            --green: #059669;
+            --green-light: #10b981;
+            --amber: #d97706;
+            --amber-light: #f59e0b;
+            --red: #dc2626;
+            --red-light: #ef4444;
+            --purple: #7c3aed;
+            --ink: #0f172a;
+            --text: #111827;
+            --text-muted: #64748b;
+            --text-dim: #94a3b8;
+            --shadow-sm: 0 8px 22px rgba(15, 23, 42, .06);
+            --shadow-md: 0 18px 48px rgba(15, 23, 42, .10);
+            --shadow-lg: 0 28px 80px rgba(30, 64, 175, .14);
+            --radius: 22px;
+            --radius-sm: 12px;
+            --radius-xs: 9px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            color: var(--text);
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top left, rgba(59, 130, 246, .16), transparent 34%),
+                radial-gradient(circle at top right, rgba(16, 185, 129, .10), transparent 30%),
+                linear-gradient(180deg, #f8fbff 0%, var(--bg) 42%, #eef3f9 100%);
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image: linear-gradient(rgba(148, 163, 184, .10) 1px, transparent 1px), linear-gradient(90deg, rgba(148, 163, 184, .10) 1px, transparent 1px);
+            background-size: 44px 44px;
+            mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .45), transparent 58%);
+        }
+
+        /* Executive top navigation */
+        .topnav {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 34px;
+            height: 72px;
+            background: var(--surface);
+            border-bottom: 1px solid rgba(226, 232, 240, .85);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(18px) saturate(160%);
+            box-shadow: 0 10px 30px rgba(15, 23, 42, .05);
+        }
+
+        .topnav .brand {
+            display: flex;
+            align-items: center;
+            gap: 13px;
+            font-weight: 800;
+            font-size: 17px;
+            letter-spacing: -.25px;
+            color: var(--ink);
+        }
+
+        .topnav .brand .icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 50%, #14b8a6 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 19px;
+            color: #fff;
+            box-shadow: 0 14px 30px rgba(37, 99, 235, .25);
+        }
+
+        .topnav .actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 18px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            border: 0;
+            transition: transform .18s ease, box-shadow .18s ease, background .18s ease, color .18s ease;
+        }
+
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-ghost {
+            background: #fff;
+            color: #475569;
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .btn-ghost:hover {
+            color: var(--blue);
+            border-color: rgba(37, 99, 235, .28);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #1d4ed8, #2563eb);
+            color: #fff;
+            box-shadow: 0 16px 34px rgba(37, 99, 235, .25);
+        }
+
+        .btn-primary:hover {
+            box-shadow: 0 20px 42px rgba(37, 99, 235, .32);
+        }
+
+        .main {
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 34px 34px 64px;
+            position: relative;
+        }
+
+        .page-header {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            margin-bottom: 26px;
+            gap: 16px;
+            flex-wrap: wrap;
+            padding: 28px;
+            border-radius: 28px;
+            background: linear-gradient(135deg, rgba(255, 255, 255, .95), rgba(239, 246, 255, .88));
+            border: 1px solid rgba(226, 232, 240, .9);
+            box-shadow: var(--shadow-lg);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .page-header::after {
+            content: '';
+            position: absolute;
+            right: -80px;
+            top: -90px;
+            width: 260px;
+            height: 260px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(37, 99, 235, .16), transparent 68%);
+        }
+
+        .page-header h1 {
+            font-size: clamp(28px, 3vw, 42px);
+            line-height: 1.05;
+            font-weight: 850;
+            letter-spacing: -1.2px;
+            color: var(--ink);
+        }
+
+        .page-header p {
+            font-size: 15px;
+            color: var(--text-muted);
+            margin-top: 10px;
+            max-width: 680px;
+            line-height: 1.55;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 22px;
+            padding: 14px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, .80);
+            border: 1px solid rgba(226, 232, 240, .85);
+            box-shadow: var(--shadow-sm);
+            backdrop-filter: blur(14px);
+        }
+
+        .search-wrap {
+            position: relative;
+            flex: 1;
+            min-width: 260px;
+            max-width: 430px;
+        }
+
+        .search-wrap input,
+        select.filter {
+            height: 44px;
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text);
+            font-size: 13px;
+            outline: none;
+            transition: border .2s, box-shadow .2s, transform .2s;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, .035);
+        }
+
+        .search-wrap input {
+            width: 100%;
+            padding: 0 16px 0 42px;
+        }
+
+        select.filter {
+            padding: 0 36px 0 15px;
+            cursor: pointer;
+        }
+
+        .search-wrap input:focus,
+        select.filter:focus {
+            border-color: rgba(37, 99, 235, .48);
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, .10);
+        }
+
+        .search-wrap .ico {
+            position: absolute;
+            left: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #94a3b8;
+            pointer-events: none;
+            font-size: 15px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 18px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, .94);
+            border: 1px solid rgba(226, 232, 240, .9);
+            border-radius: var(--radius);
+            padding: 22px 22px 20px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+            transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-md);
+            border-color: rgba(37, 99, 235, .20);
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 4px;
+        }
+
+        .stat-card::after {
+            content: '';
+            position: absolute;
+            right: -38px;
+            top: -44px;
+            width: 130px;
+            height: 130px;
+            border-radius: 50%;
+            opacity: .13;
+        }
+
+        .stat-card.blue::before,
+        .stat-card.blue::after {
+            background: linear-gradient(90deg, #2563eb, #60a5fa);
+        }
+
+        .stat-card.green::before,
+        .stat-card.green::after {
+            background: linear-gradient(90deg, #059669, #34d399);
+        }
+
+        .stat-card.amber::before,
+        .stat-card.amber::after {
+            background: linear-gradient(90deg, #d97706, #fbbf24);
+        }
+
+        .stat-card.red::before,
+        .stat-card.red::after {
+            background: linear-gradient(90deg, #dc2626, #f87171);
+        }
+
+        .stat-card.purple::before,
+        .stat-card.purple::after {
+            background: linear-gradient(90deg, #7c3aed, #a78bfa);
+        }
+
+        .stat-label {
+            font-size: 11px;
+            font-weight: 800;
+            color: var(--text-muted);
+            letter-spacing: .75px;
+            text-transform: uppercase;
+        }
+
+        .stat-value {
+            font-size: 38px;
+            line-height: 1;
+            font-weight: 850;
+            margin: 11px 0 8px;
+            letter-spacing: -1.3px;
+            color: var(--ink);
+        }
+
+        .stat-card.blue .stat-value {
+            color: var(--blue);
+        }
+
+        .stat-card.green .stat-value {
+            color: var(--green);
+        }
+
+        .stat-card.amber .stat-value {
+            color: var(--amber);
+        }
+
+        .stat-card.red .stat-value {
+            color: var(--red);
+        }
+
+        .stat-card.purple .stat-value {
+            color: var(--purple);
+        }
+
+        .stat-sub {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .stat-icon {
+            position: absolute;
+            right: 18px;
+            bottom: 17px;
+            font-size: 34px;
+            opacity: .18;
+            filter: grayscale(.15);
+        }
+
+        .charts-row {
+            display: grid;
+            grid-template-columns: 1fr 1.55fr 1fr;
+            gap: 18px;
+            margin-bottom: 24px;
+        }
+
+        @media(max-width:1100px) {
+            .charts-row {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        @media(max-width:700px) {
+            .charts-row {
+                grid-template-columns: 1fr;
+            }
+
+            .topnav {
+                padding: 0 18px
+            }
+
+            .main {
+                padding: 22px 16px 44px
+            }
+
+            .topnav .actions {
+                gap: 6px
+            }
+
+            .btn {
+                padding: 9px 12px
+            }
+
+            .page-header {
+                padding: 22px
+            }
+        }
+
+        .chart-card,
+        .table-card {
+            background: rgba(255, 255, 255, .95);
+            border: 1px solid rgba(226, 232, 240, .9);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+            overflow: hidden;
+        }
+
+        .chart-card {
+            padding: 22px;
+        }
+
+        .chart-title {
+            font-size: 12px;
+            font-weight: 850;
+            color: #334155;
+            letter-spacing: .65px;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .chart-title::after {
+            content: '';
+            height: 1px;
+            flex: 1;
+            margin-left: 14px;
+            background: linear-gradient(90deg, rgba(148, 163, 184, .35), transparent);
+        }
+
+        .chart-wrap {
+            position: relative;
+            height: 220px;
+        }
+
+        .table-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(180deg, #fff, #f8fafc);
+        }
+
+        .table-header h3 {
+            font-size: 16px;
+            font-weight: 850;
+            color: var(--ink);
+        }
+
+        .table-header span {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-left: 8px;
+        }
+
+        .tbl-wrap {
+            overflow-x: hidden;
+            width: 100%;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            border-spacing: 0;
+            table-layout: fixed;
+        }
+
+        thead th,
+        tbody td {
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+        }
+
+        table th:nth-child(1),
+        table td:nth-child(1) {
+            width: 19%;
+        }
+
+        table th:nth-child(2),
+        table td:nth-child(2) {
+            width: 25%;
+        }
+
+        table th:nth-child(3),
+        table td:nth-child(3) {
+            width: 17%;
+        }
+
+        table th:nth-child(4),
+        table td:nth-child(4) {
+            width: 12%;
+        }
+
+        table th:nth-child(5),
+        table td:nth-child(5) {
+            width: 10%;
+        }
+
+        table th:nth-child(6),
+        table td:nth-child(6) {
+            width: 8%;
+        }
+
+        table th:nth-child(7),
+        table td:nth-child(7) {
+            width: 5%;
+        }
+
+        table th:nth-child(8),
+        table td:nth-child(8) {
+            width: 4%;
+        }
+
+        thead th {
+            position: relative;
+            z-index: 1;
+            padding: 14px 12px;
+            font-size: 11px;
+            font-weight: 850;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: .75px;
+            background: #f8fafc;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            white-space: normal;
+        }
+
+        tbody tr {
+            height: auto !important;
+            transition: background .15s, transform .15s;
+        }
+
+        tbody tr:not(:last-child) td {
+            border-bottom: 1px solid #eef2f7;
+        }
+
+        tbody tr:hover td {
+            background: #f8fbff;
+        }
+
+        tbody td {
+            padding: 18px 12px;
+            font-size: 12px;
+            vertical-align: top;
+            color: #334155;
+            line-height: 1.45;
+            white-space: normal;
+            background: #ffffff;
+        }
+
+        .resp-cell {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            min-width: 0;
+        }
+
+        .avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #2563eb, #14b8a6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 12px;
+            flex-shrink: 0;
+            color: #fff;
+            box-shadow: 0 10px 20px rgba(37, 99, 235, .20);
+        }
+
+        .resp-name {
+            font-weight: 800;
+            font-size: 13px;
+            color: var(--ink);
+            line-height: 1.35;
+        }
+
+        .resp-role {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 3px;
+            line-height: 1.4;
+        }
+
+        .kpi-cell {
+            min-width: 0;
+            max-width: 100%;
+            font-weight: 700;
+            color: var(--ink);
+            word-break: break-word;
+            line-height: 1.5;
+        }
+
+        .training-cell {
+            min-width: 0;
+            max-width: 100%;
+            font-weight: 700;
+            color: #334155;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 850;
+            white-space: nowrap;
+            border: 1px solid transparent;
+        }
+
+        .badge .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            box-shadow: 0 0 0 3px currentColor;
+            opacity: .75;
+        }
+
+        .badge.training_sent {
+            background: #eff6ff;
+            color: #2563eb;
+            border-color: #bfdbfe;
+        }
+
+        .badge.training_done {
+            background: #ecfdf5;
+            color: #059669;
+            border-color: #bbf7d0;
+        }
+
+        .badge.test_sent {
+            background: #f5f3ff;
+            color: #7c3aed;
+            border-color: #ddd6fe;
+        }
+
+        .badge.test_overdue {
+            background: #fffbeb;
+            color: #b45309;
+            border-color: #fde68a;
+        }
+
+        .badge.completed_pass {
+            background: #ecfdf5;
+            color: #047857;
+            border-color: #a7f3d0;
+        }
+
+        .badge.completed_fail {
+            background: #fef2f2;
+            color: #dc2626;
+            border-color: #fecaca;
+        }
+
+        .badge.escalated {
+            background: #fff1f2;
+            color: #be123c;
+            border-color: #fecdd3;
+        }
+
+        .badge.training_sent .dot,
+        .badge.training_done .dot,
+        .badge.test_sent .dot,
+        .badge.test_overdue .dot,
+        .badge.completed_pass .dot,
+        .badge.completed_fail .dot,
+        .badge.escalated .dot {
+            background: currentColor;
+        }
+
+
+        table th:nth-child(7),
+        table td:nth-child(7) {
+            width: 120px;
+            min-width: 120px;
+            text-align: center;
+        }
+
+        table th:nth-child(8),
+        table td:nth-child(8) {
+            width: 140px;
+            min-width: 140px;
+            text-align: center;
+        }
+
+        .score-wrap {
+            min-width: 0;
+            width: 100%;
+            max-width: 120px;
+        }
+
+        .score-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 7px;
+        }
+
+        .score-num {
+            font-weight: 850;
+            font-size: 13px;
+        }
+
+        .score-pass {
+            font-size: 10px;
+            font-weight: 850;
+            padding: 3px 7px;
+            border-radius: 999px;
+        }
+
+        .score-pass.na {
+            background: #dbeafe;
+            color: #1d4ed8;
+            font-weight: 700;
+        }
+
+        .score-pass.pass {
+            background: #dcfce7;
+            color: #047857;
+        }
+
+        .score-pass.fail {
+            background: #fee2e2;
+            color: #b91c1c;
+        }
+
+        .score-pass.na {
+            background: #dbeafe;
+            color: #1d4ed8;
+        }
+
+        .score-bar-bg {
+            height: 7px;
+            background: #e5e7eb;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .score-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            transition: width .6s ease;
+        }
+
+        .fill-green {
+            background: linear-gradient(90deg, #059669, #34d399);
+        }
+
+        .fill-amber {
+            background: linear-gradient(90deg, #d97706, #fbbf24);
+        }
+
+        .fill-red {
+            background: linear-gradient(90deg, #dc2626, #fb7185);
+        }
+
+        .fill-gray {
+            background: #cbd5e1;
+        }
+
+        .esc-badge {
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 9px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 850;
+            border: 1px solid transparent;
+        }
+
+        .esc-0 {
+            background: #f1f5f9;
+            color: #64748b;
+            border-color: #e2e8f0;
+        }
+
+        .esc-1 {
+            background: #fffbeb;
+            color: #b45309;
+            border-color: #fde68a;
+        }
+
+        .esc-2 {
+            background: #fef2f2;
+            color: #b91c1c;
+            border-color: #fecaca;
+        }
+
+        .empty {
+            padding: 64px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 15px;
+        }
+
+        .pagination {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 6px;
+            padding: 16px 20px;
+            border-top: 1px solid var(--border);
+            background: #fff;
+        }
+
+        .page-btn {
+            min-width: 34px;
+            height: 34px;
+            padding: 0 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: #fff;
+            color: #64748b;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 800;
+            transition: all .15s;
+        }
+
+        .page-btn:hover,
+        .page-btn.active {
+            background: var(--blue);
+            color: #fff;
+            border-color: var(--blue);
+            box-shadow: 0 10px 20px rgba(37, 99, 235, .20);
+        }
+
+        .page-btn:disabled {
+            opacity: .45;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        .page-info {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-right: 8px;
+        }
+
+        .loader {
+            width: 42px;
+            height: 42px;
+            border: 3px solid #dbeafe;
+            border-top-color: var(--blue);
+            border-radius: 50%;
+            animation: spin .8s linear infinite;
+            margin: 42px auto;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .fade-in {
+            animation: fadeIn .45s ease forwards;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .due-date {
+            white-space: nowrap;
+            font-size: 12px;
+            font-weight: 750;
+        }
+
+        .due-date.overdue {
+            color: #dc2626;
+        }
+
+        .due-date.soon {
+            color: #b45309;
+        }
+
+        .due-date.ok {
+            color: #64748b;
+        }
+
+        .due-date.none {
+            color: #94a3b8;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- ── Top Navigation ── -->
+    <nav class="topnav">
+        <div class="brand">
+            <div class="icon">🎓</div>
+            KPI Training Control Tower
+        </div>
+        <div class="actions">
+            <span id="last-refresh" style="font-size:12px;color:var(--text-dim);"></span>
+            <button class="btn btn-ghost" onclick="loadDashboard()">↻ Refresh</button>
+            <button class="btn btn-primary" onclick="exportCsv()">⬇ Export CSV</button>
+        </div>
+    </nav>
+
+    <!-- ── Main ── -->
+    <div class="main">
+
+        <!-- Page Header -->
+        <div class="page-header">
+            <div>
+                <h1>Executive KPI Training Dashboard</h1>
+                <p>CEO-ready view of training completion, KPI readiness, testing performance, and escalation risk across
+                    trucking operations</p>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="controls">
+            <div class="search-wrap">
+                <span class="ico">🔍</span>
+                <input type="text" id="search" placeholder="Search responsible, KPI, training…"
+                    oninput="applyFilters()" />
+            </div>
+            <select class="filter" id="filterStatus" onchange="applyFilters()">
+                <option value="">All Statuses</option>
+                <option value="training_sent">Training Sent</option>
+                <option value="training_done">Training Done</option>
+                <option value="test_sent">Test Sent</option>
+                <option value="test_overdue">Test Overdue</option>
+                <option value="completed_pass">Completed – Pass</option>
+                <option value="completed_fail">Completed – Fail</option>
+                <option value="escalated">Escalated</option>
+            </select>
+            <select class="filter" id="filterPass" onchange="applyFilters()">
+                <option value="">All Results</option>
+                <option value="pass">Passed</option>
+                <option value="fail">Failed</option>
+                <option value="pending">Not Tested</option>
+            </select>
+            <select class="filter" id="filterEsc" onchange="applyFilters()">
+                <option value="">All Escalation Levels</option>
+                <option value="0">Level 0 – None</option>
+                <option value="1">Level 1 – Warning</option>
+                <option value="2">Level 2 – Critical</option>
+            </select>
+        </div>
+
+        <!-- Stat Cards -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card blue">
+                <div class="stat-label">Total Assigned</div>
+                <div class="stat-value" id="s-total">—</div>
+                <div class="stat-sub">training records</div>
+                <div class="stat-icon">📋</div>
+            </div>
+            <div class="stat-card green">
+                <div class="stat-label">Pass Rate</div>
+                <div class="stat-value" id="s-passrate">—</div>
+                <div class="stat-sub" id="s-passrate-sub">of completed tests</div>
+                <div class="stat-icon">✅</div>
+            </div>
+            <div class="stat-card amber">
+                <div class="stat-label">Avg Score</div>
+                <div class="stat-value" id="s-avgscore">—</div>
+                <div class="stat-sub">on completed tests</div>
+                <div class="stat-icon">🎯</div>
+            </div>
+            <div class="stat-card red">
+                <div class="stat-label">Overdue / Escalated</div>
+                <div class="stat-value" id="s-overdue">—</div>
+                <div class="stat-sub">need attention</div>
+                <div class="stat-icon">⚠️</div>
+            </div>
+            <div class="stat-card purple">
+                <div class="stat-label">Pending Training</div>
+                <div class="stat-value" id="s-pending">—</div>
+                <div class="stat-sub">not yet completed</div>
+                <div class="stat-icon">⏳</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-row">
+            <div class="chart-card">
+                <div class="chart-title">Status Distribution</div>
+                <div class="chart-wrap"><canvas id="chartStatus"></canvas></div>
+            </div>
+            <div class="chart-card">
+                <div class="chart-title">Score Distribution</div>
+                <div class="chart-wrap"><canvas id="chartScores"></canvas></div>
+            </div>
+            <div class="chart-card">
+                <div class="chart-title">Completion Over Time</div>
+                <div class="chart-wrap"><canvas id="chartCompletion"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Data Table -->
+        <div class="table-card fade-in">
+            <div class="table-header">
+                <div>
+                    <h3>Training Records <span id="rowCountLabel"></span></h3>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);">Showing <span id="showingLabel">—</span></div>
+            </div>
+            <div class="tbl-wrap">
+                <table id="mainTable">
+                    <thead>
+                        <tr>
+                            <th>Responsible</th>
+                            <th>KPI Subject</th>
+                            <th>Training</th>
+                            <th>Status</th>
+                            <th>Score</th>
+                            <th>Due Date</th>
+                            <th>Escalation</th>
+                            <th>Completed</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                        <tr>
+                            <td colspan="8">
+                                <div class="loader"></div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pagination" id="paginationBar"></div>
+        </div>
+
+    </div><!-- /main -->
+
+    <script>
+        // ═══════════════════════════════════════════════════════════════
+        // Config
+        // ═══════════════════════════════════════════════════════════════
+        const API_BASE = window.location.origin;
+        const PAGE_SIZE = 15;
+        let allRows = [], filteredRows = [], currentPage = 1;
+        let chartStatus, chartScores, chartCompletion;
+
+        // ═══════════════════════════════════════════════════════════════
+        // Fetch training results from backend
+        // ═══════════════════════════════════════════════════════════════
+        async function fetchTrainingResults() {
+            try {
+                const res = await fetch(`${API_BASE}/api/kpi-training/results`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return await res.json();
+            } catch {
+                // Fallback to rich demo data if API not yet available
+                return getDemoData();
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Demo data (mirrors the schema)
+        // ═══════════════════════════════════════════════════════════════
+        function getDemoData() {
+            const statuses = ['training_sent', 'training_done', 'test_sent', 'test_overdue', 'completed_pass', 'completed_fail', 'escalated'];
+            const responsibles = [
+                { name: 'Taha Khiari', role: 'Sales Director', kpi: 'Number of customer visits', training: 'Customer Visit SOP', colors: '3b82f6,8b5cf6' },
+                { name: 'Matthieu Simonnet', role: 'VP Finance', kpi: 'Cash available in Luxembourg', training: 'Finance KPI Fundamentals', colors: '10b981,3b82f6' },
+
+                { name: 'Claire Durant', role: 'VP Operations', kpi: 'OEE Production', training: 'OEE Calculation Guide', colors: '8b5cf6,10b981' },
+                { name: 'Ahmed Majid', role: 'Quality Manager', kpi: 'Defect Rate', training: 'QC Standards Module', colors: 'ef4444,f59e0b' },
+                { name: 'Laura Ferris', role: 'Logistics Lead', kpi: 'On-Time Delivery Rate', training: 'Logistics KPI Training', colors: '60a5fa,34d399' },
+                { name: 'Sven Müller', role: 'Plant Manager', kpi: 'Energy Consumption', training: 'Energy Efficiency 101', colors: 'a78bfa,fbbf24' },
+                { name: 'Nadia Bouhlel', role: 'HR Manager', kpi: 'Absenteeism Rate', training: 'HR KPI Essentials', colors: '34d399,60a5fa' },
+                { name: 'Paulo Costa', role: 'R&D Lead', kpi: 'New Product Launches', training: 'Innovation KPI Guide', colors: 'fbbf24,a78bfa' },
+                { name: 'Sophie Martin', role: 'Finance Analyst', kpi: 'EBITDA Margin', training: 'Finance Reporting SOP', colors: 'f87171,3b82f6' },
+                { name: 'Karim Bensalem', role: 'Sales Manager', kpi: 'Revenue Growth', training: 'Sales KPI Workshop', colors: '3b82f6,10b981' },
+                { name: 'Yuki Tanaka', role: 'Supply Chain Mgr', kpi: 'Inventory Turnover', training: 'Supply Chain KPI Guide', colors: '8b5cf6,f59e0b' },
+            ];
+            const rows = [];
+            responsibles.forEach((r, i) => {
+                const status = statuses[i % statuses.length];
+                const hasScore = ['completed_pass', 'completed_fail', 'escalated', 'test_sent'].includes(status);
+                const score = hasScore ? (status === 'completed_pass' ? (80 + Math.random() * 18).toFixed(1) : status === 'completed_fail' ? (30 + Math.random() * 45).toFixed(1) : status === 'test_sent' ? null : (40 + Math.random() * 55).toFixed(1)) : null;
+                const due = new Date();
+                due.setDate(due.getDate() + (i % 3 === 0 ? -3 : i % 3 === 1 ? 2 : 14));
+                const esc = status === 'escalated' ? 2 : status === 'test_overdue' ? 1 : 0;
+                rows.push({
+                    result_id: i + 1,
+                    people_name: r.name,
+                    role_name: r.role,
+                    kpi_name: r.kpi,
+                    training_name: r.training,
+                    status,
+                    score: score ? parseFloat(score) : null,
+                    passed: score !== null && r.pass_score !== null
+                        ? parseFloat(score) >= parseFloat(r.pass_score)
+                        : null,
+                    escalation_level: esc,
+                    test_due_date: due.toISOString().split('T')[0],
+                    training_completed_at: status !== 'training_sent' ? new Date(Date.now() - 1000 * 3600 * 24 * 5).toISOString() : null,
+                    test_completed_at: hasScore && score ? new Date(Date.now() - 1000 * 3600 * 24 * 2).toISOString() : null,
+                    avatar_seed: r.colors
+                });
+            });
+            return rows;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Main load
+        // ═══════════════════════════════════════════════════════════════
+        async function loadDashboard() {
+            document.getElementById('tableBody').innerHTML = '<tr><td colspan="8"><div class="loader"></div></td></tr>';
+            allRows = await fetchTrainingResults();
+            document.getElementById('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
+            applyFilters();
+            renderCharts();
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Filter + search
+        // ═══════════════════════════════════════════════════════════════
+        function applyFilters() {
+            const q = document.getElementById('search').value.toLowerCase();
+            const st = document.getElementById('filterStatus').value;
+            const ps = document.getElementById('filterPass').value;
+            const esc = document.getElementById('filterEsc').value;
+
+            filteredRows = allRows.filter(r => {
+                const text = [r.people_name, r.kpi_name, r.training_name, r.role_name].join(' ').toLowerCase();
+                if (q && !text.includes(q)) return false;
+                if (st && r.status !== st) return false;
+                if (ps === 'pass' && r.passed !== true) return false;
+                if (ps === 'fail' && r.passed !== false) return false;
+                if (ps === 'pending' && r.score !== null) return false;
+                if (esc !== '' && String(r.escalation_level) !== esc) return false;
+                return true;
+            });
+
+            currentPage = 1;
+            updateStats();
+            renderTable();
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stats
+        // ═══════════════════════════════════════════════════════════════
+        function updateStats() {
+            const d = filteredRows;
+            const completed = d.filter(r => r.score !== null);
+            const passed = completed.filter(r => r.passed);
+            const avgScore = completed.length
+                ? (completed.reduce((s, r) => s + r.score, 0) / completed.length).toFixed(1) : '—';
+            const passRate = completed.length
+                ? Math.round(passed.length / completed.length * 100) + '%' : '—';
+            const overdue = d.filter(r => ['test_overdue', 'escalated'].includes(r.status)).length;
+            const pending = d.filter(r => ['training_sent', 'training_done', 'test_sent'].includes(r.status)).length;
+
+            setText('s-total', d.length);
+            setText('s-passrate', passRate);
+            setText('s-passrate-sub', `${passed.length} of ${completed.length} tested`);
+            setText('s-avgscore', avgScore !== '—' ? avgScore + '%' : '—');
+            setText('s-overdue', overdue);
+            setText('s-pending', pending);
+
+            const total = filteredRows.length;
+            const from = total ? (currentPage - 1) * PAGE_SIZE + 1 : 0;
+            const to = Math.min(currentPage * PAGE_SIZE, total);
+            document.getElementById('showingLabel').textContent = total ? `${from}–${to} of ${total}` : '0';
+            document.getElementById('rowCountLabel').textContent = total ? `(${total})` : '';
+        }
+
+        function setText(id, val) { document.getElementById(id).textContent = val; }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Table render
+        // ═══════════════════════════════════════════════════════════════
+        function renderTable() {
+            const start = (currentPage - 1) * PAGE_SIZE;
+            const pageRows = filteredRows.slice(start, start + PAGE_SIZE);
+            const tbody = document.getElementById('tableBody');
+
+            if (!pageRows.length) {
+                tbody.innerHTML = '<tr><td colspan="8"><div class="empty">🔍 No records match your filters.</div></td></tr>';
+                renderPagination();
+                return;
+            }
+
+            tbody.innerHTML = pageRows.map(r => {
+                const initials = (r.people_name || '').split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
+                const scoreHtml = buildScoreHtml(r);
+                const dueDateHtml = buildDueDateHtml(r);
+                const completedHtml = r.test_completed_at
+                    ? formatDate(r.test_completed_at)
+                    : (r.training_completed_at ? '<span style="color:var(--text-muted);font-size:11px;">Train: ' + formatDate(r.training_completed_at) + '</span>' : '<span style="color:var(--text-dim);">—</span>');
+
+                return `<tr>
+      <td>
+        <div class="resp-cell">
+          <div class="avatar">${initials}</div>
+          <div>
+            <div class="resp-name">${esc(r.people_name)}</div>
+            <div class="resp-role">${esc(r.role_name || '')}</div>
+          </div>
+        </div>
+      </td>
+      <td>
+        <div class="kpi-cell">${esc(r.kpi_name || '')}</div>
+        ${r.kpi_target_allocation_id ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">Allocation #${r.kpi_target_allocation_id}</div>` : ''}
+      </td>
+      <td>
+        <div class="training-cell">${esc(r.training_name || '')}</div>
+        ${r.training_id ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">ID #${r.training_id}</div>` : ''}
+      </td>
+      <td>${buildStatusBadge(r.status)}</td>
+      <td>${scoreHtml}</td>
+      <td>${dueDateHtml}</td>
+      <td><span class="esc-badge esc-${r.escalation_level}">L${r.escalation_level}</span></td>
+      <td>${completedHtml}</td>
+    </tr>`;
+            }).join('');
+
+            renderPagination();
+            updateStats();
+        }
+
+        function buildStatusBadge(status) {
+            const labels = {
+                training_sent: 'Training Sent',
+                training_done: 'Training Done',
+                test_sent: 'Test Sent',
+                test_overdue: 'Test Overdue',
+                completed_pass: 'Passed ✓',
+                completed_fail: 'Failed ✗',
+                escalated: '⚠ Escalated'
+            };
+            return `<span class="badge ${status}"><span class="dot"></span>${labels[status] || status}</span>`;
+        }
+
+        function buildScoreHtml(r) {
+            if (r.score === null || r.score === undefined) {
+
+                const targetScore = r.pass_score || 80;
+
+                return `
+    <div class="score-wrap">
+        <div class="score-top">
+            <span class="score-num" style="color:var(--blue);font-weight:800;">
+                ${Number(targetScore)}%
+            </span>
+
+        </div>
+
+        <div class="score-bar-bg">
+            <div
+                class="score-bar-fill fill-green"
+                style="width:${targetScore}%"
+            ></div>
+        </div>
+    </div>`;
+            }
+            const pct = Math.min(100, r.score);
+            const cls = pct >= 80 ? 'fill-green' : pct >= 60 ? 'fill-amber' : 'fill-red';
+            const passCls = r.passed ? 'pass' : 'fail';
+            const passLabel = r.passed ? 'PASS' : 'FAIL';
+            return `<div class="score-wrap">
+    <div class="score-top">
+      <span class="score-num" style="color:${r.passed ? 'var(--green-light)' : 'var(--red-light)'}">${pct.toFixed(1)}%</span>
+      <span class="score-pass ${passCls}">${passLabel}</span>
+    </div>
+    <div class="score-bar-bg"><div class="score-bar-fill ${cls}" style="width:${pct}%"></div></div>
+  </div>`;
+        }
+
+        function buildDueDateHtml(r) {
+            if (!r.test_due_date) return '<span class="due-date none">—</span>';
+            const diff = Math.round((new Date(r.test_due_date) - new Date()) / (1000 * 3600 * 24));
+            let cls = 'ok', label = formatDate(r.test_due_date);
+            if (diff < 0) { cls = 'overdue'; label = `Overdue ${Math.abs(diff)}d`; }
+            else if (diff <= 3) { cls = 'soon'; label = `Due in ${diff}d`; }
+            return `<span class="due-date ${cls}">${label}</span>`;
+        }
+
+        function esc(s) {
+            return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        function formatDate(iso) {
+            if (!iso) return '—';
+            return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Pagination
+        // ═══════════════════════════════════════════════════════════════
+        function renderPagination() {
+            const total = Math.ceil(filteredRows.length / PAGE_SIZE);
+            const bar = document.getElementById('paginationBar');
+            if (total <= 1) { bar.innerHTML = ''; return; }
+            let html = `<span class="page-info">Page ${currentPage} of ${total}</span>`;
+            const prev = currentPage > 1;
+            const next = currentPage < total;
+            html += `<button class="page-btn" ${!prev ? 'disabled' : ''} onclick="goPage(${currentPage - 1})">‹</button>`;
+            for (let p = Math.max(1, currentPage - 2); p <= Math.min(total, currentPage + 2); p++) {
+                html += `<button class="page-btn ${p === currentPage ? 'active' : ''}" onclick="goPage(${p})">${p}</button>`;
+            }
+            html += `<button class="page-btn" ${!next ? 'disabled' : ''} onclick="goPage(${currentPage + 1})">›</button>`;
+            bar.innerHTML = html;
+        }
+        function goPage(p) { currentPage = p; renderTable(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Charts
+        // ═══════════════════════════════════════════════════════════════
+        function renderCharts() {
+            const statusCounts = {};
+            const scores = { '0-49': 0, '50-69': 0, '70-79': 0, '80-89': 0, '90-100': 0 };
+            const byMonth = {};
+
+            allRows.forEach(r => {
+                statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+                if (r.score !== null) {
+                    if (r.score < 50) scores['0-49']++;
+                    else if (r.score < 70) scores['50-69']++;
+                    else if (r.score < 80) scores['70-79']++;
+                    else if (r.score < 90) scores['80-89']++;
+                    else scores['90-100']++;
+                }
+                const d = r.training_completed_at || r.test_completed_at;
+                if (d) {
+                    const m = new Date(d).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+                    byMonth[m] = (byMonth[m] || 0) + 1;
+                }
+            });
+
+            const statusLabels = {
+                training_sent: 'Training Sent', training_done: 'Training Done',
+                test_sent: 'Test Sent', test_overdue: 'Test Overdue',
+                completed_pass: 'Passed', completed_fail: 'Failed', escalated: 'Escalated'
+            };
+            const statusColors = ['#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#34d399', '#ef4444', '#f87171'];
+
+            destroyChart(chartStatus);
+            destroyChart(chartScores);
+            destroyChart(chartCompletion);
+
+            const donutDefaults = {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { position: 'bottom', labels: { color: '#64748b', font: { size: 11, weight: '600' }, padding: 10, boxWidth: 10, usePointStyle: true } } }
+            };
+
+            chartStatus = new Chart(document.getElementById('chartStatus'), {
+                type: 'doughnut',
+                data: {
+                    labels: Object.keys(statusCounts).map(s => statusLabels[s] || s),
+                    datasets: [{
+                        data: Object.values(statusCounts), backgroundColor: statusColors,
+                        borderWidth: 2, borderColor: '#ffffff', hoverOffset: 6
+                    }]
+                },
+                options: donutDefaults
+            });
+
+            chartScores = new Chart(document.getElementById('chartScores'), {
+                type: 'bar',
+                data: {
+                    labels: Object.keys(scores),
+                    datasets: [{
+                        label: '# of Tests', data: Object.values(scores),
+                        backgroundColor: ['#ef4444', '#f59e0b', '#fbbf24', '#10b981', '#34d399'],
+                        borderRadius: 6, borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { color: '#64748b', font: { size: 11, weight: '600' } }, grid: { color: 'rgba(148,163,184,.18)' } },
+                        y: {
+                            ticks: { color: '#64748b', font: { size: 11, weight: '600' }, stepSize: 1 }, grid: { color: 'rgba(148,163,184,.18)' },
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+
+            const months = Object.keys(byMonth);
+            chartCompletion = new Chart(document.getElementById('chartCompletion'), {
+                type: 'line',
+                data: {
+                    labels: months.length ? months : ['No Data'],
+                    datasets: [{
+                        label: 'Completions', data: months.length ? Object.values(byMonth) : [0],
+                        borderColor: '#3b82f6', backgroundColor: 'rgba(37,99,235,.10)',
+                        borderWidth: 2.5, pointRadius: 4, pointBackgroundColor: '#ffffff', pointBorderColor: '#2563eb', pointBorderWidth: 2,
+                        tension: .35, fill: true
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { color: '#64748b', font: { size: 11, weight: '600' } }, grid: { color: 'rgba(148,163,184,.18)' } },
+                        y: {
+                            ticks: { color: '#64748b', font: { size: 11, weight: '600' }, stepSize: 1 }, grid: { color: 'rgba(148,163,184,.18)' },
+                            beginAtZero: true
+                        }
+                    }
+                }
+            });
+        }
+        function destroyChart(c) { if (c) try { c.destroy() } catch { } }
+
+        // ═══════════════════════════════════════════════════════════════
+        // CSV export
+        // ═══════════════════════════════════════════════════════════════
+        function exportCsv() {
+            const cols = ['Result ID', 'Responsible', 'Role', 'KPI', 'Training', 'Status', 'Score', 'Passed', 'Due Date', 'Escalation', 'Completed'];
+            const rows = filteredRows.map(r => [
+                r.result_id, r.people_name, r.role_name, r.kpi_name, r.training_name,
+                r.status, r.score ?? '', r.passed === null ? '' : r.passed ? 'Yes' : 'No',
+                r.test_due_date || '', r.escalation_level,
+                formatDate(r.test_completed_at || r.training_completed_at || '')
+            ]);
+            const csv = [cols, ...rows].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+            a.download = `kpi_training_${new Date().toISOString().split('T')[0]}.csv`;
+            a.click();
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Init
+        // ═══════════════════════════════════════════════════════════════
+        loadDashboard();
+    </script>
+</body>
+
+</html>
