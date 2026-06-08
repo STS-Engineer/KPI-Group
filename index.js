@@ -33213,38 +33213,37 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-// let cronRunning = false;
+let cronRunning = false;
+cron.schedule("25 8 * * *", async () => {
+  const lockId = "send_kpi_weekly_email_job";
+  const lock = await acquireJobLock(lockId);
+  if (!lock.acquired) return;
 
-// cron.schedule("30 11 * * *", async () => {
-//   const lockId = "send_kpi_weekly_email_job";
-//   const lock = await acquireJobLock(lockId);
-//   if (!lock.acquired) return;
+  try {
+    if (cronRunning) return;
+    cronRunning = true;
 
-//   try {
-//     if (cronRunning) return;
-//     cronRunning = true;
+    const currentWeek = getCurrentFormWeek();
 
-//     const currentWeek = getCurrentFormWeek();
+    const recipients = await loadKpiSubmissionEmailRecipients();
 
-//     const recipients = await loadKpiSubmissionEmailRecipients();
+    for (const recipient of recipients) {
+      try {
+        await sendKPIEmail(recipient.people_id, currentWeek);
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      } catch (error) {
+        console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
+      }
+    }
 
-//     for (const recipient of recipients) {
-//       try {
-//         await sendKPIEmail(recipient.people_id, currentWeek);
-//         await new Promise((resolve) => setTimeout(resolve, 750));
-//       } catch (error) {
-//         console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
-//       }
-//     }
-
-//     console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
-//   } catch (err) {
-//     console.error("Scheduled email error:", err.message);
-//   } finally {
-//     cronRunning = false;
-//     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+    console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
+  } catch (err) {
+    console.error("Scheduled email error:", err.message);
+  } finally {
+    cronRunning = false;
+    await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+  }
+}, { scheduled: true, timezone: "Africa/Tunis" });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
@@ -34742,7 +34741,7 @@ async function sendConsolidatedManagerReport(manager, directReportPeopleIds, cur
             <div style="font-size:12px;color:#94a3b8;margin-top:3px;">
               ${respRole ? escapeWeeklyReportText(respRole, 80) + " &nbsp;|&nbsp; " : ""}${escapeWeeklyReportText(respPlant, 80)}
               &nbsp;&nbsp;
-              <a href="${escapeHtml(dashboardUrl)}" style="color:#38bdf8;text-decoration:none;font-size:11px;">View Dashboard &rarr;</a>
+              
             </div>
           </div>
           <div style="padding:16px 16px 10px;">
