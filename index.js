@@ -34674,11 +34674,194 @@ async function sendDepartmentKPIReportEmail(plantId, currentWeek, recipientOverr
   }
 };
 
+// ---------------------------------------------------------------------------
+// sendConsolidatedManagerReport
+// Sends ONE combined KPI email to a manager containing the KPI charts for
+// EACH of their direct reports (passed as an array of people IDs).
+// ---------------------------------------------------------------------------
+async function sendConsolidatedManagerReport(manager, directReportPeopleIds, currentWeek) {
+  const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-codir.azurewebsites.net")
+    .replace(/\/+$/, "");
+  const reportWeekLabel = formatWeeklyReportWeekLabel(currentWeek);
+  const managerName = getPeopleDisplayName(manager) || `${manager.first_name || ""} ${manager.name || ""}`.trim();
+  const managerRoleName = normalizeOptionalTextInput(manager.role_name) || "Manager";
+
+  // ── Build per-responsible sections ────────────────────────────────────────
+  const responsibleSections = [];
+  const allInlineAttachments = [];
+  let globalChartIndex = 0;
+
+  for (const responsiblePeopleId of directReportPeopleIds) {
+    try {
+      const responsibleContext = await loadFormResponsibleContext(responsiblePeopleId);
+      const respName = normalizeOptionalTextInput(responsibleContext?.name) || `People #${responsiblePeopleId}`;
+      const respPlant = normalizeOptionalTextInput(responsibleContext?.plant_name) || "";
+      const respRole = normalizeOptionalTextInput(responsibleContext?.role_name) || "";
+      const dashboardUrl = `${appBaseUrl}/dashboard?responsible_id=${encodeURIComponent(responsiblePeopleId)}`;
+
+      const chartsData = await generateWeeklyReportData(responsiblePeopleId, currentWeek);
+      const chartsForEmail = Array.isArray(chartsData)
+        ? chartsData.slice(0, WEEKLY_REPORT_MAX_CHARTS)
+        : [];
+
+      let chartsHtml = "";
+
+      if (chartsForEmail.length > 0) {
+        const chartModels = chartsForEmail.map((chart) => buildWeeklyReportChartModel(chart));
+        const inlineChartResults = await Promise.all(
+          chartModels.map((chartModel, idx) =>
+            fetchWeeklyReportInlineChartAttachment(chartModel, globalChartIndex + idx)
+          )
+        );
+        globalChartIndex += chartModels.length;
+
+        chartsHtml = chartModels.map((chartModel, idx) =>
+          generateVerticalBarChart(chartModel, {
+            imageSrc: inlineChartResults[idx]?.cid ? `cid:${inlineChartResults[idx].cid}` : ""
+          })
+        ).join("");
+
+        inlineChartResults
+          .map((entry) => entry?.attachment)
+          .filter(Boolean)
+          .forEach((att) => allInlineAttachments.push({ ...att, contentDisposition: "inline" }));
+      } else {
+        chartsHtml = `<div style="padding:20px;text-align:center;color:#64748b;font-size:13px;">No KPI data available for this period.</div>`;
+      }
+
+      responsibleSections.push(`
+        <div style="margin:0 0 28px;border:1px solid #dbe4ef;border-radius:14px;overflow:hidden;background:#ffffff;">
+          <div style="background:#1e3a5f;padding:14px 20px;">
+            <div style="font-size:15px;font-weight:700;color:#ffffff;">${escapeWeeklyReportText(respName, 100)}</div>
+            <div style="font-size:12px;color:#94a3b8;margin-top:3px;">
+              ${respRole ? escapeWeeklyReportText(respRole, 80) + " &nbsp;|&nbsp; " : ""}${escapeWeeklyReportText(respPlant, 80)}
+              &nbsp;&nbsp;
+              <a href="${escapeHtml(dashboardUrl)}" style="color:#38bdf8;text-decoration:none;font-size:11px;">View Dashboard &rarr;</a>
+            </div>
+          </div>
+          <div style="padding:16px 16px 10px;">
+            ${chartsHtml}
+          </div>
+        </div>
+      `);
+    } catch (respErr) {
+      console.error(`[Consolidated Manager Report] Error loading data for responsible ${responsiblePeopleId}:`, respErr.message);
+    }
+  }
+
+  if (!responsibleSections.length) {
+    throw new Error(`No KPI data could be loaded for any direct report of manager ${managerName}`);
+  }
+
+  // ── Assemble email HTML ────────────────────────────────────────────────────
+  const emailHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  </head>
+  <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#edf3fb;color:#0f172a;">
+    <div style="display:none;font-size:1px;color:#edf3fb;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+      Manager KPI Report ${escapeWeeklyReportText(reportWeekLabel, 40)} — ${directReportPeopleIds.length} direct report(s).
+    </div>
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#edf3fb;">
+      <tr>
+        <td align="center" style="padding:28px 18px;">
+          <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:1040px;background:#f8fbff;border-radius:18px;">
+            <!-- Header -->
+            <tr>
+              <td style="padding:30px 30px 22px;">
+                <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#127bd8;border-radius:10px;">
+                  <tr>
+                    <td align="center" style="padding:26px 20px;">
+                      <div style="font-size:20px;font-weight:700;color:#ffffff;margin:0 0 6px;">&#128202; Manager KPI Report</div>
+                      <div style="font-size:14px;color:#e0f2fe;margin:0 0 14px;">
+                        ${escapeWeeklyReportText(reportWeekLabel, 40)}
+                        &nbsp;|&nbsp; ${escapeWeeklyReportText(managerName, 80)}
+                        &nbsp;|&nbsp; ${escapeWeeklyReportText(managerRoleName, 80)}
+                      </div>
+                      <div style="font-size:12px;color:#bae6fd;">
+                        ${directReportPeopleIds.length} direct report(s) included in this report
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <!-- Info banner -->
+            <tr>
+              <td style="padding:0 30px 20px;">
+                <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 14px;color:#1d4ed8;font-size:13px;line-height:1.5;">
+                  This report shows the KPI performance of your <strong>direct reports</strong> for ${escapeWeeklyReportText(reportWeekLabel, 40)}.
+                  Each section below corresponds to one of your direct reports.
+                </div>
+              </td>
+            </tr>
+            <!-- Responsible sections -->
+            <tr>
+              <td style="padding:0 30px 30px;">
+                ${responsibleSections.join("")}
+              </td>
+            </tr>
+            <!-- Footer -->
+            <tr>
+              <td style="padding:18px 24px 26px;text-align:center;font-size:12px;color:#64748b;border-top:1px solid #dbe4ef;">
+                AVOCarbon KPI System | Generated ${new Date().toLocaleDateString("en-GB")}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+
+  const transporter = createTransporter();
+  const messageToken = [
+    "mgr-consolidated",
+    manager.people_id,
+    String(currentWeek || "week").replace(/[^a-zA-Z0-9_-]/g, "_"),
+    Date.now()
+  ].join("-");
+
+  const info = await transporter.sendMail({
+    from: '"AVOCarbon KPI System" <administration.STS@avocarbon.com>',
+    sender: "administration.STS@avocarbon.com",
+    replyTo: "administration.STS@avocarbon.com",
+    to: manager.email,
+    subject: `Manager KPI Report — Direct Reports — ${reportWeekLabel}`,
+    html: emailHtml,
+    attachments: allInlineAttachments,
+    headers: {
+      "X-Auto-Response-Suppress": "OOF, AutoReply",
+      "X-Manager-Report-Id": messageToken
+    },
+    date: new Date(),
+    messageId: `<${messageToken}@avocarbon.com>`
+  });
+
+  console.log(`[Consolidated Manager Report] Sent to ${manager.email} (${managerName}) — ${directReportPeopleIds.length} direct report(s):`, {
+    accepted: info.accepted,
+    rejected: info.rejected,
+    messageId: info.messageId
+  });
+
+  return info;
+}
+
+// ---------------------------------------------------------------------------
+// runHierarchyKpiReports (consolidated mode)
+// For each responsible with KPIs, resolve their direct boss via the role
+// hierarchy (parent_role_id). Group all responsibles by the same direct boss
+// and send ONE combined email per manager.
+// ---------------------------------------------------------------------------
 async function runHierarchyKpiReports(frequency, options = {}) {
   const normalizedFrequency = normalizeOptionalTextInput(frequency) || "Weekly";
   const currentWeek =
     normalizeOptionalTextInput(options.reportWeek) || getPreviousWeek(getCurrentWeek());
   const targetResponsiblePeopleId = normalizeOptionalIntegerInput(options.responsiblePeopleId);
+
+  // 1️⃣  Collect all responsibles that have KPIs for the given frequency
   const responsiblesRes = targetResponsiblePeopleId
     ? { rows: [{ responsible_people_id: targetResponsiblePeopleId }] }
     : await pool.query(
@@ -34686,31 +34869,94 @@ async function runHierarchyKpiReports(frequency, options = {}) {
         SELECT DISTINCT
           COALESCE(kta.created_by_people_id, kta.set_by_people_id) AS responsible_people_id
         FROM public.kpi_target_allocation kta
-        JOIN public.kpi k
-          ON k.kpi_id = kta.kpi_id
+        JOIN public.kpi k ON k.kpi_id = kta.kpi_id
         WHERE COALESCE(kta.created_by_people_id, kta.set_by_people_id) IS NOT NULL
           AND LOWER(k.frequency) = LOWER($1)
         `,
       [normalizedFrequency]
     );
 
-  const responsibles = [];
+  // 2️⃣  For each responsible resolve their DIRECT boss (hierarchy level 1)
+  //     and group responsibles by that boss.
+  // managerMap: Map<managerPeopleId(string), { manager: hierarchyRow, directReports: Set<peopleId> }>
+  const managerMap = new Map();
 
   for (const row of responsiblesRes.rows) {
     const responsiblePeopleId = normalizeOptionalIntegerInput(row.responsible_people_id);
     if (!responsiblePeopleId) continue;
-    responsibles.push(await sendKPIReportToHierarchy(responsiblePeopleId, currentWeek));
+
+    let hierarchy;
+    try {
+      hierarchy = await getPeopleHierarchy(responsiblePeopleId);
+    } catch (hierarchyErr) {
+      console.warn(`[Hierarchy Report] Could not load hierarchy for responsible ${responsiblePeopleId}:`, hierarchyErr.message);
+      continue;
+    }
+
+    if (!hierarchy.length) continue;
+
+    // hierarchy[0] = the responsible themselves
+    // hierarchy[1] = their direct boss (one level up via parent_role_id)
+    const directBoss = hierarchy[1];
+    if (!directBoss || !directBoss.email) {
+      console.log(`[Hierarchy Report] No direct boss with email found for responsible ${responsiblePeopleId} — skipping.`);
+      continue;
+    }
+
+    const bossKey = String(directBoss.people_id);
+    if (!managerMap.has(bossKey)) {
+      managerMap.set(bossKey, { manager: directBoss, directReports: new Set() });
+    }
+    managerMap.get(bossKey).directReports.add(responsiblePeopleId);
+  }
+
+  console.log(`[Hierarchy Report] Found ${managerMap.size} manager(s) with direct reports having KPIs.`);
+
+  // 3️⃣  Send ONE consolidated email per manager
+  const managerResults = [];
+
+  for (const [bossKey, { manager, directReports }] of managerMap) {
+    const managerName = getPeopleDisplayName(manager) || `${manager.first_name || ""} ${manager.name || ""}`.trim();
+    const directReportIds = [...directReports];
+
+    console.log(`[Hierarchy Report] Sending consolidated report to ${manager.email} (${managerName}) for ${directReportIds.length} direct report(s).`);
+
+    try {
+      await sendConsolidatedManagerReport(manager, directReportIds, currentWeek);
+      managerResults.push({
+        managerId: normalizeOptionalIntegerInput(manager.people_id),
+        managerName,
+        email: manager.email,
+        roleName: normalizeOptionalTextInput(manager.role_name) || "",
+        directReportCount: directReportIds.length,
+        directReportIds,
+        status: "sent"
+      });
+    } catch (sendErr) {
+      console.error(`[Hierarchy Report] Failed consolidated email for manager ${manager.email}:`, sendErr.message);
+      managerResults.push({
+        managerId: normalizeOptionalIntegerInput(manager.people_id),
+        managerName,
+        email: manager.email,
+        roleName: normalizeOptionalTextInput(manager.role_name) || "",
+        directReportCount: directReportIds.length,
+        directReportIds,
+        status: "failed",
+        error: sendErr.message
+      });
+    }
+
+    // Brief pause between manager emails to avoid SMTP throttling
+    await new Promise(resolve => setTimeout(resolve, 1500));
   }
 
   return {
     frequency: normalizedFrequency,
     week: currentWeek,
-    responsiblesProcessed: responsibles.length,
-    deliveriesAttempted: responsibles.reduce(
-      (sum, entry) => sum + (Array.isArray(entry?.managerResults) ? entry.managerResults.length : 0),
-      0
-    ),
-    responsibles
+    managersProcessed: managerResults.length,
+    deliveriesSent: managerResults.filter((r) => r.status === "sent").length,
+    deliveriesFailed: managerResults.filter((r) => r.status === "failed").length,
+    managerResults
   };
 }
 
@@ -34914,7 +35160,7 @@ async function sendKPIReportToHierarchy(responsiblePeopleId, currentWeek) {
   }
 
   const responsible = hierarchy[0];
-  const managers = hierarchy.slice(1).filter(manager => manager.email);
+  const managers = hierarchy.slice(1, 2).filter(manager => manager.email); // direct boss only
   const responsibleName =
     getPeopleDisplayName(responsible) || String(responsible.people_id || responsiblePeopleId);
   const managerResults = [];
@@ -35007,7 +35253,7 @@ const triggerHierarchyReportNow = async (req, res) => {
       success: true,
       ...result
     });
-  } catch (error) {   
+  } catch (error) {
     console.error("[Hierarchy Report] Manual trigger error:", error.message);
     return res.status(500).json({ error: error.message || "Failed to trigger hierarchy report." });
   } finally {
@@ -35051,5 +35297,139 @@ ensureCorrectiveActionEscalationSchema()
   .catch((error) => {
     console.error("[Corrective Action Escalation] Tracking table setup failed:", error.message);
   });
+// ─────────────────────────────────────────────────────────────────────
+// KPI Training Tracking Dashboard – routes
+// ─────────────────────────────────────────────────────────────────────
+
+// Serve the dashboard HTML file
+const path = require("path");
+app.get("/kpi-training-dashboard", (req, res) => {
+  res.sendFile(path.join(__dirname, "kpi-training-dashboard.html"));
+});
+
+// GET /api/kpi-training/results – all records with responsive joins
+app.get("/api/kpi-training/results", async (req, res) => {
+  try {
+    const { status, kpi_id, people_id, passed } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (normalizeOptionalTextInput(status)) {
+      params.push(status); conditions.push(`ktr.status = $${params.length}`);
+    }
+    if (normalizeOptionalIntegerInput(kpi_id)) {
+      params.push(parseInt(kpi_id)); conditions.push(`ktr.kpi_id = $${params.length}`);
+    }
+    if (normalizeOptionalIntegerInput(people_id)) {
+      params.push(parseInt(people_id)); conditions.push(`ktr.people_id = $${params.length}`);
+    }
+    if (passed === "true") conditions.push(`ktr.passed = true`);
+    if (passed === "false") conditions.push(`ktr.passed = false`);
+
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const result = await pool.query(
+      `SELECT
+        ktr.result_id,
+        ktr.training_id,
+        ktr.test_id,
+        ktr.people_id,
+        ktr.kpi_id,
+        ktr.kpi_target_allocation_id,
+        NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name,''), COALESCE(p.name,''))), '') AS people_name,
+        p.email AS people_email,
+        pra_role.role_name,
+        COALESCE(k.kpi_sub_title, k.kpi_name, 'KPI #' || ktr.kpi_id) AS kpi_name,
+        k.frequency AS kpi_frequency,
+        COALESCE(kt.training_name, 'Training #' || ktr.training_id) AS training_name,
+        kt.version AS training_version,
+        ktest.test_name,
+        ktest.pass_score,
+        ktr.status,
+        ktr.score,
+        ktr.passed,
+        ktr.escalation_level,
+        ktr.test_due_date,
+        ktr.training_sent_at,
+        ktr.training_completed_at,
+        ktr.test_sent_at,
+        ktr.test_completed_at,
+        ktr.last_reminder_sent_at,
+        ktr.next_reminder_due_at,
+        ktr.comments,
+        ktr.created_at,
+        ktr.updated_at
+      FROM public.kpi_training_result ktr
+      LEFT JOIN public.people p ON p.people_id = ktr.people_id
+      LEFT JOIN LATERAL (
+        SELECT r.role_name
+        FROM public.people_role_assignment pra
+        JOIN public.role r ON r.role_id = pra.role_id
+        WHERE pra.people_id = ktr.people_id
+          AND COALESCE(pra.assignment_status,'ACTIVE') = 'ACTIVE'
+          AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+        ORDER BY COALESCE(pra.is_primary,false) DESC,
+                 pra.allocation_percentage DESC NULLS LAST,
+                 pra.assignment_id DESC
+        LIMIT 1
+      ) pra_role ON TRUE
+      LEFT JOIN public.kpi k           ON k.kpi_id          = ktr.kpi_id
+      LEFT JOIN public.kpi_training kt ON kt.training_id    = ktr.training_id
+      LEFT JOIN public.kpi_test ktest  ON ktest.test_id     = ktr.test_id
+      ${where}
+      ORDER BY
+        CASE ktr.status
+          WHEN 'escalated'      THEN 1
+          WHEN 'test_overdue'   THEN 2
+          WHEN 'completed_fail' THEN 3
+          WHEN 'test_sent'      THEN 4
+          WHEN 'training_done'  THEN 5
+          WHEN 'training_sent'  THEN 6
+          WHEN 'completed_pass' THEN 7
+          ELSE 8
+        END,
+        ktr.escalation_level DESC,
+        ktr.test_due_date ASC NULLS LAST,
+        ktr.result_id DESC`,
+      params
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("[KPI Training Dashboard] Error:", error.message);
+    res.status(500).json({ error: "Failed to load training results." });
+  }
+});
+
+// GET /api/kpi-training/stats – aggregate summary for header cards
+app.get("/api/kpi-training/stats", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*)                                                               AS total,
+        COUNT(*) FILTER (WHERE passed = true)                                 AS passed_count,
+        COUNT(*) FILTER (WHERE score IS NOT NULL)                             AS tested_count,
+        ROUND(AVG(score) FILTER (WHERE score IS NOT NULL), 1)                 AS avg_score,
+        COUNT(*) FILTER (WHERE status IN ('test_overdue','escalated'))         AS overdue_escalated,
+        COUNT(*) FILTER (WHERE status IN ('training_sent','training_done','test_sent')) AS pending
+      FROM public.kpi_training_result
+    `);
+    const r = rows[0] || {};
+    res.json({
+      total: parseInt(r.total) || 0,
+      passed_count: parseInt(r.passed_count) || 0,
+      tested_count: parseInt(r.tested_count) || 0,
+      avg_score: r.avg_score ? parseFloat(r.avg_score) : null,
+      pass_rate: r.tested_count > 0
+        ? Math.round(r.passed_count / r.tested_count * 100) : null,
+      overdue_escalated: parseInt(r.overdue_escalated) || 0,
+      pending: parseInt(r.pending) || 0,
+    });
+  } catch (error) {
+    console.error("[KPI Training Stats] Error:", error.message);
+    res.status(500).json({ error: "Failed to load training stats." });
+  }
+});
+
 // ---------- Start server ----------
-app.listen(port, () => console.log(`ðŸš€ Server running on port ${port}`));
+app.listen(port, () => console.log("Server running on port " + port));
