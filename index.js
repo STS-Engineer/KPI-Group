@@ -22790,8 +22790,10 @@ const mapActionPlanActionRow = (row = {}) => {
     kpi_id: subjectInfo.kpiId,
     week: subjectInfo.periodLabel,
     period_label: subjectInfo.periodLabel,
-    root_cause: normalizeOptionalTextInput(row.titre) || "",
-    implemented_solution: normalizeOptionalTextInput(row.description) || "",
+    // In Action Plan DB, the action title stores the implemented solution
+    // and the description stores the root cause narrative.
+    root_cause: normalizeOptionalTextInput(row.description) || "",
+    implemented_solution: normalizeOptionalTextInput(row.titre) || "",
     status,
     due_date: formatIsoDateValue(row.due_date),
     responsible: normalizeOptionalTextInput(row.responsable) || "",
@@ -23072,9 +23074,13 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       responsibleName,
       responsibleContext
     });
+    const implementedSolution =
+      normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution);
+    const rootCause =
+      normalizeOptionalTextInput(action.rootCause ?? action.root_cause);
     const values = [
-      normalizeOptionalTextInput(action.rootCause ?? action.root_cause),
-      normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution),
+      implementedSolution,
+      rootCause,
       status,
       responsibleName,
       normalizeOptionalDateInput(action.dueDate ?? action.due_date),
