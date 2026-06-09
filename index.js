@@ -24607,6 +24607,17 @@ app.get("/corrective-action-form", async (req, res) => {
             cursor:pointer;
             box-shadow:0 10px 24px rgba(239,68,68,0.22);
           }
+
+          .submit-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            filter: grayscale(0.3);
+             }
+
+          .kpi-card.requires-ca {
+             border: 2px solid #dc2626;
+             box-shadow: 0 0 0 4px rgba(220,38,38,0.10);
+            }
           .back-btn{
             display:inline-block;
             padding:14px 22px;
@@ -25818,7 +25829,7 @@ app.get("/form", async (req, res) => {
     });
 
     let kpiCardsHtml = "";
-
+    let hasInitialInvalidKpi = false;
     kpis.forEach((kpi) => {
       let lowLimit = null;
       if (kpi.low_limit && kpi.low_limit !== "None" && kpi.low_limit !== "null" && kpi.low_limit !== "" && !isNaN(parseFloat(kpi.low_limit))) {
@@ -25839,7 +25850,22 @@ app.get("/form", async (req, res) => {
       const goodDirection = inferKpiDirection(kpi);
       const showCA = correctiveActionsEnabled && currentValue !== null &&
         needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
-      const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
+const initialNeedsCA =
+  currentValue !== null &&
+  lowLimit !== null &&
+  currentValue <= lowLimit; 
+const hasValidCA = Array.isArray(kpi.corrective_actions) &&
+  kpi.corrective_actions.some(a =>
+    String(a.root_cause || "").trim() &&
+    String(a.implemented_solution || "").trim() &&
+    String(a.due_date || "").trim() &&
+    String(a.responsible || "").trim()
+  );
+
+if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
+  hasInitialInvalidKpi = true;
+}
+       const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
         Array.isArray(kpi.corrective_actions) ? kpi.corrective_actions : []
       ) : [];
       const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
@@ -25921,9 +25947,10 @@ app.get("/form", async (req, res) => {
       );
 
       kpiCardsHtml += `
-       <div class="kpi-card"
-        data-kpi-id="${kpi.kpi_id}"
+     <div class="kpi-card"
+       data-kpi-id="${kpi.kpi_id}"
        data-kpi-values-id="${kpi.kpi_values_id}"
+       data-initial-needs-ca="${initialNeedsCA && !hasValidCA ? "1" : "0"}"
        data-low-limit="${lowLimit !== null ? lowLimit : ""}"
        data-high-limit="${highLimit !== null ? highLimit : ""}"
        data-good-direction="${goodDirection}"
@@ -25936,11 +25963,16 @@ app.get("/form", async (req, res) => {
       data-history-actions="${encodeModalPayload(allHistoryActions)}"
       data-history-comments="${encodeModalPayload(allHistoryComments)}">
 
-          <div class="kpi-header">
-            <div>
-             <div class="kpi-title">${kpi.indicator_sub_title || "KPI"}</div>
-            </div>
-          </div>
+        <div class="kpi-header">
+         <div>
+        <div class="kpi-title">
+         ${kpi.indicator_sub_title || "KPI"}
+   <span class="kpi-definition">
+    - ${kpi.definition || ""}
+</span>
+        </div>
+        </div>
+        </div>
 
           <div class="kpi-split-layout">
             <div class="kpi-right-panel kpi-chart-trigger"
@@ -27695,6 +27727,20 @@ app.get("/form", async (req, res) => {
           .modal-actions{display:flex;gap:12px;justify-content:center;}
           .btn-cancel{padding:10px 20px;border:1px solid #ccc;background:white;border-radius:6px;cursor:pointer;font-weight:600;}
           .btn-confirm{padding:10px 20px;border:none;background:linear-gradient(135deg,#0078D7,#005ea6);color:white;border-radius:6px;cursor:pointer;font-weight:600;}
+          .submit-btn:disabled{
+          opacity:.45;
+          cursor:not-allowed;
+          filter:grayscale(.35);
+         }
+
+         .kpi-card.requires-ca{
+           border-color:#ef4444;
+           box-shadow:0 0 0 4px rgba(239,68,68,.12);
+           }
+
+          .kpi-card.requires-ca .kpi-input{
+            border-color:#ef4444 !important;
+           }
           .submit-btn{background:#0078D7;color:white;border:none;padding:12px 30px;border-radius:4px;font-size:16px;font-weight:600;cursor:pointer;display:block;width:100%;margin-top:20px;}
           .close-action-confirm-overlay{
             position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
@@ -28145,7 +28191,9 @@ app.get("/form", async (req, res) => {
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
                 <input type="hidden" name="week" value="${week}" />
                 ${kpiCardsHtml}
-                <button type="submit" class="submit-btn">Submit KPI Values</button>
+               <button type="submit" class="submit-btn" ${hasInitialInvalidKpi ? "disabled" : ""}>
+               Submit KPI Values
+               </button>
               </form>
             </div>
           </div>
@@ -28187,7 +28235,7 @@ app.get("/form", async (req, res) => {
           let caModalKvId = null;
           // In-memory store: kvId â†’ array of action objects
           const caModalStore = {};
-
+          const kpiPopupShown = {};
 function getCaModalActions(kvId) {
   if (!caModalStore[kvId]) {
     caModalStore[kvId] = [];
@@ -28542,9 +28590,10 @@ function caModalSaveForm() {
     actions.unshift(entry);
   }
 
-  renderCaModalTable(caModalKvId);
-  syncDomFromStore(caModalKvId);
-  caModalCollapseForm();
+renderCaModalTable(caModalKvId);
+syncDomFromStore(caModalKvId);
+caModalCollapseForm();
+updateSubmitButtonState(false);
 }
 
 function caModalDeleteAction(index) {
@@ -28553,8 +28602,9 @@ function caModalDeleteAction(index) {
   const actions = getCaModalActions(caModalKvId);
   actions.splice(index, 1);
 
-  renderCaModalTable(caModalKvId);
-  syncDomFromStore(caModalKvId);
+renderCaModalTable(caModalKvId);
+syncDomFromStore(caModalKvId);
+updateSubmitButtonState(false);
 }
 
 
@@ -28723,7 +28773,7 @@ function syncDomFromStore(kvId) {
           }
           window.formApplyField = formApplyField;
 
-          function checkLowLimit(input) {
+     function checkLowLimit(input) {
             const card = input.closest(".kpi-card");
             if (!card) return;
             const rawLow = parseFloat(card.dataset.lowLimit);
@@ -28744,6 +28794,137 @@ function syncDomFromStore(kvId) {
             caPanel.classList.toggle("visible", isOutside);
             caPanel.querySelectorAll(".ca-required-field").forEach(f => { f.required = isOutside; });
           }
+
+
+function toNumber(value) {
+  const text = String(value ?? "").trim().replace(",", ".");
+  const number = parseFloat(text);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isKpiUnderLowerLimit(card) {
+  // If corrective actions aren't enabled for this KPI, never block.
+  const caEnabled = card.querySelector(".open-ca-modal-btn") !== null;
+  if (!caEnabled) return false;
+
+  const input = card.querySelector(".value-input");
+  const value = toNumber(input ? input.value : "");
+  if (value === null) return false;
+
+  // Use the SAME color logic the chart uses, so "red bar" and
+  // "needs corrective action" can never disagree.
+  const fill = getPointColor(
+    value,
+    card.dataset.lowLimit,
+    card.dataset.highLimit,
+    card.dataset.goodDirection,
+    card.dataset.target
+  );
+
+  return fill === "#e34b24"; // red
+}
+
+function hasValidCorrectiveAction(kvId) {
+  const actions = getCaModalActions(kvId);
+
+  return actions.some(action =>
+    String(action.root_cause || "").trim() &&
+    String(action.implemented_solution || "").trim() &&
+    String(action.due_date || "").trim() &&
+    String(action.responsible || "").trim()
+  );
+}
+
+function showToast(message) {
+  let toast = document.getElementById("caRequiredToast");
+ 
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "caRequiredToast";
+    toast.style.cssText =
+      "position:fixed;" +
+      "top:22px;" +
+      "right:22px;" +
+      "z-index:20000;" +
+      "background:#dc2626;" +
+      "color:#fff;" +
+      "padding:14px 18px;" +
+      "border-radius:12px;" +
+      "font-weight:800;" +
+      "box-shadow:0 16px 35px rgba(220,38,38,.28);" +
+      "opacity:0;" +
+      "transform:translateY(-10px);" +
+      "transition:.25s ease;" +
+      "max-width:360px;";
+    document.body.appendChild(toast);
+  }
+ 
+  toast.textContent = message;
+  toast.style.opacity = "1";
+  toast.style.transform = "translateY(0)";
+ 
+  clearTimeout(window.caToastTimer);
+  window.caToastTimer = setTimeout(function () {
+    toast.style.opacity = "0";
+    toast.style.transform = "translateY(-10px)";
+  }, 3500);
+}
+
+function showSimpleCaRequiredModal() {
+  const modal = document.getElementById("caRequiredSimpleModal");
+  if (!modal) return;
+
+  modal.classList.add("active");
+}
+
+function closeSimpleCaRequiredModal() {
+  const modal = document.getElementById("caRequiredSimpleModal");
+  if (!modal) return;
+
+  modal.classList.remove("active");
+}
+
+function showCorrectiveActionRequiredPopup(card) {
+  showSimpleCaRequiredModal();
+}
+
+function updateSubmitButtonState(showPopup = false) {
+  const submitBtn = document.querySelector(".submit-btn");
+  const invalidCards = [];
+ 
+  document.querySelectorAll(".kpi-card").forEach(card => {
+    const kvId = card.dataset.kpiValuesId;
+ 
+    // Check if value is below low limit and no valid corrective action exists
+    const needsCA =
+      isKpiUnderLowerLimit(card) &&
+      !hasValidCorrectiveAction(kvId);
+ 
+    // Track previous state to detect transitions
+    const hadRequiresCA = card.classList.contains("requires-ca");
+    card.classList.toggle("requires-ca", needsCA);
+ 
+    if (needsCA) invalidCards.push(card);
+ 
+    // Show popup only when transitioning FROM valid TO invalid (not on every keystroke)
+    if (showPopup && needsCA && !hadRequiresCA && !kpiPopupShown[kvId]) {
+      kpiPopupShown[kvId] = true;
+      showCorrectiveActionRequiredPopup(card);
+    }
+ 
+    // Reset popup flag when corrective action is added
+    if (!needsCA && kpiPopupShown[kvId]) {
+      kpiPopupShown[kvId] = false;
+    }
+  });
+ 
+  // DISABLE SUBMIT BUTTON if any KPI needs corrective action
+  if (submitBtn) {
+    submitBtn.disabled = invalidCards.length > 0;
+  }
+ 
+  return invalidCards;
+}
 
           function collectAssistantKpis() {
             return Array.from(document.querySelectorAll(".kpi-card")).map(card => {
@@ -29565,7 +29746,7 @@ async function sendAssistantPrompt(message) {
             syncCaResponsibleDropdown();
           }
 
-          async function refreshKpiChartFromServer(kvId) {
+  async function refreshKpiChartFromServer(kvId) {
   const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
   if (!card) return;
 
@@ -29598,15 +29779,19 @@ async function sendAssistantPrompt(message) {
     ? (syncValueInputDirtyState(input) || document.activeElement === input)
     : false;
 
-  if (input && !preserveDraftValue) {
-   const latestValue = [...data.values].reverse().find(v =>
+if (input && !preserveDraftValue) {
+  const latestValue = [...data.values].reverse().find(v =>
     v !== null && v !== undefined && v !== "" && !isNaN(Number(v))
-    );
+  );
 
-   const nextValue = latestValue !== undefined ? String(latestValue) : "";
-     input.value = nextValue;
-     setValueInputServerState(input, nextValue);
-   }
+  const nextValue = latestValue !== undefined ? String(latestValue) : "";
+  input.value = nextValue;
+  setValueInputServerState(input, nextValue);
+  checkLowLimit(input);
+  setTimeout(function() {
+    updateSubmitButtonState(false);  // just disable; the delayed initial check opens the modal
+  }, 300);
+}  
 
   const chart = kpiCharts[kvId];
   if (!chart) {
@@ -29625,10 +29810,17 @@ async function sendAssistantPrompt(message) {
   }
 
   updateKpiChart(kvId);
+setTimeout(function() {
+  const invalidCards = updateSubmitButtonState(false);
+
+  if (invalidCards.length > 0) {
+    showCorrectiveActionRequiredPopup(invalidCards[0]);
+  }
+}, 300);
 }
 
 
-         function startRealtimeCharts() {
+  function startRealtimeCharts() {
   document.querySelectorAll(".kpi-card").forEach(card => {
     const kvId = card.dataset.kpiValuesId;
     if (!kvId) return;
@@ -29840,26 +30032,38 @@ async function sendAssistantPrompt(message) {
             return normalizedDirection === "down" ? "down" : "up";
           }
 
-          function getPointColor(value, lowLimit, highLimit, direction) {
+         function getPointColor(value, lowLimit, highLimit, direction, target) {
             const val = parseFloat(value);
             const rawLow = parseFloat(lowLimit);
             const rawHigh = parseFloat(highLimit);
+            const rawTarget = parseFloat(target);
             const resolvedDirection = normalizePointDirection(direction);
             const hasLow = !isNaN(rawLow);
             const hasHigh = !isNaN(rawHigh);
+            const hasTarget = !isNaN(rawTarget);
             const lower = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : null;
             const upper = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : null;
 
             if (isNaN(val)) return "#94a3b8";
-            if (resolvedDirection === "down") {
-              return upper !== null && val > upper ? "#e34b24" : "#b7dc58";
+
+            const isOutside = resolvedDirection === "down"
+              ? (upper !== null && val > upper)
+              : (lower !== null && val < lower);
+
+            if (isOutside) return "#e34b24";
+
+            // Above target AND within (at/below) the upper limit -> dark green
+            if (hasTarget && val > rawTarget && (!hasHigh || val <= rawHigh)) {
+              return "#15803d";
             }
-            return lower !== null && val < lower ? "#e34b24" : "#b7dc58";
+
+            return "#b7dc58";
           }
 
-          function getPointBorderColor(value, lowLimit, highLimit, direction) {
-            const fill = getPointColor(value, lowLimit, highLimit, direction);
+        function getPointBorderColor(value, lowLimit, highLimit, direction, target) {
+            const fill = getPointColor(value, lowLimit, highLimit, direction, target);
             if (fill === "#e34b24") return "#ba3415";
+            if (fill === "#15803d") return "#0f5132";
             if (fill === "#b7dc58") return "#86a93a";
             return "#64748b";
           }
@@ -29921,8 +30125,8 @@ async function sendAssistantPrompt(message) {
           input.value = latestValue;
           setValueInputServerState(input, latestValue);
            }
-            const colors = values.map(v => getPointColor(v, lowLimit, highLimit, goodDirection));
-            const borderColors = values.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection));
+            const colors = values.map(v => getPointColor(v, lowLimit, highLimit, goodDirection, target));
+            const borderColors = values.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection, target));
             const bounds = computeBounds(values, lowLimit, target, highLimit);
             kpiCharts[kvId] = new Chart(canvas.getContext("2d"), {
               type:"bar",
@@ -29947,8 +30151,8 @@ async function sendAssistantPrompt(message) {
             const lowLimit = parseFloat(card.dataset.lowLimit), highLimit = parseFloat(card.dataset.highLimit), target = parseFloat(card.dataset.target);
             const goodDirection = card.dataset.goodDirection || "up";
             const data = chart.data.datasets[0].data;
-            const colors = data.map(v => getPointColor(v, lowLimit, highLimit, goodDirection));
-            const borderColors = data.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection));
+            const colors = data.map(v => getPointColor(v, lowLimit, highLimit, goodDirection, target));
+            const borderColors = data.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection, target));
             chart.data.datasets[0].backgroundColor = colors;
             chart.data.datasets[0].borderColor = borderColors;
             const bounds = computeBounds(data, lowLimit, target, highLimit);
@@ -30566,25 +30770,44 @@ function getFallbackCurrentMonthLabel(card, labels) {
   document.body.classList.add("chart-modal-open");
 }
 
-          /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-             DOM READY
-          â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
-        document.addEventListener("DOMContentLoaded", () => {
+function runInitialCorrectiveActionCheck() {
+  const invalidCards = updateSubmitButtonState(false);
+
+  if (!invalidCards.length) return;
+
+  const firstCard = invalidCards[0];
+  const kvId = firstCard.dataset.kpiValuesId;
+
+  firstCard.classList.add("requires-ca");
+  kpiPopupShown[kvId] = true;   // claim it so other checks don't fight
+
+
+
+
+}
+
+
+ /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+     DOM READY
+   â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+  document.addEventListener("DOMContentLoaded", () => {
   // Value inputs
-  document.querySelectorAll(".value-input").forEach(input => {
-    const kvId = input.dataset.kpiValuesId;
-    setValueInputServerState(input, input.value);
-    checkLowLimit(input);
-    buildKpiChart(kvId);
-
-    input.addEventListener("input", function() {
-      syncValueInputDirtyState(this);
-      checkLowLimit(this);
-      updateCurrentMonthBarFromInput(kvId, this.value);
-    });
+document.querySelectorAll(".value-input").forEach(input => {
+  const kvId = input.dataset.kpiValuesId;
+  setValueInputServerState(input, input.value);
+  checkLowLimit(input);
+  buildKpiChart(kvId);
+ 
+  input.addEventListener("input", function() {
+    syncValueInputDirtyState(this);
+    checkLowLimit(this);
+    updateCurrentMonthBarFromInput(kvId, this.value);
+    // IMPORTANT: Pass true to show popup when value goes below limit
+    updateSubmitButtonState(true);
   });
+});
 
-  startRealtimeCharts();
+startRealtimeCharts();
             // Chart expand
             document.querySelectorAll(".kpi-chart-trigger").forEach(panel => {
               const kvId = panel.dataset.kpiValuesId;
@@ -30729,45 +30952,71 @@ function getFallbackCurrentMonthLabel(card, labels) {
             });
 
             // Submit form
-            const form = document.getElementById("kpiForm");
-            const confirmModal = document.getElementById("confirmModal");
-            const confirmBtn = document.getElementById("confirmBtn");
-            const cancelBtn = document.getElementById("cancelBtn");
-            const loadingOverlay = document.getElementById("loadingOverlay");
-            let formToSubmit = null;
+   // Submit form
+const form = document.getElementById("kpiForm");
+const confirmModal = document.getElementById("confirmModal");
+const confirmBtn = document.getElementById("confirmBtn");
+const cancelBtn = document.getElementById("cancelBtn");
+const loadingOverlay = document.getElementById("loadingOverlay");
 
-            if (form && confirmModal && confirmBtn && cancelBtn) {
-              form.addEventListener("submit", function(e) {
-                e.preventDefault();
-                let hasError = false;
-                this.querySelectorAll("input.value-input[required]").forEach(input => {
-                  if (!input.value.trim() || isNaN(input.value.trim())) { hasError = true; input.style.borderColor = "#dc3545"; }
-                  else input.style.borderColor = "#ddd";
-                });
-                document.querySelectorAll(".ca-container.visible").forEach(panel => {
-                  panel.querySelectorAll(".ca-textarea, .ca-date-input, .ca-text-input").forEach(field => {
-                    if (!field.value.trim()) { hasError = true; field.classList.add("error"); }
-                    else field.classList.remove("error");
-                  });
-                });
-                if (hasError) return;
-                formToSubmit = this;
-                confirmModal.classList.add("active");
-              });
-              confirmBtn.addEventListener("click", () => {
-                confirmModal.classList.remove("active");
-                if (loadingOverlay) loadingOverlay.classList.add("active");
-                if (formToSubmit) formToSubmit.submit();
-              });
-              cancelBtn.addEventListener("click", () => confirmModal.classList.remove("active"));
-            }
-          });
+let formToSubmit = null;
+
+if (form && confirmModal && confirmBtn && cancelBtn) {
+  form.addEventListener("submit", function(e) {
+    e.preventDefault();
+
+    const invalidCards = updateSubmitButtonState(true);
+
+    if (invalidCards.length > 0) {
+      return false;
+    }
+
+    formToSubmit = this;
+    confirmModal.classList.add("active");
+  });
+
+  confirmBtn.addEventListener("click", function() {
+    confirmModal.classList.remove("active");
+    if (loadingOverlay) loadingOverlay.classList.add("active");
+    if (formToSubmit) formToSubmit.submit();
+  });
+
+     cancelBtn.addEventListener("click", function() {
+     confirmModal.classList.remove("active");
+      });
+      }
+       });
 
           window.caModalOpenEdit = caModalOpenEdit;
           window.caModalDeleteAction = caModalDeleteAction;
           window.openHistoryModal = openHistoryModal;
           window.openCaTableModal = openCaTableModal;
+
+     function scheduleInitialCorrectiveActionCheck() {
+        // Wait for charts, inputs, and modal handlers to be fully ready,
+        // and for refreshKpiChartFromServer to settle the input value.
+        setTimeout(runInitialCorrectiveActionCheck, 800);
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", scheduleInitialCorrectiveActionCheck);
+      } else {
+        scheduleInitialCorrectiveActionCheck();
+      }
         </script>
+
+        <div id="caRequiredSimpleModal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-icon">⚠️</div>
+    <h3>Corrective Action </h3>
+    <p>Please provide corrective action for this submission</p>
+    <div class="modal-actions">
+      <button type="button" class="btn-confirm" onclick="closeSimpleCaRequiredModal()">
+        OK
+      </button>
+    </div>
+  </div>
+</div>
       </body>
       </html>
     `);
@@ -31730,11 +31979,16 @@ const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
         NULLIF(TRIM(primary_unit.unit_name), ''),
         NULLIF(TRIM(home_unit.unit_name), '')
       ) AS unit_name,
-      COALESCE(
-        allocation_scope.resolved_unit_short_name,
-        NULLIF(TRIM(primary_unit.unit_short_name), ''),
-        NULLIF(TRIM(home_unit.unit_short_name), '')
-      ) AS unit_short_name
+COALESCE(
+  allocation_scope.resolved_unit_short_name,
+  NULLIF(TRIM(primary_unit.unit_short_name), ''),
+  NULLIF(TRIM(home_unit.unit_short_name), '')
+) AS unit_short_name,
+COALESCE(
+  allocation_scope.resolved_country,
+  NULLIF(TRIM(primary_unit.country), ''),
+  NULLIF(TRIM(home_unit.country), '')
+) AS country
     FROM recipient_people recipient
     JOIN public.people owner
       ON owner.people_id = recipient.people_id
@@ -31763,7 +32017,11 @@ const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
         COALESCE(
           NULLIF(TRIM(unit_scope.unit_short_name), ''),
           NULLIF(TRIM(plant.unit_short_name), '')
-        ) AS resolved_unit_short_name
+        ) AS resolved_unit_short_name,
+        COALESCE(
+        NULLIF(TRIM(unit_scope.country), ''),
+        NULLIF(TRIM(plant.country), '')
+       ) AS resolved_country
       FROM public.kpi_target_allocation kta
       JOIN public.kpi k
         ON k.kpi_id = kta.kpi_id
@@ -31792,32 +32050,21 @@ const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
 };
 
 const DEFAULT_KPI_SUBMISSION_TIMEZONE = "Africa/Tunis";
-const KPI_SUBMISSION_TARGET_LOCAL_HOUR = 8;
 const KPI_SUBMISSION_DISPATCH_WINDOW_MINUTES = 15;
-const UNIT_TIMEZONE_BY_NAME = {
-  "luxembourg": "Europe/Luxembourg",
-  "luxembourg hq": "Europe/Luxembourg",
-  "cyclam": "Europe/Paris",
-  "poitiers": "Europe/Paris",
-  "sts": "Africa/Tunis",
-  "same": "Africa/Tunis",
-  "sceet": "Africa/Tunis",
-  "nadhour": "Africa/Tunis",
-  "frankfurt": "Europe/Berlin",
-  "chennai": "Asia/Kolkata",
-  "daegu": "Asia/Seoul",
-  "tianjin": "Asia/Shanghai",
-  "kunshan": "Asia/Shanghai",
-  "anhui": "Asia/Shanghai",
-  "mexico": "America/Mexico_City"
+const COUNTRY_TIMEZONE_BY_NAME = {
+  luxembourg: "Europe/Paris",
+  france: "Europe/Paris",
+  tunisia: "Africa/Tunis",
+  germany: "Europe/Berlin",
+  india: "Asia/Kolkata",
+  korea: "Asia/Seoul",
+  "south korea": "Asia/Seoul",
+  china: "Asia/Shanghai",
+  mexico: "America/Mexico_City"
 };
 
-const normalizeUnitTimezoneLookupKey = (value) =>
-  String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+const normalizeCountryTimezoneKey = (value) =>
+  String(value ?? "").trim().toLowerCase();
 
 const getCanonicalKpiCalculationMode = (value) => {
   const normalizedValue = normalizeOptionalTextInput(value);
@@ -31826,17 +32073,10 @@ const getCanonicalKpiCalculationMode = (value) => {
 };
 
 const resolveKpiSubmissionRecipientTimeZone = (recipient = {}) => {
-  const lookupCandidates = [
-    recipient.unit_short_name,
-    recipient.unit_name
-  ]
-    .map((value) => normalizeUnitTimezoneLookupKey(value))
-    .filter(Boolean);
+  const countryKey = normalizeCountryTimezoneKey(recipient.country);
 
-  for (const candidate of lookupCandidates) {
-    if (UNIT_TIMEZONE_BY_NAME[candidate]) {
-      return UNIT_TIMEZONE_BY_NAME[candidate];
-    }
+  if (COUNTRY_TIMEZONE_BY_NAME[countryKey]) {
+    return COUNTRY_TIMEZONE_BY_NAME[countryKey];
   }
 
   return DEFAULT_KPI_SUBMISSION_TIMEZONE;
@@ -31894,9 +32134,19 @@ const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
   }
 };
 
-const hasReachedKpiSubmissionLocalSendWindow = (timeContext = {}) => {
+const getKpiSubmissionTargetLocalHour = (calculationMode) => {
+  const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+  return canonicalMode === "Ratio" ? 8 : 9;
+};
+
+const hasReachedKpiSubmissionLocalSendWindow = (
+  timeContext = {},
+  calculationMode = "Direct"
+) => {
+  const targetHour = getKpiSubmissionTargetLocalHour(calculationMode);
+
   return (
-    Number(timeContext.hour) === KPI_SUBMISSION_TARGET_LOCAL_HOUR &&
+    Number(timeContext.hour) === targetHour &&
     Number(timeContext.minute) >= 0 &&
     Number(timeContext.minute) < KPI_SUBMISSION_DISPATCH_WINDOW_MINUTES
   );
@@ -33589,10 +33839,10 @@ const runWeeklyKpiSubmissionCron = async ({
       const timeContext = buildTimeZoneDateContext(recipientTimeZone, dispatchDate);
       const currentWeek = getCurrentFormWeekFromPseudoDate(timeContext.pseudoDate);
 
-      if (!hasReachedKpiSubmissionLocalSendWindow(timeContext)) {
-        notDueCount += 1;
-        continue;
-      }
+   if (!hasReachedKpiSubmissionLocalSendWindow(timeContext, calculationMode)) {
+      notDueCount += 1;
+      continue;
+   } 
 
       eligibleCount += 1;
 
@@ -33650,23 +33900,24 @@ const runWeeklyKpiSubmissionCron = async ({
   }
 };
 
-// cron.schedule(DIRECT_KPI_SUBMISSION_CRON, async () => {
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Direct",
-//     lockId: "send_kpi_weekly_email_direct_job",
-//     stateKey: "direct",
-//     logLabel: "Direct"
-//   });
-// }, { scheduled: true, timezone: "UTC" });
-
-// cron.schedule(RATIO_KPI_SUBMISSION_CRON, async () => {
+// cron.schedule("*/5 * * * *", async () => {
 //   await runWeeklyKpiSubmissionCron({
 //     calculationMode: "Ratio",
 //     lockId: "send_kpi_weekly_email_ratio_job",
 //     stateKey: "ratio",
 //     logLabel: "Ratio"
 //   });
-// }, { scheduled: true, timezone: "UTC" });
+
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
@@ -37111,6 +37362,152 @@ app.get("/api/kpi-training/stats", async (req, res) => {
     res.status(500).json({ error: "Failed to load training stats." });
   }
 });
+
+async function sendKpiTrainingLinksToResponsibles() {
+  const appBaseUrl = (
+    normalizeOptionalTextInput(process.env.APP_BASE_URL) ||
+    "https://kpi-form.azurewebsites.net"
+  ).replace(/\/+$/, "");
+
+  const result = await pool.query(`
+    SELECT
+      ktr.people_id,
+      NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
+      p.email,
+      COUNT(*) AS assignment_count,
+      MIN(ktr.test_due_date) AS nearest_due_date
+    FROM public.kpi_training_result ktr
+    JOIN public.people p
+      ON p.people_id = ktr.people_id
+    WHERE p.email IS NOT NULL
+      AND TRIM(p.email) <> ''
+      AND ktr.status IN (
+        'training_sent',
+        'training_done',
+        'test_sent',
+        'test_overdue',
+        'escalated'
+      )
+    GROUP BY
+      ktr.people_id,
+      p.first_name,
+      p.name,
+      p.email
+    ORDER BY people_name, ktr.people_id
+  `);
+
+  const transporter = createTransporter();
+  const sent = [];
+  const failed = [];
+
+  for (const row of result.rows) {
+    const peopleId = row.people_id;
+    const responsibleName = row.people_name || `Responsible #${peopleId}`;
+    const recipientEmail = row.email;
+
+    const trainingUrl =
+      `${appBaseUrl}/kpi-training-center?people_id=${encodeURIComponent(peopleId)}`;
+
+    const emailHtml = `
+      <div style="font-family:Arial,sans-serif;background:#f4f7fb;padding:24px;">
+        <div style="max-width:680px;margin:auto;background:#ffffff;border-radius:18px;padding:28px;border:1px solid #e2e8f0;">
+          <h2 style="margin:0 0 12px;color:#0f172a;">KPI Training Assigned</h2>
+
+          <p style="font-size:14px;color:#334155;line-height:1.6;">
+            Hello ${escapeHtml(responsibleName)},
+          </p>
+
+          <p style="font-size:14px;color:#334155;line-height:1.6;">
+            You have <strong>${row.assignment_count}</strong> KPI training assignment(s).
+            Please review all documentation, then complete the QCM.
+          </p>
+
+          <div style="margin:24px 0;">
+            <a href="${trainingUrl}"
+               style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;padding:13px 20px;border-radius:999px;font-weight:700;font-size:14px;">
+              Open My KPI Training
+            </a>
+          </div>
+
+          <p style="font-size:12px;color:#64748b;">
+            ${trainingUrl}
+          </p>
+        </div>
+      </div>
+    `;
+
+    try {
+      const info = await transporter.sendMail({
+        from: '"AVOCarbon KPI Training" <administration.STS@avocarbon.com>',
+        to: recipientEmail,
+        subject: "Your KPI Training Center",
+        html: emailHtml
+      });
+
+      await pool.query(`
+        UPDATE public.kpi_training_result
+        SET
+          training_sent_at = COALESCE(training_sent_at, NOW()),
+          status = CASE
+            WHEN status IN ('completed_pass', 'completed_fail') THEN status
+            ELSE 'training_sent'
+          END,
+          updated_at = NOW()
+        WHERE people_id = $1
+          AND status IN (
+            'training_sent',
+            'training_done',
+            'test_sent',
+            'test_overdue',
+            'escalated'
+          )
+      `, [peopleId]);
+
+      sent.push({
+        people_id: peopleId,
+        email: recipientEmail,
+        assignment_count: Number(row.assignment_count),
+        message_id: info.messageId
+      });
+    } catch (error) {
+      failed.push({
+        people_id: peopleId,
+        email: recipientEmail,
+        error: error.message
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    sent_count: sent.length,
+    failed_count: failed.length,
+    sent,
+    failed
+  };
+}
+
+app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
+  try {
+    const result = await sendKpiTrainingLinksToResponsibles();
+    res.json(result);
+  } catch (error) {
+    console.error("[KPI Training Email] Error:", error.message);
+    res.status(500).json({ error: "Failed to send KPI training links." });
+  }
+});
+
+//Training cron 
+
+// cron.schedule("0 11 * * *", async () => {
+//   try {
+//     console.log("[KPI Training Cron] Sending responsible training links...");
+//     const result = await sendKpiTrainingLinksToResponsibles();
+//     console.log("[KPI Training Cron] Done:", result);
+//   } catch (error) {
+//     console.error("[KPI Training Cron] Failed:", error.message);
+//   }
+// });
 
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
