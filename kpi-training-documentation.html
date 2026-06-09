@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KPI Training Documentation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <style>
+        :root {
+            --bg: #f4f8fb;
+            --surface: rgba(255, 255, 255, .92);
+            --surface-strong: #ffffff;
+            --border: rgba(148, 163, 184, .24);
+            --border-strong: rgba(148, 163, 184, .38);
+            --ink: #0f172a;
+            --text: #1e293b;
+            --muted: #64748b;
+            --muted-soft: #94a3b8;
+            --blue: #1d4ed8;
+            --blue-soft: #eff6ff;
+            --teal: #0f766e;
+            --teal-soft: #ecfeff;
+            --amber: #d97706;
+            --amber-soft: #fff7ed;
+            --shadow-sm: 0 14px 30px rgba(15, 23, 42, .06);
+            --shadow-md: 0 28px 60px rgba(15, 23, 42, .09);
+            --radius: 24px;
+            --radius-sm: 18px;
+            --radius-xs: 14px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            min-height: 100vh;
+            font-family: "Manrope", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(29, 78, 216, .12), transparent 28%),
+                radial-gradient(circle at top right, rgba(15, 118, 110, .12), transparent 24%),
+                linear-gradient(180deg, #f8fbff 0%, var(--bg) 48%, #eef4f7 100%);
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(148, 163, 184, .07) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 163, 184, .07) 1px, transparent 1px);
+            background-size: 44px 44px;
+            mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .32), transparent 74%);
+        }
+
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 18px 26px;
+            background: rgba(248, 251, 255, .84);
+            border-bottom: 1px solid rgba(226, 232, 240, .84);
+            backdrop-filter: blur(20px) saturate(160%);
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .brand-mark {
+            width: 48px;
+            height: 48px;
+            border-radius: 16px;
+            background: linear-gradient(145deg, #0f172a 0%, #1d4ed8 58%, #14b8a6 100%);
+            box-shadow: 0 16px 30px rgba(29, 78, 216, .22);
+        }
+
+        .brand-copy strong {
+            display: block;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 19px;
+            letter-spacing: -.4px;
+            color: var(--ink);
+        }
+
+        .brand-copy span {
+            display: block;
+            margin-top: 3px;
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--muted);
+        }
+
+        .topbar-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .topbar-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, .88);
+            border: 1px solid rgba(148, 163, 184, .16);
+            box-shadow: var(--shadow-sm);
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--muted);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--teal);
+            box-shadow: 0 0 0 5px rgba(20, 184, 166, .12);
+        }
+
+        .page {
+            width: 100%;
+            max-width: none;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .loading-shell,
+        .setup-state,
+        .empty-state {
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 44px 38px;
+            text-align: center;
+            background: var(--surface);
+            border: 1px solid rgba(226, 232, 240, .84);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .loading-shell,
+        .setup-state p,
+        .empty-state p {
+            font-size: 14px;
+            line-height: 1.75;
+            color: var(--muted);
+        }
+
+        .setup-state h2,
+        .empty-state h2 {
+            color: var(--ink);
+            font-size: 28px;
+            letter-spacing: -.5px;
+        }
+
+        .empty-code {
+            display: inline-flex;
+            margin-top: 18px;
+            padding: 12px 16px;
+            border-radius: 999px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            font-size: 12px;
+            font-weight: 800;
+            color: var(--blue);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 310px minmax(0, 1fr);
+            gap: 22px;
+            align-items: start;
+        }
+
+        .panel {
+            background: var(--surface);
+            border: 1px solid rgba(226, 232, 240, .84);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+            backdrop-filter: blur(18px) saturate(150%);
+        }
+
+        .rail {
+            position: sticky;
+            top: 96px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 11px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, .14);
+            border: 1px solid rgba(255, 255, 255, .16);
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: .72px;
+            text-transform: uppercase;
+        }
+
+        .rail-hero {
+            position: relative;
+            overflow: hidden;
+            padding: 22px;
+            color: #fff;
+            background: linear-gradient(160deg, #0f172a 0%, #1447b5 56%, #0f766e 100%);
+        }
+
+        .rail-hero::after {
+            content: "";
+            position: absolute;
+            right: -64px;
+            top: -72px;
+            width: 210px;
+            height: 210px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(255, 255, 255, .22), transparent 64%);
+        }
+
+        .rail-hero h2 {
+            margin-top: 16px;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 27px;
+            line-height: 1.08;
+            letter-spacing: -.8px;
+        }
+
+        .rail-hero p {
+            margin-top: 12px;
+            font-size: 13px;
+            line-height: 1.72;
+            color: rgba(255, 255, 255, .82);
+        }
+
+        .person-card,
+        .assignment-rail {
+            padding: 20px 22px;
+        }
+
+        .section-title {
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .72px;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .person-name {
+            margin-top: 12px;
+            font-size: 22px;
+            font-weight: 800;
+            letter-spacing: -.4px;
+            color: var(--ink);
+        }
+
+        .person-role {
+            margin-top: 6px;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .person-email {
+            margin-top: 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 12px;
+            border-radius: 999px;
+            background: #f8fafc;
+            border: 1px solid rgba(226, 232, 240, .9);
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--muted);
+        }
+
+        .mini-metrics {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .mini-metric {
+            padding: 14px;
+            border-radius: var(--radius-xs);
+            background: rgba(248, 250, 252, .92);
+            border: 1px solid rgba(226, 232, 240, .92);
+        }
+
+        .mini-metric span {
+            display: block;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .3px;
+            color: var(--muted);
+        }
+
+        .mini-metric strong {
+            display: block;
+            margin-top: 8px;
+            font-size: 18px;
+            letter-spacing: -.4px;
+            color: var(--ink);
+        }
+
+        .assignment-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .assignment-chip {
+            width: 100%;
+            appearance: none;
+            border: 1px solid rgba(226, 232, 240, .92);
+            background: rgba(248, 250, 252, .92);
+            border-radius: var(--radius-sm);
+            padding: 14px;
+            text-align: left;
+            cursor: pointer;
+            transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+        }
+
+        .assignment-chip:hover {
+            transform: translateY(-1px);
+            border-color: rgba(59, 130, 246, .34);
+            box-shadow: 0 14px 24px rgba(15, 23, 42, .06);
+        }
+
+        .assignment-chip.is-active {
+            background: linear-gradient(180deg, rgba(239, 246, 255, .98), rgba(240, 249, 255, .98));
+            border-color: rgba(59, 130, 246, .42);
+            box-shadow: 0 18px 32px rgba(29, 78, 216, .12);
+        }
+
+        .assignment-chip strong {
+            display: block;
+            font-size: 14px;
+            color: var(--ink);
+        }
+
+        .assignment-chip span {
+            display: block;
+            margin-top: 5px;
+            font-size: 12px;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        .workspace {
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .hero-panel {
+            padding: 28px;
+            background:
+                radial-gradient(circle at top right, rgba(20, 184, 166, .18), transparent 22%),
+                linear-gradient(135deg, rgba(15, 23, 42, .97), rgba(30, 64, 175, .94) 62%, rgba(15, 118, 110, .9) 100%);
+            color: #fff;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 18px;
+            align-items: end;
+        }
+
+        .hero-panel h1 {
+            margin-top: 16px;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 34px;
+            line-height: 1.02;
+            letter-spacing: -.9px;
+        }
+
+        .hero-panel p {
+            margin-top: 14px;
+            max-width: 760px;
+            font-size: 14px;
+            line-height: 1.8;
+            color: rgba(255, 255, 255, .82);
+        }
+
+        .hero-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        .hero-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, .14);
+            border: 1px solid rgba(255, 255, 255, .14);
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(255, 255, 255, .88);
+        }
+
+        .hero-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 18px;
+            border-radius: 999px;
+            border: 0;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 800;
+            cursor: pointer;
+            transition: transform .18s ease, box-shadow .18s ease, opacity .18s ease;
+        }
+
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn-primary {
+            color: #fff;
+            background: linear-gradient(135deg, #1d4ed8, #2563eb);
+            box-shadow: 0 14px 28px rgba(29, 78, 216, .22);
+        }
+
+        .btn-secondary {
+            color: var(--blue);
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 16px;
+        }
+
+        .summary-card {
+            padding: 18px 20px;
+        }
+
+        .summary-card span {
+            display: block;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .72px;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .summary-card strong {
+            display: block;
+            margin-top: 10px;
+            font-size: 18px;
+            letter-spacing: -.4px;
+            color: var(--ink);
+        }
+
+        .summary-card small {
+            display: block;
+            margin-top: 8px;
+            font-size: 13px;
+            line-height: 1.65;
+            color: var(--muted);
+        }
+
+        .note-panel,
+        .document-panel {
+            padding: 22px;
+        }
+
+        .note-panel {
+            background: linear-gradient(180deg, rgba(236, 254, 255, .92), rgba(255, 255, 255, .9));
+            border-color: rgba(94, 234, 212, .34);
+        }
+
+        .note-panel strong,
+        .panel-head h2 {
+            color: var(--ink);
+        }
+
+        .note-panel p {
+            margin-top: 8px;
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--text);
+        }
+
+        .panel-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 18px;
+        }
+
+        .panel-head p {
+            margin-top: 8px;
+            max-width: 760px;
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--muted);
+        }
+
+        .document-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .document-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(239, 246, 255, .92);
+            border: 1px solid rgba(191, 219, 254, .92);
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--blue);
+        }
+
+        .document-frame-wrap {
+            min-height: 720px;
+            border-radius: 22px;
+            overflow: hidden;
+            border: 1px solid rgba(226, 232, 240, .94);
+            background: #ffffff;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, .8);
+        }
+
+        .document-frame {
+            width: 100%;
+            min-height: 720px;
+            border: 0;
+            background: #ffffff;
+        }
+
+        .doc-block-list {
+            display: grid;
+            gap: 14px;
+        }
+
+        .doc-block {
+            padding: 20px 22px;
+            border-radius: var(--radius-sm);
+            background: linear-gradient(180deg, rgba(255, 255, 255, .98), rgba(248, 250, 252, .96));
+            border: 1px solid rgba(226, 232, 240, .92);
+            box-shadow: 0 12px 22px rgba(15, 23, 42, .04);
+        }
+
+        .doc-block h3 {
+            font-size: 18px;
+            letter-spacing: -.4px;
+            color: var(--ink);
+        }
+
+        .doc-block p,
+        .doc-block li {
+            margin-top: 10px;
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--text);
+        }
+
+        .doc-block ul {
+            padding-left: 18px;
+        }
+
+        .document-empty {
+            padding: 34px 22px;
+            text-align: center;
+            border-radius: var(--radius-sm);
+            background: linear-gradient(180deg, rgba(248, 250, 252, .92), rgba(255, 255, 255, .95));
+            border: 1px dashed rgba(148, 163, 184, .34);
+            color: var(--muted);
+            line-height: 1.8;
+        }
+
+        @media (max-width: 1320px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+
+            .rail {
+                position: static;
+            }
+        }
+
+        @media (max-width: 1100px) {
+            .summary-grid,
+            .hero-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .hero-actions {
+                justify-content: flex-start;
+            }
+        }
+
+        @media (max-width: 760px) {
+            .topbar {
+                padding: 16px 18px;
+            }
+
+            .page {
+                padding: 12px;
+            }
+
+            .summary-grid,
+            .mini-metrics {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="topbar">
+        <div class="brand">
+            <div class="brand-mark"></div>
+            <div class="brand-copy">
+                <strong>KPI Training Documentation</strong>
+                <span>Dedicated source-material workspace for training packages</span>
+            </div>
+        </div>
+        <div class="topbar-actions">
+            <a id="topbarReturnLink" class="btn btn-secondary" href="/kpi-training-center">Return to Training</a>
+            <div class="topbar-status">
+                <span class="status-dot"></span>
+                <span id="topbarStatus">Loading documentation...</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="page">
+        <div id="appRoot" class="loading-shell">Preparing the documentation workspace...</div>
+    </div>
+
+    <script>
+        const state = {
+            portal: null,
+            activeResultId: null
+        };
+
+        const params = new URLSearchParams(window.location.search);
+        const peopleId = params.get("people_id");
+        const preferredResultId = params.get("result_id");
+        const appRoot = document.getElementById("appRoot");
+        const topbarStatus = document.getElementById("topbarStatus");
+        const topbarReturnLink = document.getElementById("topbarReturnLink");
+
+        const escapeHtml = (value) =>
+            String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+
+        const ANSWER_REVEAL_PATTERNS = [
+            /^((good|correct|right|best|expected)\s+answer|(correct|best)\s+option|answer\s+key|solution|bonne\s+r[eÃ©]ponse|r[eÃ©]ponse\s+correcte)\s*[:\-]/i,
+            /^(the\s+correct\s+answer\s+is|la\s+bonne\s+r[eÃ©]ponse\s+est|la\s+r[eÃ©]ponse\s+correcte\s+est)\b/i
+        ];
+
+        const normalizeRevealCandidate = (value) =>
+            String(value ?? "")
+                .replace(/<[^>]*>/g, " ")
+                .replace(/&nbsp;/gi, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+
+        const isAnswerRevealText = (value) => {
+            const candidate = normalizeRevealCandidate(value);
+            return candidate
+                ? ANSWER_REVEAL_PATTERNS.some((pattern) => pattern.test(candidate))
+                : false;
+        };
+
+        const stripAnswerRevealLines = (value) => {
+            const text = String(value ?? "");
+            if (!text) return "";
+
+            return text
+                .split(/\n+/)
+                .map((line) => line.trim())
+                .filter((line) => line && !isAnswerRevealText(line))
+                .join("\n\n")
+                .trim();
+        };
+
+        const QUESTION_SECTION_PATTERNS = [
+            /^questions?$/i,
+            /^question\s*\d+[\s:.)-]*/i,
+            /^(assessment|quiz|qcm|knowledge\s*check|review\s*questions?)$/i,
+            /^assessment\s+questions?$/i
+        ];
+
+        const QUESTION_OPTION_LINE_PATTERN = /(?:^|\n)\s*(?:[A-D]|[1-9]|[IVX]+)[\.\)]\s+\S/m;
+
+        const isQuestionSectionTitle = (value) => {
+            const normalized = normalizeRevealCandidate(value);
+            return normalized
+                ? QUESTION_SECTION_PATTERNS.some((pattern) => pattern.test(normalized))
+                : false;
+        };
+
+        const hasQuestionOptionLines = (value) =>
+            QUESTION_OPTION_LINE_PATTERN.test(
+                String(value ?? "")
+                    .replace(/<br\s*\/?>/gi, "\n")
+                    .replace(/\r/g, "")
+            );
+
+        const isQuestionLikeDocumentationBlock = (block = {}) => {
+            const title = normalizeRevealCandidate(block.title || "");
+            const body = String(block.body || "");
+            const bullets = Array.isArray(block.bullets) ? block.bullets : [];
+            const combined = [title, body, ...bullets].join("\n");
+            const hasQuestionPrompt =
+                isQuestionSectionTitle(title) ||
+                /^question\s*\d+[\s:.)-]*/i.test(normalizeRevealCandidate(combined)) ||
+                /\b(?:quiz|qcm|knowledge\s*check)\b/i.test(normalizeRevealCandidate(combined));
+
+            return hasQuestionPrompt && hasQuestionOptionLines(combined);
+        };
+
+        const getDocumentationBlocks = (assignment) =>
+            (assignment?.training?.blocks || [])
+                .map((block) => sanitizeTrainingBlock(block))
+                .filter((block) => block.title || block.body || block.bullets.length)
+                .filter((block) => !isQuestionLikeDocumentationBlock(block));
+
+        const sanitizeTrainingBlock = (block = {}) => {
+            const sanitizedTitle = stripAnswerRevealLines(block.title || "");
+            const sanitizedBody = stripAnswerRevealLines(block.body || "");
+            const sanitizedBullets = Array.isArray(block.bullets)
+                ? block.bullets
+                    .map((bullet) => stripAnswerRevealLines(bullet))
+                    .filter(Boolean)
+                : [];
+
+            return {
+                ...block,
+                title: sanitizedTitle || (isAnswerRevealText(block.title || "") ? "Documentation Section" : String(block.title || "Documentation Section")),
+                body: sanitizedBody,
+                bullets: sanitizedBullets
+            };
+        };
+
+        const sanitizeTrainingHtml = (html) => {
+            if (!html) return "";
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(`<!DOCTYPE html><html><body>${html}</body></html>`, "text/html");
+            doc.querySelectorAll("script, noscript").forEach((node) => node.remove());
+            doc.querySelectorAll("[data-answer], [data-correct-answer], [data-solution], [data-is-correct='true'], [data-correct='true']").forEach((node) => node.remove());
+            doc.querySelectorAll("form, input, select, textarea, button").forEach((node) => node.remove());
+            doc.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((element) => {
+                if (isQuestionSectionTitle(element.textContent || "")) {
+                    element.remove();
+                }
+            });
+
+            doc.body.querySelectorAll("p, li, div, blockquote, td, section, article, pre").forEach((element) => {
+                const className = String(element.getAttribute("class") || "").toLowerCase();
+                const elementId = String(element.getAttribute("id") || "").toLowerCase();
+                if (/(correct-answer|answer-key|good-answer|revealed-answer|solution-note|bonne-reponse|reponse-correcte)/.test(className)) {
+                    element.remove();
+                    return;
+                }
+
+                const identityText = `${className} ${elementId}`.trim();
+                if (/(question|quiz|qcm|questionnaire|knowledge-check|assessment-question)/.test(identityText)) {
+                    element.remove();
+                    return;
+                }
+
+                if (/<br\s*\/?>/i.test(element.innerHTML || "")) {
+                    const segments = element.innerHTML.split(/<br\s*\/?>/i);
+                    const cleanedSegments = segments.filter((segment) => !isAnswerRevealText(segment));
+                    if (cleanedSegments.length !== segments.length) {
+                        element.innerHTML = cleanedSegments.join("<br>");
+                    }
+                }
+
+                const candidateText = normalizeRevealCandidate(element.textContent || "");
+                if (candidateText && hasQuestionOptionLines(element.innerHTML || candidateText)) {
+                    if (
+                        isQuestionSectionTitle(candidateText) ||
+                        /^question\s*\d+[\s:.)-]*/i.test(candidateText) ||
+                        /\b(?:quiz|qcm|knowledge\s*check)\b/i.test(candidateText)
+                    ) {
+                        element.remove();
+                        return;
+                    }
+                }
+
+                if (candidateText && candidateText.length <= 240 && isAnswerRevealText(candidateText) && !element.querySelector("table, ul, ol, article, section")) {
+                    element.remove();
+                    return;
+                }
+
+                if (!element.children.length) {
+                    const cleanedText = stripAnswerRevealLines(element.textContent || "");
+                    if (cleanedText) {
+                        element.textContent = cleanedText;
+                    }
+                }
+            });
+
+            doc.body.querySelectorAll("p, li, div, blockquote, pre").forEach((element) => {
+                const hasChildContent = element.querySelector("img, table, ul, ol, video, iframe");
+                const textContent = normalizeRevealCandidate(element.textContent || "");
+                if (!hasChildContent && !textContent) {
+                    element.remove();
+                }
+            });
+
+            return doc.body.innerHTML;
+        };
+
+        const formatDate = (value) => {
+            if (!value) return "Not scheduled";
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return "Not scheduled";
+            return date.toLocaleDateString("en-GB", {
+                day: "2-digit",
+                month: "short",
+                year: "numeric"
+            });
+        };
+
+        const getStatusLabel = (status) => {
+            const labels = {
+                training_sent: "Training Assigned",
+                training_done: "Training Completed",
+                test_sent: "Assessment Ready",
+                test_overdue: "Assessment Overdue",
+                completed_pass: "Passed",
+                completed_fail: "Failed",
+                escalated: "Escalated"
+            };
+            return labels[status] || status || "Assigned";
+        };
+
+        const setStatus = (label) => {
+            topbarStatus.textContent = label || "Documentation workspace ready";
+        };
+
+        const buildTrainingWorkspaceUrl = (resultId) => {
+            const url = new URL("/kpi-training-center", window.location.origin);
+            if (peopleId) {
+                url.searchParams.set("people_id", peopleId);
+            }
+            if (resultId) {
+                url.searchParams.set("result_id", resultId);
+            }
+            return `${url.pathname}${url.search}`;
+        };
+
+        const buildDocumentationUrl = (resultId) => {
+            const url = new URL("/kpi-training-documentation", window.location.origin);
+            if (peopleId) {
+                url.searchParams.set("people_id", peopleId);
+            }
+            if (resultId) {
+                url.searchParams.set("result_id", resultId);
+            }
+            return `${url.pathname}${url.search}`;
+        };
+
+        const updateUrl = () => {
+            if (!peopleId || !state.activeResultId) return;
+            const url = new URL(window.location.href);
+            url.searchParams.set("people_id", peopleId);
+            url.searchParams.set("result_id", state.activeResultId);
+            window.history.replaceState({}, "", url.toString());
+        };
+
+        const getActiveAssignment = () =>
+            (state.portal?.assignments || []).find((assignment) => String(assignment.result_id) === String(state.activeResultId)) || null;
+
+        const renderSetupState = () => {
+            appRoot.className = "setup-state";
+            appRoot.innerHTML = `
+                <h2>Open the documentation workspace with a responsible id</h2>
+                <p>This page reads assigned training rows from <code>kpi_training_result</code> and opens the documentation content from <code>kpi_training.training_html</code> or the structured training blocks.</p>
+                <div class="empty-code">/kpi-training-documentation?people_id=123&result_id=456</div>
+            `;
+        };
+
+        const renderErrorState = (message) => {
+            appRoot.className = "empty-state";
+            appRoot.innerHTML = `
+                <h2>We could not open the documentation workspace</h2>
+                <p>${escapeHtml(message || "An unexpected error occurred.")}</p>
+            `;
+        };
+
+        const renderEmptyState = () => {
+            const person = state.portal?.people || {};
+            appRoot.className = "empty-state";
+            appRoot.innerHTML = `
+                <h2>No training documentation found</h2>
+                <p>${escapeHtml(person.name || "This responsible")} does not currently have a training assignment that can be opened in the documentation workspace.</p>
+            `;
+        };
+
+        const renderSidebar = (assignments, person) => {
+            const completedCount = assignments.filter((assignment) => assignment.progress.training_completed).length;
+            const htmlCount = assignments.filter((assignment) => assignment.training.html_available).length;
+
+            return `
+                <aside class="rail">
+                    <section class="panel rail-hero">
+                        <span class="eyebrow">Documentation Space</span>
+                        <h2>Documentation workflow.</h2>
+                        <p>This workspace isolates the training documentation, keeps answer-reveal hints hidden, and leaves the training center focused on completion and assessment.</p>
+                    </section>
+
+                    <section class="panel person-card">
+                        <div class="section-title">Responsible</div>
+                        <div class="person-name">${escapeHtml(person.name || "Responsible")}</div>
+                        <div class="person-role">${escapeHtml(person.role_name || "Active assignment owner")}</div>
+                        ${person.email ? `<div class="person-email">${escapeHtml(person.email)}</div>` : ""}
+                        <div class="mini-metrics">
+                            <div class="mini-metric">
+                                <span>Assignments</span>
+                                <strong>${assignments.length}</strong>
+                            </div>
+                            <div class="mini-metric">
+                                <span>Completed</span>
+                                <strong>${completedCount}</strong>
+                            </div>
+                            <div class="mini-metric">
+                                <span>HTML docs</span>
+                                <strong>${htmlCount}</strong>
+                            </div>
+                            <div class="mini-metric">
+                                <span>Hidden answers</span>
+                                <strong>On</strong>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel assignment-rail">
+                        <div class="section-title">Documentation Packages</div>
+                        <div class="assignment-list">
+                            ${assignments.map((assignment) => `
+                                <button
+                                    type="button"
+                                    class="assignment-chip ${String(assignment.result_id) === String(state.activeResultId) ? "is-active" : ""}"
+                                    data-result-id="${escapeHtml(assignment.result_id)}"
+                                >
+                                    <strong>${escapeHtml(assignment.training.name || `Training #${assignment.training.id}`)}</strong>
+                                    <span>${escapeHtml(assignment.kpi.name || `KPI #${assignment.kpi.id}`)}</span>
+                                    <span>${assignment.training.html_available ? "Formatted documentation available" : `${assignment.training.block_count} structured block${assignment.training.block_count === 1 ? "" : "s"}`}</span>
+                                </button>
+                            `).join("")}
+                        </div>
+                    </section>
+                </aside>
+            `;
+        };
+
+        const renderStructuredDocumentation = (assignment) => {
+            const safeTrainingBlocks = getDocumentationBlocks(assignment);
+
+            if (!safeTrainingBlocks.length) {
+                return `
+                    <div class="document-empty">
+                        No formatted HTML document was available for this training and no documentation-only structured blocks were found in <code>training_content</code>.
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="doc-block-list">
+                    ${safeTrainingBlocks.map((block) => `
+                        <article class="doc-block">
+                            <h3>${escapeHtml(block.title)}</h3>
+                            ${block.body ? `<p>${escapeHtml(block.body)}</p>` : ""}
+                            ${block.bullets.length ? `<ul>${block.bullets.map((bullet) => `<li>${escapeHtml(bullet)}</li>`).join("")}</ul>` : ""}
+                        </article>
+                    `).join("")}
+                </div>
+            `;
+        };
+
+        const renderWorkspace = (assignment) => {
+            const safeTrainingComment = stripAnswerRevealLines(assignment.training.comments || "");
+            const safeHtml = sanitizeTrainingHtml(assignment.training.html);
+            const hasFormattedDocumentation = Boolean(safeHtml.trim());
+            const documentationBlocks = getDocumentationBlocks(assignment);
+            const documentationBlockCount = documentationBlocks.length;
+            const trainingWorkspaceUrl = buildTrainingWorkspaceUrl(assignment.result_id);
+
+            return `
+                <section class="workspace">
+                    <section class="panel hero-panel">
+                        <div class="hero-grid">
+                            <div>
+                                <span class="eyebrow">Dedicated Documentation</span>
+                                <h1> Training Documentation </h1>
+                                <p>Review the source documentation in its own interface, then return to the training workspace when you are ready to confirm completion or continue to the QCM.</p>
+                                <div class="hero-meta">
+                                   
+                                </div>
+                            </div>
+                       
+                        </div>
+                    </section>
+
+            
+                    ${safeTrainingComment ? `
+                        <section class="panel note-panel">
+                            <strong>Trainer note</strong>
+                            <p>${escapeHtml(safeTrainingComment)}</p>
+                        </section>
+                    ` : ""}
+
+                    <section class="panel document-panel">
+                        <div class="panel-head">
+                            <div>
+                                <div class="section-title">Documentation View</div>
+                                <h2>Source material</h2>
+                                <p>This page keeps the original documentation separate from the training flow, while answer-reveal lines remain hidden in the responsible workspace.</p>
+                            </div>
+                            <div class="document-meta">
+                                <span class="document-pill">${hasFormattedDocumentation ? "Isolated document frame" : "Structured document mode"}</span>
+                                <span class="document-pill">Answer keys hidden</span>
+                                <span class="document-pill">${documentationBlockCount} documentation block${documentationBlockCount === 1 ? "" : "s"}</span>
+                            </div>
+                        </div>
+
+                        ${hasFormattedDocumentation
+                    ? `
+                                <div class="document-frame-wrap">
+                                    <iframe class="document-frame" id="documentationFrame" sandbox=""></iframe>
+                                </div>
+                            `
+                    : renderStructuredDocumentation(assignment)}
+                    </section>
+                </section>
+            `;
+        };
+
+        const renderApp = () => {
+            const assignments = state.portal?.assignments || [];
+            if (!assignments.length) {
+                renderEmptyState();
+                return;
+            }
+
+            const person = state.portal?.people || assignments[0].responsible;
+            const activeAssignment = getActiveAssignment() || assignments[0];
+            state.activeResultId = String(activeAssignment.result_id);
+
+            appRoot.className = "layout";
+            appRoot.innerHTML = `
+                ${renderSidebar(assignments, person)}
+                ${renderWorkspace(activeAssignment)}
+            `;
+
+            bindWorkspaceEvents();
+            renderDocumentationFrame(activeAssignment);
+            topbarReturnLink.href = buildTrainingWorkspaceUrl(activeAssignment.result_id);
+            updateUrl();
+        };
+
+        const renderDocumentationFrame = (assignment) => {
+            const frame = document.getElementById("documentationFrame");
+            if (!frame) return;
+
+            const safeHtml = sanitizeTrainingHtml(assignment.training.html);
+            if (!safeHtml.trim()) return;
+
+            frame.srcdoc = `
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8" />
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                    <style>
+                        body {
+                            margin: 0;
+                            padding: 34px;
+                            font-family: "Manrope", Arial, sans-serif;
+                            color: #1e293b;
+                            background:
+                                radial-gradient(circle at top right, rgba(37, 99, 235, .08), transparent 24%),
+                                linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+                            line-height: 1.72;
+                        }
+                        body > *:first-child {
+                            margin-top: 0 !important;
+                        }
+                        h1, h2, h3, h4 {
+                            color: #0f172a;
+                            line-height: 1.2;
+                            letter-spacing: -.02em;
+                        }
+                        p, li, td, th {
+                            color: #334155;
+                            font-size: 14px;
+                        }
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            background: rgba(255, 255, 255, .94);
+                            border-radius: 18px;
+                            overflow: hidden;
+                            border: 1px solid rgba(226, 232, 240, .9);
+                        }
+                        td, th {
+                            padding: 12px 14px;
+                            border: 1px solid rgba(226, 232, 240, .75);
+                        }
+                        blockquote, pre, .card, .panel, .module, .question {
+                            background: rgba(255, 255, 255, .94);
+                            border: 1px solid rgba(226, 232, 240, .88);
+                            border-radius: 18px;
+                            padding: 16px 18px;
+                            box-shadow: 0 16px 32px rgba(15, 23, 42, .05);
+                        }
+                        ul, ol {
+                            padding-left: 20px;
+                        }
+                        img, table, video, iframe {
+                            max-width: 100%;
+                        }
+                        [class*="correct-answer"],
+                        [class*="answer-key"],
+                        [class*="good-answer"],
+                        [class*="revealed-answer"],
+                        [class*="solution-note"],
+                        [data-answer],
+                        [data-correct-answer],
+                        [data-solution],
+                        [data-is-correct="true"],
+                        [data-correct="true"] {
+                            display: none !important;
+                        }
+                    </style>
+                </head>
+                <body>${safeHtml}</body>
+                </html>
+            `;
+        };
+
+        const bindWorkspaceEvents = () => {
+            document.querySelectorAll("[data-result-id]").forEach((button) => {
+                button.addEventListener("click", () => {
+                    state.activeResultId = button.dataset.resultId;
+                    renderApp();
+                });
+            });
+        };
+
+        const loadPortal = async (focusResultId = null) => {
+            if (!peopleId) {
+                renderSetupState();
+                return;
+            }
+
+            setStatus("Loading assigned documentation...");
+
+            try {
+                const response = await fetch(`/api/kpi-training/portal?people_id=${encodeURIComponent(peopleId)}`);
+                const payload = await response.json();
+                if (!response.ok) {
+                    throw new Error(payload.error || "Could not load documentation assignments.");
+                }
+
+                state.portal = payload;
+                const nextActiveId =
+                    focusResultId && payload.assignments.some((assignment) => String(assignment.result_id) === String(focusResultId))
+                        ? String(focusResultId)
+                        : payload.active_result_id
+                            ? String(payload.active_result_id)
+                            : payload.assignments[0]
+                                ? String(payload.assignments[0].result_id)
+                                : null;
+
+                state.activeResultId = nextActiveId;
+                renderApp();
+                setStatus(payload.assignments.length ? "Documentation workspace ready" : "No documentation found");
+            } catch (error) {
+                renderErrorState(error.message || "Could not load the documentation workspace.");
+                setStatus("Documentation workspace unavailable");
+            }
+        };
+
+        loadPortal(preferredResultId);
+    </script>
+</body>
+
+</html>
