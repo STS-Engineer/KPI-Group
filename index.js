@@ -816,6 +816,7 @@ let responsibleParameterKpiSchemaPromise = null;
 let kpiRatioSchemaPromise = null;
 let kpiObjectSchemaPromise = null;
 let kpiAssistantConversationSchemaPromise = null;
+let kpiSubmissionEmailDispatchLogSchemaPromise = null;
 
 const ensureKpiRatioSchema = async () => {
   if (!kpiRatioSchemaPromise) {
@@ -1606,6 +1607,49 @@ const ensureKpiAssistantConversationSchema = async () => {
   }
 
   return kpiAssistantConversationSchemaPromise;
+};
+
+const ensureKpiSubmissionEmailDispatchLogSchema = async () => {
+  if (!kpiSubmissionEmailDispatchLogSchemaPromise) {
+    kpiSubmissionEmailDispatchLogSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.kpi_submission_email_dispatch_log (
+          dispatch_id BIGSERIAL PRIMARY KEY,
+          people_id INTEGER NOT NULL
+            REFERENCES public.people (people_id)
+            ON UPDATE NO ACTION
+            ON DELETE CASCADE,
+          calculation_mode VARCHAR(40) NOT NULL,
+          target_week VARCHAR(40) NOT NULL,
+          local_dispatch_date DATE NOT NULL,
+          unit_id INTEGER NULL
+            REFERENCES public.unit (unit_id)
+            ON UPDATE NO ACTION
+            ON DELETE SET NULL,
+          unit_name VARCHAR(255),
+          unit_short_name VARCHAR(100),
+          unit_timezone VARCHAR(120) NOT NULL,
+          sent_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_kpi_submission_email_dispatch_log_people_mode_date
+        ON public.kpi_submission_email_dispatch_log (people_id, calculation_mode, local_dispatch_date)
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_submission_email_dispatch_log_mode_date
+        ON public.kpi_submission_email_dispatch_log (calculation_mode, local_dispatch_date DESC)
+      `);
+    })().catch((error) => {
+      kpiSubmissionEmailDispatchLogSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return kpiSubmissionEmailDispatchLogSchemaPromise;
 };
 
 const loadKpiAssistantConversationRow = async (
@@ -23339,10 +23383,14 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
   };
 };
 
-const generateEmailHtml = ({ responsible, week }) => {
+const generateEmailHtml = ({ responsible, week, calculationMode = null }) => {
   const responsibleLinkId = encodeURIComponent(
     responsible?.people_id ?? responsible?.responsible_id ?? ""
   );
+  const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode);
+  const calculationModeQuery = normalizedCalculationMode
+    ? `&calculation_mode=${encodeURIComponent(normalizedCalculationMode)}`
+    : "";
 
   // Convert week format (e.g., "2026-Week12") to month and year
   const getMonthYearFromWeek = (weekStr) => {
@@ -23378,10 +23426,13 @@ const generateEmailHtml = ({ responsible, week }) => {
       </div>
       
       <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission </h2>
+      ${normalizedCalculationMode
+      ? `<p style="margin:0 0 14px 0;color:#0f4c81;font-size:14px;font-weight:600;">Calculation Mode: ${normalizedCalculationMode}</p>`
+      : ""}
       
       <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsible.plant_name}</h3>
       
-      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsibleLinkId}&week=${week}"
+      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsibleLinkId}&week=${week}${calculationModeQuery}"
          style="display:inline-block;padding:14px 35px;background:#0078D7;color:white;
                 border-radius:50px;text-decoration:none;font-weight:600;font-size:16px;
                 margin-bottom:20px;border:none;cursor:pointer;">
@@ -31618,52 +31669,316 @@ app.get("/dashboard-history", async (req, res) => {
 });
 
 // ---------- Send KPI email ----------
-const sendKPIEmail = async (responsibleId, week) => {
+const sendKPIEmail = async (responsibleId, week, options = {}) => {
   try {
     const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week);
+    const calculationMode = normalizeOptionalTextInput(options.calculationMode);
     if (!responsible) {
       throw new Error(`Responsible ${responsibleId} not found`);
     }
     if (!normalizeOptionalTextInput(responsible.email)) {
       console.warn(`[KPI Reminder] Skipping ${responsible.name || responsibleId} because no email is defined.`);
-      return;
+      return false;
     }
     if (!Array.isArray(kpis) || !kpis.length) {
       console.warn(`[KPI Reminder] Skipping ${responsible.name || responsibleId} because no KPI allocations were found.`);
-      return;
+      return false;
     }
-    const html = generateEmailHtml({ responsible, week });
+    const html = generateEmailHtml({ responsible, week, calculationMode });
     const transporter = createTransporter();
+    const subjectModeSuffix = calculationMode ? ` (${calculationMode})` : "";
     await transporter.sendMail({
       from: '"Administration STS" <administration.STS@avocarbon.com>',
       to: responsible.email,
-      subject: `KPI Form for ${responsible.name} - ${week}`,
+      subject: `KPI Form${subjectModeSuffix} for ${responsible.name} - ${week}`,
       html,
     });
     console.log(`Email sent to ${responsible.email}`);
+    return true;
   } catch (err) {
     console.error(`âŒ Failed to send email to responsible ID ${responsibleId}:`, err.message);
+    return false;
   }
 };
 
-const loadKpiSubmissionEmailRecipients = async () => {
+const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
+  const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode);
+  const modeFilter = normalizedCalculationMode
+    ? normalizedCalculationMode.toLowerCase()
+    : null;
   const result = await pool.query(
     `
-    SELECT DISTINCT
+    WITH recipient_people AS (
+      SELECT DISTINCT
+        kta.set_by_people_id AS people_id
+      FROM public.kpi_target_allocation kta
+      JOIN public.kpi k
+        ON k.kpi_id = kta.kpi_id
+      WHERE kta.set_by_people_id IS NOT NULL
+        AND (
+          $1::text IS NULL
+          OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = $1
+        )
+    )
+    SELECT
       owner.people_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(owner.first_name, ''), COALESCE(owner.name, ''))), '') AS name,
-      owner.email
-    FROM public.kpi_target_allocation kta
+      owner.email,
+      COALESCE(allocation_scope.resolved_unit_id, primary_unit.unit_id, home_unit.unit_id) AS unit_id,
+      COALESCE(
+        allocation_scope.resolved_unit_name,
+        NULLIF(TRIM(primary_unit.unit_name), ''),
+        NULLIF(TRIM(home_unit.unit_name), '')
+      ) AS unit_name,
+      COALESCE(
+        allocation_scope.resolved_unit_short_name,
+        NULLIF(TRIM(primary_unit.unit_short_name), ''),
+        NULLIF(TRIM(home_unit.unit_short_name), '')
+      ) AS unit_short_name
+    FROM recipient_people recipient
     JOIN public.people owner
-      ON owner.people_id = kta.set_by_people_id
+      ON owner.people_id = recipient.people_id
+    LEFT JOIN LATERAL (
+      SELECT pra.unit_id
+      FROM public.people_role_assignment pra
+      WHERE pra.people_id = owner.people_id
+        AND COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+        AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      ORDER BY
+        COALESCE(pra.is_primary, false) DESC,
+        pra.assignment_id DESC
+      LIMIT 1
+    ) primary_assignment ON TRUE
+    LEFT JOIN public.unit primary_unit
+      ON primary_unit.unit_id = primary_assignment.unit_id
+    LEFT JOIN public.unit home_unit
+      ON home_unit.unit_id = owner.work_at_unit_id
+    LEFT JOIN LATERAL (
+      SELECT
+        COALESCE(unit_scope.unit_id, plant.unit_id) AS resolved_unit_id,
+        COALESCE(
+          NULLIF(TRIM(unit_scope.unit_name), ''),
+          NULLIF(TRIM(plant.unit_name), '')
+        ) AS resolved_unit_name,
+        COALESCE(
+          NULLIF(TRIM(unit_scope.unit_short_name), ''),
+          NULLIF(TRIM(plant.unit_short_name), '')
+        ) AS resolved_unit_short_name
+      FROM public.kpi_target_allocation kta
+      JOIN public.kpi k
+        ON k.kpi_id = kta.kpi_id
+      LEFT JOIN public.unit unit_scope
+        ON unit_scope.unit_id = kta.unit_id
+      LEFT JOIN public.unit plant
+        ON plant.unit_id = kta.plant_id
+      WHERE kta.set_by_people_id = owner.people_id
+        AND (
+          $1::text IS NULL
+          OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = $1
+        )
+      ORDER BY
+        COALESCE(kta.updated_at, kta.created_at, CURRENT_TIMESTAMP) DESC,
+        kta.kpi_target_allocation_id DESC
+      LIMIT 1
+    ) allocation_scope ON TRUE
     WHERE owner.people_id IS NOT NULL
       AND COALESCE(TRIM(owner.email), '') <> ''
     ORDER BY owner.people_id ASC
-    `
+    `,
+    [modeFilter]
   );
 
   return result.rows;
 };
+
+const DEFAULT_KPI_SUBMISSION_TIMEZONE = "Africa/Tunis";
+const KPI_SUBMISSION_TARGET_LOCAL_HOUR = 8;
+const KPI_SUBMISSION_DISPATCH_WINDOW_MINUTES = 15;
+const UNIT_TIMEZONE_BY_NAME = {
+  "luxembourg": "Europe/Luxembourg",
+  "luxembourg hq": "Europe/Luxembourg",
+  "cyclam": "Europe/Paris",
+  "poitiers": "Europe/Paris",
+  "sts": "Africa/Tunis",
+  "same": "Africa/Tunis",
+  "sceet": "Africa/Tunis",
+  "nadhour": "Africa/Tunis",
+  "frankfurt": "Europe/Berlin",
+  "chennai": "Asia/Kolkata",
+  "daegu": "Asia/Seoul",
+  "tianjin": "Asia/Shanghai",
+  "kunshan": "Asia/Shanghai",
+  "anhui": "Asia/Shanghai",
+  "mexico": "America/Mexico_City"
+};
+
+const normalizeUnitTimezoneLookupKey = (value) =>
+  String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const getCanonicalKpiCalculationMode = (value) => {
+  const normalizedValue = normalizeOptionalTextInput(value);
+  if (!normalizedValue) return "Direct";
+  return normalizedValue.trim().toLowerCase() === "ratio" ? "Ratio" : "Direct";
+};
+
+const resolveKpiSubmissionRecipientTimeZone = (recipient = {}) => {
+  const lookupCandidates = [
+    recipient.unit_short_name,
+    recipient.unit_name
+  ]
+    .map((value) => normalizeUnitTimezoneLookupKey(value))
+    .filter(Boolean);
+
+  for (const candidate of lookupCandidates) {
+    if (UNIT_TIMEZONE_BY_NAME[candidate]) {
+      return UNIT_TIMEZONE_BY_NAME[candidate];
+    }
+  }
+
+  return DEFAULT_KPI_SUBMISSION_TIMEZONE;
+};
+
+const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
+  const resolvedTimeZone =
+    normalizeOptionalTextInput(timeZone) || DEFAULT_KPI_SUBMISSION_TIMEZONE;
+
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: resolvedTimeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      hourCycle: "h23"
+    });
+
+    const partsMap = formatter.formatToParts(date).reduce((accumulator, part) => {
+      if (part.type !== "literal") {
+        accumulator[part.type] = part.value;
+      }
+      return accumulator;
+    }, {});
+
+    const year = Number(partsMap.year || 0);
+    const month = Number(partsMap.month || 1);
+    const day = Number(partsMap.day || 1);
+    const hour = Number(partsMap.hour || 0);
+    const minute = Number(partsMap.minute || 0);
+    const second = Number(partsMap.second || 0);
+    const pseudoDate = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+
+    return {
+      timeZone: resolvedTimeZone,
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second,
+      localDate: `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+      pseudoDate
+    };
+  } catch (error) {
+    if (resolvedTimeZone !== DEFAULT_KPI_SUBMISSION_TIMEZONE) {
+      return buildTimeZoneDateContext(DEFAULT_KPI_SUBMISSION_TIMEZONE, date);
+    }
+
+    throw error;
+  }
+};
+
+const hasReachedKpiSubmissionLocalSendWindow = (timeContext = {}) => {
+  return (
+    Number(timeContext.hour) === KPI_SUBMISSION_TARGET_LOCAL_HOUR &&
+    Number(timeContext.minute) >= 0 &&
+    Number(timeContext.minute) < KPI_SUBMISSION_DISPATCH_WINDOW_MINUTES
+  );
+};
+
+const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
+  peopleId,
+  calculationMode,
+  localDispatchDate
+}) => {
+  const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
+  const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+  const normalizedLocalDate = normalizeOptionalTextInput(localDispatchDate);
+
+  if (!normalizedPeopleId || !normalizedLocalDate) {
+    return false;
+  }
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM public.kpi_submission_email_dispatch_log
+    WHERE people_id = $1
+      AND calculation_mode = $2
+      AND local_dispatch_date = $3::date
+    LIMIT 1
+    `,
+    [normalizedPeopleId, canonicalMode, normalizedLocalDate]
+  );
+
+  return Boolean(result.rows.length);
+};
+
+const recordKpiSubmissionEmailDispatch = async ({
+  peopleId,
+  calculationMode,
+  targetWeek,
+  localDispatchDate,
+  unitId = null,
+  unitName = null,
+  unitShortName = null,
+  unitTimeZone
+}) => {
+  const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
+  const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+  const normalizedTargetWeek = normalizeOptionalTextInput(targetWeek);
+  const normalizedLocalDate = normalizeOptionalTextInput(localDispatchDate);
+
+  if (!normalizedPeopleId || !normalizedTargetWeek || !normalizedLocalDate) {
+    return false;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO public.kpi_submission_email_dispatch_log (
+      people_id,
+      calculation_mode,
+      target_week,
+      local_dispatch_date,
+      unit_id,
+      unit_name,
+      unit_short_name,
+      unit_timezone
+    )
+    VALUES ($1, $2, $3, $4::date, $5, $6, $7, $8)
+    ON CONFLICT (people_id, calculation_mode, local_dispatch_date) DO NOTHING
+    `,
+    [
+      normalizedPeopleId,
+      canonicalMode,
+      normalizedTargetWeek,
+      normalizedLocalDate,
+      normalizeOptionalIntegerInput(unitId),
+      normalizeOptionalTextInput(unitName),
+      normalizeOptionalTextInput(unitShortName),
+      normalizeOptionalTextInput(unitTimeZone) || DEFAULT_KPI_SUBMISSION_TIMEZONE
+    ]
+  );
+
+  return true;
+};
+
 const loadWeeklyReportRecipientsForWeek = async (reportWeek) => {
   const result = await pool.query(
     `
@@ -32853,6 +33168,26 @@ function getCurrentFormWeek(date = new Date()) {
     : getPreviousWeek(currentWeek);
 }
 
+function getCurrentWeekFromPseudoDate(date = new Date()) {
+  const now = new Date(date);
+  const year = now.getUTCFullYear();
+  const startDate = new Date(Date.UTC(year, 0, 1));
+  const days = Math.floor((now.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000));
+  const weekNumber = Math.ceil((days + startDate.getUTCDay() + 1) / 7);
+  return `${year}-Week${weekNumber}`;
+}
+
+function getCurrentFormWeekFromPseudoDate(date = new Date()) {
+  const pseudoDate = new Date(date);
+  const dayOfWeek = pseudoDate.getUTCDay();
+  const currentWeek = getCurrentWeekFromPseudoDate(pseudoDate);
+  const fridayCutoverReached = dayOfWeek === 5 || dayOfWeek === 6 || dayOfWeek === 0;
+
+  return fridayCutoverReached
+    ? currentWeek
+    : getPreviousWeek(currentWeek);
+}
+
 const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOverride = null) => {
   try {
     const responsibleContext = await loadFormResponsibleContext(responsibleId);
@@ -33213,42 +33548,130 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-let cronRunning = false;
-cron.schedule("10 8 * * *", async () => {
-  const lockId = "send_kpi_weekly_email_job";
+const DIRECT_KPI_SUBMISSION_CRON = "0 9 * * 1";   // Example: Monday 08:00 UTC
+const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * 1";   // Example: Monday 09:00 UTC
+const weeklyKpiSubmissionCronState = {
+  direct: false,
+  ratio: false
+};
+
+const runWeeklyKpiSubmissionCron = async ({
+  calculationMode,
+  lockId,
+  stateKey,
+  logLabel
+}) => {
   const lock = await acquireJobLock(lockId);
-  if (!lock.acquired) return;
+  if (!lock.acquired) {
+    console.log(`[KPI Reminder:${logLabel}] lock not acquired`);
+    return;
+  }
 
   try {
-    if (cronRunning) return;
-    cronRunning = true;
+    if (weeklyKpiSubmissionCronState[stateKey]) {
+      console.log(`[KPI Reminder:${logLabel}] already running`);
+      return;
+    }
 
-    const currentWeek = getCurrentFormWeek();
-
-    const recipients = await loadKpiSubmissionEmailRecipients();
+    weeklyKpiSubmissionCronState[stateKey] = true;
+    await ensureKpiSubmissionEmailDispatchLogSchema();
+    const recipients = await loadKpiSubmissionEmailRecipients(calculationMode);
+    const dispatchDate = new Date();
+    const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+    let eligibleCount = 0;
+    let sentCount = 0;
+    let alreadySentCount = 0;
+    let notDueCount = 0;
+    let skippedCount = 0;
 
     for (const recipient of recipients) {
+      const recipientTimeZone = resolveKpiSubmissionRecipientTimeZone(recipient);
+      const timeContext = buildTimeZoneDateContext(recipientTimeZone, dispatchDate);
+      const currentWeek = getCurrentFormWeekFromPseudoDate(timeContext.pseudoDate);
+
+      if (!hasReachedKpiSubmissionLocalSendWindow(timeContext)) {
+        notDueCount += 1;
+        continue;
+      }
+
+      eligibleCount += 1;
+
+      const alreadySent = await hasKpiSubmissionEmailBeenSentForLocalDate({
+        peopleId: recipient.people_id,
+        calculationMode: canonicalMode,
+        localDispatchDate: timeContext.localDate
+      });
+
+      if (alreadySent) {
+        alreadySentCount += 1;
+        continue;
+      }
+
       try {
-        await sendKPIEmail(recipient.people_id, currentWeek);
+        const emailSent = await sendKPIEmail(recipient.people_id, currentWeek, {
+          calculationMode
+        });
+
+        if (!emailSent) {
+          skippedCount += 1;
+          continue;
+        }
+
+        await recordKpiSubmissionEmailDispatch({
+          peopleId: recipient.people_id,
+          calculationMode: canonicalMode,
+          targetWeek: currentWeek,
+          localDispatchDate: timeContext.localDate,
+          unitId: recipient.unit_id,
+          unitName: recipient.unit_name,
+          unitShortName: recipient.unit_short_name,
+          unitTimeZone: recipientTimeZone
+        });
+
+        sentCount += 1;
         await new Promise((resolve) => setTimeout(resolve, 750));
       } catch (error) {
-        console.error(`[KPI Reminder] Failed for ${recipient.name || recipient.people_id}:`, error.message);
+        skippedCount += 1;
+        console.error(
+          `[KPI Reminder:${logLabel}] Failed for ${recipient.name || recipient.people_id}:`,
+          error.message
+        );
       }
     }
 
-    console.log(`[KPI Reminder] Emails processed for ${recipients.length} people for ${currentWeek}`);
-  } catch (err) {
-    console.error("Scheduled email error:", err.message);
+    console.log(
+      `[KPI Reminder:${logLabel}] Dispatch scan complete. recipients=${recipients.length}, eligible=${eligibleCount}, sent=${sentCount}, already_sent=${alreadySentCount}, not_due=${notDueCount}, skipped=${skippedCount}`
+    );
+  } catch (error) {
+    console.error(`[KPI Reminder:${logLabel}] Scheduled email error:`, error.message);
   } finally {
-    cronRunning = false;
+    weeklyKpiSubmissionCronState[stateKey] = false;
     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
   }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+};
+
+// cron.schedule(DIRECT_KPI_SUBMISSION_CRON, async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, { scheduled: true, timezone: "UTC" });
+
+// cron.schedule(RATIO_KPI_SUBMISSION_CRON, async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
+// }, { scheduled: true, timezone: "UTC" });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
 
-// cron.schedule("50 15 * * *", async () => {
+// cron.schedule("40 14 * * *", async () => {
 //   const lockId = "weekly_kpi_report_job";
 //   const lock = await acquireJobLock(lockId);
 
@@ -35272,7 +35695,7 @@ app.post("/api/hierarchy-report/send", triggerHierarchyReportNow);
 // ---------- Cron: weekly manager/plant report ----------
 // let managerCronRunning = false;
 
-// cron.schedule("56 16 * * *", async () => {
+// cron.schedule("02 15 * * *", async () => {
 //   if (managerCronRunning) return;
 //   managerCronRunning = true;
 
@@ -35295,6 +35718,13 @@ ensureKpiRatioSchema()
   .catch((error) => {
     console.error("[KPI Knowledge Base] Sync infrastructure setup failed:", error.message);
   });
+ensureKpiSubmissionEmailDispatchLogSchema()
+  .then(() => {
+    console.log("[KPI Reminder] Dispatch log infrastructure is ready.");
+  })
+  .catch((error) => {
+    console.error("[KPI Reminder] Dispatch log infrastructure setup failed:", error.message);
+  });
 ensureCorrectiveActionEscalationSchema()
   .then(() => {
     console.log("[Corrective Action Escalation] Tracking table is ready.");
@@ -35302,14 +35732,1259 @@ ensureCorrectiveActionEscalationSchema()
   .catch((error) => {
     console.error("[Corrective Action Escalation] Tracking table setup failed:", error.message);
   });
+
+const KPI_TRAINING_DEFAULT_TEST_DUE_DAYS = 7;
+const KPI_TRAINING_COMPLETED_STATUSES = new Set([
+  "training_done",
+  "test_sent",
+  "test_overdue",
+  "completed_pass",
+  "completed_fail",
+  "escalated"
+]);
+const KPI_TRAINING_TEST_SENT_STATUSES = new Set([
+  "test_sent",
+  "test_overdue",
+  "completed_pass",
+  "completed_fail",
+  "escalated"
+]);
+const KPI_TRAINING_TEST_COMPLETED_STATUSES = new Set([
+  "completed_pass",
+  "completed_fail"
+]);
+
+const formatIsoTimestampValue = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const normalizeJsonColumnValue = (value) => {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+
+    if (
+      (text.startsWith("{") && text.endsWith("}")) ||
+      (text.startsWith("[") && text.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(text);
+      } catch (error) {
+        return text;
+      }
+    }
+
+    return text;
+  }
+
+  return value;
+};
+
+const normalizeTrainingPlainText = (value) => {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === "string") {
+    const text = value.replace(/\r\n/g, "\n").trim();
+    return text || null;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  return null;
+};
+
+const pickFirstPortalText = (...values) => {
+  for (const value of values) {
+    const text = normalizeTrainingPlainText(value);
+    if (text) return text;
+  }
+
+  return null;
+};
+
+const normalizePortalBulletItems = (value) =>
+  toArray(value)
+    .flatMap((item) => {
+      if (item === undefined || item === null) return [];
+
+      if (typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+        const text = normalizeTrainingPlainText(item);
+        return text ? [text] : [];
+      }
+
+      if (typeof item === "object") {
+        const text = pickFirstPortalText(
+          item.text,
+          item.label,
+          item.title,
+          item.value,
+          item.name,
+          item.description
+        );
+        return text ? [text] : [];
+      }
+
+      return [];
+    })
+    .filter(Boolean);
+
+const buildNormalizedTrainingBlocks = (rawContent) => {
+  const parsedContent = normalizeJsonColumnValue(rawContent);
+  if (!parsedContent) return [];
+
+  const blocks = [];
+  const seenSignatures = new Set();
+  const childKeys = [
+    "sections",
+    "modules",
+    "lessons",
+    "slides",
+    "items",
+    "content",
+    "topics",
+    "steps",
+    "chapters",
+    "parts",
+    "cards",
+    "entries"
+  ];
+  const bulletKeys = [
+    "bullets",
+    "points",
+    "takeaways",
+    "key_points",
+    "keyPoints",
+    "highlights",
+    "checklist",
+    "objectives",
+    "outcomes",
+    "options",
+    "choices"
+  ];
+
+  const pushBlock = ({ title = null, body = null, bullets = [] } = {}) => {
+    const normalizedTitle = normalizeTrainingPlainText(title);
+    const normalizedBody = normalizeTrainingPlainText(body);
+    const normalizedBullets = Array.from(
+      new Set(normalizePortalBulletItems(bullets))
+    );
+
+    if (!normalizedTitle && !normalizedBody && !normalizedBullets.length) {
+      return;
+    }
+
+    const signature = JSON.stringify([
+      normalizedTitle || "",
+      normalizedBody || "",
+      normalizedBullets
+    ]).toLowerCase();
+
+    if (seenSignatures.has(signature)) {
+      return;
+    }
+
+    seenSignatures.add(signature);
+    blocks.push({
+      id: `training-block-${blocks.length + 1}`,
+      title: normalizedTitle || `Learning Block ${blocks.length + 1}`,
+      body: normalizedBody || "",
+      bullets: normalizedBullets
+    });
+  };
+
+  const visitNode = (node, fallbackTitle = null) => {
+    if (node === undefined || node === null) return;
+
+    if (Array.isArray(node)) {
+      node.forEach((entry) => visitNode(entry, fallbackTitle));
+      return;
+    }
+
+    if (typeof node === "string" || typeof node === "number" || typeof node === "boolean") {
+      pushBlock({
+        title: fallbackTitle,
+        body: node
+      });
+      return;
+    }
+
+    if (typeof node !== "object") {
+      return;
+    }
+
+    const title = pickFirstPortalText(
+      node.title,
+      node.heading,
+      node.name,
+      node.label,
+      node.question,
+      node.prompt,
+      fallbackTitle
+    );
+
+    const bodySegments = [
+      node.text,
+      typeof node.content === "string" ? node.content : null,
+      node.description,
+      node.body,
+      node.summary,
+      node.explanation,
+      node.instructions,
+      node.note,
+      node.notes,
+      node.context,
+      node.overview
+    ]
+      .map((entry) => normalizeTrainingPlainText(entry))
+      .filter(Boolean);
+
+    const bulletItems = bulletKeys.flatMap((key) => normalizePortalBulletItems(node[key]));
+
+    if (title || bodySegments.length || bulletItems.length) {
+      pushBlock({
+        title,
+        body: bodySegments.join("\n\n"),
+        bullets: bulletItems
+      });
+    }
+
+    childKeys.forEach((key) => {
+      const child = node[key];
+      if (Array.isArray(child)) {
+        visitNode(child, title);
+      } else if (child && typeof child === "object") {
+        visitNode(child, title);
+      }
+    });
+  };
+
+  visitNode(parsedContent);
+  return blocks.slice(0, 80);
+};
+
+const buildComparableToken = (value) => {
+  const normalized = normalizeTrainingPlainText(value);
+  return normalized ? normalized.toLowerCase() : null;
+};
+
+const QUESTION_OPTION_LINE_RE = /^\s*([A-Z]|\d{1,2})[\.\)\:\-]\s+(.+?)\s*$/i;
+
+const normalizePortalQuestionText = (value) => {
+  const normalized = normalizeTrainingPlainText(value);
+  if (!normalized) return null;
+
+  return normalized
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "- ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+};
+
+const extractInlineQuestionOptions = (value) => {
+  const normalized = normalizePortalQuestionText(value);
+  if (!normalized) {
+    return {
+      text: "",
+      options: []
+    };
+  }
+
+  const lines = normalized
+    .split(/\n+/)
+    .map((line) => normalizeTrainingPlainText(line))
+    .filter(Boolean);
+  const options = [];
+  const keptLines = [];
+
+  lines.forEach((line, index) => {
+    const match = line.match(QUESTION_OPTION_LINE_RE);
+    if (!match) {
+      keptLines.push(line);
+      return;
+    }
+
+    const key = normalizeTrainingPlainText(match[1]) || `option-${index + 1}`;
+    const label = normalizeTrainingPlainText(match[2]);
+    if (!label) return;
+
+    options.push({
+      key: key.toUpperCase(),
+      label
+    });
+  });
+
+  return {
+    text: keptLines.join("\n").trim(),
+    options
+  };
+};
+
+const extractObjectQuestionOptions = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+
+  const sortWeight = (key) => {
+    const normalizedKey = String(key || "").trim().toUpperCase();
+    if (/^[A-Z]$/.test(normalizedKey)) return normalizedKey.charCodeAt(0) - 64;
+    if (/^\d+$/.test(normalizedKey)) return 100 + Number(normalizedKey);
+    return 1000;
+  };
+
+  return Object.entries(value)
+    .map(([rawKey, rawValue], index) => {
+      const label = rawValue && typeof rawValue === "object"
+        ? pickFirstPortalText(rawValue.text, rawValue.label, rawValue.title, rawValue.value, rawValue.name, rawValue.answer)
+        : pickFirstPortalText(rawValue);
+
+      if (!label) return null;
+
+      return {
+        key: normalizeTrainingPlainText(rawKey) || `option-${index + 1}`,
+        label,
+        sortOrder: sortWeight(rawKey)
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.sortOrder - right.sortOrder)
+    .map(({ key, label }) => ({ key, label }));
+};
+
+const extractNamedQuestionOptions = (node = {}) => {
+  if (!node || typeof node !== "object") return [];
+
+  const optionFieldGroups = [
+    ["option_a", "optionA", "choice_a", "choiceA", "answer_a", "answerA", "response_a", "responseA", "a", "A"],
+    ["option_b", "optionB", "choice_b", "choiceB", "answer_b", "answerB", "response_b", "responseB", "b", "B"],
+    ["option_c", "optionC", "choice_c", "choiceC", "answer_c", "answerC", "response_c", "responseC", "c", "C"],
+    ["option_d", "optionD", "choice_d", "choiceD", "answer_d", "answerD", "response_d", "responseD", "d", "D"],
+    ["option_e", "optionE", "choice_e", "choiceE", "answer_e", "answerE", "response_e", "responseE", "e", "E"],
+    ["option_f", "optionF", "choice_f", "choiceF", "answer_f", "answerF", "response_f", "responseF", "f", "F"]
+  ];
+
+  return optionFieldGroups
+    .map((fieldNames, index) => {
+      for (const fieldName of fieldNames) {
+        const value = node[fieldName];
+        const label = value && typeof value === "object"
+          ? pickFirstPortalText(value.text, value.label, value.title, value.value, value.name, value.answer)
+          : pickFirstPortalText(value);
+
+        if (label) {
+          return {
+            key: String.fromCharCode(65 + index),
+            label
+          };
+        }
+      }
+
+      return null;
+    })
+    .filter(Boolean);
+};
+
+const buildNormalizedQuestionnaire = (rawQuestionnaire) => {
+  const parsedQuestionnaire = normalizeJsonColumnValue(rawQuestionnaire);
+  if (!parsedQuestionnaire) return [];
+
+  const questions = [];
+  const childKeys = ["questions", "items", "sections", "pages", "groups", "quiz", "questionnaire", "chapters", "modules", "lessons", "slides", "topics", "steps", "parts", "cards", "entries", "content"];
+  const optionKeys = ["options", "choices", "answers", "propositions", "responses"];
+
+  const visitNode = (node, fallbackTitle = null) => {
+    if (node === undefined || node === null) return;
+
+    if (Array.isArray(node)) {
+      node.forEach((entry) => visitNode(entry, fallbackTitle));
+      return;
+    }
+
+    if (typeof node !== "object") {
+      return;
+    }
+
+    const rawPrompt = pickFirstPortalText(
+      node.question,
+      node.prompt,
+      node.title,
+      node.label,
+      node.text,
+      node.name,
+      fallbackTitle
+    );
+    const rawHelpText = pickFirstPortalText(
+      node.description,
+      node.explanation,
+      node.help_text,
+      node.helpText,
+      node.instructions,
+      node.context
+    );
+    const promptExtraction = extractInlineQuestionOptions(rawPrompt);
+    const helpExtraction = extractInlineQuestionOptions(rawHelpText);
+    const inlineOptionText = pickFirstPortalText(
+      typeof node.options === "string" ? node.options : null,
+      typeof node.choices === "string" ? node.choices : null,
+      typeof node.answers === "string" ? node.answers : null,
+      typeof node.propositions === "string" ? node.propositions : null,
+      typeof node.responses === "string" ? node.responses : null,
+      node.option_text,
+      node.optionText,
+      node.choice_text,
+      node.choiceText
+    );
+    const inlineOptionExtraction = extractInlineQuestionOptions(inlineOptionText);
+    const prompt = pickFirstPortalText(promptExtraction.text, rawPrompt, fallbackTitle);
+
+    const rawCorrectValues = [
+      ...toArray(node.correct_answers),
+      ...toArray(node.correctAnswers),
+      ...toArray(node.valid_answers),
+      ...toArray(node.validAnswers),
+      ...toArray(node.expected_answers),
+      ...toArray(node.expectedAnswers)
+    ]
+      .map((entry) => normalizeTrainingPlainText(entry))
+      .filter(Boolean);
+
+    const singleCorrectValue = pickFirstPortalText(
+      node.correct_option_id,
+      node.correctOptionId,
+      node.correct_answer,
+      node.correctAnswer,
+      node.expected_answer,
+      node.expectedAnswer,
+      node.right_answer,
+      node.rightAnswer,
+      node.solution,
+      typeof node.answer === "string" ? node.answer : null
+    );
+
+    if (singleCorrectValue) {
+      rawCorrectValues.push(singleCorrectValue);
+    }
+
+    const correctIndexSet = new Set(
+      [
+        ...toArray(node.correct_index),
+        ...toArray(node.correctIndex),
+        ...toArray(node.correct_indexes),
+        ...toArray(node.correctIndexes),
+        ...toArray(node.correct_option_index),
+        ...toArray(node.correctOptionIndex)
+      ]
+        .map((entry) => Number(entry))
+        .filter((entry) => Number.isInteger(entry) && entry >= 0)
+    );
+
+    const correctTokenSet = new Set(
+      rawCorrectValues
+        .map((entry) => buildComparableToken(entry))
+        .filter(Boolean)
+    );
+    const implicitHelpAnswerToken = buildComparableToken(helpExtraction.text || rawHelpText);
+
+    const rawOptions = optionKeys
+      .map((key) => node[key])
+      .find((entry) => Array.isArray(entry) && entry.length);
+    const rawOptionObject = optionKeys
+      .map((key) => node[key])
+      .find((entry) => entry && typeof entry === "object" && !Array.isArray(entry));
+
+    let options = Array.isArray(rawOptions)
+      ? rawOptions
+        .map((option, optionIndex) => {
+          if (option === undefined || option === null) return null;
+
+          const label = typeof option === "object"
+            ? pickFirstPortalText(option.text, option.label, option.title, option.value, option.name, option.answer)
+            : pickFirstPortalText(option);
+          if (!label) return null;
+
+          const explicitKey = typeof option === "object"
+            ? pickFirstPortalText(option.key, option.id, option.value, option.code)
+            : null;
+          const key = explicitKey || `option-${optionIndex + 1}`;
+          const comparisonTokens = new Set(
+            [
+              key,
+              label,
+              typeof option === "object" ? option.value : null,
+              typeof option === "object" ? option.id : null,
+              optionIndex,
+              optionIndex + 1
+            ]
+              .map((entry) => buildComparableToken(entry))
+              .filter(Boolean)
+          );
+
+          const isCorrectFlag = typeof option === "object" && (
+            option.correct === true ||
+            option.is_correct === true ||
+            option.isCorrect === true ||
+            option.valid === true ||
+            option.expected === true ||
+            option.answer === true
+          );
+
+          const isCorrect = Boolean(
+            isCorrectFlag ||
+            correctIndexSet.has(optionIndex) ||
+            correctIndexSet.has(optionIndex + 1) ||
+            Array.from(comparisonTokens).some((token) => correctTokenSet.has(token)) ||
+            (!correctTokenSet.size && implicitHelpAnswerToken && Array.from(comparisonTokens).some((token) => token === implicitHelpAnswerToken))
+          );
+
+          return {
+            key,
+            label,
+            isCorrect
+          };
+        })
+        .filter(Boolean)
+      : [];
+
+    if (!options.length) {
+      const inlineOptions = [
+        ...promptExtraction.options,
+        ...helpExtraction.options,
+        ...inlineOptionExtraction.options,
+        ...extractObjectQuestionOptions(rawOptionObject),
+        ...extractNamedQuestionOptions(node)
+      ].filter((option) => option && option.label);
+      const seenInlineLabels = new Set();
+
+      options = inlineOptions.filter((option, optionIndex) => {
+        const labelToken = buildComparableToken(option.label);
+        if (!labelToken || seenInlineLabels.has(labelToken)) return false;
+        seenInlineLabels.add(labelToken);
+        return true;
+      }).map((option, optionIndex) => {
+        const normalizedKey = normalizeTrainingPlainText(option.key) || `option-${optionIndex + 1}`;
+        const keyToken = buildComparableToken(normalizedKey);
+        const labelToken = buildComparableToken(option.label);
+
+        return {
+          key: normalizedKey,
+          label: option.label,
+          isCorrect: Boolean(
+            (labelToken && correctTokenSet.has(labelToken)) ||
+            (keyToken && correctTokenSet.has(keyToken)) ||
+            (!correctTokenSet.size && implicitHelpAnswerToken && (labelToken === implicitHelpAnswerToken || keyToken === implicitHelpAnswerToken)) ||
+            correctIndexSet.has(optionIndex) ||
+            correctIndexSet.has(optionIndex + 1)
+          )
+        };
+      });
+    }
+
+    const acceptedAnswers = options.length
+      ? []
+      : [
+        ...rawCorrectValues.filter(Boolean),
+        ...(!rawCorrectValues.length && implicitHelpAnswerToken ? [helpExtraction.text || rawHelpText] : [])
+      ].filter(Boolean);
+    let helpText = pickFirstPortalText(helpExtraction.text, rawHelpText) || "";
+    const helpToken = buildComparableToken(helpText);
+
+    if (helpToken) {
+      const acceptedTokenSet = new Set(
+        acceptedAnswers
+          .map((entry) => buildComparableToken(entry))
+          .filter(Boolean)
+      );
+      const correctOptionTokenSet = new Set(
+        options
+          .filter((option) => option.isCorrect)
+          .flatMap((option) => [option.label, option.key])
+          .map((entry) => buildComparableToken(entry))
+          .filter(Boolean)
+      );
+
+      if (acceptedTokenSet.has(helpToken) || correctOptionTokenSet.has(helpToken)) {
+        helpText = "";
+      }
+    }
+
+    const scorable = options.length
+      ? options.some((option) => option.isCorrect)
+      : acceptedAnswers.length > 0;
+
+    const looksLikeQuestion = Boolean(
+      prompt &&
+      (options.length || acceptedAnswers.length || node.question || node.prompt)
+    );
+
+    if (looksLikeQuestion) {
+      questions.push({
+        id: pickFirstPortalText(node.id, node.question_id, node.questionId) || "",
+        prompt,
+        helpText: helpText || "",
+        type: options.length
+          ? (options.filter((option) => option.isCorrect).length > 1 ? "multi" : "single")
+          : "text",
+        options,
+        acceptedAnswers,
+        scorable
+      });
+    }
+
+    childKeys.forEach((key) => {
+      const child = node[key];
+      if (Array.isArray(child)) {
+        visitNode(child, prompt || fallbackTitle);
+      } else if (child && typeof child === "object") {
+        visitNode(child, prompt || fallbackTitle);
+      }
+    });
+  };
+
+  visitNode(parsedQuestionnaire);
+
+  return questions.map((question, index) => ({
+    ...question,
+    id: question.id || `question-${index + 1}`,
+    order: index + 1
+  }));
+};
+
+const buildClientFacingQuestion = (question = {}) => ({
+  id: question.id,
+  order: question.order,
+  prompt: question.prompt,
+  help_text: question.helpText || "",
+  type: question.type || "single",
+  options: Array.isArray(question.options)
+    ? question.options.map((option) => ({
+      key: option.key,
+      label: option.label
+    }))
+    : []
+});
+
+const mergeTrainingQuestions = (primaryQuestions = [], fallbackQuestions = []) => {
+  const primary = Array.isArray(primaryQuestions) ? primaryQuestions : [];
+  const fallback = Array.isArray(fallbackQuestions) ? fallbackQuestions : [];
+
+  if (!primary.length) {
+    return fallback;
+  }
+
+  const fallbackByPrompt = new Map();
+  fallback.forEach((question) => {
+    const key = buildComparableToken(question?.prompt);
+    if (key && !fallbackByPrompt.has(key)) {
+      fallbackByPrompt.set(key, question);
+    }
+  });
+
+  return primary.map((question, index) => {
+    const promptKey = buildComparableToken(question?.prompt);
+    const fallbackQuestion =
+      (promptKey ? fallbackByPrompt.get(promptKey) : null) ||
+      fallback[index] ||
+      null;
+
+    if (!fallbackQuestion) {
+      return question;
+    }
+
+    const primaryOptions = Array.isArray(question.options) ? question.options : [];
+    const fallbackOptions = Array.isArray(fallbackQuestion.options) ? fallbackQuestion.options : [];
+
+    if (primaryOptions.length || !fallbackOptions.length) {
+      return question;
+    }
+
+    const acceptedTokenSet = new Set(
+      toArray(question.acceptedAnswers)
+        .map((entry) => buildComparableToken(entry))
+        .filter(Boolean)
+    );
+
+    const mergedOptions = fallbackOptions.map((option) => {
+      const optionKeyToken = buildComparableToken(option.key);
+      const optionLabelToken = buildComparableToken(option.label);
+
+      return {
+        ...option,
+        isCorrect: Boolean(
+          option.isCorrect ||
+          (optionKeyToken && acceptedTokenSet.has(optionKeyToken)) ||
+          (optionLabelToken && acceptedTokenSet.has(optionLabelToken))
+        )
+      };
+    });
+
+    const correctOptionCount = mergedOptions.filter((option) => option.isCorrect).length;
+    let mergedHelpText = question.helpText || fallbackQuestion.helpText || "";
+    const mergedHelpToken = buildComparableToken(mergedHelpText);
+
+    if (mergedHelpToken) {
+      const mergedCorrectTokenSet = new Set(
+        mergedOptions
+          .filter((option) => option.isCorrect)
+          .flatMap((option) => [option.label, option.key])
+          .map((entry) => buildComparableToken(entry))
+          .filter(Boolean)
+      );
+
+      if (mergedCorrectTokenSet.has(mergedHelpToken)) {
+        mergedHelpText = "";
+      }
+    }
+
+    return {
+      ...question,
+      helpText: mergedHelpText,
+      type: correctOptionCount > 1 ? "multi" : "single",
+      options: mergedOptions,
+      acceptedAnswers: [],
+      scorable: mergedOptions.some((option) => option.isCorrect) || question.scorable
+    };
+  });
+};
+
+const normalizeSubmittedTrainingAnswers = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const normalizedAnswers = {};
+
+  Object.entries(value).forEach(([questionId, answerValue]) => {
+    const normalizedQuestionId = normalizeOptionalTextInput(questionId);
+    if (!normalizedQuestionId) return;
+
+    normalizedAnswers[normalizedQuestionId] = toArray(answerValue)
+      .map((entry) => normalizeTrainingPlainText(entry))
+      .filter(Boolean);
+  });
+
+  return normalizedAnswers;
+};
+
+const scoreTrainingQuestionnaire = (questions = [], submittedAnswers = {}) => {
+  const normalizedQuestions = Array.isArray(questions) ? questions : [];
+  const answerMap = normalizeSubmittedTrainingAnswers(submittedAnswers);
+
+  let scorableCount = 0;
+  let correctCount = 0;
+
+  const responses = normalizedQuestions.map((question) => {
+    const selectedValues = Array.from(
+      new Set(
+        toArray(answerMap[question.id]).map((entry) => normalizeTrainingPlainText(entry)).filter(Boolean)
+      )
+    );
+    const selectedTokenSet = new Set(
+      selectedValues.map((entry) => buildComparableToken(entry)).filter(Boolean)
+    );
+
+    let isCorrect = null;
+    let correctLabels = [];
+
+    if (question.type === "text" && Array.isArray(question.acceptedAnswers) && question.acceptedAnswers.length) {
+      scorableCount += 1;
+      correctLabels = question.acceptedAnswers.slice();
+      const acceptedTokenSet = new Set(
+        question.acceptedAnswers
+          .map((entry) => buildComparableToken(entry))
+          .filter(Boolean)
+      );
+      isCorrect = selectedValues.length > 0 &&
+        selectedValues.length === 1 &&
+        acceptedTokenSet.has(buildComparableToken(selectedValues[0]));
+    } else {
+      const correctOptions = Array.isArray(question.options)
+        ? question.options.filter((option) => option.isCorrect)
+        : [];
+      if (correctOptions.length) {
+        scorableCount += 1;
+        correctLabels = correctOptions.map((option) => option.label);
+        const correctTokenSet = new Set(
+          correctOptions
+            .map((option) => buildComparableToken(option.key))
+            .filter(Boolean)
+        );
+        isCorrect =
+          selectedTokenSet.size === correctTokenSet.size &&
+          Array.from(correctTokenSet).every((token) => selectedTokenSet.has(token));
+      }
+    }
+
+    if (isCorrect === true) {
+      correctCount += 1;
+    }
+
+    const selectedLabels = question.type === "text"
+      ? selectedValues
+      : Array.isArray(question.options)
+        ? question.options
+          .filter((option) => selectedTokenSet.has(buildComparableToken(option.key)))
+          .map((option) => option.label)
+        : selectedValues;
+
+    return {
+      question_id: question.id,
+      prompt: question.prompt,
+      type: question.type,
+      selected_values: selectedValues,
+      selected_labels: selectedLabels,
+      correct_labels: correctLabels,
+      is_correct: isCorrect
+    };
+  });
+
+  const score = scorableCount > 0
+    ? Number(((correctCount / scorableCount) * 100).toFixed(2))
+    : null;
+
+  return {
+    score,
+    correctCount,
+    scorableCount,
+    responses
+  };
+};
+
+const buildTrainingReview = (rawAnswersJson, fullQuestions = []) => {
+  const parsedAnswers = normalizeJsonColumnValue(rawAnswersJson);
+  if (!parsedAnswers) return [];
+
+  const directResponses = Array.isArray(parsedAnswers?.questions)
+    ? parsedAnswers.questions
+    : Array.isArray(parsedAnswers?.responses)
+      ? parsedAnswers.responses
+      : [];
+
+  if (directResponses.length) {
+    return directResponses.map((entry, index) => ({
+      question_id: normalizeOptionalTextInput(entry.question_id ?? entry.questionId) || `review-${index + 1}`,
+      prompt: normalizeOptionalTextInput(entry.prompt) || `Question ${index + 1}`,
+      selected_labels: Array.isArray(entry.selected_labels)
+        ? entry.selected_labels
+        : toArray(entry.selected_labels ?? entry.selected_values ?? entry.selectedValue).filter(Boolean),
+      correct_labels: Array.isArray(entry.correct_labels)
+        ? entry.correct_labels
+        : toArray(entry.correct_labels ?? entry.correct_values ?? entry.correctValue).filter(Boolean),
+      is_correct: entry.is_correct === true ? true : entry.is_correct === false ? false : null
+    }));
+  }
+
+  const answerMap = normalizeSubmittedTrainingAnswers(
+    parsedAnswers.answers && typeof parsedAnswers.answers === "object"
+      ? parsedAnswers.answers
+      : parsedAnswers
+  );
+
+  if (!Object.keys(answerMap).length || !Array.isArray(fullQuestions) || !fullQuestions.length) {
+    return [];
+  }
+
+  return scoreTrainingQuestionnaire(fullQuestions, answerMap).responses;
+};
+
+const buildTrainingPortalAssignment = (row = {}) => {
+  const status =
+    normalizeOptionalTextInput(row.status) ||
+    "training_sent";
+  const normalizedTrainingHtml = normalizeOptionalTextInput(row.training_html);
+  const trainingBlocks = buildNormalizedTrainingBlocks(row.training_content);
+  const questionnaireQuestions = buildNormalizedQuestionnaire(row.questionnaire_json);
+  const trainingQuestions = buildNormalizedQuestionnaire(row.training_content);
+  const fullQuestions = mergeTrainingQuestions(questionnaireQuestions, trainingQuestions);
+  const review = buildTrainingReview(row.answers_json, fullQuestions);
+  const parsedPassScore = Number(row.pass_score);
+  const trainingCompleted =
+    Boolean(row.training_completed_at) ||
+    KPI_TRAINING_COMPLETED_STATUSES.has(status);
+  const testAvailable = Boolean(normalizeOptionalIntegerInput(row.test_id));
+  const passScore = testAvailable
+    ? (Number.isFinite(parsedPassScore) ? parsedPassScore : 80)
+    : null;
+  const testCompleted =
+    Boolean(row.test_completed_at) ||
+    KPI_TRAINING_TEST_COMPLETED_STATUSES.has(status);
+  const progressPercent = testCompleted
+    ? 100
+    : trainingCompleted
+      ? (testAvailable ? 72 : 100)
+      : 28;
+
+  return {
+    result_id: normalizeOptionalIntegerInput(row.result_id),
+    training_id: normalizeOptionalIntegerInput(row.training_id),
+    test_id: normalizeOptionalIntegerInput(row.test_id),
+    people_id: normalizeOptionalIntegerInput(row.people_id),
+    kpi_id: normalizeOptionalIntegerInput(row.kpi_id),
+    kpi_target_allocation_id: normalizeOptionalIntegerInput(row.kpi_target_allocation_id),
+    status,
+    score: row.score === null || row.score === undefined ? null : Number(row.score),
+    passed: row.passed === true,
+    escalation_level: Number(row.escalation_level || 0),
+    due_date: formatIsoDateValue(row.test_due_date),
+    training_sent_at: formatIsoTimestampValue(row.training_sent_at),
+    training_completed_at: formatIsoTimestampValue(row.training_completed_at),
+    test_sent_at: formatIsoTimestampValue(row.test_sent_at),
+    test_completed_at: formatIsoTimestampValue(row.test_completed_at),
+    last_reminder_sent_at: formatIsoTimestampValue(row.last_reminder_sent_at),
+    next_reminder_due_at: formatIsoTimestampValue(row.next_reminder_due_at),
+    created_at: formatIsoTimestampValue(row.created_at),
+    updated_at: formatIsoTimestampValue(row.updated_at),
+    comments: normalizeOptionalTextInput(row.comments) || "",
+    progress: {
+      training_completed: trainingCompleted,
+      test_available: testAvailable,
+      test_sent: Boolean(row.test_sent_at) || KPI_TRAINING_TEST_SENT_STATUSES.has(status),
+      test_completed: testCompleted,
+      progress_percent: progressPercent
+    },
+    responsible: {
+      people_id: normalizeOptionalIntegerInput(row.people_id),
+      name: normalizeOptionalTextInput(row.people_name) || "Responsible",
+      email: normalizeOptionalTextInput(row.people_email),
+      role_name: normalizeOptionalTextInput(row.role_name) || ""
+    },
+    kpi: {
+      id: normalizeOptionalIntegerInput(row.kpi_id),
+      name: normalizeOptionalTextInput(row.kpi_name) || `KPI #${row.kpi_id}`,
+      frequency: normalizeOptionalTextInput(row.kpi_frequency) || ""
+    },
+    training: {
+      id: normalizeOptionalIntegerInput(row.training_id),
+      name: normalizeOptionalTextInput(row.training_name) || `Training #${row.training_id}`,
+      version: normalizeOptionalTextInput(row.training_version) || "",
+      comments: normalizeOptionalTextInput(row.training_comments) || "",
+      html: normalizedTrainingHtml,
+      html_available: Boolean(normalizedTrainingHtml),
+      blocks: trainingBlocks,
+      block_count: trainingBlocks.length
+    },
+    test: {
+      available: testAvailable,
+      id: normalizeOptionalIntegerInput(row.test_id),
+      name: normalizeOptionalTextInput(row.test_name) || "Knowledge Check",
+      version: normalizeOptionalTextInput(row.test_version) || "",
+      comments: normalizeOptionalTextInput(row.test_comments) || "",
+      pass_score: passScore,
+      question_count: fullQuestions.length,
+      scorable_count: fullQuestions.filter((question) => question.scorable).length,
+      questions: fullQuestions.map((question) => buildClientFacingQuestion(question))
+    },
+    review
+  };
+};
+
+const loadKpiTrainingPortalRows = async ({
+  peopleId = null,
+  resultId = null
+} = {}) => {
+  const conditions = [];
+  const params = [];
+
+  if (normalizeOptionalIntegerInput(peopleId)) {
+    params.push(Number(peopleId));
+    conditions.push(`ktr.people_id = $${params.length}`);
+  }
+
+  if (normalizeOptionalIntegerInput(resultId)) {
+    params.push(Number(resultId));
+    conditions.push(`ktr.result_id = $${params.length}`);
+  }
+
+  const whereClause = conditions.length
+    ? `WHERE ${conditions.join(" AND ")}`
+    : "";
+
+  const result = await pool.query(
+    `SELECT
+      ktr.result_id,
+      ktr.training_id,
+      ktr.test_id,
+      ktr.people_id,
+      ktr.kpi_id,
+      ktr.kpi_target_allocation_id,
+      NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name,''), COALESCE(p.name,''))), '') AS people_name,
+      p.email AS people_email,
+      pra_role.role_name,
+      COALESCE(k.kpi_sub_title, k.kpi_name, 'KPI #' || ktr.kpi_id) AS kpi_name,
+      k.frequency AS kpi_frequency,
+      COALESCE(kt.training_name, 'Training #' || ktr.training_id) AS training_name,
+      kt.training_content,
+      kt.training_html,
+      kt.version AS training_version,
+      kt.comments AS training_comments,
+      COALESCE(ktest.test_name, 'Knowledge Check') AS test_name,
+      ktest.questionnaire_json,
+      ktest.pass_score,
+      ktest.version AS test_version,
+      ktest.comments AS test_comments,
+      ktr.answers_json,
+      ktr.status,
+      ktr.score,
+      ktr.passed,
+      ktr.escalation_level,
+      ktr.test_due_date,
+      ktr.training_sent_at,
+      ktr.training_completed_at,
+      ktr.test_sent_at,
+      ktr.test_completed_at,
+      ktr.last_reminder_sent_at,
+      ktr.next_reminder_due_at,
+      ktr.comments,
+      ktr.created_at,
+      ktr.updated_at
+    FROM public.kpi_training_result ktr
+    LEFT JOIN public.people p ON p.people_id = ktr.people_id
+    LEFT JOIN LATERAL (
+      SELECT r.role_name
+      FROM public.people_role_assignment pra
+      JOIN public.role r ON r.role_id = pra.role_id
+      WHERE pra.people_id = ktr.people_id
+        AND COALESCE(pra.assignment_status,'ACTIVE') = 'ACTIVE'
+        AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      ORDER BY COALESCE(pra.is_primary,false) DESC,
+               pra.allocation_percentage DESC NULLS LAST,
+               pra.assignment_id DESC
+      LIMIT 1
+    ) pra_role ON TRUE
+    LEFT JOIN public.kpi k           ON k.kpi_id       = ktr.kpi_id
+    LEFT JOIN public.kpi_training kt ON kt.training_id = ktr.training_id
+    LEFT JOIN public.kpi_test ktest  ON ktest.test_id  = ktr.test_id
+    ${whereClause}
+    ORDER BY
+      CASE ktr.status
+        WHEN 'escalated'      THEN 1
+        WHEN 'test_overdue'   THEN 2
+        WHEN 'completed_fail' THEN 3
+        WHEN 'test_sent'      THEN 4
+        WHEN 'training_done'  THEN 5
+        WHEN 'training_sent'  THEN 6
+        WHEN 'completed_pass' THEN 7
+        ELSE 8
+      END,
+      ktr.escalation_level DESC,
+      ktr.test_due_date ASC NULLS LAST,
+      ktr.result_id DESC`,
+    params
+  );
+
+  return result.rows;
+};
 // ─────────────────────────────────────────────────────────────────────
 // KPI Training Tracking Dashboard – routes
 // ─────────────────────────────────────────────────────────────────────
 
 // Serve the dashboard HTML file
 const path = require("path");
+app.get("/kpi-training-center", (req, res) => {
+  res.sendFile(path.join(__dirname, "kpi-training-center.html"));
+});
+
+app.get("/kpi-training-documentation", (req, res) => {
+  res.sendFile(path.join(__dirname, "kpi-training-documentation.html"));
+});
+
 app.get("/kpi-training-dashboard", (req, res) => {
   res.sendFile(path.join(__dirname, "kpi-training-dashboard.html"));
+});
+
+app.get("/api/kpi-training/portal", async (req, res) => {
+  try {
+    const peopleId = normalizeOptionalIntegerInput(req.query.people_id);
+    const focusedResultId = normalizeOptionalIntegerInput(req.query.result_id);
+
+    if (!peopleId) {
+      return res.status(400).json({ error: "Missing people_id" });
+    }
+
+    const rows = await loadKpiTrainingPortalRows({
+      peopleId
+    });
+    const assignments = rows.map((row) => buildTrainingPortalAssignment(row));
+    const activeResultId = assignments.some((assignment) => assignment.result_id === focusedResultId)
+      ? focusedResultId
+      : assignments[0]?.result_id || null;
+
+    res.json({
+      people: assignments[0]?.responsible || {
+        people_id: peopleId,
+        name: "Responsible",
+        email: null,
+        role_name: ""
+      },
+      active_result_id: activeResultId,
+      assignments
+    });
+  } catch (error) {
+    console.error("[KPI Training Portal] Error:", error.message);
+    res.status(500).json({ error: "Failed to load training portal." });
+  }
+});
+
+app.post("/api/kpi-training/results/:resultId/training-complete", async (req, res) => {
+  try {
+    const resultId = normalizeOptionalIntegerInput(req.params.resultId);
+    if (!resultId) {
+      return res.status(400).json({ error: "Missing result id." });
+    }
+
+    const lookupResult = await pool.query(
+      `
+      SELECT result_id, test_id, status
+      FROM public.kpi_training_result
+      WHERE result_id = $1
+      LIMIT 1
+      `,
+      [resultId]
+    );
+
+    const existingRow = lookupResult.rows[0];
+    if (!existingRow) {
+      return res.status(404).json({ error: "Training assignment not found." });
+    }
+
+    const nextStatus = normalizeOptionalIntegerInput(existingRow.test_id)
+      ? "test_sent"
+      : "training_done";
+
+    await pool.query(
+      `
+      UPDATE public.kpi_training_result
+      SET
+        training_completed_at = COALESCE(training_completed_at, NOW()),
+        test_sent_at = CASE
+          WHEN test_id IS NOT NULL THEN COALESCE(test_sent_at, NOW())
+          ELSE test_sent_at
+        END,
+        test_due_date = CASE
+          WHEN test_id IS NOT NULL THEN COALESCE(test_due_date, CURRENT_DATE + $2::int)
+          ELSE test_due_date
+        END,
+        status = CASE
+          WHEN status IN ('completed_pass', 'completed_fail') THEN status
+          ELSE $3
+        END,
+        updated_at = NOW()
+      WHERE result_id = $1
+      `,
+      [resultId, KPI_TRAINING_DEFAULT_TEST_DUE_DAYS, nextStatus]
+    );
+
+    const refreshedRows = await loadKpiTrainingPortalRows({ resultId });
+    const assignment = refreshedRows[0] ? buildTrainingPortalAssignment(refreshedRows[0]) : null;
+
+    res.json({
+      ok: true,
+      assignment
+    });
+  } catch (error) {
+    console.error("[KPI Training Complete] Error:", error.message);
+    res.status(500).json({ error: "Failed to update training progress." });
+  }
+});
+
+app.post("/api/kpi-training/results/:resultId/test-submit", async (req, res) => {
+  try {
+    const resultId = normalizeOptionalIntegerInput(req.params.resultId);
+    if (!resultId) {
+      return res.status(400).json({ error: "Missing result id." });
+    }
+
+    const rows = await loadKpiTrainingPortalRows({ resultId });
+    const row = rows[0];
+
+    if (!row) {
+      return res.status(404).json({ error: "Training assignment not found." });
+    }
+
+    if (!normalizeOptionalIntegerInput(row.test_id)) {
+      return res.status(400).json({ error: "No test is linked to this training assignment." });
+    }
+
+    if (row.test_completed_at) {
+      return res.status(409).json({ error: "This test was already submitted." });
+    }
+
+    const questionnaireQuestions = buildNormalizedQuestionnaire(row.questionnaire_json);
+    const trainingQuestions = buildNormalizedQuestionnaire(row.training_content);
+    const fullQuestions = mergeTrainingQuestions(questionnaireQuestions, trainingQuestions);
+    const scorableQuestions = fullQuestions.filter((question) => question.scorable);
+
+    if (!scorableQuestions.length) {
+      return res.status(400).json({ error: "This questionnaire is not fully configured for scoring yet." });
+    }
+
+    const submittedAnswers = normalizeSubmittedTrainingAnswers(req.body?.answers);
+    const grading = scoreTrainingQuestionnaire(fullQuestions, submittedAnswers);
+    if (grading.score === null) {
+      return res.status(400).json({ error: "No valid answers were submitted." });
+    }
+
+    const passScore = Number.isFinite(Number(row.pass_score)) ? Number(row.pass_score) : 80;
+    const passed = grading.score >= passScore;
+    const answersPayload = {
+      submitted_at: new Date().toISOString(),
+      pass_score: passScore,
+      score: grading.score,
+      correct_count: grading.correctCount,
+      scorable_count: grading.scorableCount,
+      answers: submittedAnswers,
+      questions: grading.responses
+    };
+
+    await pool.query(
+      `
+      UPDATE public.kpi_training_result
+      SET
+        training_completed_at = COALESCE(training_completed_at, NOW()),
+        test_sent_at = COALESCE(test_sent_at, NOW()),
+        test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
+        answers_json = $3::jsonb,
+        score = $4,
+        test_completed_at = NOW(),
+        status = $5,
+        updated_at = NOW()
+      WHERE result_id = $1
+      `,
+      [
+        resultId,
+        KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
+        JSON.stringify(answersPayload),
+        grading.score,
+        passed ? "completed_pass" : "completed_fail"
+      ]
+    );
+
+    const refreshedRows = await loadKpiTrainingPortalRows({ resultId });
+    const assignment = refreshedRows[0] ? buildTrainingPortalAssignment(refreshedRows[0]) : null;
+
+    res.json({
+      ok: true,
+      score: grading.score,
+      passed,
+      assignment
+    });
+  } catch (error) {
+    console.error("[KPI Training Submit Test] Error:", error.message);
+    res.status(500).json({ error: "Failed to submit the questionnaire." });
+  }
 });
 
 // GET /api/kpi-training/results – all records with responsive joins
