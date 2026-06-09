@@ -1508,6 +1508,28 @@
             color: #c2410c;
         }
 
+        .review-card.pass {
+  border-color: #a7f3d0;
+  background: linear-gradient(180deg, #ecfdf5, #ffffff);
+}
+
+.review-card.fail {
+  border-color: #fdba74;
+  background: linear-gradient(180deg, #fff7ed, #ffffff);
+}
+
+.review-outcome.pass {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.review-outcome.fail {
+  background: #fff7ed;
+  border-color: #fdba74;
+  color: #c2410c;
+}
+
         .empty-state,
         .setup-state {
             padding: 30px;
@@ -1820,12 +1842,10 @@
                     ? "Type the answer in your own words."
                     : "Select the one answer you believe is correct.";
 
-        const getReviewOutcomeLabel = (entry) =>
-            entry.is_correct === true
-                ? "Accepted"
-                : entry.is_correct === false
-                    ? "Needs improvement"
-                    : "Recorded for review";
+       const getReviewOutcomeLabel = (entry) =>
+          entry.is_correct === true
+           ? "Accepted"
+           : "To be improved";
 
         const formatDate = (value) => {
             if (!value) return "Not scheduled";
@@ -2071,30 +2091,7 @@
             `;
         };
 
-        const renderSummaryCards = (assignment) => `
-            <div class="summary-grid">
-                <div class="panel summary-card">
-                    <span>KPI Scope</span>
-                    <strong>${escapeHtml(assignment.kpi.name)}</strong>
-                    <small>${escapeHtml(assignment.kpi.frequency || "Operational readiness scope")}</small>
-                </div>
-                <div class="panel summary-card">
-                    <span>Training Package</span>
-                    <strong>${escapeHtml(assignment.training.name)}</strong>
-                    <small>${assignment.training.block_count} structured blocks in the training flow plus a separate documentation workspace</small>
-                </div>
-                <div class="panel summary-card">
-                    <span>Assessment</span>
-                    <strong>${assignment.test.available ? `${assignment.test.question_count} QCM` : "No test linked"}</strong>
-                    <small>${assignment.test.available ? `Pass threshold ${assignment.test.pass_score}%` : "Training can still be completed without a linked questionnaire."}</small>
-                </div>
-                <div class="panel summary-card">
-                    <span>Current Result</span>
-                    <strong>${assignment.score === null ? "-" : `${assignment.score}%`}</strong>
-                    <small>${assignment.progress.test_completed ? `Submitted on ${escapeHtml(formatDateTime(assignment.test_completed_at))}` : "No score submitted yet"}</small>
-                </div>
-            </div>
-        `;
+      
 
         const renderStepStrip = (assignment) => {
             const cards = [
@@ -2215,7 +2212,7 @@
                         <div>
                             <div class="section-title">Documentation</div>
                             <h2>${escapeHtml(assignment.training.name)}</h2>
-                            <p>Read the full documentation first. When you reach the end, click <strong>Move to quiz</strong> to unlock and display the QCM in this same training center endpoint.</p>
+                            <p>Read the full documentation first. When you reach the end, click <strong>Move to quize</strong> to unlock and display the QCM in this same training center endpoint.</p>
                         </div>
                         <div class="panel-actions">
                             <span class="status-chip ${getStatusClass(assignment.status)}">${escapeHtml(getStatusLabel(assignment.status))}</span>
@@ -2243,12 +2240,7 @@
                         <div class="assessment-state">No documentation content is available for this assignment yet.</div>
                     ` : ""}
 
-                    <div class="assessment-actions">
-                        <small>${isAssessmentOpen ? "Quiz is unlocked below." : "Complete the documentation step to continue to the quiz."}</small>
-                        <button type="button" class="btn btn-primary" id="completeTrainingBtn" ${assignment.progress.test_completed ? "disabled" : ""}>
-                            ${isAssessmentOpen ? "Quiz unlocked" : "Move to quiz"}
-                        </button>
-                    </div>
+                  
                 </section>
             `;
         };
@@ -2301,36 +2293,43 @@
             `;
         };
 
-        const renderReviewSection = (assignment) => {
-            if (!assignment.progress.test_completed) return "";
+    const renderReviewSection = (assignment) => {
+    if (!assignment.progress.test_completed) return "";
 
-            return `
-                <div class="result-banner ${assignment.passed ? "pass" : "fail"}">
-                    <strong>${assignment.passed ? "Assessment Passed" : "Assessment Completed"}</strong>
-                    <span>The QCM is now locked for review. Final score: ${assignment.score === null ? "-" : `${assignment.score}%`} with a pass threshold of ${assignment.test.pass_score}%.</span>
-                    <small class="review-policy">Correct answers remain hidden in the responsible workspace. This review only shows the submitted response and the result status.</small>
-                </div>
-                <div class="review-list">
-                    ${assignment.review.map((entry, index) => `
-                        <div class="review-card ${entry.is_correct === true ? "pass" : entry.is_correct === false ? "fail" : ""}">
-                            <strong>${escapeHtml(entry.prompt || `Question ${index + 1}`)}</strong>
-                            <div class="review-grid">
-                                <div class="review-box">
-                                    <span>Submitted</span>
-                                    <p>${escapeHtml((entry.selected_labels || []).join(", ") || "No answer recorded")}</p>
-                                </div>
-                                <div class="review-box">
-                                    <span>Outcome</span>
-                                    <p>${escapeHtml(getReviewOutcomeLabel(entry))}</p>
-                                </div>
+    return `
+        <div class="result-banner ${assignment.passed ? "pass" : "fail"}">
+            <strong>Assessment Completed</strong>
+            <span>Final score: ${assignment.score === null ? "-" : `${assignment.score}%`} / Pass threshold: ${assignment.test.pass_score}%.</span>
+        </div>
+
+        <div class="review-list">
+            ${(assignment.review || []).map((entry, index) => {
+                const isCorrect = entry.is_correct === true;
+                return `
+                    <div class="review-card ${isCorrect ? "pass" : "fail"}">
+                        <strong>${escapeHtml(entry.prompt || `Question ${index + 1}`)}</strong>
+
+                        <div class="review-grid">
+                            <div class="review-box">
+                                <span>Submitted answer</span>
+                                <p>${escapeHtml((entry.selected_labels || []).join(", ") || "No answer recorded")}</p>
                             </div>
-                            <span class="review-outcome ${entry.is_correct === true ? "pass" : entry.is_correct === false ? "fail" : ""}">${escapeHtml(getReviewOutcomeLabel(entry))}</span>
-                        </div>
-                    `).join("")}
-                </div>
-            `;
-        };
 
+                            <div class="review-box">
+                                <span>Result</span>
+                                <p>${isCorrect ? "Accepted" : "To be improved"}</p>
+                            </div>
+                        </div>
+
+                        <span class="review-outcome ${isCorrect ? "pass" : "fail"}">
+                            ${isCorrect ? "Accepted" : "To be improved"}
+                        </span>
+                    </div>
+                `;
+            }).join("")}
+        </div>
+    `;
+};
         const renderAssessmentPanel = (assignment) => {
             if (!assignment.test.available) {
                 return `
@@ -2414,10 +2413,7 @@
                             `;
             }).join("")}
 
-                            <div class="assessment-actions">
-                                <small>${questions.length} question${questions.length === 1 ? "" : "s"} ready for submission. Pass threshold: ${assignment.test.pass_score}%.</small>
-                                <button type="button" class="btn btn-primary" id="submitAssessmentBtn">Submit QCM</button>
-                            </div>
+                        
                         </form>
                     ` : ""}
 
@@ -2426,50 +2422,309 @@
             `;
         };
 
-        const renderWorkspace = (assignment) => `
-            <main class="workspace">
-                <section class="panel hero">
-                    <div class="hero-grid">
-                        <div>
-                            <span class="eyebrow">Training Journey</span>
-                            <h1>${escapeHtml(assignment.training.name)}</h1>
-                            <p>${escapeHtml(assignment.kpi.name)} is currently assigned to ${escapeHtml(assignment.responsible.name)}. This view combines the training material, the QCM, and the live result status into one controlled workflow.</p>
-                            <div class="hero-pills">
-                                <span class="hero-pill">Live assignment status</span>
-                                <span class="hero-pill">Answer keys hidden</span>
-                                <span class="hero-pill">Automatic QCM scoring</span>
-                            </div>
-                        </div>
-                        <div class="hero-metrics">
-                            <div class="hero-metric">
-                                <span>Status</span>
-                                <strong>${escapeHtml(getStatusLabel(assignment.status))}</strong>
-                            </div>
-                            <div class="hero-metric">
-                                <span>Due Date</span>
-                                <strong>${escapeHtml(formatDate(assignment.due_date))}</strong>
-                            </div>
-                            <div class="hero-metric">
-                                <span>Ques</span>
-                                <strong>${assignment.test.question_count}</strong>
-                            </div>
-                            <div class="hero-metric">
-                                <span>Pass Score</span>
-                                <strong>${assignment.test.available ? `${assignment.test.pass_score}%` : "Not set"}</strong>
-                            </div>
-                        </div>
-                    </div>
-                </section>
+const renderWorkspace = (assignments) => `
+  <main class="workspace">
+    <section class="panel hero">
+      <div class="hero-grid">
+        <div>
+          <span class="eyebrow">Training Journey</span>
+          <h1>All assigned KPI trainings</h1>
+          <p>
+            Review the documentation for every assigned KPI first.
+            After that, move to the quiz section for all assigned KPI tests.
+          </p>
+          <div class="hero-pills">
+            <span class="hero-pill">${assignments.length} KPI assigned</span>
+            <span class="hero-pill">Documentation first</span>
+            <span class="hero-pill">Quiz after review</span>
+          </div>
+        </div>
+        <div class="hero-metrics">
+          <div class="hero-metric">
+            <span>Assigned</span>
+            <strong>${assignments.length}</strong>
+          </div>
+          <div class="hero-metric">
+            <span>Completed</span>
+            <strong>${assignments.filter(a => a.progress.test_completed).length}</strong>
+          </div>
+          <div class="hero-metric">
+            <span>QCM</span>
+            <strong>${assignments.reduce((sum, a) => sum + Number(a.test.question_count || 0), 0)}</strong>
+          </div>
+          <div class="hero-metric">
+            <span>Status</span>
+            <strong>Grouped view</strong>
+          </div>
+        </div>
+      </div>
+    </section>
 
-                ${renderSummaryCards(assignment)}
-                ${renderStepStrip(assignment)}
+    <div class="content-grid" id="allDocumentationGrid">
+      ${assignments.map((assignment) => `
+        <div id="doc-${assignment.result_id}">
+          ${renderStepStrip(assignment)}
+          ${renderLearningPanel(assignment)}
+        </div>
+      `).join("")}
+    </div>
 
-            <div class="content-grid">
-            ${renderLearningPanel(assignment)}
-             </div>
-            </main>
+    <div class="assessment-actions">
+      <small>After reading all KPI documentation, unlock the quizzes.</small>
+      <button type="button" class="btn btn-primary" id="unlockAllQuizzesBtn">
+        Move to quizzes for all KPI
+      </button>
+    </div>
+
+ <div class="content-grid" id="allQuizGrid" style="display:none;">
+  ${assignments.map((assignment) => `
+    <div id="quiz-${assignment.result_id}">
+      ${renderAssessmentPanel({
+        ...assignment,
+        progress: {
+          ...assignment.progress,
+          training_completed: true,
+          test_sent: true
+        }
+      })}
+    </div>
+  `).join("")}
+
+  <div class="assessment-actions">
+    <small>Submit all completed KPI quizzes together.</small>
+<button type="button" class="btn btn-primary" id="submitAllQuizzesBtn" onclick="submitAllQcm()">
+  Submit all QCM
+</button>
+  </div>
+</div>
+  </main>
+`;
+
+
+const bindAllWorkspaceEvents = (assignments) => {
+
+    document.querySelectorAll(".assignment-card").forEach((button) => {
+        button.addEventListener("click", () => {
+            const target = document.getElementById(
+                `doc-${button.dataset.resultId}`
+            );
+
+            if (target) {
+                target.scrollIntoView({
+                    behavior: "smooth",
+                    block: "start"
+                });
+            }
+        });
+    });
+
+    const unlockBtn = document.getElementById("unlockAllQuizzesBtn");
+
+    if (unlockBtn) {
+        unlockBtn.addEventListener("click", async () => {
+
+            const confirmed = await showQuizConfirmation();
+
+            if (!confirmed) {
+                return;
+            }
+
+            try {
+                setBusy(true, "Unlocking all questionnaires...");
+
+                for (const assignment of assignments) {
+
+                    if (
+                        !assignment.progress.training_completed &&
+                        !assignment.progress.test_completed
+                    ) {
+                        await postJson(
+                            `/api/kpi-training/results/${assignment.result_id}/training-complete`,
+                            {}
+                        );
+                    }
+                }
+
+                document.getElementById("allDocumentationGrid").style.display = "none";
+                document.getElementById("allQuizGrid").style.display = "grid";
+
+                unlockBtn.disabled = true;
+                unlockBtn.textContent = "Quizzes unlocked";
+
+               
+                setFlash(
+                    "success",
+                    "All documentation completed. All quizzes are now unlocked."
+                );
+
+                setBusy(false, "Questionnaires ready");
+
+            } catch (error) {
+
+                setFlash(
+                    "error",
+                    error.message || "Could not unlock all quizzes."
+                );
+
+                setBusy(false, "Training center ready");
+            }
+        });
+    }
+};
+
+
+
+const readAnswersFromScopedForm = (assignment) => {
+  const quizSection = document.getElementById(`quiz-${assignment.result_id}`);
+  const form = quizSection ? quizSection.querySelector(".assessment-form") : null;
+
+  if (!form) return {};
+
+  const answers = {};
+
+  assignment.test.questions.forEach((question) => {
+    if (question.type === "text") {
+      const input = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+      const value = input ? input.value.trim() : "";
+      answers[question.id] = value ? [value] : [];
+      return;
+    }
+
+    const checkedInputs = Array.from(
+      form.querySelectorAll(`[data-question-id="${CSS.escape(question.id)}"]:checked`)
+    );
+
+    answers[question.id] = checkedInputs.map((input) => input.value).filter(Boolean);
+  });
+
+  state.responses[assignment.result_id] = answers;
+  return answers;
+};
+
+const renderWorkspaceCompleted = (assignments) => `
+  <main class="workspace">
+    <section class="panel hero">
+      <div class="hero-grid">
+        <div>
+          <span class="eyebrow">Assessment Completed</span>
+          <h1>Quiz review</h1>
+          <p>All submitted answers are now locked. Correct answers show as Accepted. Wrong answers show as To be improved.</p>
+        </div>
+        <div class="hero-metrics">
+          <div class="hero-metric">
+            <span>Assigned</span>
+            <strong>${assignments.length}</strong>
+          </div>
+          <div class="hero-metric">
+            <span>Completed</span>
+            <strong>${assignments.filter(a => a.progress.test_completed).length}</strong>
+          </div>
+          <div class="hero-metric">
+            <span>Status</span>
+            <strong>Completed</strong>
+          </div>
+          <div class="hero-metric">
+            <span>Review</span>
+            <strong>Visible</strong>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="content-grid">
+      ${assignments.map((assignment) => `
+        <div id="review-${assignment.result_id}">
+          ${renderStepStrip(assignment)}
+          ${renderAssessmentPanel(assignment)}
+        </div>
+      `).join("")}
+    </div>
+  </main>
+`;
+
+
+const submitAllQcm = async () => {
+    const submitAllBtn = document.getElementById("submitAllQuizzesBtn");
+    const assignments = state.portal?.assignments || [];
+
+    if (!submitAllBtn) return;
+
+    try {
+        const payloads = [];
+
+        for (const assignment of assignments) {
+            if (!assignment.test.available || assignment.progress.test_completed) {
+                continue;
+            }
+
+            const answers = readAnswersFromScopedForm(assignment);
+            const validation = validateAnswers(assignment, answers);
+
+            if (!validation.valid) {
+                setFlash(
+                    "error",
+                    `Please complete all questions for ${assignment.kpi.name}. Missing: ${validation.missingCount}.`
+                );
+
+                document
+                    .getElementById(`quiz-${assignment.result_id}`)
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+                return;
+            }
+
+            payloads.push({
+                assignment,
+                answers
+            });
+        }
+
+        if (!payloads.length) {
+            setFlash("error", "No quiz is ready to submit.");
+            return;
+        }
+
+        setBusy(true, "Submitting all questionnaires...");
+        submitAllBtn.disabled = true;
+        submitAllBtn.textContent = "Submitting...";
+
+        for (const item of payloads) {
+            await postJson(
+                `/api/kpi-training/results/${item.assignment.result_id}/test-submit`,
+                { answers: item.answers }
+            );
+        }
+
+        const response = await fetch(
+            `/api/kpi-training/portal?people_id=${encodeURIComponent(peopleId)}`
+        );
+
+        const payload = await response.json();
+
+        if (!response.ok) {
+            throw new Error(payload.error || "Could not reload completed assessment.");
+        }
+
+        state.portal = payload;
+
+        const updatedAssignments = payload.assignments || [];
+
+        appRoot.className = "app-shell";
+        appRoot.innerHTML = `
+            ${renderSidebar(updatedAssignments, payload.people || updatedAssignments[0]?.responsible || {})}
+            ${renderWorkspaceCompleted(updatedAssignments)}
         `;
 
+        setFlash("success", "Assessment completed. Review is now displayed.");
+        setBusy(false, "Assessment completed");
+
+    } catch (error) {
+        submitAllBtn.disabled = false;
+        submitAllBtn.textContent = "Submit all QCM";
+        setFlash("error", error.message || "Could not submit all questionnaires.");
+        setBusy(false, "Questionnaires ready");
+    }
+};
         const renderApp = () => {
             const assignments = state.portal?.assignments || [];
             if (!assignments.length) {
@@ -2478,44 +2733,16 @@
             }
 
             const person = state.portal?.people || assignments[0].responsible;
-            const activeAssignment = getActiveAssignment() || assignments[0];
-            state.activeResultId = String(activeAssignment.result_id);
+           appRoot.className = "app-shell";
+           appRoot.innerHTML = `
+           ${renderSidebar(assignments, person)}
+           ${renderWorkspace(assignments)}
+           `;
 
-            appRoot.className = "app-shell";
-            appRoot.innerHTML = `
-                ${renderSidebar(assignments, person)}
-                ${renderWorkspace(activeAssignment)}
-            `;
-
-            bindWorkspaceEvents(activeAssignment);
+            bindAllWorkspaceEvents(assignments);
             updateUrl();
         };
 
-        const updateDraftAnswer = (resultId, questionId, values) => {
-            ensureDraftAnswers({ result_id: resultId });
-            state.responses[resultId][questionId] = values;
-        };
-
-        const readAnswersFromForm = (assignment) => {
-            const form = document.getElementById("assessmentForm");
-            if (!form) return {};
-
-            const answers = {};
-            assignment.test.questions.forEach((question) => {
-                if (question.type === "text") {
-                    const input = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
-                    const value = input ? input.value.trim() : "";
-                    answers[question.id] = value ? [value] : [];
-                    return;
-                }
-
-                const checkedInputs = Array.from(form.querySelectorAll(`[data-question-id="${CSS.escape(question.id)}"]:checked`));
-                answers[question.id] = checkedInputs.map((input) => input.value).filter(Boolean);
-            });
-
-            state.responses[assignment.result_id] = answers;
-            return answers;
-        };
 
         const validateAnswers = (assignment, answers) => {
             const missing = (assignment.test.questions || []).filter((question) => {
@@ -2529,126 +2756,7 @@
             };
         };
 
-        const bindWorkspaceEvents = (assignment) => {
-            document.querySelectorAll(".assignment-card").forEach((button) => {
-                button.addEventListener("click", () => {
-                    state.activeResultId = button.dataset.resultId;
-                    renderApp();
-                });
-            });
-
-            const jumpToAssessmentBtn = document.getElementById("jumpToAssessmentBtn");
-            if (jumpToAssessmentBtn) {
-                jumpToAssessmentBtn.addEventListener("click", () => {
-                    const target = document.getElementById("assessmentPanel");
-                    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
-                });
-            }
-
-            const completeTrainingBtn = document.getElementById("completeTrainingBtn");
-
-            if (completeTrainingBtn) {
-                completeTrainingBtn.addEventListener("click", async () => {
-
-                    // SHOW CONFIRMATION MODAL FIRST
-                    const confirmed = await showQuizConfirmation();
-
-                    if (!confirmed) {
-                        return;
-                    }
-
-                    try {
-                        setBusy(true, "Opening questionnaire...");
-
-                        const result = await postJson(
-                            `/api/kpi-training/results/${assignment.result_id}/training-complete`,
-                            {}
-                        );
-
-                        const nextResultId =
-                            result.assignment?.result_id || assignment.result_id;
-
-                        state.viewByResultId[nextResultId] = "quiz";
-
-                        const documentationPanel =
-                            document.getElementById("documentationPanel");
-
-                        if (documentationPanel) {
-                            documentationPanel.remove();
-                        }
-
-                        const contentGrid =
-                            document.querySelector(".content-grid");
-
-                        if (contentGrid) {
-                            contentGrid.innerHTML =
-                                renderAssessmentPanel({
-                                    ...assignment,
-                                    progress: {
-                                        ...assignment.progress,
-                                        training_completed: true,
-                                        test_sent: true
-                                    }
-                                });
-                        }
-
-                        setBusy(false, "Questionnaire ready");
-
-                        setFlash(
-                            "success",
-                            "Documentation completed. Questionnaire unlocked."
-                        );
-
-                    } catch (error) {
-
-                        setFlash(
-                            "error",
-                            error.message || "Could not open questionnaire."
-                        );
-
-                        setBusy(false, "Training center ready");
-                    }
-                });
-            }
-
-            const assessmentForm = document.getElementById("assessmentForm");
-            if (assessmentForm) {
-                assessmentForm.querySelectorAll("input[type='radio'], input[type='checkbox'], input[type='text']").forEach((input) => {
-                    input.addEventListener("change", () => {
-                        readAnswersFromForm(assignment);
-                    });
-                    input.addEventListener("input", () => {
-                        readAnswersFromForm(assignment);
-                    });
-                });
-            }
-
-            const submitAssessmentBtn = document.getElementById("submitAssessmentBtn");
-            if (submitAssessmentBtn) {
-                submitAssessmentBtn.addEventListener("click", async () => {
-                    try {
-                        const answers = readAnswersFromForm(assignment);
-                        const validation = validateAnswers(assignment, answers);
-                        if (!validation.valid) {
-                            setFlash("error", `Please complete all ${validation.missingCount} remaining question(s) before submitting the QCM.`);
-                            return;
-                        }
-
-                        setBusy(true, "Submitting questionnaire...");
-                        const result = await postJson(`/api/kpi-training/results/${assignment.result_id}/test-submit`, {
-                            answers
-                        });
-                        setFlash("success", result.passed
-                            ? `QCM submitted successfully. Final score: ${result.score}%.`
-                            : `QCM submitted. Final score: ${result.score}%.`);
-                        await loadPortal(result.assignment?.result_id || assignment.result_id);
-                    } catch (error) {
-                        setFlash("error", error.message || "Could not submit the questionnaire.");
-                        setBusy(false, "Training center ready");
-                    }
-                });
-            }
-        };
+    
 
         if (peopleId) {
             loadPortal(preferredResultId);
