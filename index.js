@@ -32136,7 +32136,7 @@ const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
 
 const getKpiSubmissionTargetLocalHour = (calculationMode) => {
   const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
-  return canonicalMode === "Ratio" ? 8 : 9;
+  return canonicalMode === "Ratio" ? 8 : 10;
 };
 
 const hasReachedKpiSubmissionLocalSendWindow = (
@@ -33798,8 +33798,8 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-const DIRECT_KPI_SUBMISSION_CRON = "0 9 * * 1";   // Example: Monday 08:00 UTC
-const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * 1";   // Example: Monday 09:00 UTC
+const DIRECT_KPI_SUBMISSION_CRON = "0 10 * * *";   
+const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * *";   
 const weeklyKpiSubmissionCronState = {
   direct: false,
   ratio: false
