@@ -7,7 +7,9 @@
     <title>KPI Training Center</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <link
+        href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+        rel="stylesheet" />
     <style>
         :root {
             --bg: #f3f7fb;
@@ -1380,13 +1382,13 @@
             box-shadow: 0 18px 32px rgba(29, 78, 216, .08);
         }
 
-        .option-card input:checked + .option-shell {
+        .option-card input:checked+.option-shell {
             border-color: rgba(37, 99, 235, .42);
             background: linear-gradient(180deg, rgba(239, 246, 255, .98), #ffffff);
             box-shadow: 0 18px 34px rgba(29, 78, 216, .12);
         }
 
-        .option-card input:focus-visible + .option-shell {
+        .option-card input:focus-visible+.option-shell {
             box-shadow: 0 0 0 4px rgba(29, 78, 216, .12);
         }
 
@@ -1405,7 +1407,7 @@
             border: 1px solid rgba(191, 219, 254, .95);
         }
 
-        .option-card input:checked + .option-shell .option-letter {
+        .option-card input:checked+.option-shell .option-letter {
             color: #ffffff;
             background: linear-gradient(135deg, #1d4ed8, #0ea5e9);
             border-color: transparent;
@@ -1456,43 +1458,43 @@
         }
 
         .modal-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(15,23,42,.55);
-    backdrop-filter: blur(4px);
-    z-index: 9999;
-    align-items: center;
-    justify-content: center;
-}
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .55);
+            backdrop-filter: blur(4px);
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+        }
 
-.modal-overlay.show {
-    display: flex;
-}
+        .modal-overlay.show {
+            display: flex;
+        }
 
-.modal-card {
-    width: 420px;
-    max-width: 90%;
-    background: white;
-    border-radius: 20px;
-    padding: 24px;
-    box-shadow: 0 30px 80px rgba(0,0,0,.25);
-}
+        .modal-card {
+            width: 420px;
+            max-width: 90%;
+            background: white;
+            border-radius: 20px;
+            padding: 24px;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, .25);
+        }
 
-.modal-card h3 {
-    margin-bottom: 12px;
-}
+        .modal-card h3 {
+            margin-bottom: 12px;
+        }
 
-.modal-card p {
-    margin-bottom: 20px;
-    color: #64748b;
-}
+        .modal-card p {
+            margin-bottom: 20px;
+            color: #64748b;
+        }
 
-.modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-}
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
 
         .review-outcome.pass {
             background: #ecfdf5;
@@ -1520,83 +1522,87 @@
         }
 
         .quiz-modal {
-    position: fixed;
-    inset: 0;
-    background: rgba(15, 23, 42, .45);
-    backdrop-filter: blur(8px);
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 9999;
-}
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, .45);
+            backdrop-filter: blur(8px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
 
-.quiz-modal.show {
-    display: flex;
-    animation: fadeIn .2s ease;
-}
+        .quiz-modal.show {
+            display: flex;
+            animation: fadeIn .2s ease;
+        }
 
-.quiz-modal-card {
-    width: 480px;
-    max-width: calc(100vw - 40px);
-    background: #fff;
-    border-radius: 28px;
-    padding: 32px;
-    text-align: center;
-    box-shadow: 0 40px 80px rgba(15,23,42,.20);
-    animation: scaleIn .25s ease;
-}
+        .quiz-modal-card {
+            width: 480px;
+            max-width: calc(100vw - 40px);
+            background: #fff;
+            border-radius: 28px;
+            padding: 32px;
+            text-align: center;
+            box-shadow: 0 40px 80px rgba(15, 23, 42, .20);
+            animation: scaleIn .25s ease;
+        }
 
-.quiz-modal-icon {
-    width: 72px;
-    height: 72px;
-    margin: 0 auto 18px;
-    border-radius: 20px;
-    background: linear-gradient(
-        135deg,
-        rgba(37,99,235,.12),
-        rgba(20,184,166,.12)
-    );
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 32px;
-}
+        .quiz-modal-icon {
+            width: 72px;
+            height: 72px;
+            margin: 0 auto 18px;
+            border-radius: 20px;
+            background: linear-gradient(135deg,
+                    rgba(37, 99, 235, .12),
+                    rgba(20, 184, 166, .12));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+        }
 
-.quiz-modal-card h3 {
-    font-size: 26px;
-    font-weight: 800;
-    color: var(--ink);
-    margin-bottom: 12px;
-}
+        .quiz-modal-card h3 {
+            font-size: 26px;
+            font-weight: 800;
+            color: var(--ink);
+            margin-bottom: 12px;
+        }
 
-.quiz-modal-card p {
-    font-size: 14px;
-    line-height: 1.8;
-    color: var(--muted);
-}
+        .quiz-modal-card p {
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--muted);
+        }
 
-.quiz-modal-actions {
-    display: flex;
-    justify-content: center;
-    gap: 12px;
-    margin-top: 24px;
-}
+        .quiz-modal-actions {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 24px;
+        }
 
-@keyframes fadeIn {
-    from { opacity: 0; }
-    to   { opacity: 1; }
-}
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
 
-@keyframes scaleIn {
-    from {
-        opacity: 0;
-        transform: scale(.92);
-    }
-    to {
-        opacity: 1;
-        transform: scale(1);
-    }
-}
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes scaleIn {
+            from {
+                opacity: 0;
+                transform: scale(.92);
+            }
+
+            to {
+                opacity: 1;
+                transform: scale(1);
+            }
+        }
 
         .empty-state p,
         .setup-state p {
@@ -1645,6 +1651,7 @@
         }
 
         @media (max-width: 1100px) {
+
             .hero-grid,
             .content-grid,
             .summary-grid,
@@ -1696,37 +1703,31 @@
         <div id="appRoot" class="loading-shell">Preparing the training workspace...</div>
     </div>
 
-   <div id="quizModal" class="quiz-modal">
-    <div class="quiz-modal-card">
-        <div class="quiz-modal-icon">
-            📝
-        </div>
+    <div id="quizModal" class="quiz-modal">
+        <div class="quiz-modal-card">
+            <div class="quiz-modal-icon">
+                📝
+            </div>
 
-        <h3>Move to Quiz</h3>
+            <h3>Move to Quiz</h3>
 
-        <p>
-            Are you sure you want to move to the quiz?
-            The documentation will be hidden and the questionnaire will be displayed.
-        </p>
+            <p>
+                Are you sure you want to move to the quiz?
+                The documentation will be hidden and the questionnaire will be displayed.
+            </p>
 
-        <div class="quiz-modal-actions">
-            <button
-                type="button"
-                id="cancelQuizBtn"
-                class="btn btn-secondary">
-                Continue Reading
-            </button>
+            <div class="quiz-modal-actions">
+                <button type="button" id="cancelQuizBtn" class="btn btn-secondary">
+                    Continue Reading
+                </button>
 
-            <button
-                type="button"
-                id="confirmQuizBtn"
-                class="btn btn-primary">
-                Move to Quiz
-            </button>
+                <button type="button" id="confirmQuizBtn" class="btn btn-primary">
+                    Move to Quiz
+                </button>
+            </div>
         </div>
     </div>
-</div>
-</div>
+    </div>
 
     <script>
         const state = {
@@ -1971,33 +1972,33 @@
         };
 
         function showQuizConfirmation() {
-    return new Promise((resolve) => {
-        const modal = document.getElementById("quizModal");
-        const confirmBtn = document.getElementById("confirmQuizBtn");
-        const cancelBtn = document.getElementById("cancelQuizBtn");
+            return new Promise((resolve) => {
+                const modal = document.getElementById("quizModal");
+                const confirmBtn = document.getElementById("confirmQuizBtn");
+                const cancelBtn = document.getElementById("cancelQuizBtn");
 
-        modal.classList.add("show");
+                modal.classList.add("show");
 
-        const cleanup = () => {
-            modal.classList.remove("show");
-            confirmBtn.removeEventListener("click", onConfirm);
-            cancelBtn.removeEventListener("click", onCancel);
-        };
+                const cleanup = () => {
+                    modal.classList.remove("show");
+                    confirmBtn.removeEventListener("click", onConfirm);
+                    cancelBtn.removeEventListener("click", onCancel);
+                };
 
-        const onConfirm = () => {
-            cleanup();
-            resolve(true);
-        };
+                const onConfirm = () => {
+                    cleanup();
+                    resolve(true);
+                };
 
-        const onCancel = () => {
-            cleanup();
-            resolve(false);
-        };
+                const onCancel = () => {
+                    cleanup();
+                    resolve(false);
+                };
 
-        confirmBtn.addEventListener("click", onConfirm);
-        cancelBtn.addEventListener("click", onCancel);
-    });
-}
+                confirmBtn.addEventListener("click", onConfirm);
+                cancelBtn.addEventListener("click", onCancel);
+            });
+        }
 
         const renderEmptyState = () => {
             const person = state.portal?.people || {};
@@ -2143,12 +2144,49 @@
             `;
         };
 
+        const removeQuestionsSection = (html) => {
+    const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+
+    const headings = Array.from(doc.querySelectorAll("h1,h2,h3,h4,strong,b"))
+        .filter(el => el.textContent.trim().toLowerCase() === "questions");
+
+    headings.forEach((heading) => {
+        let node = heading;
+        const toRemove = [];
+
+        while (node) {
+            toRemove.push(node);
+
+            const next = node.nextElementSibling;
+
+            if (
+                next &&
+                /^h[1-4]$/i.test(next.tagName) &&
+                next.textContent.trim().toLowerCase() !== "questions"
+            ) {
+                break;
+            }
+
+            node = next;
+        }
+
+        toRemove.forEach(el => el.remove());
+    });
+
+    return doc.body.innerHTML;
+};
+
         const renderLearningPanel = (assignment) => {
             const safeTrainingBlocks = (assignment.training.blocks || [])
                 .map((block) => sanitizeTrainingBlock(block))
                 .filter((block) => block.title || block.body || block.bullets.length);
             const safeTrainingComment = stripAnswerRevealLines(assignment.training.comments || "");
-            const rawDocumentationHtml = assignment.training.html || assignment.training.html_content || assignment.training.documentation_html || "";
+            const rawDocumentationHtml = removeQuestionsSection(
+           assignment.training.html ||
+           assignment.training.html_content ||
+           assignment.training.documentation_html ||
+            ""
+            );
             const rawDocumentationUrl = assignment.training.html_url || assignment.training.documentation_url || "";
             const hasDocumentationHtml = Boolean(assignment.training.html_available && rawDocumentationHtml);
             const hasDocumentationUrl = Boolean(assignment.training.html_available && rawDocumentationUrl);
@@ -2360,9 +2398,9 @@
                     ${!locked && !assignment.progress.test_completed && questions.length ? `
                         <form class="assessment-form" id="assessmentForm">
                             ${questions.map((question, index) => {
-                                const safePrompt = stripAnswerRevealLines(question.prompt) || `Question ${index + 1}`;
-                                const safeHelpText = stripAnswerRevealLines(question.help_text || "");
-                                return `
+                const safePrompt = stripAnswerRevealLines(question.prompt) || `Question ${index + 1}`;
+                const safeHelpText = stripAnswerRevealLines(question.help_text || "");
+                return `
                                 <article class="question-card">
                                     <div class="question-top">
                                         <span class="question-index">${index + 1}</span>
@@ -2374,7 +2412,7 @@
                                     ${renderQuestionInput(question, assignment)}
                                 </article>
                             `;
-                            }).join("")}
+            }).join("")}
 
                             <div class="assessment-actions">
                                 <small>${questions.length} question${questions.length === 1 ? "" : "s"} ready for submission. Pass threshold: ${assignment.test.pass_score}%.</small>
@@ -2426,10 +2464,9 @@
                 ${renderSummaryCards(assignment)}
                 ${renderStepStrip(assignment)}
 
-                <div class="content-grid">
-                    ${renderLearningPanel(assignment)}
-                    ${(state.viewByResultId[assignment.result_id] === "quiz" || assignment.progress.test_completed) ? renderAssessmentPanel(assignment) : ""}
-                </div>
+            <div class="content-grid">
+            ${renderLearningPanel(assignment)}
+             </div>
             </main>
         `;
 
@@ -2508,71 +2545,71 @@
                 });
             }
 
-const completeTrainingBtn = document.getElementById("completeTrainingBtn");
+            const completeTrainingBtn = document.getElementById("completeTrainingBtn");
 
-if (completeTrainingBtn) {
-    completeTrainingBtn.addEventListener("click", async () => {
+            if (completeTrainingBtn) {
+                completeTrainingBtn.addEventListener("click", async () => {
 
-        // SHOW CONFIRMATION MODAL FIRST
-        const confirmed = await showQuizConfirmation();
+                    // SHOW CONFIRMATION MODAL FIRST
+                    const confirmed = await showQuizConfirmation();
 
-        if (!confirmed) {
-            return;
-        }
+                    if (!confirmed) {
+                        return;
+                    }
 
-        try {
-            setBusy(true, "Opening questionnaire...");
+                    try {
+                        setBusy(true, "Opening questionnaire...");
 
-            const result = await postJson(
-                `/api/kpi-training/results/${assignment.result_id}/training-complete`,
-                {}
-            );
+                        const result = await postJson(
+                            `/api/kpi-training/results/${assignment.result_id}/training-complete`,
+                            {}
+                        );
 
-            const nextResultId =
-                result.assignment?.result_id || assignment.result_id;
+                        const nextResultId =
+                            result.assignment?.result_id || assignment.result_id;
 
-            state.viewByResultId[nextResultId] = "quiz";
+                        state.viewByResultId[nextResultId] = "quiz";
 
-            const documentationPanel =
-                document.getElementById("documentationPanel");
+                        const documentationPanel =
+                            document.getElementById("documentationPanel");
 
-            if (documentationPanel) {
-                documentationPanel.remove();
-            }
-
-            const contentGrid =
-                document.querySelector(".content-grid");
-
-            if (contentGrid) {
-                contentGrid.innerHTML =
-                    renderAssessmentPanel({
-                        ...assignment,
-                        progress: {
-                            ...assignment.progress,
-                            training_completed: true,
-                            test_sent: true
+                        if (documentationPanel) {
+                            documentationPanel.remove();
                         }
-                    });
+
+                        const contentGrid =
+                            document.querySelector(".content-grid");
+
+                        if (contentGrid) {
+                            contentGrid.innerHTML =
+                                renderAssessmentPanel({
+                                    ...assignment,
+                                    progress: {
+                                        ...assignment.progress,
+                                        training_completed: true,
+                                        test_sent: true
+                                    }
+                                });
+                        }
+
+                        setBusy(false, "Questionnaire ready");
+
+                        setFlash(
+                            "success",
+                            "Documentation completed. Questionnaire unlocked."
+                        );
+
+                    } catch (error) {
+
+                        setFlash(
+                            "error",
+                            error.message || "Could not open questionnaire."
+                        );
+
+                        setBusy(false, "Training center ready");
+                    }
+                });
             }
-
-            setBusy(false, "Questionnaire ready");
-
-            setFlash(
-                "success",
-                "Documentation completed. Questionnaire unlocked."
-            );
-
-        } catch (error) {
-
-            setFlash(
-                "error",
-                error.message || "Could not open questionnaire."
-            );
-
-            setBusy(false, "Training center ready");
-        }
-    });
-}
 
             const assessmentForm = document.getElementById("assessmentForm");
             if (assessmentForm) {
