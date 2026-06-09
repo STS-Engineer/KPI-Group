@@ -35735,6 +35735,8 @@ ensureCorrectiveActionEscalationSchema()
 
 const KPI_TRAINING_DEFAULT_TEST_DUE_DAYS = 7;
 const KPI_TRAINING_COMPLETED_STATUSES = new Set([
+  "training_assigned",
+  "training_sent",
   "training_done",
   "test_sent",
   "test_overdue",
@@ -35743,6 +35745,9 @@ const KPI_TRAINING_COMPLETED_STATUSES = new Set([
   "escalated"
 ]);
 const KPI_TRAINING_TEST_SENT_STATUSES = new Set([
+  "training_assigned",
+  "training_sent",
+  "training_done",
   "test_sent",
   "test_overdue",
   "completed_pass",
@@ -36621,11 +36626,7 @@ const buildTrainingPortalAssignment = (row = {}) => {
   const testCompleted =
     Boolean(row.test_completed_at) ||
     KPI_TRAINING_TEST_COMPLETED_STATUSES.has(status);
-  const progressPercent = testCompleted
-    ? 100
-    : trainingCompleted
-      ? (testAvailable ? 72 : 100)
-      : 28;
+    const progressPercent = testCompleted ? 100 : 72;
 
   return {
     result_id: normalizeOptionalIntegerInput(row.result_id),
