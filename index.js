@@ -28236,6 +28236,26 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
           // In-memory store: kvId â†’ array of action objects
           const caModalStore = {};
           const kpiPopupShown = {};
+
+          let lastCorrectiveActionPopupTime = 0;
+const CORRECTIVE_ACTION_POPUP_INTERVAL = 2 * 60 * 1000; // 2 minutes
+
+function runCorrectiveActionPopupCheck() {
+  if (document.activeElement && document.activeElement.classList.contains("value-input")) {
+    updateSubmitButtonState(false);
+    return;
+  }
+
+  const invalidCards = updateSubmitButtonState(false);
+  if (!invalidCards.length) return;
+
+  const now = Date.now();
+
+  if (now - lastCorrectiveActionPopupTime >= CORRECTIVE_ACTION_POPUP_INTERVAL) {
+    showCorrectiveActionRequiredPopup(invalidCards[0]);
+    lastCorrectiveActionPopupTime = now;
+  }
+}
 function getCaModalActions(kvId) {
   if (!caModalStore[kvId]) {
     caModalStore[kvId] = [];
@@ -28802,26 +28822,27 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function isKpiUnderLowerLimit(card) {
-  // If corrective actions aren't enabled for this KPI, never block.
-  const caEnabled = card.querySelector(".open-ca-modal-btn") !== null;
-  if (!caEnabled) return false;
+document.querySelectorAll(".value-input").forEach(input => {
+   input.addEventListener("input", function () {
+    const kvId = this.dataset.kpiValuesId;
 
+    updateCurrentMonthBarFromInput(kvId, this.value);
+
+    // Do not show modal while typing
+    updateSubmitButtonState(false);
+  });
+});
+
+ 
+
+function isKpiUnderLowerLimit(card) {
   const input = card.querySelector(".value-input");
   const value = toNumber(input ? input.value : "");
-  if (value === null) return false;
+  const lowLimit = toNumber(card.dataset.lowLimit);
 
-  // Use the SAME color logic the chart uses, so "red bar" and
-  // "needs corrective action" can never disagree.
-  const fill = getPointColor(
-    value,
-    card.dataset.lowLimit,
-    card.dataset.highLimit,
-    card.dataset.goodDirection,
-    card.dataset.target
-  );
+  if (value === null || lowLimit === null) return false;
 
-  return fill === "#e34b24"; // red
+  return value <= lowLimit;
 }
 
 function hasValidCorrectiveAction(kvId) {
@@ -29810,13 +29831,7 @@ if (input && !preserveDraftValue) {
   }
 
   updateKpiChart(kvId);
-setTimeout(function() {
-  const invalidCards = updateSubmitButtonState(false);
-
-  if (invalidCards.length > 0) {
-    showCorrectiveActionRequiredPopup(invalidCards[0]);
-  }
-}, 300);
+  setTimeout(runCorrectiveActionPopupCheck, 300);
 }
 
 
@@ -33798,8 +33813,8 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-const DIRECT_KPI_SUBMISSION_CRON = "0 10 * * *";   
-const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * *";   
+const DIRECT_KPI_SUBMISSION_CRON = "0 9 * * *";   // Example: Monday 08:00 UTC
+const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * *";   // Example: Monday 09:00 UTC
 const weeklyKpiSubmissionCronState = {
   direct: false,
   ratio: false
@@ -37499,7 +37514,7 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("0 11 * * *", async () => {
+cron.schedule("15 11 * * *", async () => {
   try {
     console.log("[KPI Training Cron] Sending responsible training links...");
     const result = await sendKpiTrainingLinksToResponsibles();
