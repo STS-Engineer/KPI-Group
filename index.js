@@ -37499,15 +37499,15 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 //Training cron 
 
-// cron.schedule("0 11 * * *", async () => {
-//   try {
-//     console.log("[KPI Training Cron] Sending responsible training links...");
-//     const result = await sendKpiTrainingLinksToResponsibles();
-//     console.log("[KPI Training Cron] Done:", result);
-//   } catch (error) {
-//     console.error("[KPI Training Cron] Failed:", error.message);
-//   }
-// });
+cron.schedule("0 11 * * *", async () => {
+  try {
+    console.log("[KPI Training Cron] Sending responsible training links...");
+    const result = await sendKpiTrainingLinksToResponsibles();
+    console.log("[KPI Training Cron] Done:", result);
+  } catch (error) {
+    console.error("[KPI Training Cron] Failed:", error.message);
+  }
+});
 
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
