@@ -11285,10 +11285,6 @@ textarea {
   backdrop-filter: blur(14px) saturate(140%) !important;
 }
 
-#parameterModalBackdrop.open .parameter-modal {
-  animation: parameterModalIn 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
 .parameter-modal {
   width: min(1500px, calc(100vw - 42px)) !important;
   height: calc(100vh - 42px) !important;
@@ -11301,6 +11297,37 @@ textarea {
     linear-gradient(180deg, #ffffff 0%, #f8fbff 100%) !important;
   border: 1px solid rgba(255,255,255,0.88) !important;
   box-shadow: 0 40px 100px rgba(15,23,42,0.30) !important;
+
+  /* THE FIX: force a strict 3-row flex column */
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.parameter-modal .modal-header {
+  flex: 0 0 auto !important;          /* header never grows/shrinks */
+  padding: 26px 32px 20px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-bottom: 1px solid rgba(148,163,184,0.18) !important;
+}
+
+.parameter-modal .modal-body {
+  flex: 1 1 auto !important;          /* body takes remaining space */
+  min-height: 0 !important;           /* CRITICAL for scroll inside flex */
+  padding: 18px 22px !important;
+  max-height: none !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  background: linear-gradient(180deg, #fbfdff 0%, #f4f8fd 100%) !important;
+}
+
+.parameter-modal .modal-footer {
+  flex: 0 0 auto !important;          /* footer always pinned, never scrolls away */
+  padding: 18px 24px !important;
+  background: rgba(255,255,255,0.96) !important;
+  border-top: 1px solid rgba(148,163,184,0.18) !important;
+  display: flex !important;
+  justify-content: flex-end !important;
+  align-items: center !important;
 }
 
 .parameter-modal .modal-header {
@@ -11400,6 +11427,8 @@ textarea {
   box-shadow: 0 0 0 4px rgba(37,99,235,0.12) !important;
   transform: translateY(-1px) !important;
 }
+
+
 
 .parameter-role-select {
   position: relative;
@@ -12940,6 +12969,7 @@ textarea {
                   <option value="Multisite">Multisite</option>
                   <option value="Individual">Individual</option>
                   <option value="Zone">Zone</option>
+                  <option value="Product Line">Product Line</option>
                 </select>
               </div>
               <div class="field col-2" id="parameter_unit_type_field">
@@ -12970,9 +13000,18 @@ textarea {
                     </div>
                     <div class="parameter-role-options" id="parameterRoleOptions" role="listbox" aria-label="Role options"></div>
                   </div>
-                  <select id="parameter_role_id" class="parameter-role-native" tabindex="-1" aria-hidden="true"></select>
-                </div>
+                <select id="parameter_role_id" class="parameter-role-native" tabindex="-1" aria-hidden="true"></select>
+                  </div>
+                  </div>
+
+              <div class="field col-4 is-hidden" id="parameter_product_line_field">
+              <label><span>Product Line</span></label>
+              <select id="parameter_product_line_id">
+              <option value="">Select product line</option>
+              </select>
               </div>
+          
+            
               <div class="field col-12">
                 <label><span>KPI Definition</span><span class="hint">Read only</span></label>
                 <textarea
@@ -13396,11 +13435,15 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
         setLookupSelectOptions("parameter_plant_id", unitOptions, "Select unit", selectedValue);
       }
 
-      function getParameterScopeKind() {
-        return String(getParameterFieldValue("parameter_kpi_type") || "").trim().toLowerCase() === "zone"
-          ? "zone"
-          : "unit";
-      }
+       function getParameterScopeKind() {
+         const type = String(getParameterFieldValue("parameter_kpi_type") || "")
+         .trim()
+         .toLowerCase();
+
+        if (type === "zone") return "zone";
+        if (type === "product line") return "product_line";
+         return "unit";
+        }
 
       function getParameterRowStateKey(scopeType, scopeId) {
         const normalizedScopeType = String(scopeType || "unit").trim().toLowerCase() || "unit";
@@ -14244,6 +14287,31 @@ function getParameterVisibleUnitRows() {
       });
   }
 
+if (scopeKind === "product_line") {
+  const selectedProductLineId = getParameterFieldValue("parameter_product_line_id");
+
+  if (!selectedProductLineId) return [];
+
+  const factoryUnits = getParameterAllocationUnits()
+    .filter(unitEntry =>
+      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
+    )
+    .filter(unitEntry =>
+      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
+    )
+    .map(unitEntry => ({
+      ...unitEntry,
+      row_kind: "unit",
+      product_line_id: selectedProductLineId,
+      local_currency:
+        unitEntry.selling_currency ||
+        unitEntry.operating_currency ||
+        ""
+    }));
+
+  return factoryUnits;
+}
+
   const factoryUnits = getParameterAllocationUnits()
     .filter(unitEntry =>
       String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
@@ -14317,6 +14385,7 @@ function getParameterUnitAllocationRows() {
   const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || "";
   const sharedRoleId        = getParameterFieldValue("parameter_role_id");
   const sharedUnitTypeId    = getParameterFieldValue("parameter_unit_type_id");
+  
   const fallbackSetupDate   =
     getParameterFieldValue("parameter_target_setup_date") ||
     getLocalDateInputValue();
@@ -14336,11 +14405,12 @@ function getParameterUnitAllocationRows() {
         String(state.responsible_id || "").trim() || sharedSetByPeopleId;
  
       return {
-        plant_id:            scopeKind === "unit" ? scopeId : null,
-        zone_id:             scopeKind === "zone" ? scopeId : null,
-        unit_type_id:        scopeKind === "unit"
-                               ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
-                               : null,
+        plant_id: scopeKind === "unit" ? scopeId : null,
+        zone_id: scopeKind === "zone" ? scopeId : null,
+        product_line_id: scopeKind === "product_line" ? scopeId : null,
+        unit_type_id: scopeKind === "unit"
+         ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
+          : null,
         role_id:             scopeKind === "unit" ? sharedRoleId : null,
         target_value:        targetValue,
         target_setup_date:   targetSetupDate,
@@ -14452,6 +14522,18 @@ function getParameterVisibleUnitRows() {
       unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
+
+  if (scopeKind === "product_line") {
+  const selectedProductLineId = getParameterFieldValue("parameter_product_line_id");
+
+  if (!selectedProductLineId) return [];
+
+  return factoryUnits.map(unitEntry => ({
+    ...unitEntry,
+    row_kind: "unit",
+    product_line_id: selectedProductLineId
+  }));
+}
 
   return factoryUnits;
 }
@@ -14612,9 +14694,7 @@ function getParameterResponsibleCellNote(scopeEntry, responsibleEntry) {
     return "";
   }
 
-  if (!roleLabel) {
-    return "Enter the role please.";
-  }
+
 
   if (responsibleEntry?.source === "role") {
     return isIndividualParameterScope()
@@ -14904,14 +14984,12 @@ function getParameterUnitAllocationRows() {
     if (!targetValue) return [];
 
     return [{
-      kpi_target_allocation_id:
-        String(
-          existingState.kpi_target_allocation_id ||
-          getParameterFieldValue("parameter_object_id") ||
-          ""
-        ).trim() || null,
-      plant_id: plantId || null,
-      zone_id: null,
+      kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
+      plant_id: scopeKind === "unit" ? scopeId : null,
+      zone_id: scopeKind === "zone" ? scopeId : null,
+      product_line_id: getParameterScopeKind() === "product_line"
+      ? getParameterFieldValue("parameter_product_line_id")
+      : null,
       unit_type_id: sharedUnitTypeId || String(unitEntry?.unit_type_id || "").trim() || null,
       role_id: sharedRoleId || null,
       target_value: targetValue,
@@ -15117,7 +15195,8 @@ function syncParameterScopePresentation() {
   const zoneDisplayEl = document.getElementById("parameter_zone_resolved_display");
   const roleLabelEl = document.getElementById("parameter_role_label");
   const roleHintEl = document.getElementById("parameter_role_hint");
- 
+  const isProductLineScope = scopeKind === "product_line";
+
   /* ── bottom section: only for Individual ── */
   const allocSection = document.getElementById("parameterAllocationFieldsSection");
   if (allocSection) {
@@ -15133,8 +15212,9 @@ function syncParameterScopePresentation() {
   toggleScopedParameterField("parameter_multisite_matrix_field", !isIndividual);
  
   /* ── scope fields: Multisite only in the latest Individual layout ── */
-  toggleScopedParameterField("parameter_unit_type_field", !isZoneScope && !isIndividual, { clearOnHide: false });
-  toggleScopedParameterField("parameter_role_field",      hasKpiType && !isZoneScope, { clearOnHide: false });
+  toggleScopedParameterField("parameter_unit_type_field", !isZoneScope && !isIndividual && !isProductLineScope, { clearOnHide: false });
+  toggleScopedParameterField("parameter_role_field", hasKpiType && !isZoneScope && !isProductLineScope, { clearOnHide: false });
+  toggleScopedParameterField("parameter_product_line_field", isProductLineScope, { clearOnHide: false });
   toggleScopedParameterField("parameter_plant_field",     false, { clearOnHide: false });
   toggleScopedParameterField("parameter_previous_target_field", !isIndividual, { clearOnHide: false });
   toggleScopedParameterField("parameter_target_start_date_field", !isIndividual, { clearOnHide: false });
@@ -15236,15 +15316,24 @@ function renderMultisiteUnitMatrix() {
     return;
   }
 
-  if (scopeKind !== "zone" && !selectedUnitTypeId && !parameterLockedUnitId) {
-    renderParameterTableEmptyState("Select a unit type to display the units that should receive targets.");
-    return;
-  }
+if (
+  scopeKind !== "zone" &&
+  scopeKind !== "product_line" &&
+  !selectedUnitTypeId &&
+  !parameterLockedUnitId
+) {
+  renderParameterTableEmptyState("Select a unit type to display the units that should receive targets.");
+  return;
+}
 
-  if (scopeKind !== "zone" && !selectedRoleId) {
-    renderParameterTableEmptyState("Enter the role please to load the target table and resolve the related responsible for each unit.");
-    return;
-  }
+if (
+  scopeKind !== "zone" &&
+  scopeKind !== "product_line" &&
+  !selectedRoleId
+) {
+  renderParameterTableEmptyState("Enter the role please to load the target table and resolve the related responsible for each unit.");
+  return;
+}
 
   const visibleRows = getParameterVisibleUnitRows();
   if (!visibleRows.length) {
@@ -18773,8 +18862,11 @@ updateParameterKpiSummary();
           relatedAllocations.find(
             (row) => String(row?.kpi_target_allocation_id || "") === String(data?.kpi_target_allocation_id || "")
           ) || relatedAllocations[0] || data;
-        const normalizedKpiType = String(primaryRow?.kpi_type || "").trim().toLowerCase();
-        const isGroupedScope = normalizedKpiType === "multisite" || normalizedKpiType === "zone";
+         const normalizedKpiType = String(primaryRow?.kpi_type || "").trim().toLowerCase();
+         const isGroupedScope =
+          normalizedKpiType === "multisite" ||
+          normalizedKpiType === "zone" ||
+          normalizedKpiType === "product line";
 
         const mappings = {
           parameter_object_id: primaryRow.kpi_target_allocation_id,
@@ -19034,17 +19126,22 @@ function buildParameterPayload() {
       return;
     }
 
-     if (!isIndividualParameterScope() && scopeKind !== "zone" && !getParameterFieldValue("parameter_unit_type_id") && !parameterLockedUnitId) {
-      showToast("Select a unit type");
-      return;
-    }
 
-    if (scopeKind !== "zone" && !getNormalizedParameterRoleId()) {
-      showToast("Select the role first");
-      const roleTrigger = document.getElementById("parameterRoleTrigger");
-      if (roleTrigger) roleTrigger.focus();
-      return;
-    }
+    if (scopeKind !== "zone" && scopeKind !== "product_line" && !getNormalizedParameterRoleId()) {
+     showToast("Select the role first");
+     return;
+    } 
+
+  if (
+  !isIndividualParameterScope() &&
+  scopeKind !== "zone" &&
+  scopeKind !== "product_line" &&
+  !getParameterFieldValue("parameter_unit_type_id") &&
+  !parameterLockedUnitId
+) {
+  showToast("Select a unit type");
+  return;
+}
 
   if (isIndividualParameterScope()) {
   const targetVal = getParameterFieldValue("parameter_target_value");
@@ -19281,7 +19378,7 @@ if (missingRow) {
     }
 
 const parameterRoleSelect = document.getElementById("parameter_role_id");
-if (parameterRoleSelect) {
+ if (parameterRoleSelect) {
   parameterRoleSelect.addEventListener("change", () => {
     syncParameterRoleDropdown();
     if (isIndividualParameterScope()) {
@@ -19296,12 +19393,21 @@ if (parameterRoleSelect) {
   syncParameterRoleDropdown();
 }
 
+const parameterProductLineSelect = document.getElementById("parameter_product_line_id");
+if (parameterProductLineSelect) {
+  parameterProductLineSelect.addEventListener("change", () => {
+    resetParameterUnitTargetState();
+    renderMultisiteUnitMatrix();
+  });
+}
+
 const parameterRoleTrigger = document.getElementById("parameterRoleTrigger");
 if (parameterRoleTrigger) {
   parameterRoleTrigger.addEventListener("click", (event) => {
     event.preventDefault();
     toggleParameterRoleDropdown();
   });
+  
 }
 
 const parameterRoleOptionsHost = document.getElementById("parameterRoleOptions");
@@ -26133,9 +26239,18 @@ let historyValues = historyLabels.map((label) => {
                 <div>
                      <!-- â”€â”€ Manager Comment (moved above action bar) â”€â”€ -->
           <div class="comment-section">
-            <div class="comment-label">
-              Manager Comment <span style="font-size:11px;color:#888;">(Optional)</span>
-            </div>
+          <div class="comment-label comment-label-row">
+         <span>Manager Comment <span style="font-size:11px;color:#888;">(Optional)</span></span>
+
+         <button
+         type="button"
+         class="comment-history-btn"
+         title="View comment history"
+         aria-label="View comment history"
+         onclick="openCommentsHistoryModal('${kpi.kpi_values_id}'); return false;">
+          🕘
+        </button>
+          </div>
             <textarea
               name="comment_${kpi.kpi_values_id}"
               class="comment-input"
@@ -27765,6 +27880,30 @@ let historyValues = historyLabels.map((label) => {
   display:flex;
   flex-direction:column;
   gap:10px;
+}
+
+.comment-label-row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.comment-history-btn{
+  width:30px;
+  height:30px;
+  border:none;
+  border-radius:999px;
+  background:#eff6ff;
+  color:#0f6cbd;
+  cursor:pointer;
+  font-size:15px;
+  box-shadow:0 6px 14px rgba(15,108,189,.14);
+}
+
+.comment-history-btn:hover{
+  background:#dbeafe;
+  transform:translateY(-1px);
 }
 
 .greeting-item{
@@ -31130,9 +31269,63 @@ if (form && confirmModal && confirmBtn && cancelBtn) {
       } else {
         scheduleInitialCorrectiveActionCheck();
       }
+
+      function formatCommentDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return String(value);
+  return d.toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function openCommentsHistoryModal(kvId) {
+  const historyModal = document.getElementById("historyModal");
+  const historyModalTitle = document.getElementById("historyModalTitle");
+  const historyModalSubtitle = document.getElementById("historyModalSubtitle");
+  const historyModalContent = document.getElementById("historyModalContent");
+  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+
+  if (!card || !historyModal || !historyModalContent) return;
+
+  const comments = decodeModalPayload(card.dataset.historyComments, []);
+
+  if (historyModalTitle) historyModalTitle.textContent = "Comment History";
+  if (historyModalSubtitle) historyModalSubtitle.textContent =
+    getTrimmedText(card.querySelector(".kpi-title")) || "Previous comments for this KPI";
+
+  historyModalContent.innerHTML = comments.length
+    ? '<div class="history-section">' +
+        '<h4 class="history-section-title">💬 Comments</h4>' +
+        '<div class="history-comments-list">' +
+          comments.map(function(c) {
+            return '' +
+              '<div class="history-comment-card">' +
+                '<div class="history-comment-label">' +
+                  escapeHistoryHtml(formatHistoryWeek(c.week)) +
+                  ' · ' +
+                  escapeHistoryHtml(formatCommentDate(c.updated_at)) +
+                '</div>' +
+                '<div class="history-comment-text">' +
+                  formatHistoryText(c.text || c.comment || "") +
+                '</div>' +
+              '</div>';
+          }).join("") +
+        '</div>' +
+        '</div>'
+       : '<div class="history-empty">No previous comments for this KPI.</div>';
+
+      historyModal.classList.add("active");
+      historyModal.setAttribute("aria-hidden", "false");
+      document.body.classList.add("chart-modal-open");
+     }
         </script>
 
-        <div id="caRequiredSimpleModal" class="modal-overlay">
+   <div id="caRequiredSimpleModal" class="modal-overlay">
   <div class="modal-box">
     <div class="modal-icon">⚠️</div>
     <h3>Corrective Action </h3>
@@ -33925,7 +34118,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
   }
 };
 // ---------- Cron: weekly KPI submission email ----------
-const DIRECT_KPI_SUBMISSION_CRON = "0 9 * * *";   // Example: Monday 08:00 UTC
+const DIRECT_KPI_SUBMISSION_CRON = "0 10 * * *";   // Example: Monday 08:00 UTC
 const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * *";   // Example: Monday 09:00 UTC
 const weeklyKpiSubmissionCronState = {
   direct: false,
@@ -37626,15 +37819,15 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("00 11 * * *", async () => {
-  try {
-    console.log("[KPI Training Cron] Sending responsible training links...");
-    const result = await sendKpiTrainingLinksToResponsibles();
-    console.log("[KPI Training Cron] Done:", result);
-  } catch (error) {
-    console.error("[KPI Training Cron] Failed:", error.message);
-  }
-});
+// cron.schedule("15 12 * * *", async () => {
+//   try {
+//     console.log("[KPI Training Cron] Sending responsible training links...");
+//     const result = await sendKpiTrainingLinksToResponsibles();
+//     console.log("[KPI Training Cron] Done:", result);
+//   } catch (error) {
+//     console.error("[KPI Training Cron] Failed:", error.message);
+//   }
+// });
 
 
 //kpi tree endpoint 
