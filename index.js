@@ -23271,7 +23271,15 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
       kta.kpi_id,
       COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject,
       COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
-      COALESCE(kta.target_unit, k.unit) AS unit,
+     COALESCE(kta.target_unit, k.unit) AS unit,
+     COALESCE(unit_scope.selling_currency, plant_scope.selling_currency, kta.local_currency) AS selling_currency,
+     kta.local_currency,
+     CASE
+     WHEN LOWER(TRIM(COALESCE(kta.target_unit, k.unit))) = 'kcur'
+     AND NULLIF(TRIM(COALESCE(unit_scope.selling_currency, plant_scope.selling_currency, kta.local_currency)), '') IS NOT NULL
+     THEN 'k' || UPPER(TRIM(COALESCE(unit_scope.selling_currency, plant_scope.selling_currency, kta.local_currency)))
+     ELSE COALESCE(kta.target_unit, k.unit)
+     END AS display_unit,
       COALESCE(latest_result.target_value, kta.target_value, k.target_value) AS target,
       k.min_value AS min,
       k.max_value AS max,
@@ -23290,6 +23298,11 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
       COALESCE(latest_result.recorded_at, CURRENT_TIMESTAMP) AS last_updated
     FROM public.kpi_target_allocation kta
     JOIN public.kpi k ON k.kpi_id = kta.kpi_id
+    LEFT JOIN public.unit unit_scope
+    ON unit_scope.unit_id = kta.unit_id
+
+    LEFT JOIN public.unit plant_scope
+    ON plant_scope.unit_id = kta.plant_id
     LEFT JOIN LATERAL (
       SELECT s.subject_name
       FROM public.subject_kpi sk
@@ -25904,8 +25917,25 @@ app.get("/form", async (req, res) => {
 
     let kpiCardsHtml = "";
     let hasInitialInvalidKpi = false;
+    function getDisplayUnit(kpi) {
+  const unit = String(kpi.unit || "").trim();
+
+  if (unit.toLowerCase() !== "kcur") return unit;
+
+  const currency = String(
+    kpi.selling_currency ||
+    kpi.local_currency ||
+    ""
+  ).trim().toUpperCase();
+
+  return currency ? `k${currency}` : "kCur";
+    }
     kpis.forEach((kpi) => {
       let lowLimit = null;
+      const displayUnit = getDisplayUnit({
+       ...kpi,
+       unit: kpi.display_unit
+      });
       if (kpi.low_limit && kpi.low_limit !== "None" && kpi.low_limit !== "null" && kpi.low_limit !== "" && !isNaN(parseFloat(kpi.low_limit))) {
         lowLimit = parseFloat(kpi.low_limit);
       }
@@ -26041,7 +26071,7 @@ let historyValues = historyLabels.map((label) => {
        data-history-values='${JSON.stringify(historyValues)}'
        data-current-week="${week}"
        data-current-month-label="${currentPeriodLabel}"
-       data-unit="${kpi.unit || ""}"
+       data-unit="${displayUnit}"
       data-history-actions="${encodeModalPayload(allHistoryActions)}"
       data-history-comments="${encodeModalPayload(allHistoryComments)}">
 
@@ -26085,7 +26115,7 @@ let historyValues = historyLabels.map((label) => {
 
                 <div class="kpi-input-stack">
                   <label class="kpi-side-label" for="value_${kpi.kpi_values_id}">Current Value</label>
-                  <div class="kpi-input-shell ${kpi.unit ? "has-unit" : ""}">
+                  <div class="kpi-input-shell ${displayUnit ? "has-unit" : ""}">
                     <input
                       type="number"
                       step="any"
@@ -26097,7 +26127,7 @@ let historyValues = historyLabels.map((label) => {
                       data-kpi-values-id="${kpi.kpi_values_id}"
                       required
                     />
-                    ${kpi.unit ? `<span class="kpi-input-unit">${kpi.unit}</span>` : ""}
+                    ${displayUnit ? `<span class="kpi-input-unit">${displayUnit}</span>` : ""}
                   </div>
                 </div>
                 <div>
@@ -26162,17 +26192,17 @@ let historyValues = historyLabels.map((label) => {
                 <div class="mini-stat-card">
                   <div class="mini-stat-label">HIGH LIMIT</div>
                   <div class="mini-stat-value high">${highLimit !== null ? highLimit : "â€”"}</div>
-                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                  <div class="mini-stat-unit">${displayUnit}</div>
                 </div>
                 <div class="mini-stat-card">
                   <div class="mini-stat-label">TARGET</div>
                   <div class="mini-stat-value target">${targetValue !== null ? targetValue : "â€”"}</div>
-                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                  <div class="mini-stat-unit">${displayUnit}</div>
                 </div>
                 <div class="mini-stat-card">
                   <div class="mini-stat-label">LOW LIMIT</div>
                   <div class="mini-stat-value low">${lowLimit !== null ? lowLimit : "â€”"}</div>
-                  <div class="mini-stat-unit">${kpi.unit || ""}</div>
+                  <div class="mini-stat-unit">${displayUnit}</div>
                 </div>
               </div>
             </div>
@@ -37596,13 +37626,109 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("15 11 * * *", async () => {
+cron.schedule("00 11 * * *", async () => {
   try {
     console.log("[KPI Training Cron] Sending responsible training links...");
     const result = await sendKpiTrainingLinksToResponsibles();
     console.log("[KPI Training Cron] Done:", result);
   } catch (error) {
     console.error("[KPI Training Cron] Failed:", error.message);
+  }
+});
+
+
+//kpi tree endpoint 
+app.get("/api/units/tree", async (req, res) => {
+  try {
+    const { country, parent_unit_id } = req.query;
+
+    const params = [];
+    let where = "u.status_id = 1";
+
+    if (country) {
+      params.push(country);
+      where += ` AND u.country = $${params.length}`;
+    }
+
+    if (parent_unit_id) {
+      params.push(Number(parent_unit_id));
+      where += ` AND u.parent_unit_id = $${params.length}`;
+    } else if (!country) {
+      where += ` AND u.parent_unit_id IS NULL`;
+    }
+
+    const result = await pool.query(`
+      SELECT
+        u.unit_id,
+        u.parent_unit_id,
+        u.unit_name,
+        u.unit_short_name,
+        u.country,
+        u.city,
+        u.unit_type_id,
+        ut.unit_type_name,
+
+        EXISTS (
+          SELECT 1
+          FROM public.unit child
+          WHERE child.parent_unit_id = u.unit_id
+            AND child.status_id = 1
+        ) AS has_children,
+
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'people_id', p.people_id,
+              'name', TRIM(CONCAT_WS(' ', p.first_name, p.name)),
+              'email', p.email,
+              'role_id', r.role_id,
+              'role_name', r.role_name,
+              'assignment_id', pra.assignment_id,
+              'is_primary', pra.is_primary,
+              'allocation_percentage', pra.allocation_percentage
+            )
+          ) FILTER (WHERE p.people_id IS NOT NULL),
+          '[]'
+        ) AS people
+
+      FROM public.unit u
+
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+
+      LEFT JOIN public.people_role_assignment pra
+        ON pra.unit_id = u.unit_id
+       AND pra.assignment_status = 'ACTIVE'
+       AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
+
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+
+      WHERE ${where}
+
+      GROUP BY
+        u.unit_id,
+        u.parent_unit_id,
+        u.unit_name,
+        u.unit_short_name,
+        u.country,
+        u.city,
+        u.unit_type_id,
+        ut.unit_type_name
+
+      ORDER BY u.unit_name
+    `, params);
+
+    res.json(result.rows.map(row => ({
+      ...row,
+      flag: countryFlags[row.country] || "🏳️"
+    })));
+  } catch (err) {
+    console.error("GET /api/units/tree error:", err);
+    res.status(500).json({ error: "Failed to load unit tree" });
   }
 });
 
