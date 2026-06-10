@@ -25523,9 +25523,24 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       : "kr.kpi_id = $1";
     const baseWhereValue = allocationId || kpiId;
 
+    const kpiFrequencyRes = await pool.query(
+      `
+      SELECT frequency
+      FROM public.kpi
+      WHERE kpi_id = $1
+      LIMIT 1
+      `,
+      [kpiId]
+    );
+
+    const frequencyMode = normalizeKpiFrequency(kpiFrequencyRes.rows[0]?.frequency);
+
     const histRes = await pool.query(
       `
-      SELECT DISTINCT ON (COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')))
+      SELECT DISTINCT ON (
+        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD'))
+      )
+        kr.result_date,
         COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
         kr.raw_value AS new_value,
         kr.recorded_at AS updated_at
@@ -25566,45 +25581,97 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       return d.toLocaleString("en-US", { month: "short", year: "numeric" });
     }
 
-    function monthLabelToDate(monthLabel) {
-      const d = new Date("1 " + monthLabel);
-      return isNaN(d.getTime()) ? new Date(0) : d;
+    function periodLabelToDate(label, frequencyMode) {
+      if (frequencyMode === "daily") return new Date(label);
+      if (frequencyMode === "monthly") return new Date("1 " + label);
+      return weekLabelToDate(label);
     }
 
-    const monthMap = {};
+    function getPeriodLabel(row) {
+      if (frequencyMode === "daily") {
+        return row.result_date
+          ? new Date(row.result_date).toISOString().slice(0, 10)
+          : row.week;
+      }
+
+      if (frequencyMode === "weekly") {
+        return row.week;
+      }
+
+      return weekToMonthLabel(row.week);
+    }
+
+    const periodMap = {};
+
     for (const row of histRes.rows) {
       const value = parseFloat(row.new_value);
       if (isNaN(value)) continue;
 
-      const monthLabel = weekToMonthLabel(row.week);
-      if (!monthMap[monthLabel]) monthMap[monthLabel] = { sum: 0, count: 0 };
-      monthMap[monthLabel].sum += value;
-      monthMap[monthLabel].count += 1;
+      const periodLabel = getPeriodLabel(row);
+      if (!periodLabel) continue;
+
+      if (!periodMap[periodLabel]) periodMap[periodLabel] = { sum: 0, count: 0 };
+      periodMap[periodLabel].sum += value;
+      periodMap[periodLabel].count += 1;
     }
 
-    const currentMonthLabel = weekToMonthLabel(normalizedWeek);
+    const currentPeriodLabel =
+      frequencyMode === "daily"
+        ? new Date().toISOString().slice(0, 10)
+        : frequencyMode === "monthly"
+          ? weekToMonthLabel(normalizedWeek)
+          : normalizedWeek;
     const currentValue = parseFloat(currentRes.rows[0]?.value);
 
     if (!isNaN(currentValue)) {
-      monthMap[currentMonthLabel] = { sum: currentValue, count: 1 };
+      periodMap[currentPeriodLabel] = { sum: currentValue, count: 1 };
     }
 
-    const labels = Object.keys(monthMap).sort(
-      (a, b) => monthLabelToDate(a) - monthLabelToDate(b)
+    const labels = Object.keys(periodMap).sort(
+      (a, b) => periodLabelToDate(a, frequencyMode) - periodLabelToDate(b, frequencyMode)
     );
 
     const values = labels.map((label) => {
-      const m = monthMap[label];
-      return Number((m.sum / m.count).toFixed(2));
+      const p = periodMap[label];
+      return Number((p.sum / p.count).toFixed(2));
     });
 
-    res.json({ labels, values, currentMonthLabel, currentValue: isNaN(currentValue) ? null : currentValue });
+    res.json({
+      labels,
+      values,
+      currentMonthLabel: currentPeriodLabel,
+      currentValue: isNaN(currentValue) ? null : currentValue
+    });
   } catch (err) {
     console.error("kpi-chart-data error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
+
+function normalizeKpiFrequency(frequency) {
+  const f = String(frequency || "").toLowerCase();
+
+  if (f.includes("day") || f.includes("daily")) return "daily";
+  if (f.includes("week") || f.includes("weekly")) return "weekly";
+  if (f.includes("month") || f.includes("monthly")) return "monthly";
+
+  return "weekly";
+}
+
+function getPeriodLabelForFrequency(item, frequency) {
+  const mode = normalizeKpiFrequency(frequency);
+
+  if (mode === "daily") {
+    return item.result_date || item.week;
+  }
+
+  if (mode === "weekly") {
+    return item.week;
+  }
+
+  return weekToMonthLabel(item.week);
+}
 
 
 // ---------- Form page ----------
@@ -25674,34 +25741,41 @@ app.get("/form", async (req, res) => {
       .map((kpi) => normalizeOptionalIntegerInput(kpi.kpi_values_id))
       .filter((value) => Number.isInteger(value));
 
-    const histRes = await pool.query(
-      `
-      SELECT DISTINCT ON (kr.kpi_target_allocation_id, COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')))
-        kr.kpi_target_allocation_id AS kpi_values_id,
-        kr.kpi_id,
-        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
-        kr.raw_value AS new_value,
-        kr.recorded_at AS updated_at
-      FROM public.kpi_result kr
-      WHERE kr.kpi_target_allocation_id = ANY($1::int[])
-        AND kr.raw_value IS NOT NULL
-      ORDER BY
-        kr.kpi_target_allocation_id,
-        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
-        kr.recorded_at DESC,
-        kr.kpi_result_id DESC
-      `,
-      [allocationIds]
-    );
+  const histRes = await pool.query(
+  `
+  SELECT DISTINCT ON (
+    kr.kpi_target_allocation_id,
+    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD'))
+  )
+    kr.kpi_target_allocation_id AS kpi_values_id,
+    kr.kpi_id,
+    kr.result_date,
+    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+    kr.raw_value AS new_value,
+    kr.recorded_at AS updated_at
+  FROM public.kpi_result kr
+  WHERE kr.kpi_target_allocation_id = ANY($1::int[])
+    AND kr.raw_value IS NOT NULL
+  ORDER BY
+    kr.kpi_target_allocation_id,
+    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+    kr.recorded_at DESC,
+    kr.kpi_result_id DESC
+  `,
+  [allocationIds]
+);
 
     const historyByKpi = {};
     histRes.rows.forEach((row) => {
       const historyKey = String(row.kpi_values_id || row.kpi_id);
       if (!historyByKpi[historyKey]) historyByKpi[historyKey] = [];
-      historyByKpi[historyKey].push({
-        week: row.week,
-        value: parseFloat(row.new_value)
-      });
+   historyByKpi[historyKey].push({
+  week: row.week,
+  result_date: row.result_date
+    ? new Date(row.result_date).toISOString().slice(0, 10)
+    : null,
+  value: parseFloat(row.new_value)
+});
     });
 
     function weekLabelToDate(weekStr) {
@@ -25894,36 +25968,44 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
         .filter((h) => !isNaN(h.value))
         .sort((a, b) => weekLabelToDate(a.week) - weekLabelToDate(b.week));
 
-      const currentMonthLabel = weekToMonthLabel(week);
-      const monthMap = {};
+const frequencyMode = normalizeKpiFrequency(kpi.frequency);
 
-      sortedHistory.forEach((item) => {
-        const monthLabel = weekToMonthLabel(item.week);
+const currentPeriodLabel =
+  frequencyMode === "daily"
+    ? new Date().toISOString().slice(0, 10)
+    : frequencyMode === "monthly"
+      ? weekToMonthLabel(week)
+      : week;
 
-        if (!monthMap[monthLabel]) {
-          monthMap[monthLabel] = { sum: 0, count: 0 };
-        }
+const periodMap = {};
 
-        monthMap[monthLabel].sum += item.value;
-        monthMap[monthLabel].count += 1;
-      });
+sortedHistory.forEach((item) => {
+  const periodLabel = getPeriodLabelForFrequency(item, kpi.frequency);
 
-      // also force the current input value into the current month
-      if (currentValue !== null) {
-        monthMap[currentMonthLabel] = {
-          sum: currentValue,
-          count: 1
-        };
-      }
+  if (!periodMap[periodLabel]) {
+    periodMap[periodLabel] = { sum: 0, count: 0 };
+  }
 
-      let historyLabels = Object.keys(monthMap).sort(
-        (a, b) => monthLabelToDate(a) - monthLabelToDate(b)
-      );
+  periodMap[periodLabel].sum += item.value;
+  periodMap[periodLabel].count += 1;
+});
 
-      let historyValues = historyLabels.map((label) => {
-        const m = monthMap[label];
-        return Number((m.sum / m.count).toFixed(2));
-      });
+if (currentValue !== null) {
+  periodMap[currentPeriodLabel] = {
+    sum: currentValue,
+    count: 1
+  };
+}
+
+let historyLabels = Object.keys(periodMap);
+
+let historyValues = historyLabels.map((label) => {
+  const p = periodMap[label];
+  return Number((p.sum / p.count).toFixed(2));
+});
+
+     
+    
 
       const allHistoryActions = sortHistoryEntries(
         Object.values(
@@ -25958,7 +26040,7 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
        data-history-labels='${JSON.stringify(historyLabels)}'
        data-history-values='${JSON.stringify(historyValues)}'
        data-current-week="${week}"
-       data-current-month-label="${currentMonthLabel}"
+       data-current-month-label="${currentPeriodLabel}"
        data-unit="${kpi.unit || ""}"
       data-history-actions="${encodeModalPayload(allHistoryActions)}"
       data-history-comments="${encodeModalPayload(allHistoryComments)}">
@@ -37514,7 +37596,7 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("16 11 * * *", async () => {
+cron.schedule("15 11 * * *", async () => {
   try {
     console.log("[KPI Training Cron] Sending responsible training links...");
     const result = await sendKpiTrainingLinksToResponsibles();
