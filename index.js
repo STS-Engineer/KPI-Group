@@ -33787,7 +33787,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
     if (!deliveryRecipient) {
       throw new Error(`No email defined for weekly report delivery for ${responsible.name}`);
     }
-    const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-codir.azurewebsites.net")
+    const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-form.azurewebsites.net")
       .replace(/\/+$/, "");
     const dashboardUrl = `${appBaseUrl}/dashboard?responsible_id=${encodeURIComponent(responsible.people_id)}`;
     const chartsData = await generateWeeklyReportData(responsible.people_id, reportWeek);
@@ -35679,7 +35679,7 @@ async function sendDepartmentKPIReportEmail(plantId, currentWeek, recipientOverr
 // EACH of their direct reports (passed as an array of people IDs).
 // ---------------------------------------------------------------------------
 async function sendConsolidatedManagerReport(manager, directReportPeopleIds, currentWeek) {
-  const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-codir.azurewebsites.net")
+  const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-form.azurewebsites.net")
     .replace(/\/+$/, "");
   const reportWeekLabel = formatWeeklyReportWeekLabel(currentWeek);
   const managerName = getPeopleDisplayName(manager) || `${manager.first_name || ""} ${manager.name || ""}`.trim();
