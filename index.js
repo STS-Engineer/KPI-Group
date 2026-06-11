@@ -25830,6 +25830,10 @@ app.get("/form", async (req, res) => {
       normalizeOptionalTextInput(responsibleContext?.role) ||
       "Not assigned";
 
+    const formFrequencyLabel =
+     normalizeOptionalTextInput(kpis?.[0]?.frequency) ||
+      "Weekly";
+
     if (!kpis.length) {
       return res.send(`
         <!DOCTYPE html>
@@ -26377,7 +26381,7 @@ let historyValues = historyLabels.map((label) => {
           .form-section{padding:30px;}
           .info-section{
             display:grid;
-            grid-template-columns:repeat(4,minmax(0,1fr));
+            grid-template-columns:repeat(5,minmax(0,1fr));
             gap:16px;
             background:linear-gradient(135deg,#f8fbff 0%,#eef6ff 100%);
             padding:20px;
@@ -28434,6 +28438,7 @@ let historyValues = historyLabels.map((label) => {
               <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsibleGroupLabel}</div></div>
               <div class="info-row"><div class="info-label">Role</div><div class="info-value">${responsibleRoleLabel}</div></div>
               <div class="info-row"><div class="info-label">Week</div><div class="info-value">${week}</div></div>
+              <div class="info-row"><div class="info-label">Frequency</div><div class="info-value">${formFrequencyLabel}</div></div>
             </div>
 
             <div class="kpi-section">
