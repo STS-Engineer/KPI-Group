@@ -14974,33 +14974,38 @@ function getParameterUnitAllocationRows() {
   const sharedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
   const fallbackSetupDate = getParameterFieldValue("parameter_target_setup_date") || getLocalDateInputValue();
 
-  if (isIndividualParameterScope()) {
-    const plantId = String(getParameterFieldValue("parameter_plant_id") || parameterLockedUnitId || "").trim();
-    const unitEntry = getParameterUnitById(plantId);
-    const existingState = plantId ? getParameterUnitState("unit", plantId) : {};
-    const targetValue = String(getParameterFieldValue("parameter_target_value") || "").trim();
-    const selectedResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
+if (isIndividualParameterScope()) {
+  const plantId = String(getParameterFieldValue("parameter_plant_id") || parameterLockedUnitId || "").trim();
+  const unitEntry = plantId ? getParameterUnitById(plantId) : null;
+  const existingState = plantId ? getParameterUnitState("unit", plantId) : {};
 
-    if (!targetValue) return [];
+  const targetValue = String(getParameterFieldValue("parameter_target_value") || "").trim();
+  const selectedResponsibleId = String(getParameterFieldValue("parameter_set_by_people_id") || "").trim();
 
-    return [{
-      kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
-      plant_id: scopeKind === "unit" ? scopeId : null,
-      zone_id: scopeKind === "zone" ? scopeId : null,
-      product_line_id: getParameterScopeKind() === "product_line"
-      ? getParameterFieldValue("parameter_product_line_id")
-      : null,
-      unit_type_id: sharedUnitTypeId || String(unitEntry?.unit_type_id || "").trim() || null,
-      role_id: sharedRoleId || null,
-      target_value: targetValue,
-      target_setup_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_setup_date")) || fallbackSetupDate,
-      target_unit: getParameterFieldValue("parameter_target_unit") || kpiUnit,
-      local_currency: getParameterFieldValue("parameter_local_currency") || unitEntry?.selling_currency || unitEntry?.operating_currency || "",
-      set_by_people_id: selectedResponsibleId || null,
-      last_best_target: getParameterFieldValue("parameter_last_best_target") || null,
-      approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id") || null
-      }];
-     }
+  if (!targetValue) return [];
+
+  return [{
+    kpi_target_allocation_id: String(existingState.kpi_target_allocation_id ?? "").trim() || null,
+    plant_id: plantId || null,
+    zone_id: null,
+    unit_id: null,
+    product_line_id: null,
+    product_id: null,
+    unit_type_id: sharedUnitTypeId || String(unitEntry?.unit_type_id || "").trim() || null,
+    role_id: sharedRoleId || null,
+    target_value: targetValue,
+    target_setup_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_setup_date")) || fallbackSetupDate,
+    target_unit: getParameterFieldValue("parameter_target_unit") || kpiUnit,
+    local_currency:
+      getParameterFieldValue("parameter_local_currency") ||
+      unitEntry?.selling_currency ||
+      unitEntry?.operating_currency ||
+      "",
+    set_by_people_id: selectedResponsibleId || null,
+    last_best_target: getParameterFieldValue("parameter_last_best_target") || null,
+    approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id") || null
+  }];
+}
 
   return getParameterVisibleUnitRows()
     .map((scopeEntry) => {
@@ -23224,19 +23229,27 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       responsibleName,
       responsibleContext
     });
+    const demandeur =
+    normalizeOptionalTextInput(responsibleContext?.name) ||
+    normalizeOptionalTextInput(responsibleContext?.email);
+    const emailDemandeur =
+     normalizeOptionalTextInput(responsibleContext?.email);
+
     const implementedSolution =
       normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution);
     const rootCause =
       normalizeOptionalTextInput(action.rootCause ?? action.root_cause);
-    const values = [
-      implementedSolution,
-      rootCause,
-      status,
-      responsibleName,
-      normalizeOptionalDateInput(action.dueDate ?? action.due_date),
-      index + 1,
-      responsibleEmail
-    ];
+   const values = [
+     implementedSolution,
+     rootCause,
+     status,
+     responsibleName,
+     normalizeOptionalDateInput(action.dueDate ?? action.due_date),
+     index + 1,
+     responsibleEmail,
+     demandeur,
+     emailDemandeur
+   ];
 
     if (actionId && existingActionIds.has(actionId)) {
       const updatedActionRes = await actionPlanPool.query(
@@ -23250,6 +23263,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
           due_date = $6,
           ordre = $7,
           email_responsable = $8,
+          demandeur = $9,
+          email_demandeur = $10,
           type = 'action',
           updated_at = NOW(),
           closed_date = CASE
@@ -23257,7 +23272,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
             ELSE NULL
           END
         WHERE id = $1
-          AND sujet_id = $9
+         AND sujet_id = $11
         RETURNING id
         `,
         [actionId, ...values, sujetId]
@@ -23283,6 +23298,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       due_date,
      ordre,
      email_responsable,
+     demandeur,
+     email_demandeur,
      closed_date
     )
       VALUES (
@@ -23295,6 +23312,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
         $6,
         $7,
         $8,
+        $9,
+        $10,
         CASE
           WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
           ELSE NULL
@@ -23571,7 +23590,7 @@ const upsertCorrectiveAction = async (
   responsibleId,
   kpiId,
   week,
-  { correctiveActionId, rootCause, implementedSolution, dueDate, responsibleName, status }
+  { correctiveActionId, rootCause, implementedSolution, dueDate, responsibleName, status, demandeur }
 ) => {
   try {
     const normalizedPayload = {
@@ -23579,7 +23598,8 @@ const upsertCorrectiveAction = async (
       implementedSolution: normalizeText(implementedSolution),
       dueDate: normalizeText(dueDate),
       responsibleName: normalizeText(responsibleName),
-      status: normalizeCorrectiveActionStatus(status)
+      status: normalizeCorrectiveActionStatus(status),
+      demandeur: normalizeText(demandeur),
     };
     let resolvedStatus = normalizedPayload.status || "Open";
 
@@ -23602,6 +23622,7 @@ const upsertCorrectiveAction = async (
        due_date = $4::date,
        responsible = $5::text,
        status = $6::text,
+       demandeur = $7::text,
        updated_date = NOW()
       WHERE corrective_action_id = $1
        RETURNING corrective_action_id`,
@@ -23611,6 +23632,7 @@ const upsertCorrectiveAction = async (
           normalizedPayload.implementedSolution,
           normalizedPayload.dueDate,
           normalizedPayload.responsibleName,
+          normalizedPayload.demandeur,
           resolvedStatus
         ]
       );
@@ -24904,7 +24926,8 @@ app.post("/submit-corrective-action", async (req, res) => {
       implementedSolution: normalizeText(implemented_solution),
       dueDate: due_date || null,
       responsibleName: normalizeText(responsible),
-      status: normalizeCorrectiveActionStatus(req.body?.status)
+      status: normalizeCorrectiveActionStatus(req.body?.status),
+      demandeur
     });
 
     if (!saved) {
@@ -38206,6 +38229,5 @@ app.get("/api/statistics/department-distribution", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
