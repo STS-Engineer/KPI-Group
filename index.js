@@ -38023,6 +38023,85 @@ app.get("/api/units/tree", async (req, res) => {
   }
 });
 
+app.get("/api/units/:unitId/people-kpis", async (req, res) => {
+  try {
+    const { unitId } = req.params;
+    const { week } = req.query;
+
+    const result = await pool.query(`
+      SELECT
+        v.people_id,
+        v.employee_name AS people_name,
+        v.role_id,
+        v.role_name,
+        v.department_id,
+        v.department_name,
+
+        kta.kpi_target_allocation_id,
+        k.kpi_id,
+        k.kpi_name,
+        k.kpi_sub_title AS indicator_title,
+        k.frequency,
+
+        kta.target_value AS target,
+        kr.kpi_result_id AS result_id,
+        kr.raw_value AS value,
+        kr.result_status AS status
+
+      FROM public.v_people_department v
+
+      LEFT JOIN public.kpi_target_allocation kta
+        ON COALESCE(kta.created_by_people_id, kta.set_by_people_id) = v.people_id
+
+      LEFT JOIN public.kpi k
+        ON k.kpi_id = kta.kpi_id
+
+      LEFT JOIN public.kpi_result kr
+        ON kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
+       AND ($2::text IS NULL OR kr.week = $2)
+
+      WHERE v.department_id = $1::int
+
+      ORDER BY v.employee_name, k.kpi_name
+    `, [unitId, week || null]);
+
+    const peopleMap = new Map();
+
+    result.rows.forEach(row => {
+      if (!peopleMap.has(row.people_id)) {
+        peopleMap.set(row.people_id, {
+          people_id: row.people_id,
+          people_name: row.people_name,
+          role_id: row.role_id,
+          role_name: row.role_name,
+          department_id: row.department_id,
+          department_name: row.department_name,
+          kpis: []
+        });
+      }
+
+      if (row.kpi_id) {
+        peopleMap.get(row.people_id).kpis.push({
+          kpi_target_allocation_id: row.kpi_target_allocation_id,
+          kpi_id: row.kpi_id,
+          kpi_name: row.kpi_name,
+          indicator_title: row.indicator_title,
+          frequency: row.frequency,
+          target: row.target,
+          value: row.value,
+          status: row.status,
+          result_id: row.result_id
+        });
+      }
+    });
+
+    res.json([...peopleMap.values()]);
+  } catch (err) {
+    console.error("GET /api/units/:unitId/people-kpis error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
