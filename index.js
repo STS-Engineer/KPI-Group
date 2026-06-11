@@ -295,9 +295,9 @@ DIAGNOSIS RESPONSE FORMAT:
 ❓<one focused question based on matched KPI knowledge>
 
 Suggestions:
-1. <suggestion from kpi_knowledge_base> — Source: <JSON path>
-2. <suggestion from kpi_knowledge_base> — Source: <JSON path>
-3. <suggestion from kpi_knowledge_base> — Source: <JSON path>
+1. <suggestion from kpi_knowledge_base> 
+2. <suggestion from kpi_knowledge_base> 
+3. <suggestion from kpi_knowledge_base> 
 
 ROOT CAUSE RULE:
 When enough answers are collected, return:
