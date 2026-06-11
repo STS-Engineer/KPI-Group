@@ -37930,5 +37930,99 @@ app.get("/api/units/tree", async (req, res) => {
   }
 });
 
+//kpi tree endpoint 
+const countryCodes = {
+  Tunisia: "TN",
+  France: "FR",
+  Germany: "DE",
+  India: "IN",
+  China: "CN",
+  Mexico: "MX",
+  Luxembourg: "LU",
+  "South Korea": "KR"
+};
+
+app.get("/api/units/countries", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT country, COUNT(*)::int AS unit_count
+      FROM public.unit
+      WHERE country IS NOT NULL
+        AND TRIM(country) <> ''
+        AND status_id = 1
+      GROUP BY country
+      ORDER BY country
+    `);
+
+    res.json(result.rows.map(row => ({
+      country: row.country,
+      country_code: countryCodes[row.country] || null,
+      unit_count: row.unit_count
+    })));
+  } catch (err) {
+    console.error("GET /api/units/countries error:", err);
+    res.status(500).json({ error: "Failed to load countries" });
+  }
+});
+
+app.get("/api/units/tree", async (req, res) => {
+  try {
+    const { country, parent_unit_id } = req.query;
+
+    const params = [];
+    let where = "u.status_id = 1";
+
+    if (country && !parent_unit_id) {
+      params.push(country);
+      where += `
+        AND u.country = $${params.length}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.unit parent
+          WHERE parent.unit_id = u.parent_unit_id
+            AND parent.country = u.country
+        )
+      `;
+    }
+
+    if (parent_unit_id) {
+      params.push(Number(parent_unit_id));
+      where += ` AND u.parent_unit_id = $${params.length}`;
+    }
+
+    const result = await pool.query(`
+      SELECT
+        u.unit_id,
+        u.parent_unit_id,
+        u.unit_name,
+        u.unit_short_name,
+        u.country,
+        u.city,
+        u.unit_type_id,
+        ut.unit_type_name,
+        EXISTS (
+          SELECT 1
+          FROM public.unit child
+          WHERE child.parent_unit_id = u.unit_id
+            AND child.status_id = 1
+        ) AS has_children
+      FROM public.unit u
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      WHERE ${where}
+      ORDER BY u.unit_name
+    `, params);
+
+    res.json(result.rows.map(row => ({
+      ...row,
+      country_code: countryCodes[row.country] || null
+    })));
+  } catch (err) {
+    console.error("GET /api/units/tree error:", err);
+    res.status(500).json({ error: "Failed to load unit tree" });
+  }
+});
+
+
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
