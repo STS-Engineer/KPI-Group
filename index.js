@@ -37958,7 +37958,7 @@ app.get("/api/units/:unitId/people-kpis", async (req, res) => {
       FROM public.v_people_department v
 
       LEFT JOIN public.kpi_target_allocation kta
-        ON COALESCE(kta.created_by_people_id, kta.set_by_people_id) = v.people_id
+        ON kta.set_by_people_id = v.people_id
 
       LEFT JOIN public.kpi k
         ON k.kpi_id = kta.kpi_id
