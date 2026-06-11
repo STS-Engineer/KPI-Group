@@ -25823,6 +25823,7 @@ app.get("/form", async (req, res) => {
       normalizeOptionalTextInput(responsibleContext?.group_name) ||
       normalizeOptionalTextInput(responsibleContext?.plant_name) ||
       "Allocated scope";
+
     const responsibleRoleLabel =
       normalizeOptionalTextInput(responsible?.role_name) ||
       normalizeOptionalTextInput(responsible?.role) ||
@@ -25831,7 +25832,7 @@ app.get("/form", async (req, res) => {
       "Not assigned";
 
     const formFrequencyLabel =
-     normalizeOptionalTextInput(kpis?.[0]?.frequency) ||
+      normalizeOptionalTextInput(kpis?.[0]?.frequency) ||
       "Weekly";
 
     if (!kpis.length) {
@@ -28438,7 +28439,7 @@ let historyValues = historyLabels.map((label) => {
               <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsibleGroupLabel}</div></div>
               <div class="info-row"><div class="info-label">Role</div><div class="info-value">${responsibleRoleLabel}</div></div>
               <div class="info-row"><div class="info-label">Week</div><div class="info-value">${week}</div></div>
-              <div class="info-row"><div class="info-label">Frequency</div><div class="info-value">${formFrequencyLabel}</div></div>
+             <div class="info-row"><div class="info-label">Frequency</div><div class="info-value">${formFrequencyLabel}</div></div>
             </div>
 
             <div class="kpi-section">
@@ -34225,24 +34226,24 @@ const runWeeklyKpiSubmissionCron = async ({
   }
 };
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
@@ -37836,101 +37837,6 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 
 
 //kpi tree endpoint 
-app.get("/api/units/tree", async (req, res) => {
-  try {
-    const { country, parent_unit_id } = req.query;
-
-    const params = [];
-    let where = "u.status_id = 1";
-
-    if (country) {
-      params.push(country);
-      where += ` AND u.country = $${params.length}`;
-    }
-
-    if (parent_unit_id) {
-      params.push(Number(parent_unit_id));
-      where += ` AND u.parent_unit_id = $${params.length}`;
-    } else if (!country) {
-      where += ` AND u.parent_unit_id IS NULL`;
-    }
-
-    const result = await pool.query(`
-      SELECT
-        u.unit_id,
-        u.parent_unit_id,
-        u.unit_name,
-        u.unit_short_name,
-        u.country,
-        u.city,
-        u.unit_type_id,
-        ut.unit_type_name,
-
-        EXISTS (
-          SELECT 1
-          FROM public.unit child
-          WHERE child.parent_unit_id = u.unit_id
-            AND child.status_id = 1
-        ) AS has_children,
-
-        COALESCE(
-          json_agg(
-            DISTINCT jsonb_build_object(
-              'people_id', p.people_id,
-              'name', TRIM(CONCAT_WS(' ', p.first_name, p.name)),
-              'email', p.email,
-              'role_id', r.role_id,
-              'role_name', r.role_name,
-              'assignment_id', pra.assignment_id,
-              'is_primary', pra.is_primary,
-              'allocation_percentage', pra.allocation_percentage
-            )
-          ) FILTER (WHERE p.people_id IS NOT NULL),
-          '[]'
-        ) AS people
-
-      FROM public.unit u
-
-      LEFT JOIN public.unit_type ut
-        ON ut.unit_type_id = u.unit_type_id
-
-      LEFT JOIN public.people_role_assignment pra
-        ON pra.unit_id = u.unit_id
-       AND pra.assignment_status = 'ACTIVE'
-       AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
-
-      LEFT JOIN public.people p
-        ON p.people_id = pra.people_id
-
-      LEFT JOIN public.role r
-        ON r.role_id = pra.role_id
-
-      WHERE ${where}
-
-      GROUP BY
-        u.unit_id,
-        u.parent_unit_id,
-        u.unit_name,
-        u.unit_short_name,
-        u.country,
-        u.city,
-        u.unit_type_id,
-        ut.unit_type_name
-
-      ORDER BY u.unit_name
-    `, params);
-
-    res.json(result.rows.map(row => ({
-      ...row,
-      flag: countryFlags[row.country] || "🏳️"
-    })));
-  } catch (err) {
-    console.error("GET /api/units/tree error:", err);
-    res.status(500).json({ error: "Failed to load unit tree" });
-  }
-});
-
-//kpi tree endpoint 
 const countryCodes = {
   Tunisia: "TN",
   France: "FR",
@@ -38023,6 +37929,7 @@ app.get("/api/units/tree", async (req, res) => {
   }
 });
 
+
 app.get("/api/units/:unitId/people-kpis", async (req, res) => {
   try {
     const { unitId } = req.params;
@@ -38101,7 +38008,5 @@ app.get("/api/units/:unitId/people-kpis", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
