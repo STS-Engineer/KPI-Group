@@ -2904,7 +2904,8 @@ const loadKpiTargetAllocationLookups = async () => {
     customersResult,
     peopleResult,
     multisiteAssignmentsResult,
-    peopleRoleAssignmentsResult
+    peopleRoleAssignmentsResult,
+    productLineAssignmentsResult
   ] = await Promise.all([
     pool.query(`
       SELECT
@@ -3047,6 +3048,34 @@ const loadKpiTargetAllocationLookups = async () => {
         p.name,
         p.first_name,
         pra.people_id
+    `),
+
+    pool.query(`
+      SELECT
+        pl.product_line_id,
+        pl.product_line_name,
+        pra.people_id,
+        pra.role_id,
+        COALESCE(r.role_name, '') AS role_name,
+        COALESCE(pra.is_primary, false) AS is_primary,
+        p.name,
+        p.first_name
+      FROM public.product_line pl
+      LEFT JOIN public.people_role_assignment pra
+        ON pra.product_line_id = pl.product_line_id
+       AND pra.assignment_status = 'ACTIVE'
+       AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
+      WHERE LOWER(TRIM(COALESCE(r.role_name, ''))) = 'product line manager'
+      ORDER BY
+        pl.product_line_name,
+        COALESCE(pra.is_primary, false) DESC,
+        p.name,
+        p.first_name,
+        pra.people_id
     `)
   ]);
 
@@ -3160,6 +3189,49 @@ const loadKpiTargetAllocationLookups = async () => {
     }
   });
 
+  const productLineAssignmentsMap = new Map();
+
+  productLineAssignmentsResult.rows.forEach((row) => {
+    const productLineId = normalizeOptionalIntegerInput(row.product_line_id);
+    if (!productLineId) return;
+
+    const productLineKey = String(productLineId);
+
+    if (!productLineAssignmentsMap.has(productLineKey)) {
+      productLineAssignmentsMap.set(productLineKey, {
+        value: productLineKey,
+        product_line_id: productLineKey,
+        label:
+          normalizeOptionalTextInput(row.product_line_name) ||
+          `Product line ${productLineKey}`,
+        product_line_name: normalizeOptionalTextInput(row.product_line_name) || "",
+        responsible_people_id: "",
+        responsable_product_line: "",
+        responsibles: []
+      });
+    }
+
+    const productLineEntry = productLineAssignmentsMap.get(productLineKey);
+    const peopleId = normalizeOptionalIntegerInput(row.people_id);
+    if (!peopleId) return;
+
+    const responsibleLabel =
+      getPeopleDisplayName(row) || `Person ${peopleId}`;
+
+    productLineEntry.responsibles.push({
+      people_id: String(peopleId),
+      label: responsibleLabel,
+      role_id: normalizeOptionalIntegerInput(row.role_id),
+      role_name: normalizeOptionalTextInput(row.role_name) || "",
+      is_primary: Boolean(row.is_primary)
+    });
+
+    if (!productLineEntry.responsible_people_id) {
+      productLineEntry.responsible_people_id = String(peopleId);
+      productLineEntry.responsable_product_line = responsibleLabel;
+    }
+  });
+
   return {
     plants: unitOptions,
     units: unitOptions,
@@ -3174,12 +3246,23 @@ const loadKpiTargetAllocationLookups = async () => {
     multisiteAssignments: Array.from(multisiteAssignmentsMap.values()),
     zones: Array.from(zoneAssignmentsMap.values()),
 
-    productLines: productLinesResult.rows.map((row) => ({
-      value: String(row.product_line_id),
-      label:
-        normalizeOptionalTextInput(row.product_line_name) ||
-        `Product line ${row.product_line_id}`
-    })),
+    productLines: productLinesResult.rows.map((row) => {
+      const productLineId = String(row.product_line_id);
+      const assignmentEntry = productLineAssignmentsMap.get(productLineId);
+
+      return {
+        value: productLineId,
+        label:
+          normalizeOptionalTextInput(row.product_line_name) ||
+          `Product line ${productLineId}`,
+        product_line_id: productLineId,
+        product_line_name: normalizeOptionalTextInput(row.product_line_name) || "",
+        responsible_people_id: assignmentEntry?.responsible_people_id || "",
+        responsable_product_line:
+          assignmentEntry?.responsable_product_line || "",
+        responsibles: assignmentEntry?.responsibles || []
+      };
+    }),
 
     products: productsResult.rows.map((row) => ({
       value: String(row.product_id),
@@ -3891,11 +3974,11 @@ const getKpiObjectInsertValues = (payload = {}) => ([
 const getKpiTargetAllocationScopeKey = (row = {}) => {
   const normalizedZoneId = normalizeOptionalIntegerInput(row.zone_id);
   const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
+  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
   const normalizedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
   const normalizedUnitTypeId = normalizeOptionalIntegerInput(row.unit_type_id);
   const normalizedRoleId = normalizeOptionalIntegerInput(row.role_id);
   const normalizedProductId = normalizeOptionalIntegerInput(row.product_id);
-  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
   const normalizedMarketId = normalizeOptionalIntegerInput(row.market_id);
   const normalizedCustomerId = normalizeOptionalIntegerInput(row.customer_id);
   const normalizedFunction = normalizeOptionalTextInput(row.function);
@@ -3903,7 +3986,11 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
 
   const scopeIdentifier = normalizedZoneId
     ? `zone:${normalizedZoneId}`
-    : (normalizedUnitId ? `unit:${normalizedUnitId}` : "");
+    : normalizedUnitId
+      ? `unit:${normalizedUnitId}`
+      : normalizedProductLineId
+        ? `productLine:${normalizedProductLineId}`
+        : "";
 
   if (!scopeIdentifier) {
     return "";
@@ -3927,12 +4014,13 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
 
 const getKpiTargetAllocationScopeIdentifier = (row = {}) => {
   const normalizedZoneId = normalizeOptionalIntegerInput(row.zone_id);
-  if (normalizedZoneId) {
-    return `zone:${normalizedZoneId}`;
-  }
+  if (normalizedZoneId) return `zone:${normalizedZoneId}`;
 
   const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
-  return normalizedUnitId ? `unit:${normalizedUnitId}` : "";
+  if (normalizedUnitId) return `unit:${normalizedUnitId}`;
+
+  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
+  return normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "";
 };
 
 const getKpiTargetAllocationGroupIds = async (allocationId) => {
@@ -13004,14 +13092,8 @@ textarea {
                   </div>
                   </div>
 
-              <div class="field col-4 is-hidden" id="parameter_product_line_field">
-              <label><span>Product Line</span></label>
-              <select id="parameter_product_line_id">
-              <option value="">Select product line</option>
-              </select>
-              </div>
-          
-            
+           
+        
               <div class="field col-12">
                 <label><span>KPI Definition</span><span class="hint">Read only</span></label>
                 <textarea
@@ -13478,26 +13560,64 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
         parameterUnitTargetState = {};
       }
 
-      function initializeParameterUnitTargetState(rows = []) {
-        resetParameterUnitTargetState();
+function initializeParameterUnitTargetState(rows = []) {
+  resetParameterUnitTargetState();
 
-        (Array.isArray(rows) ? rows : []).forEach((row) => {
-          const scopeType = row?.zone_id ? "zone" : "unit";
-          const scopeId = row?.zone_id ?? row?.plant_id ?? row?.unit_id;
-          if (!scopeId) return;
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const isProductLine =
+      String(row?.kpi_type || "").trim().toLowerCase() === "product line";
 
-          setParameterUnitState(scopeType, scopeId, {
+    if (isProductLine && row.comments) {
+      try {
+        const parsed = JSON.parse(row.comments);
+        const targets = Array.isArray(parsed.product_line_targets)
+          ? parsed.product_line_targets
+          : [];
+
+        targets.forEach((targetRow) => {
+          const productLineId = String(targetRow.product_line_id || "").trim();
+          if (!productLineId) return;
+
+          setParameterUnitState("product_line", productLineId, {
             kpi_target_allocation_id: row.kpi_target_allocation_id ?? "",
-            target_value: row.target_value ?? "",
-            local_currency: row.local_currency ?? "",
-            target_setup_date: normalizeParameterDateValue(row?.target_setup_date) || getLocalDateInputValue(),
-            set_by_people_id: row.set_by_people_id ?? "",
-            responsible_id: row.set_by_people_id ?? "",
-            last_best_target: row.last_best_target ?? "",
-            approved_by_id: row.approved_by_people_id ?? ""
+            target_value: targetRow.target_value ?? "",
+            target_setup_date:
+              normalizeParameterDateValue(targetRow.target_setup_date) ||
+              getLocalDateInputValue(),
+            responsible_id: targetRow.responsible_people_id ?? "",
+            set_by_people_id: targetRow.responsible_people_id ?? ""
           });
         });
+
+        return;
+      } catch (error) {
+        console.warn("Invalid product line comments JSON", error);
       }
+    }
+
+    const scopeType = row?.product_line_id
+      ? "product_line"
+      : row?.zone_id
+        ? "zone"
+        : "unit";
+
+    const scopeId = row?.product_line_id ?? row?.zone_id ?? row?.plant_id ?? row?.unit_id;
+    if (!scopeId) return;
+
+    setParameterUnitState(scopeType, scopeId, {
+      kpi_target_allocation_id: row.kpi_target_allocation_id ?? "",
+      target_value: row.target_value ?? "",
+      local_currency: row.local_currency ?? "",
+      target_setup_date:
+        normalizeParameterDateValue(row?.target_setup_date) ||
+        getLocalDateInputValue(),
+      set_by_people_id: row.set_by_people_id ?? "",
+      responsible_id: row.set_by_people_id ?? "",
+      last_best_target: row.last_best_target ?? "",
+      approved_by_id: row.approved_by_people_id ?? ""
+    });
+  });
+}
 
       function updateParameterKpiSummary() {
         const selectedKpi = getParameterKpiById(getParameterFieldValue("parameter_kpi_id"));
@@ -14288,28 +14408,17 @@ function getParameterVisibleUnitRows() {
   }
 
 if (scopeKind === "product_line") {
-  const selectedProductLineId = getParameterFieldValue("parameter_product_line_id");
-
-  if (!selectedProductLineId) return [];
-
-  const factoryUnits = getParameterAllocationUnits()
-    .filter(unitEntry =>
-      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
-    )
-    .filter(unitEntry =>
-      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
-    )
-    .map(unitEntry => ({
-      ...unitEntry,
-      row_kind: "unit",
-      product_line_id: selectedProductLineId,
-      local_currency:
-        unitEntry.selling_currency ||
-        unitEntry.operating_currency ||
-        ""
-    }));
-
-  return factoryUnits;
+  return (allocationLookups.productLines || []).map(productLine => ({
+    row_kind: "product_line",
+    value: String(productLine.value || productLine.product_line_id || ""),
+    label: productLine.label || productLine.product_line_name || "",
+    local_currency: "",
+    responsible_people_id: productLine.responsible_people_id || "",
+    responsable_product_line: productLine.responsable_product_line || "",
+    responsibles: Array.isArray(productLine.responsibles)
+      ? productLine.responsibles.slice()
+      : []
+  }));
 }
 
   const factoryUnits = getParameterAllocationUnits()
@@ -14381,43 +14490,48 @@ function getParameterUnitMetaText(unitEntry) {
 }
 
 function getParameterUnitAllocationRows() {
-  const kpiUnit             = getParameterSelectedKpiUnit();
+  const kpiUnit = getParameterSelectedKpiUnit();
   const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || "";
-  const sharedRoleId        = getParameterFieldValue("parameter_role_id");
-  const sharedUnitTypeId    = getParameterFieldValue("parameter_unit_type_id");
-  
-  const fallbackSetupDate   =
+  const sharedRoleId = getNormalizedParameterRoleId();
+  const sharedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
+
+  const fallbackSetupDate =
     getParameterFieldValue("parameter_target_setup_date") ||
     getLocalDateInputValue();
- 
+
   return getParameterVisibleUnitRows()
     .map(function(scopeEntry) {
-      const scopeKind  = scopeEntry.row_kind || "unit";
-      const scopeId    = String(scopeEntry.value || "").trim();
-      const state      = getParameterUnitState(scopeKind, scopeId);
-      const targetValue      = String(state.target_value ?? "").trim();
-      const targetSetupDate  = String(state.target_setup_date ?? "").trim() || fallbackSetupDate;
- 
+      const scopeKind = scopeEntry.row_kind || "unit";
+      const scopeId = String(scopeEntry.value || "").trim();
+      const state = getParameterUnitState(scopeKind, scopeId);
+      const targetValue = String(state.target_value ?? "").trim();
+      const targetSetupDate =
+        String(state.target_setup_date ?? "").trim() || fallbackSetupDate;
+
       if (!targetValue) return null;
- 
-      /* Per-row responsible falls back to the shared dashboard responsible */
-      const rowResponsibleId =
-        String(state.responsible_id || "").trim() || sharedSetByPeopleId;
- 
+
+     const rowResponsibleId =
+     String(state.responsible_id || "").trim() ||
+     String(scopeEntry.responsible_people_id || "").trim() ||
+     sharedSetByPeopleId;
+
       return {
         plant_id: scopeKind === "unit" ? scopeId : null,
         zone_id: scopeKind === "zone" ? scopeId : null,
         product_line_id: scopeKind === "product_line" ? scopeId : null,
-        unit_type_id: scopeKind === "unit"
-         ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
-          : null,
-        role_id:             scopeKind === "unit" ? sharedRoleId : null,
-        target_value:        targetValue,
-        target_setup_date:   targetSetupDate,
-        target_unit:         kpiUnit,
-        local_currency:      scopeKind === "unit" ? (scopeEntry.local_currency || "") : "",
-        set_by_people_id:    rowResponsibleId,
-        last_best_target:    String(state.last_best_target ?? "").trim() || null,
+        product_id: null,
+        unit_id: null,
+        unit_type_id:
+          scopeKind === "unit"
+            ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
+            : null,
+        role_id: scopeKind === "unit" ? sharedRoleId : null,
+        target_value: targetValue,
+        target_setup_date: targetSetupDate,
+        target_unit: kpiUnit,
+        local_currency: scopeKind === "unit" ? (scopeEntry.local_currency || "") : "",
+        set_by_people_id: rowResponsibleId || null,
+        last_best_target: String(state.last_best_target ?? "").trim() || null,
         approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
       };
     })
@@ -14460,6 +14574,21 @@ function renderParameterTableEmptyState(message) {
 }
 
 function handleParameterKpiTypeChange() {
+  const scopeKind = getParameterScopeKind();
+
+const productLineField = document.getElementById("parameter_product_line_field");
+
+if (productLineField) {
+  productLineField.classList.toggle(
+    "is-hidden",
+    getParameterScopeKind() === "product_line"
+  );
+}
+
+  if (!parameterEditMode) {
+    resetParameterUnitTargetState();
+  }
+
   renderMultisiteUnitMatrix();
 }
 
@@ -14477,8 +14606,23 @@ function autoFillSetByFromUnit() {
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
+if (scopeKind === "product_line") {
+  return (allocationLookups.productLines || []).map(productLine => ({
+    row_kind: "product_line",
+    value: String(productLine.value || productLine.product_line_id || ""),
+    label: productLine.label || productLine.product_line_name || "",
+    local_currency: "",
+    responsible_people_id: productLine.responsible_people_id || "",
+    responsable_product_line: productLine.responsable_product_line || "",
+    responsibles: Array.isArray(productLine.responsibles)
+      ? productLine.responsibles.slice()
+      : []
+  }));
+}
+
   if (scopeKind === "zone") {
     const normalizedRoleId = getNormalizedParameterRoleId();
+
     return (allocationLookups.zones || [])
       .map(zoneEntry => ({
         row_kind: "zone",
@@ -14489,21 +14633,19 @@ function getParameterVisibleUnitRows() {
         responsible_people_id: zoneEntry.responsible_people_id || "",
         responsibles: Array.isArray(zoneEntry.responsibles)
           ? zoneEntry.responsibles.slice()
-          : [],
-        role: ""
+          : []
       }))
-      .filter((zoneEntry) => {
+      .filter(zoneEntry => {
         if (!normalizedRoleId) return true;
         return zoneEntry.responsibles.some(
-          (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === normalizedRoleId
+          r => String(r?.role_id || "").trim() === normalizedRoleId
         );
       });
   }
 
   const factoryUnits = getParameterAllocationUnits()
     .filter(unitEntry =>
-      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory" ||
-      String(unitEntry.unit_type_id || "").trim() === "4"
+      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
     )
     .filter(unitEntry =>
       String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
@@ -14522,18 +14664,6 @@ function getParameterVisibleUnitRows() {
       unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
-
-  if (scopeKind === "product_line") {
-  const selectedProductLineId = getParameterFieldValue("parameter_product_line_id");
-
-  if (!selectedProductLineId) return [];
-
-  return factoryUnits.map(unitEntry => ({
-    ...unitEntry,
-    row_kind: "unit",
-    product_line_id: selectedProductLineId
-  }));
-}
 
   return factoryUnits;
 }
@@ -14683,6 +14813,39 @@ function resolveParameterResponsibleEntry(scopeEntry, state = null) {
       };
     }
   }
+
+  if (scopeKind === "product_line") {
+  const productLineResponsiblePeopleId = String(
+    scopeEntry.responsible_people_id ||
+    rowState?.responsible_people_id ||
+    ""
+  ).trim();
+
+  const productLineResponsibleLabel = String(
+    scopeEntry.responsable_product_line ||
+    rowState?.responsable_product_line ||
+    ""
+  ).trim();
+
+  if (productLineResponsiblePeopleId) {
+    return {
+      people_id: productLineResponsiblePeopleId,
+      label:
+        productLineResponsibleLabel ||
+        getParameterPeopleLabel(productLineResponsiblePeopleId) ||
+        ("Person " + productLineResponsiblePeopleId),
+      source: "product-line-assignment"
+    };
+  }
+
+  if (productLineResponsibleLabel) {
+    return {
+      people_id: "",
+      label: productLineResponsibleLabel,
+      source: "product-line-assignment-label"
+    };
+  }
+}
 
   return null;
 }
@@ -15024,9 +15187,9 @@ if (isIndividualParameterScope()) {
       kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
       plant_id: scopeKind === "unit" ? scopeId : null,
       zone_id: scopeKind === "zone" ? scopeId : null,
-
-     unit_id: null,
-     product_id: scopeKind === "zone" ? null : getParameterFieldValue("parameter_product_id"),
+      product_line_id: null,
+       unit_id: null,
+        product_id: scopeKind === "zone" || scopeKind === "product_line" ? null : getParameterFieldValue("parameter_product_id"),
         unit_type_id: scopeKind === "unit" ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || "")) : null,
         role_id: scopeKind === "zone" ? null : (sharedRoleId || null),
         target_value: targetValue,
@@ -15314,7 +15477,12 @@ function renderMultisiteUnitMatrix() {
   const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
   const selectedRoleId = getParameterFieldValue("parameter_role_id");
   const selectedKpiUnit = getParameterSelectedKpiUnit();
-  const scopeLabel = scopeKind === "zone" ? "Zone" : "Unit";
+  const scopeLabel =
+  scopeKind === "zone"
+    ? "Zone"
+    : scopeKind === "product_line"
+      ? "Product Line"
+      : "Unit";
 
   if (!selectedKpiId) {
     renderParameterTableEmptyState("Select a KPI name to load the KPI unit and available target rows.");
@@ -19057,55 +19225,145 @@ updateParameterKpiSummary();
         }
       }
 
+
+function buildSingleProductLineAllocationRow() {
+  const kpiUnit = getParameterSelectedKpiUnit();
+  const fallbackSetupDate =
+    getParameterFieldValue("parameter_target_setup_date") ||
+    getLocalDateInputValue();
+
+  const productLineTargets = getParameterVisibleUnitRows()
+    .filter(row => String(row.row_kind || "") === "product_line")
+    .map(row => {
+      const productLineId = String(row.value || "").trim();
+      const state = getParameterUnitState("product_line", productLineId);
+
+      return {
+        product_line_id: productLineId,
+        product_line_name: row.label || "",
+        target_value: String(state.target_value ?? "").trim(),
+        target_setup_date:
+          String(state.target_setup_date ?? "").trim() || fallbackSetupDate,
+        responsible_people_id:
+          String(state.responsible_id || "").trim() ||
+          String(row.responsible_people_id || "").trim() ||
+          ""
+      };
+    });
+
+  const firstFilled = productLineTargets.find(row => row.target_value);
+
+  return {
+    plant_id: null,
+    zone_id: null,
+    product_line_id: null,
+    product_id: null,
+    unit_id: null,
+    unit_type_id: null,
+    role_id: null,
+    target_value: firstFilled?.target_value || "",
+    target_setup_date: firstFilled?.target_setup_date || fallbackSetupDate,
+    target_unit: kpiUnit,
+    local_currency: "",
+    set_by_people_id: firstFilled?.responsible_people_id || null,
+    comments: JSON.stringify({
+      product_line_targets: productLineTargets
+    })
+  };
+}
+
+
 function buildParameterPayload() {
   const scopeKind = getParameterScopeKind();
   const isIndividualScope = isIndividualParameterScope();
-  const unitAllocations = getParameterUnitAllocationRows();
+
+ let unitAllocations =
+  scopeKind === "product_line"
+    ? [buildSingleProductLineAllocationRow()]
+    : getParameterUnitAllocationRows();
+
   const primaryAllocation = unitAllocations[0] || null;
+
   const existingAllocationIds = getParameterAllocationIdsForDelete(
     getParameterFieldValue("parameter_object_id"),
     { preferFormState: true }
   );
 
- const roleId = scopeKind === "zone" ? "" : getNormalizedParameterRoleId();
+  const roleId =
+    scopeKind === "zone" || scopeKind === "product_line"
+      ? ""
+      : getNormalizedParameterRoleId();
 
-   return {
-     kpi_target_allocation_id: getParameterFieldValue("parameter_object_id") || "",
-     kpi_id: getParameterFieldValue("parameter_kpi_id"),
-     kpi_type: getParameterFieldValue("parameter_kpi_type"),
-     unit_type_id: scopeKind === "zone" ? null : getParameterFieldValue("parameter_unit_type_id"),
+  return {
+    kpi_target_allocation_id: getParameterFieldValue("parameter_object_id") || "",
+    kpi_id: getParameterFieldValue("parameter_kpi_id"),
+    kpi_type: getParameterFieldValue("parameter_kpi_type"),
+
+    unit_type_id:
+      scopeKind === "zone" || scopeKind === "product_line"
+        ? null
+        : getParameterFieldValue("parameter_unit_type_id"),
+
     role_id: roleId,
     target_status: getParameterFieldValue("parameter_target_status"),
-    plant_id: primaryAllocation?.plant_id || getParameterFieldValue("parameter_plant_id"),
-    zone_id: primaryAllocation?.zone_id || getParameterFieldValue("parameter_zone_id"),
-    function: getParameterFieldValue("parameter_function"),
-    product_line_id: getParameterFieldValue("parameter_product_line_id"),
-    unit_id: scopeKind === "zone"
-   ? null
-   : getParameterFieldValue("parameter_unit_id"),
 
-   product_id: scopeKind === "zone"
-   ? null
-   : getParameterFieldValue("parameter_product_id"),
+    plant_id:
+      scopeKind === "product_line"
+        ? null
+        : primaryAllocation?.plant_id || getParameterFieldValue("parameter_plant_id"),
+
+    zone_id:
+      scopeKind === "product_line"
+        ? null
+        : primaryAllocation?.zone_id || getParameterFieldValue("parameter_zone_id"),
+
+    function: getParameterFieldValue("parameter_function"),
+
+    product_line_id: null,
+
+    unit_id: null,
+    product_id: null,
+
     market_id: getParameterFieldValue("parameter_market_id"),
     customer_id: getParameterFieldValue("parameter_customer_id"),
-   target_value: primaryAllocation?.target_value || getParameterFieldValue("parameter_target_value"),
-    target_unit: primaryAllocation?.target_unit || getParameterFieldValue("parameter_target_unit"),
-    local_currency: primaryAllocation?.local_currency || getParameterFieldValue("parameter_local_currency"),
+
+    target_value:
+      primaryAllocation?.target_value ||
+      getParameterFieldValue("parameter_target_value"),
+
+    target_unit:
+      primaryAllocation?.target_unit ||
+      getParameterFieldValue("parameter_target_unit"),
+
+    local_currency:
+      primaryAllocation?.local_currency ||
+      getParameterFieldValue("parameter_local_currency"),
+
     last_best_target: getParameterFieldValue("parameter_last_best_target"),
     previous_target_value: getParameterFieldValue("parameter_previous_target_value"),
-    target_setup_date: normalizeParameterDateValue(primaryAllocation?.target_setup_date || getParameterFieldValue("parameter_target_setup_date")),
+
+    target_setup_date: normalizeParameterDateValue(
+      primaryAllocation?.target_setup_date ||
+      getParameterFieldValue("parameter_target_setup_date")
+    ),
+
     target_start_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_start_date")),
     target_end_date: normalizeParameterDateValue(getParameterFieldValue("parameter_target_end_date")),
+
     set_by_people_id: isIndividualScope
       ? (getParameterFieldValue("parameter_set_by_people_id") || null)
       : (primaryAllocation?.set_by_people_id || null),
+
     approved_by_people_id: getParameterFieldValue("parameter_approved_by_people_id"),
     comments: getParameterFieldValue("parameter_comments"),
     existing_allocation_ids: existingAllocationIds,
-    unit_allocations: unitAllocations
+
+    unit_allocations:
+      scopeKind === "product_line"
+        ? unitAllocations.slice(0, 1)
+        : unitAllocations
   };
-  }
+}
 
    async function saveParameterKpi() {
   if (parameterSavePending) {
@@ -19168,7 +19426,12 @@ if (!visibleRows.length) {
   return;
 }
 
-const missingRow = visibleRows.find((row) => {
+const rowsToValidate =
+  scopeKind === "product_line"
+    ? visibleRows.slice(0, 1)
+    : visibleRows;
+
+const missingRow = rowsToValidate.find((row) => {
   const state = getParameterUnitState(row.row_kind || "unit", row.value);
   return !String(state.target_value ?? "").trim();
 });
@@ -31512,7 +31775,6 @@ app.get("/dashboard", async (req, res) => {
       return res.status(400).send("Missing responsible_id");
     }
     const responsible_id = responsibleId;
-
     const responsibleContext = await loadFormResponsibleContext(responsible_id);
     const responsiblePeopleId = normalizeOptionalIntegerInput(
       responsibleContext?.people_id ?? responsible_id
@@ -34377,24 +34639,26 @@ const runWeeklyKpiSubmissionCron = async ({
   }
 };
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
+
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
