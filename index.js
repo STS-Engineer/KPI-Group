@@ -23405,7 +23405,7 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
      THEN 'k' || UPPER(TRIM(COALESCE(unit_scope.selling_currency, plant_scope.selling_currency, kta.local_currency)))
      ELSE COALESCE(kta.target_unit, k.unit)
      END AS display_unit,
-      COALESCE(latest_result.target_value, kta.target_value, k.target_value) AS target,
+      COALESCE(latest_result.target_value, latest_limits.target_value, kta.target_value, k.target_value) AS target,
       k.min_value AS min,
       k.max_value AS max,
       k.tolerance_type,
@@ -23415,8 +23415,8 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
       k.kpi_explanation AS definition,
       k.calculation_on,
       k.target_auto_adjustment,
-      COALESCE(latest_result.upper_limit, k.high_limit) AS high_limit,
-      COALESCE(latest_result.lower_limit, k.low_limit) AS low_limit,
+      COALESCE(latest_result.upper_limit, latest_limits.upper_limit, k.high_limit) AS high_limit,
+      COALESCE(latest_result.lower_limit, latest_limits.lower_limit, k.low_limit) AS low_limit,
       k.target_direction,
       latest_result.raw_value AS value,
       latest_result.comments AS latest_comment,
@@ -23456,6 +23456,29 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
         kr.kpi_result_id DESC
       LIMIT 1
     ) latest_result ON TRUE
+     LEFT JOIN LATERAL (
+  SELECT
+    kr.target_value,
+    kr.upper_limit,
+    kr.lower_limit
+  FROM public.kpi_result kr
+  WHERE kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
+    AND (
+      $1::text IS NULL
+      OR kr.week <= $1
+      OR kr.period_label <= $1
+    )
+    AND (
+      kr.target_value IS NOT NULL
+      OR kr.upper_limit IS NOT NULL
+      OR kr.lower_limit IS NOT NULL
+    )
+  ORDER BY
+    COALESCE(kr.week, kr.period_label) DESC,
+    kr.recorded_at DESC,
+    kr.kpi_result_id DESC
+  LIMIT 1
+) latest_limits ON TRUE
     WHERE $2::integer IS NOT NULL
       AND kta.set_by_people_id = $2
     ORDER BY
@@ -25778,12 +25801,53 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       return Number((p.sum / p.count).toFixed(2));
     });
 
-    res.json({
-      labels,
-      values,
-      currentMonthLabel: currentPeriodLabel,
-      currentValue: isNaN(currentValue) ? null : currentValue
-    });
+    const limitsRes = await pool.query(
+  `
+  SELECT
+    COALESCE(latest_limits.target_value, kta.target_value, k.target_value) AS target,
+    COALESCE(latest_limits.upper_limit, k.high_limit) AS high_limit,
+    COALESCE(latest_limits.lower_limit, k.low_limit) AS low_limit
+  FROM public.kpi k
+  LEFT JOIN public.kpi_target_allocation kta
+    ON kta.kpi_id = k.kpi_id
+    AND ($1::integer IS NULL OR kta.kpi_target_allocation_id = $1)
+  LEFT JOIN LATERAL (
+    SELECT
+      kr.target_value,
+      kr.upper_limit,
+      kr.lower_limit
+    FROM public.kpi_result kr
+    WHERE kr.kpi_target_allocation_id = COALESCE($1::integer, kta.kpi_target_allocation_id)
+      AND (
+        kr.week <= $3
+        OR kr.period_label <= $3
+      )
+      AND (
+        kr.target_value IS NOT NULL
+        OR kr.upper_limit IS NOT NULL
+        OR kr.lower_limit IS NOT NULL
+      )
+    ORDER BY
+      COALESCE(kr.week, kr.period_label) DESC,
+      kr.recorded_at DESC,
+      kr.kpi_result_id DESC
+    LIMIT 1
+  ) latest_limits ON TRUE
+  WHERE k.kpi_id = $2
+  LIMIT 1
+  `,
+  [allocationId, kpiId, normalizedWeek]
+);
+
+res.json({
+  labels,
+  values,
+  currentMonthLabel: currentPeriodLabel,
+  currentValue: isNaN(currentValue) ? null : currentValue,
+  target: limitsRes.rows[0]?.target ?? null,
+  highLimit: limitsRes.rows[0]?.high_limit ?? null,
+  lowLimit: limitsRes.rows[0]?.low_limit ?? null
+});
   } catch (err) {
     console.error("kpi-chart-data error:", err.message);
     res.status(500).json({ error: err.message });
@@ -30090,6 +30154,17 @@ async function sendAssistantPrompt(message) {
 
   card.dataset.historyLabels = JSON.stringify(data.labels);
   card.dataset.historyValues = JSON.stringify(data.values);
+  if (data.target !== null && data.target !== undefined) {
+  card.dataset.target = data.target;
+}
+
+if (data.highLimit !== null && data.highLimit !== undefined) {
+  card.dataset.highLimit = data.highLimit;
+}
+
+if (data.lowLimit !== null && data.lowLimit !== undefined) {
+  card.dataset.lowLimit = data.lowLimit;
+}
   if (data.currentMonthLabel) {
     card.dataset.currentMonthLabel = data.currentMonthLabel;
   }
