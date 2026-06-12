@@ -23488,8 +23488,8 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     const allocationKey = String(
       kpi.kpi_target_allocation_id ?? kpi.kpi_values_id ?? ""
     ).trim();
-    const currentPeriodActions = currentByAllocationId[allocationKey] || [];
-    const openActions = currentPeriodActions.filter((action) => {
+     const allPeriodActions = historyByAllocationId[allocationKey] || [];
+     const openActions = allPeriodActions.filter((action) => { 
       return (
         normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !==
         CLOSED_CORRECTIVE_ACTION_STATUS
@@ -28961,25 +28961,37 @@ function syncDomFromStore(kvId) {
   }
 }
 
-          function openCaTableModal(kvId) {
-            caModalKvId = kvId;
-            const overlay = document.getElementById("caTableModal");
-            if (!overlay) return;
-            const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
-            const title = card ? (card.querySelector(".kpi-title") || {}).textContent || "KPI" : "KPI";
+    function openCaTableModal(kvId) {
+  caModalKvId = kvId;
 
-            const modalTitle = document.getElementById("caModalTitle");
-            const modalSubtitle = document.getElementById("caModalSubtitle");
-            if (modalTitle) modalTitle.textContent = " ";
-            if (modalSubtitle) modalSubtitle.textContent = "";
+  const overlay = document.getElementById("caTableModal");
+  if (!overlay) return;
 
-            caModalCollapseForm();
-            renderCaModalTable(kvId);
+  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
 
-            overlay.classList.add("active");
-            overlay.setAttribute("aria-hidden", "false");
-            document.body.classList.add("chart-modal-open");
-          }
+  if (card) {
+    const historyActions = decodeModalPayload(card.dataset.historyActions, []);
+    if (Array.isArray(historyActions) && historyActions.length) {
+      caModalStore[kvId] = historyActions
+        .filter(a => getCanonicalCorrectiveActionStatus(a.status) !== "Closed")
+        .map(a => ({
+          id: a.corrective_action_id || a.id || "",
+          root_cause: a.root_cause || "",
+          implemented_solution: a.implemented_solution || "",
+          due_date: a.due_date || "",
+          responsible: a.responsible || "",
+          status: getCanonicalCorrectiveActionStatus(a.status)
+        }));
+    }
+  }
+
+  caModalCollapseForm();
+  renderCaModalTable(kvId);
+
+  overlay.classList.add("active");
+  overlay.setAttribute("aria-hidden", "false");
+  document.body.classList.add("chart-modal-open");
+}
 
           function closeCaTableModal() {
             const overlay = document.getElementById("caTableModal");
@@ -29186,7 +29198,14 @@ function closeSimpleCaRequiredModal() {
 }
 
 function showCorrectiveActionRequiredPopup(card) {
-  showSimpleCaRequiredModal();
+  if (!card) {
+    showSimpleCaRequiredModal();
+    return;
+  }
+
+  const kvId = card.dataset.kpiValuesId;
+  openCaTableModal(kvId);
+  caModalOpenForm(null);
 }
 
 function updateSubmitButtonState(showPopup = false) {
@@ -34249,24 +34268,24 @@ const runWeeklyKpiSubmissionCron = async ({
   }
 };
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
@@ -38229,6 +38248,7 @@ app.get("/api/statistics/department-distribution", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // =====================================================
 // CEO KPI DASHBOARD API
