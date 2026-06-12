@@ -23512,7 +23512,9 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
       kpi.kpi_target_allocation_id ?? kpi.kpi_values_id ?? ""
     ).trim();
      const allPeriodActions = historyByAllocationId[allocationKey] || [];
-     const openActions = allPeriodActions.filter((action) => { 
+     const currentWeekActions = currentByAllocationId[allocationKey] || [];
+
+     const openActions = allPeriodActions.filter((action) => {
       return (
         normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !==
         CLOSED_CORRECTIVE_ACTION_STATUS
@@ -23525,6 +23527,7 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
     return {
       ...kpi,
       corrective_actions: correctiveActions,
+      current_week_corrective_actions: sortCorrectiveActions(currentWeekActions),
       corrective_action_count: correctiveActions.length,
       corrective_action_id: latestCorrectiveAction?.corrective_action_id ?? null,
       ca_root_cause: latestCorrectiveAction?.root_cause ?? "",
@@ -26154,10 +26157,9 @@ app.get("/form", async (req, res) => {
         needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
 const initialNeedsCA =
   currentValue !== null &&
-  lowLimit !== null &&
-  currentValue <= lowLimit; 
-const hasValidCA = Array.isArray(kpi.corrective_actions) &&
-  kpi.corrective_actions.some(a =>
+  needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
+const hasValidCA = Array.isArray(kpi.current_week_corrective_actions) &&
+  kpi.current_week_corrective_actions.some(a =>
     String(a.root_cause || "").trim() &&
     String(a.implemented_solution || "").trim() &&
     String(a.due_date || "").trim() &&
@@ -29179,26 +29181,44 @@ function toNumber(value) {
 }
 
 document.querySelectorAll(".value-input").forEach(input => {
-   input.addEventListener("input", function () {
+  input.addEventListener("input", function () {
     const kvId = this.dataset.kpiValuesId;
 
     updateCurrentMonthBarFromInput(kvId, this.value);
 
-    // Do not show modal while typing
-    updateSubmitButtonState(false);
+    updateSubmitButtonState(true);
   });
 });
 
+
+function needsCorrectiveAction(value, lowLimit, highLimit, goodDirection) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return false;
+  }
+
+  const numericValue = Number(value);
+  const direction = String(goodDirection || "up").toLowerCase();
+
+  if (direction === "down") {
+    return highLimit !== null && highLimit !== undefined && numericValue > Number(highLimit);
+  }
+
+  return lowLimit !== null && lowLimit !== undefined && numericValue < Number(lowLimit);
+}
  
 
 function isKpiUnderLowerLimit(card) {
   const input = card.querySelector(".value-input");
   const value = toNumber(input ? input.value : "");
+
   const lowLimit = toNumber(card.dataset.lowLimit);
+  const highLimit = toNumber(card.dataset.highLimit);
+  const goodDirection =
+    String(card.dataset.goodDirection || "up").toLowerCase() === "down"
+      ? "down"
+      : "up";
 
-  if (value === null || lowLimit === null) return false;
-
-  return value <= lowLimit;
+  return needsCorrectiveAction(value, lowLimit, highLimit, goodDirection);
 }
 
 function hasValidCorrectiveAction(kvId) {
@@ -29262,14 +29282,7 @@ function closeSimpleCaRequiredModal() {
 }
 
 function showCorrectiveActionRequiredPopup(card) {
-  if (!card) {
-    showSimpleCaRequiredModal();
-    return;
-  }
-
-  const kvId = card.dataset.kpiValuesId;
-  openCaTableModal(kvId);
-  caModalOpenForm(null);
+  showSimpleCaRequiredModal();
 }
 
 function updateSubmitButtonState(showPopup = false) {
@@ -31168,11 +31181,32 @@ function runInitialCorrectiveActionCheck() {
   const kvId = firstCard.dataset.kpiValuesId;
 
   firstCard.classList.add("requires-ca");
-  kpiPopupShown[kvId] = true;   // claim it so other checks don't fight
+  showSimpleCaRequiredModal();
 
+  kpiPopupShown[kvId] = true;
+}
 
+function showSimpleCaRequiredModal() {
+  const caTableModal = document.getElementById("caTableModal");
+  if (caTableModal) {
+    caTableModal.classList.remove("active");
+    caTableModal.setAttribute("aria-hidden", "true");
+  }
 
+  const modal = document.getElementById("caRequiredSimpleModal");
+  if (!modal) return;
 
+  modal.classList.add("active");
+  modal.style.display = "flex";
+}
+
+function closeSimpleCaRequiredModal() {
+  const modal = document.getElementById("caRequiredSimpleModal");
+  if (!modal) return;
+
+  modal.classList.remove("active");
+  modal.style.display = "none";
+  modal.setAttribute("aria-hidden", "true");
 }
 
 
@@ -31448,7 +31482,7 @@ function openCommentsHistoryModal(kvId) {
      }
         </script>
 
-   <div id="caRequiredSimpleModal" class="modal-overlay">
+<div id="caRequiredSimpleModal" class="modal-overlay">
   <div class="modal-box">
     <div class="modal-icon">⚠️</div>
     <h3>Corrective Action </h3>
@@ -34343,24 +34377,24 @@ const runWeeklyKpiSubmissionCron = async ({
   }
 };
 
-// cron.schedule("*/5 * * * *", async () => {
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Ratio",
-//     lockId: "send_kpi_weekly_email_ratio_job",
-//     stateKey: "ratio",
-//     logLabel: "Ratio"
-//   });
+cron.schedule("*/5 * * * *", async () => {
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Ratio",
+    lockId: "send_kpi_weekly_email_ratio_job",
+    stateKey: "ratio",
+    logLabel: "Ratio"
+  });
 
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Direct",
-//     lockId: "send_kpi_weekly_email_direct_job",
-//     stateKey: "direct",
-//     logLabel: "Direct"
-//   });
-// }, {
-//   scheduled: true,
-//   timezone: "UTC"
-// });
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Direct",
+    lockId: "send_kpi_weekly_email_direct_job",
+    stateKey: "direct",
+    logLabel: "Direct"
+  });
+}, {
+  scheduled: true,
+  timezone: "UTC"
+});
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
