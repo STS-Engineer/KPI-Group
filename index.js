@@ -515,6 +515,10 @@ const getPeopleDisplayName = (row = {}) => {
   return name || firstName || null;
 };
 
+const KPI_REACTIVITY_STATUS_OPTIONS = Object.freeze(["Anticipated", "Reactive"]);
+const KPI_IMPORTANCE_OPTIONS = Object.freeze(["High", "Not Important"]);
+const KPI_REACTIVITY_NEED_OPTIONS = Object.freeze(["Urgent", "Not Urgent"]);
+
 const prepareKpiWritePayload = (payload = {}) => {
   const rawSubjectNodeId = normalizeOptionalTextInput(payload.subject_node_id ?? payload.subject_id);
   const rawTarget = normalizeOptionalTextInput(payload.target ?? payload.target_value);
@@ -526,7 +530,8 @@ const prepareKpiWritePayload = (payload = {}) => {
   const rawLowLimit = normalizeOptionalTextInput(payload.low_limit);
   const rawReferenceKpiId = normalizeOptionalTextInput(payload.reference_kpi_id);
   const rawOwnerRoleId = normalizeOptionalTextInput(payload.owner_role_id);
-
+  const rawKfs = normalizeOptionalTextInput(payload.kfs);
+  const kfs = ["KPI", "KFS"].includes(rawKfs) ? rawKfs : null;
   const subjectNodeId = rawSubjectNodeId === null ? null : Number(rawSubjectNodeId);
   const targetValue = normalizeOptionalNumericInput(rawTarget);
   const minValue = normalizeOptionalNumericInput(rawMinValue);
@@ -546,6 +551,9 @@ const prepareKpiWritePayload = (payload = {}) => {
   const maxType = normalizeOptionalTextInput(payload.max_type);
   const nombrePeriode = normalizeOptionalTextInput(payload.nombre_periode);
   const targetAutoAdjustment = normalizeOptionalTextInput(payload.target_auto_adjustment);
+  const reactivityStatus = normalizeOptionalTextInput(payload.reactivity_status);
+  const importance = normalizeOptionalTextInput(payload.importance);
+  const reactivityNeed = normalizeOptionalTextInput(payload.reactivity_need);
   const referenceKpiId = rawReferenceKpiId === null ? null : Number(rawReferenceKpiId);
   const ownerRoleId = rawOwnerRoleId === null ? null : Number(rawOwnerRoleId);
   const kpiName = normalizeOptionalTextInput(payload.kpi_name ?? payload.indicator_sub_title);
@@ -598,6 +606,10 @@ const prepareKpiWritePayload = (payload = {}) => {
     throw createHttpError(400, "Regression is required when display trend is Yes.");
   }
 
+  if (!kfs) {
+    throw createHttpError(400, "KFS is required.");
+  }
+
   if (!minType) {
     throw createHttpError(400, "Min selection is required.");
   }
@@ -636,6 +648,16 @@ const prepareKpiWritePayload = (payload = {}) => {
 
   if (!targetAutoAdjustment) {
     throw createHttpError(400, "Target auto adjust is required.");
+  }
+
+  if (reactivityStatus !== null && !KPI_REACTIVITY_STATUS_OPTIONS.includes(reactivityStatus)) {
+    throw createHttpError(400, "Reactivity status is invalid.");
+  }
+
+ 
+
+  if (reactivityNeed !== null && !KPI_REACTIVITY_NEED_OPTIONS.includes(reactivityNeed)) {
+    throw createHttpError(400, "Reactivity need is invalid.");
   }
 
   if (rawSubjectNodeId !== null && (!Number.isInteger(subjectNodeId) || subjectNodeId <= 0)) {
@@ -713,6 +735,10 @@ const prepareKpiWritePayload = (payload = {}) => {
     max_type: maxType,
     calculation_on: calculationOn,
     target_auto_adjustment: targetAutoAdjustment,
+    reactivity_status: reactivityStatus,
+    importance,
+    reactivity_need: reactivityNeed,
+    kfs,
     reference_kpi_id: normalizedCalculationMode === "ratio" ? referenceKpiId : null,
     owner_role_id: ownerRoleId,
     status,
@@ -834,6 +860,21 @@ const ensureKpiRatioSchema = async () => {
       await pool.query(`
         ALTER TABLE public.kpi
         ADD COLUMN IF NOT EXISTS kpi_knowledge_updated_date TIMESTAMPTZ
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS reactivity_status VARCHAR(255)
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS importance VARCHAR(255)
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS reactivity_need VARCHAR(255)
       `);
 
       await pool.query(`
@@ -1620,6 +1661,7 @@ const ensureKpiSubmissionEmailDispatchLogSchema = async () => {
             ON UPDATE NO ACTION
             ON DELETE CASCADE,
           calculation_mode VARCHAR(40) NOT NULL,
+          frequency_label VARCHAR(50),
           target_week VARCHAR(40) NOT NULL,
           local_dispatch_date DATE NOT NULL,
           unit_id INTEGER NULL
@@ -1635,13 +1677,42 @@ const ensureKpiSubmissionEmailDispatchLogSchema = async () => {
       `);
 
       await pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_kpi_submission_email_dispatch_log_people_mode_date
-        ON public.kpi_submission_email_dispatch_log (people_id, calculation_mode, local_dispatch_date)
+        ALTER TABLE public.kpi_submission_email_dispatch_log
+        ADD COLUMN IF NOT EXISTS frequency_label VARCHAR(50)
       `);
 
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_kpi_submission_email_dispatch_log_mode_date
-        ON public.kpi_submission_email_dispatch_log (calculation_mode, local_dispatch_date DESC)
+        UPDATE public.kpi_submission_email_dispatch_log
+        SET frequency_label = 'Weekly'
+        WHERE COALESCE(TRIM(frequency_label), '') = ''
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi_submission_email_dispatch_log
+        ALTER COLUMN frequency_label SET NOT NULL
+      `);
+
+      await pool.query(`
+        DROP INDEX IF EXISTS public.uq_kpi_submission_email_dispatch_log_people_mode_date
+      `);
+
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_kpi_submission_email_dispatch_log_people_mode_frequency_date
+        ON public.kpi_submission_email_dispatch_log (
+          people_id,
+          calculation_mode,
+          frequency_label,
+          local_dispatch_date
+        )
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_submission_email_dispatch_log_mode_frequency_date
+        ON public.kpi_submission_email_dispatch_log (
+          calculation_mode,
+          frequency_label,
+          local_dispatch_date DESC
+        )
       `);
     })().catch((error) => {
       kpiSubmissionEmailDispatchLogSchemaPromise = null;
@@ -2226,6 +2297,9 @@ const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
         k.target_value,
         k.target_direction,
         k.target_auto_adjustment,
+        k.reactivity_status,
+        k.importance,
+        k.reactivity_need,
         k.min_value,
         k.min_type,
         k.max_value,
@@ -2607,6 +2681,11 @@ const buildKpiKnowledgeBaseDocument = (
         default_value: kpi.target_value ?? null,
         direction: kpi.target_direction || null,
         auto_adjustment: kpi.target_auto_adjustment || null
+      },
+      classification: {
+        reactivity_status: kpi.reactivity_status || null,
+        importance: kpi.importance || null,
+        reactivity_need: kpi.reactivity_need || null
       },
       thresholds: {
         min_value: kpi.min_value ?? null,
@@ -3446,6 +3525,7 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     kpi_id: row.kpi_id,
     indicator_title: row.kpi_sub_title || "",
     indicator_sub_title: row.kpi_name || "",
+    kfs: row.kfs || "KPI",
     kpi_code: row.kpi_code || "",
     kpi_formula: row.kpi_formula || "",
     unit: row.unit || "",
@@ -3469,6 +3549,9 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     max_type: row.max_type || "",
     reference_kpi_id: row.reference_kpi_id,
     target_auto_adjustment: row.target_auto_adjustment || "",
+    reactivity_status: row.reactivity_status || "",
+    importance: row.importance || "",
+    reactivity_need: row.reactivity_need || "",
     high_limit: row.high_limit,
     low_limit: row.low_limit,
     owner_role_id: row.owner_role_id,
@@ -3526,6 +3609,9 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
       k.target_value,
       k.target_direction,
       k.target_auto_adjustment,
+      k.reactivity_status,
+      k.importance,
+      k.reactivity_need,
       k.min_value,
       k.min_type,
       k.max_value,
@@ -3545,6 +3631,7 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
       k.reference_kpi_id,
       k.owner_role_id,
       k.status,
+      k.kfs,
       k.comments,
       k.created_at,
       k.updated_at,
@@ -4544,11 +4631,15 @@ app.post("/api/kpis", async (req, res) => {
       regression,
       reference_kpi_id,
       target_auto_adjustment,
+      reactivity_status,
+      importance,
+      reactivity_need,
       owner_role_id,
       status,
       comments,
       high_limit,
-      low_limit
+      low_limit,
+      kfs
     } = prepareKpiWritePayload(req.body);
     const createdByPeopleId = normalizeOptionalIntegerInput(req.body.created_by_people_id);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
@@ -4587,6 +4678,9 @@ app.post("/api/kpis", async (req, res) => {
         calculation_mode,
         reference_kpi_id,
         target_auto_adjustment,
+        reactivity_status,
+        importance,
+        reactivity_need,
         display_trend,
         regression,
         owner_role_id,
@@ -4594,10 +4688,11 @@ app.post("/api/kpis", async (req, res) => {
         comments,
         high_limit,
         low_limit,
-        created_by_people_id
+        created_by_people_id,
+        kfs
       )
       VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33
       )
       RETURNING *;
       `,
@@ -4623,6 +4718,9 @@ app.post("/api/kpis", async (req, res) => {
         calculation_mode,
         reference_kpi_id,
         target_auto_adjustment,
+        reactivity_status,
+        importance,
+        reactivity_need,
         display_trend,
         regression,
         owner_role_id,
@@ -4630,7 +4728,8 @@ app.post("/api/kpis", async (req, res) => {
         comments,
         high_limit,
         low_limit,
-        createdByPeopleId
+        createdByPeopleId,
+        kfs
       ]
     );
 
@@ -4687,11 +4786,15 @@ app.put("/api/kpis/:id", async (req, res) => {
       regression,
       reference_kpi_id,
       target_auto_adjustment,
+      reactivity_status,
+      importance,
+      reactivity_need,
       owner_role_id,
       status,
       comments,
       high_limit,
-      low_limit
+      low_limit,
+      kfs
     } = prepareKpiWritePayload(req.body);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
       subject_id,
@@ -4737,8 +4840,12 @@ app.put("/api/kpis/:id", async (req, res) => {
         comments = $26,
         high_limit = $27,
         low_limit = $28,
+        reactivity_status = $29,
+        importance = $30,
+        reactivity_need = $31,
+        kfs = $32,
         updated_at = NOW()
-      WHERE kpi_id = $29
+      WHERE kpi_id = $33
       RETURNING *;
       `,
       [
@@ -4770,6 +4877,10 @@ app.put("/api/kpis/:id", async (req, res) => {
         comments,
         high_limit,
         low_limit,
+        reactivity_status,
+        importance,
+        reactivity_need,
+        kfs,
         req.params.id
       ]
     );
@@ -5966,6 +6077,7 @@ app.get("/kpi-admin", async (req, res) => {
         if (el) el.value = "";
       });
 
+      document.getElementById("kfs").value = "KPI";
       document.getElementById("calculation_on").value = "Value";
       document.getElementById("target_auto_adjustment").value = "Yes";
       document.getElementById("tolerance_type").value = "Relative";
@@ -5974,7 +6086,7 @@ app.get("/kpi-admin", async (req, res) => {
 
     function fillForm(data) {
      const fields = [
-    "kpi_id","indicator_title","indicator_sub_title","unit","subject","definition",
+    "kpi_id","kfs","indicator_title","indicator_sub_title","unit","subject","definition",
     "frequency","target","tolerance_type","up_tolerance","low_tolerance",
     "max","min","calculation_on","target_auto_adjustment","high_limit","low_limit"
     ];
@@ -5983,7 +6095,8 @@ app.get("/kpi-admin", async (req, res) => {
     const el = document.getElementById(id);
     if (el) el.value = data[id] ?? "";
     });
-
+    
+    document.getElementById("kfs").value = data.kfs || "KPI";
     handleToleranceTypeChange();
   }
         document.getElementById("up_tolerance").value = formatToleranceForInput(data.up_tolerance, data.tolerance_type);
@@ -6036,6 +6149,7 @@ app.get("/kpi-admin", async (req, res) => {
           regression: document.getElementById("regression").value,
           min_type: document.getElementById("min_type").value,
           max_type: document.getElementById("max_type").value,
+          kfs: document.getElementById("kfs").value || "KPI",
           calculation_on: document.getElementById("calculation_on").value,
           target_auto_adjustment: document.getElementById("target_auto_adjustment").value,
           high_limit: document.getElementById("high_limit").value || null,
@@ -6235,12 +6349,16 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
       max_type,
       calculation_on,
       target_auto_adjustment,
+      reactivity_status,
+      importance,
+      reactivity_need,
       reference_kpi_id,
       owner_role_id,
       status,
       comments,
       high_limit,
-      low_limit
+      low_limit,
+      kfs
     } = prepareKpiWritePayload(req.body);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
       subject_id,
@@ -6279,17 +6397,21 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   max_type,
   calculation_on,
   target_auto_adjustment,
+  reactivity_status,
+  importance,
+  reactivity_need,
   reference_kpi_id,
   owner_role_id,
   status,
   comments,
   high_limit,
   low_limit,
-  created_by_people_id
+  created_by_people_id,
+  kfs
 )
 VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
-  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
 )
       RETURNING *
       `,
@@ -6316,13 +6438,17 @@ VALUES (
         max_type,
         calculation_on,
         target_auto_adjustment,
+        reactivity_status,
+        importance,
+        reactivity_need,
         reference_kpi_id,
         owner_role_id,
         status,
         comments,
         high_limit,
         low_limit,
-        createdByPeopleId
+        createdByPeopleId,
+        kfs
       ]
     );
 
@@ -6438,6 +6564,10 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
       max_type,
       calculation_on,
       target_auto_adjustment,
+      reactivity_status,
+      importance,
+      reactivity_need,
+      kfs,
       reference_kpi_id,
       owner_role_id,
       status,
@@ -6489,9 +6619,13 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
           comments = $26,
           high_limit = $27,
           low_limit = $28,
+          reactivity_status = $29,
+          importance = $30,
+          reactivity_need = $31,
+          kfs = $32,
           updated_at = NOW()
-      WHERE kpi_id = $29
-        AND created_by_people_id = $30
+      WHERE kpi_id = $33
+        AND created_by_people_id = $34
       RETURNING *
       `,
       [
@@ -6523,6 +6657,10 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
         comments,
         high_limit,
         low_limit,
+        reactivity_status,
+        importance,
+        reactivity_need,
+        kfs,
         kpiId,
         responsiblePeopleId
       ]
@@ -12294,7 +12432,17 @@ textarea {
   display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
 }
 .kpi-main-row .field { display: flex; flex-direction: column; gap: 4px; }
+.kpi-three-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.kpi-three-row .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .kpi-main-row .field.f-name { flex: 2.5; min-width: 160px; }
+.kpi-main-row .field.f-kfs {
+  flex: 0.7;
+  min-width: 120px;
+}
 .kpi-main-row .field.f-unit { flex: 0.9; min-width: 80px; }
 .kpi-main-row .field.f-freq { flex: 1.2; min-width: 110px; }
 .kpi-main-row .field.f-dir  { flex: 0.9; min-width: 85px; }
@@ -12362,19 +12510,25 @@ textarea {
   color: #94a3b8 !important;
 }
 
-.kpi-main-row .field label {
+.kpi-main-row .field label,
+.kpi-three-row .field label {
   display: flex; align-items: center; justify-content: space-between;
   gap: 8px; font-size: 10px; font-weight: 800; color: #334155;
 }
-.kpi-main-row .field .hint { font-size: 9px; font-weight: 700; color: #94a3b8; }
+.kpi-main-row .field .hint,
+.kpi-three-row .field .hint { font-size: 9px; font-weight: 700; color: #94a3b8; }
 .kpi-main-row .field input,
 .kpi-main-row .field select,
-.kpi-main-row .field textarea {
+.kpi-main-row .field textarea,
+.kpi-three-row .field input,
+.kpi-three-row .field select,
+.kpi-three-row .field textarea {
   width: 100%; border: 1px solid rgba(148,163,184,0.28);
   background: #fff; color: #0f172a; border-radius: 10px;
   padding: 7px 10px; font-size: 13px; font-family: inherit; outline: none;
 }
-.kpi-main-row .field textarea { min-height: 56px; resize: none; line-height: 1.45; }
+.kpi-main-row .field textarea,
+.kpi-three-row .field textarea { min-height: 56px; resize: none; line-height: 1.45; }
 
 .calc-section-rows {
   display: flex;
@@ -12546,6 +12700,10 @@ textarea {
 }
 
 @media (max-width: 1180px) {
+  .kpi-three-row {
+    grid-template-columns: 1fr;
+  }
+
   .calc-logic-row {
     min-height: auto;
   }
@@ -12801,14 +12959,24 @@ textarea {
           <input type="hidden" id="comments" />
           <input type="hidden" id="target" />
 
-          <div class="form-section">
-            <div class="kpi-main-row">
-              <div class="field f-name">
-                <label><span>KPI Name</span></label>
-                <input id="indicator_sub_title" placeholder="Type or adjust the KPI name" required />
-              </div>
-            </div>
-          </div>
+<div class="form-section">
+  <div class="kpi-main-row">
+    <div class="field f-kfs">
+      <label><span>Type</span></label>
+      <select id="kfs" required>
+        <option value="KPI">KPI</option>
+        <option value="KFS">KFS</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="kpi-main-row">
+    <div class="field f-name">
+      <label><span>KPI Name</span></label>
+      <input id="indicator_sub_title" placeholder="Type or adjust the KPI name" required />
+    </div>
+  </div>
+</div>
 
           <div class="form-section">
             <div class="form-grid">
@@ -12901,6 +13069,36 @@ textarea {
               <div class="field f-maxv" id="wrap_max_value" style="display:none;">
                 <label><span>Max Value</span><span class="hint">Enter</span></label>
                 <input id="max" placeholder="Max value" />
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <div class="kpi-three-row">
+              <div class="field">
+                <label><span>Reactivity Status</span></label>
+                <select id="reactivity_status">
+                  <option value="" selected>Select reactivity status</option>
+                  <option value="Anticipated">Anticipated</option>
+                  <option value="Reactive">Reactive</option>
+                </select>
+              </div>
+              <div class="field">
+                <label><span>Importance</span></label>
+                <select id="importance">
+                  <option value="" selected>Select importance</option>
+                  <option value="High">High</option>
+                  <option value="Medium">Medium</option>
+                  <option value="Low">Low</option>
+                </select>
+              </div>
+              <div class="field">
+                <label><span>Need for responsiveness </span></label>
+                <select id="reactivity_need">
+                  <option value="" selected>Select reactivity need</option>
+                  <option value="Urgent">Urgent</option>
+                  <option value="Not Urgent">Not Urgent</option>
+                </select>
               </div>
             </div>
           </div>
@@ -13845,6 +14043,9 @@ const KPI_MODAL_FIELD_IDS = new Set([
   "min",
   "calculation_on",
   "target_auto_adjustment",
+  "reactivity_status",
+  "importance",
+  "reactivity_need",
   "high_limit",
   "low_limit",
   "direction",
@@ -13857,7 +14058,8 @@ const KPI_MODAL_FIELD_IDS = new Set([
   "max_type",
   "status",
   "comments",
-  "owner_role_id"
+  "owner_role_id",
+  "kfs"
 ]);
 
 function getKpiFieldElement(id) {
@@ -16985,6 +17187,19 @@ const identityHtml = row("Identity", colClass(identityFields),
     field("Target Auto Adjust", kpi.target_auto_adjustment)
   );
 
+  const classificationFields = [
+    kpi.reactivity_status,
+    kpi.importance,
+    kpi.reactivity_need
+  ];
+  const classificationHtml = classificationFields.some(hasValue)
+    ? row("Priority", colClass(classificationFields),
+      field("Reactivity Status", kpi.reactivity_status),
+      field("Importance",        kpi.importance),
+      field("Reactivity Need",   kpi.reactivity_need)
+    )
+    : "";
+
   /* ── Calculation ── */
   const calcFields = [
     kpi.calculation_on,
@@ -17077,7 +17292,7 @@ function fmtTolerance(value) {
       '</div>' +
     '</div>';
 
-  const html = identityHtml + measHtml + calcHtml + rangeHtml + tolHtml + timeHtml + defHtml;
+  const html = identityHtml + measHtml + classificationHtml + calcHtml + rangeHtml + tolHtml + timeHtml + defHtml;
 
   const contentEl = document.getElementById("kpiDetailsModalContent");
   if (contentEl) contentEl.innerHTML = html || '<div style="padding:20px;color:#64748b;text-align:center;">No KPI data available.</div>';
@@ -19466,6 +19681,9 @@ function resetForm() {
     "min",
     "calculation_on",
     "target_auto_adjustment",
+    "reactivity_status",
+    "importance",
+    "reactivity_need",
     "high_limit",
     "low_limit",
     "direction",
@@ -19578,7 +19796,10 @@ function fillForm(data) {
 
   setFieldValue("target", data.target);
   setFieldValue("target_auto_adjustment", data.target_auto_adjustment);
-
+  setFieldValue("reactivity_status", data.reactivity_status);
+  setFieldValue("importance", data.importance);
+  setFieldValue("reactivity_need", data.reactivity_need);
+  setFieldValue("kfs", data.kfs || "KPI");
   setFieldValue("min_type", data.min_type || inferValueType(data.min));
   setFieldValue("max_type", data.max_type || inferValueType(data.max));
   setFieldValue("min", normalizeNullableFieldValue(data.min));
@@ -19673,47 +19894,54 @@ function fillForm(data) {
      return el.value || "";
     }
 
-      function buildPayload() {
-        const toleranceType = getSafeValue("tolerance_type");
-        const minType = getSafeValue("min_type") || "Null";
-        const maxType = getSafeValue("max_type") || "Null";
-        const minValue = normalizeNullableFieldValue(getSafeValue("min", { optional: true }));
-        const maxValue = normalizeNullableFieldValue(getSafeValue("max", { optional: true }));
-        return {
-          indicator_title: getSafeValue("subject"),              // use subject as title
-          indicator_sub_title: getSafeValue("indicator_sub_title"), // manual KPI name
-          subject_node_id: getSafeValue("subject_node_id"),
-          kpi_code: getSafeValue("kpi_code"),
-          kpi_formula: getSafeValue("kpi_formula"),
-          unit: getSafeValue("unit"),
-          subject: getSafeValue("subject"),
-          definition: getSafeValue("definition"),
-          frequency: getSafeValue("frequency"),
-          target: getSafeValue("target", { optional: true }),
-          tolerance_type: toleranceType,
-          up_tolerance: serializeToleranceForPayload(getSafeValue("up_tolerance", { optional: true }), toleranceType, "up"),
-          low_tolerance: serializeToleranceForPayload(getSafeValue("low_tolerance", { optional: true }), toleranceType, "low"),
-          max: maxType === "Null" ? "" : maxType === "0" ? "0" : maxValue,
-          min: minType === "Null" ? "" : minType === "0" ? "0" : minValue,
-          calculation_on: getSafeValue("calculation_on"),
-          target_auto_adjustment: getSafeValue("target_auto_adjustment"),
-          target_direction: getSafeValue("direction"),
-          nombre_periode: getSafeValue("nombre_periode"),
-          calculation_mode: getSafeValue("calculation_mode"),
-          reference_kpi_id: getSafeValue("calculation_mode") === "Ratio"
-            ? (getSafeValue("reference_kpi_id", { optional: true }) || null)
-            : null,
-          display_trend: getSafeValue("display_trend"),
-          regression: getSafeValue("regression", { optional: true }),
-          min_type: getSafeValue("min_type"),
-          max_type: getSafeValue("max_type"),
-          owner_role_id: getSafeValue("owner_role_id", { optional: true }) || null,
-          status: getSafeValue("status", { optional: true }),
-          comments: getSafeValue("comments", { optional: true }),
-          high_limit: getSafeValue("high_limit", { optional: true }) || null,
-          low_limit: getSafeValue("low_limit", { optional: true }) || null
-        };
-      }
+   function buildPayload() {
+  const kfs = getSafeValue("kfs") || "KPI";
+  const toleranceType = getSafeValue("tolerance_type");
+  const minType = getSafeValue("min_type") || "Null";
+  const maxType = getSafeValue("max_type") || "Null";
+  const minValue = normalizeNullableFieldValue(getSafeValue("min", { optional: true }));
+  const maxValue = normalizeNullableFieldValue(getSafeValue("max", { optional: true }));
+
+  return {
+    kfs: kfs, // ADD THIS LINE
+
+    indicator_title: getSafeValue("subject"),
+    indicator_sub_title: getSafeValue("indicator_sub_title"),
+    subject_node_id: getSafeValue("subject_node_id"),
+    kpi_code: getSafeValue("kpi_code"),
+    kpi_formula: getSafeValue("kpi_formula"),
+    unit: getSafeValue("unit"),
+    subject: getSafeValue("subject"),
+    definition: getSafeValue("definition"),
+    frequency: getSafeValue("frequency"),
+    target: getSafeValue("target", { optional: true }),
+    tolerance_type: toleranceType,
+    up_tolerance: serializeToleranceForPayload(getSafeValue("up_tolerance", { optional: true }), toleranceType, "up"),
+    low_tolerance: serializeToleranceForPayload(getSafeValue("low_tolerance", { optional: true }), toleranceType, "low"),
+    max: maxType === "Null" ? "" : maxType === "0" ? "0" : maxValue,
+    min: minType === "Null" ? "" : minType === "0" ? "0" : minValue,
+    calculation_on: getSafeValue("calculation_on"),
+    target_auto_adjustment: getSafeValue("target_auto_adjustment"),
+    reactivity_status: getSafeValue("reactivity_status", { optional: true }) || null,
+    importance: getSafeValue("importance", { optional: true }) || null,
+    reactivity_need: getSafeValue("reactivity_need", { optional: true }) || null,
+    target_direction: getSafeValue("direction"),
+    nombre_periode: getSafeValue("nombre_periode"),
+    calculation_mode: getSafeValue("calculation_mode"),
+    reference_kpi_id: getSafeValue("calculation_mode") === "Ratio"
+      ? (getSafeValue("reference_kpi_id", { optional: true }) || null)
+      : null,
+    display_trend: getSafeValue("display_trend"),
+    regression: getSafeValue("regression", { optional: true }),
+    min_type: getSafeValue("min_type"),
+    max_type: getSafeValue("max_type"),
+    owner_role_id: getSafeValue("owner_role_id", { optional: true }) || null,
+    status: getSafeValue("status", { optional: true }),
+    comments: getSafeValue("comments", { optional: true }),
+    high_limit: getSafeValue("high_limit", { optional: true }) || null,
+    low_limit: getSafeValue("low_limit", { optional: true }) || null
+  };
+}
 
       async function saveKpi() {
         if (kpiSavePending) {
@@ -20367,6 +20595,7 @@ if (missingRow) {
     parameterSavePending = true;
     setParameterSaveLoading(true);
 
+    console.log("KFS SENT =", payload.kfs, payload);
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
@@ -23771,16 +24000,32 @@ const parseWeekLabelDate = (weekLabel) => {
   return new Date(Date.UTC(year, 0, 1 + (weekNumber - 1) * 7));
 };
 
-const deriveKpiResultDate = (periodLabel) =>
-  normalizeOptionalDateInput(periodLabel) ||
-  formatIsoDateValue(parseWeekLabelDate(periodLabel)) ||
-  formatIsoDateValue(new Date());
+const deriveKpiResultDate = (periodLabel) => {
+  const normalizedDate = normalizeOptionalDateInput(periodLabel);
+  if (normalizedDate) return normalizedDate;
+
+  const text = String(periodLabel || "").trim();
+  if (/^\d{4}-\d{2}$/.test(text)) return `${text}-01`;
+
+  const quarterMatch = text.match(/^(\d{4})-Q([1-4])$/i);
+  if (quarterMatch) {
+    const quarterStartMonth = String((Number(quarterMatch[2]) - 1) * 3 + 1).padStart(2, "0");
+    return `${quarterMatch[1]}-${quarterStartMonth}-01`;
+  }
+
+  if (/^\d{4}$/.test(text)) return `${text}-01-01`;
+
+  return formatIsoDateValue(parseWeekLabelDate(periodLabel)) || formatIsoDateValue(new Date());
+};
 
 const deriveKpiResultPeriodType = (periodLabel) => {
   const text = normalizeOptionalTextInput(periodLabel);
   if (!text) return "Date";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return "Date";
   if (/^\d{4}-Week\d{1,2}$/i.test(text)) return "Week";
   if (/^\d{4}-\d{2}$/.test(text)) return "Month";
+  if (/^\d{4}-Q[1-4]$/i.test(text)) return "Quarter";
+  if (/^\d{4}$/.test(text)) return "Year";
   return "Period";
 };
 
@@ -24582,9 +24827,15 @@ const updateActionPlanCorrectiveActionStatus = async (correctiveActionId, nextSt
   };
 };
 
-const getResponsibleWithKPIs = async (responsibleId, week) => {
+const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
   const responsible = await loadFormResponsibleContext(responsibleId);
   const normalizedWeek = normalizeOptionalTextInput(week);
+  const normalizedFrequencyFilter = normalizeOptionalTextInput(filters.frequency)
+    ? getCanonicalKpiSubmissionFrequency(filters.frequency)
+    : null;
+  const normalizedCalculationModeFilter = normalizeOptionalTextInput(filters.calculationMode)
+    ? getCanonicalKpiCalculationMode(filters.calculationMode)
+    : null;
   const responsibleNumericId = normalizeOptionalIntegerInput(
     responsible?.people_id ?? responsibleId
   );
@@ -24683,12 +24934,25 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
 ) latest_limits ON TRUE
     WHERE $2::integer IS NOT NULL
       AND kta.set_by_people_id = $2
+      AND (
+        $3::text IS NULL
+        OR LOWER(COALESCE(NULLIF(TRIM(k.frequency), ''), 'weekly')) = LOWER($3)
+      )
+      AND (
+        $4::text IS NULL
+        OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = LOWER($4)
+      )
     ORDER BY
       COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') ASC,
       COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') ASC,
       kta.kpi_target_allocation_id ASC
     `,
-    [normalizedWeek, responsibleNumericId]
+    [
+      normalizedWeek,
+      responsibleNumericId,
+      normalizedFrequencyFilter,
+      normalizedCalculationModeFilter
+    ]
   );
 
   const {
@@ -24749,31 +25013,39 @@ const getResponsibleWithKPIs = async (responsibleId, week) => {
   };
 };
 
-const generateEmailHtml = ({ responsible, week, calculationMode = null }) => {
-  const responsibleLinkId = encodeURIComponent(
-    responsible?.people_id ?? responsible?.responsible_id ?? ""
+const generateEmailHtml = ({
+  responsible,
+  week,
+  calculationMode = null,
+  frequencyLabel = null
+}) => {
+  const responsibleId = responsible?.people_id ?? responsible?.responsible_id ?? "";
+  const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode)
+    ? getCanonicalKpiCalculationMode(calculationMode)
+    : null;
+  const normalizedFrequencyLabel = normalizeOptionalTextInput(frequencyLabel)
+    ? getCanonicalKpiSubmissionFrequency(frequencyLabel)
+    : null;
+  const queryParams = new URLSearchParams({
+    responsible_id: String(responsibleId),
+    week: String(week || "")
+  });
+  const appBaseUrl = (normalizeOptionalTextInput(process.env.APP_BASE_URL) || "https://kpi-form.azurewebsites.net")
+    .replace(/\/+$/, "");
+
+  if (normalizedCalculationMode) {
+    queryParams.set("calculation_mode", normalizedCalculationMode);
+  }
+
+  if (normalizedFrequencyLabel) {
+    queryParams.set("frequency", normalizedFrequencyLabel);
+  }
+
+  const formUrl = `${appBaseUrl}/form?${queryParams.toString()}`;
+  const periodLabel = formatKpiSubmissionPeriodLabel(week, normalizedFrequencyLabel);
+  const responsiblePlant = escapeHtml(
+    normalizeOptionalTextInput(responsible?.plant_name) || "Allocated scope"
   );
-  const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode);
-  const calculationModeQuery = normalizedCalculationMode
-    ? `&calculation_mode=${encodeURIComponent(normalizedCalculationMode)}`
-    : "";
-
-  // Convert week format (e.g., "2026-Week12") to month and year
-  const getMonthYearFromWeek = (weekStr) => {
-    const match = weekStr.match(/(\d{4})-Week(\d+)/);
-    if (!match) return weekStr; // Return original if format doesn't match
-
-    const year = parseInt(match[1]);
-    const weekNumber = parseInt(match[2]);
-
-    // Calculate approximate date from week number (week 1 starts around Jan 1)
-    const date = new Date(year, 0, 1 + (weekNumber - 1) * 7);
-
-    // Return month and year (e.g., "March 2026")
-    return date.toLocaleString('en-US', { month: 'long', year: 'numeric' });
-  };
-
-  const monthYear = getMonthYearFromWeek(week);
 
   return `
   <!DOCTYPE html><html><head><meta charset="utf-8"><title>KPI Form</title></head>
@@ -24793,19 +25065,22 @@ const generateEmailHtml = ({ responsible, week, calculationMode = null }) => {
       
       <h2 style="color:#0078D7;font-size:24px;margin:0 0 10px 0;font-weight:600;">KPI Submission </h2>
       ${normalizedCalculationMode
-      ? `<p style="margin:0 0 14px 0;color:#0f4c81;font-size:14px;font-weight:600;">Calculation Mode: ${normalizedCalculationMode}</p>`
+      ? `<p style="margin:0 0 6px 0;color:#0f4c81;font-size:14px;font-weight:600;">Calculation Mode: ${escapeHtml(normalizedCalculationMode)}</p>`
+      : ""}
+      ${normalizedFrequencyLabel
+      ? `<p style="margin:0 0 14px 0;color:#0f4c81;font-size:14px;font-weight:600;">Frequency: ${escapeHtml(normalizedFrequencyLabel)}</p>`
       : ""}
       
-      <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsible.plant_name}</h3>
+      <h3 style="color:#333;font-size:18px;margin:0 0 25px 0;font-weight:500;">${responsiblePlant}</h3>
       
-      <a href="https://kpi-form.azurewebsites.net/form?responsible_id=${responsibleLinkId}&week=${week}${calculationModeQuery}"
+      <a href="${escapeHtml(formUrl)}"
          style="display:inline-block;padding:14px 35px;background:#0078D7;color:white;
                 border-radius:50px;text-decoration:none;font-weight:600;font-size:16px;
                 margin-bottom:20px;border:none;cursor:pointer;">
         Fill KPI Form
       </a>
       
-      <p style="margin:0;font-size:13px;color:#666;">Click the button above to fill your KPIs for ${monthYear}.</p>
+      <p style="margin:0;font-size:13px;color:#666;">Click the button above to fill your KPIs for ${escapeHtml(periodLabel)}.</p>
     </div>
   </body></html>`;
 };
@@ -27109,10 +27384,23 @@ function getPeriodLabelForFrequency(item, frequency) {
 // ---------- Form page ----------
 app.get("/form", async (req, res) => {
   try {
-    const { responsible_id, week: requestedWeek } = req.query;
+    const {
+      responsible_id,
+      week: requestedWeek,
+      frequency: requestedFrequency,
+      calculation_mode: requestedCalculationMode
+    } = req.query;
+    const normalizedFrequencyFilter = normalizeOptionalTextInput(requestedFrequency)
+      ? getCanonicalKpiSubmissionFrequency(requestedFrequency)
+      : null;
     const week =
       normalizeOptionalTextInput(requestedWeek) ||
-      getCurrentFormWeek();
+      (normalizedFrequencyFilter
+        ? getKpiSubmissionTargetPeriodLabel({
+            timeContext: buildTimeZoneDateContext(DEFAULT_KPI_SUBMISSION_TIMEZONE),
+            frequencyLabel: normalizedFrequencyFilter
+          })
+        : getCurrentFormWeek());
     const peopleRes = await pool.query(
       `SELECT people_id,
           TRIM(first_name || ' ' || name) AS display_name
@@ -27127,7 +27415,10 @@ app.get("/form", async (req, res) => {
       kpis,
       correctiveActionsEnabled,
       correctiveActionHistoryByAllocation
-    } = await getResponsibleWithKPIs(responsible_id, week);
+    } = await getResponsibleWithKPIs(responsible_id, week, {
+      frequency: normalizedFrequencyFilter,
+      calculationMode: normalizeOptionalTextInput(requestedCalculationMode)
+    });
 
     const responsibleContext = await loadFormResponsibleContext(responsible_id);
     const responsibleGroupLabel =
@@ -27145,6 +27436,7 @@ app.get("/form", async (req, res) => {
       "Not assigned";
 
     const formFrequencyLabel =
+      normalizedFrequencyFilter ||
       normalizeOptionalTextInput(kpis?.[0]?.frequency) ||
       "Weekly";
 
@@ -33666,8 +33958,16 @@ app.get("/dashboard-history", async (req, res) => {
 // ---------- Send KPI email ----------
 const sendKPIEmail = async (responsibleId, week, options = {}) => {
   try {
-    const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week);
-    const calculationMode = normalizeOptionalTextInput(options.calculationMode);
+    const calculationMode = normalizeOptionalTextInput(options.calculationMode)
+      ? getCanonicalKpiCalculationMode(options.calculationMode)
+      : null;
+    const frequencyLabel = normalizeOptionalTextInput(options.frequency)
+      ? getCanonicalKpiSubmissionFrequency(options.frequency)
+      : null;
+    const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week, {
+      calculationMode,
+      frequency: frequencyLabel
+    });
     if (!responsible) {
       throw new Error(`Responsible ${responsibleId} not found`);
     }
@@ -33679,13 +33979,20 @@ const sendKPIEmail = async (responsibleId, week, options = {}) => {
       console.warn(`[KPI Reminder] Skipping ${responsible.name || responsibleId} because no KPI allocations were found.`);
       return false;
     }
-    const html = generateEmailHtml({ responsible, week, calculationMode });
+    const html = generateEmailHtml({
+      responsible,
+      week,
+      calculationMode,
+      frequencyLabel
+    });
     const transporter = createTransporter();
-    const subjectModeSuffix = calculationMode ? ` (${calculationMode})` : "";
+    const subjectContext = [calculationMode, frequencyLabel].filter(Boolean).join(" | ");
+    const subjectSuffix = subjectContext ? ` (${subjectContext})` : "";
+    const formattedPeriodLabel = formatKpiSubmissionPeriodLabel(week, frequencyLabel);
     await transporter.sendMail({
       from: '"Administration STS" <administration.STS@avocarbon.com>',
       to: responsible.email,
-      subject: `KPI Form${subjectModeSuffix} for ${responsible.name} - ${week}`,
+      subject: `KPI Submission${subjectSuffix} for ${responsible.name} - ${formattedPeriodLabel}`,
       html,
     });
     console.log(`Email sent to ${responsible.email}`);
@@ -33699,45 +34006,41 @@ const sendKPIEmail = async (responsibleId, week, options = {}) => {
 const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
   const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode);
   const modeFilter = normalizedCalculationMode
-    ? normalizedCalculationMode.toLowerCase()
+    ? getCanonicalKpiCalculationMode(normalizedCalculationMode).toLowerCase()
     : null;
   const result = await pool.query(
     `
-    WITH recipient_people AS (
-      SELECT DISTINCT
-        kta.set_by_people_id AS people_id
-      FROM public.kpi_target_allocation kta
-      JOIN public.kpi k
-        ON k.kpi_id = kta.kpi_id
-      WHERE kta.set_by_people_id IS NOT NULL
-        AND (
-          $1::text IS NULL
-          OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = $1
-        )
-    )
     SELECT
       owner.people_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(owner.first_name, ''), COALESCE(owner.name, ''))), '') AS name,
       owner.email,
-      COALESCE(allocation_scope.resolved_unit_id, primary_unit.unit_id, home_unit.unit_id) AS unit_id,
+      COALESCE(unit_scope.unit_id, plant_scope.unit_id, primary_unit.unit_id, home_unit.unit_id) AS unit_id,
       COALESCE(
-        allocation_scope.resolved_unit_name,
+        NULLIF(TRIM(unit_scope.unit_name), ''),
+        NULLIF(TRIM(plant_scope.unit_name), ''),
         NULLIF(TRIM(primary_unit.unit_name), ''),
         NULLIF(TRIM(home_unit.unit_name), '')
       ) AS unit_name,
-COALESCE(
-  allocation_scope.resolved_unit_short_name,
-  NULLIF(TRIM(primary_unit.unit_short_name), ''),
-  NULLIF(TRIM(home_unit.unit_short_name), '')
-) AS unit_short_name,
-COALESCE(
-  allocation_scope.resolved_country,
-  NULLIF(TRIM(primary_unit.country), ''),
-  NULLIF(TRIM(home_unit.country), '')
-) AS country
-    FROM recipient_people recipient
+      COALESCE(
+        NULLIF(TRIM(unit_scope.unit_short_name), ''),
+        NULLIF(TRIM(plant_scope.unit_short_name), ''),
+        NULLIF(TRIM(primary_unit.unit_short_name), ''),
+        NULLIF(TRIM(home_unit.unit_short_name), '')
+      ) AS unit_short_name,
+      COALESCE(
+        NULLIF(TRIM(unit_scope.country), ''),
+        NULLIF(TRIM(plant_scope.country), ''),
+        NULLIF(TRIM(primary_unit.country), ''),
+        NULLIF(TRIM(home_unit.country), '')
+      ) AS country,
+      k.frequency,
+      COALESCE(kta.updated_at, kta.created_at, CURRENT_TIMESTAMP) AS allocation_updated_at,
+      kta.kpi_target_allocation_id
+    FROM public.kpi_target_allocation kta
+    JOIN public.kpi k
+      ON k.kpi_id = kta.kpi_id
     JOIN public.people owner
-      ON owner.people_id = recipient.people_id
+      ON owner.people_id = kta.set_by_people_id
     LEFT JOIN LATERAL (
       SELECT pra.unit_id
       FROM public.people_role_assignment pra
@@ -33753,46 +34056,48 @@ COALESCE(
       ON primary_unit.unit_id = primary_assignment.unit_id
     LEFT JOIN public.unit home_unit
       ON home_unit.unit_id = owner.work_at_unit_id
-    LEFT JOIN LATERAL (
-      SELECT
-        COALESCE(unit_scope.unit_id, plant.unit_id) AS resolved_unit_id,
-        COALESCE(
-          NULLIF(TRIM(unit_scope.unit_name), ''),
-          NULLIF(TRIM(plant.unit_name), '')
-        ) AS resolved_unit_name,
-        COALESCE(
-          NULLIF(TRIM(unit_scope.unit_short_name), ''),
-          NULLIF(TRIM(plant.unit_short_name), '')
-        ) AS resolved_unit_short_name,
-        COALESCE(
-        NULLIF(TRIM(unit_scope.country), ''),
-        NULLIF(TRIM(plant.country), '')
-       ) AS resolved_country
-      FROM public.kpi_target_allocation kta
-      JOIN public.kpi k
-        ON k.kpi_id = kta.kpi_id
-      LEFT JOIN public.unit unit_scope
-        ON unit_scope.unit_id = kta.unit_id
-      LEFT JOIN public.unit plant
-        ON plant.unit_id = kta.plant_id
-      WHERE kta.set_by_people_id = owner.people_id
-        AND (
-          $1::text IS NULL
-          OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = $1
-        )
-      ORDER BY
-        COALESCE(kta.updated_at, kta.created_at, CURRENT_TIMESTAMP) DESC,
-        kta.kpi_target_allocation_id DESC
-      LIMIT 1
-    ) allocation_scope ON TRUE
+    LEFT JOIN public.unit unit_scope
+      ON unit_scope.unit_id = kta.unit_id
+    LEFT JOIN public.unit plant_scope
+      ON plant_scope.unit_id = kta.plant_id
     WHERE owner.people_id IS NOT NULL
+      AND kta.set_by_people_id IS NOT NULL
       AND COALESCE(TRIM(owner.email), '') <> ''
-    ORDER BY owner.people_id ASC
+      AND (
+        $1::text IS NULL
+        OR LOWER(COALESCE(NULLIF(TRIM(k.calculation_mode), ''), 'direct')) = $1
+      )
+    ORDER BY
+      owner.people_id ASC,
+      COALESCE(kta.updated_at, kta.created_at, CURRENT_TIMESTAMP) DESC,
+      kta.kpi_target_allocation_id DESC
     `,
     [modeFilter]
   );
 
-  return result.rows;
+  const recipientByKey = new Map();
+
+  result.rows.forEach((row) => {
+    const peopleId = normalizeOptionalIntegerInput(row.people_id);
+    if (!peopleId) return;
+
+    const frequencyLabel = getCanonicalKpiSubmissionFrequency(row.frequency);
+    const key = `${peopleId}:${frequencyLabel}`;
+
+    if (!recipientByKey.has(key)) {
+      recipientByKey.set(key, {
+        ...row,
+        people_id: peopleId,
+        frequency_label: frequencyLabel
+      });
+    }
+  });
+
+  return Array.from(recipientByKey.values()).sort((left, right) => {
+    const peopleIdDiff = Number(left.people_id || 0) - Number(right.people_id || 0);
+    if (peopleIdDiff !== 0) return peopleIdDiff;
+    return String(left.frequency_label || "").localeCompare(String(right.frequency_label || ""));
+  });
 };
 
 const DEFAULT_KPI_SUBMISSION_TIMEZONE = "Africa/Tunis";
@@ -33816,6 +34121,126 @@ const getCanonicalKpiCalculationMode = (value) => {
   const normalizedValue = normalizeOptionalTextInput(value);
   if (!normalizedValue) return "Direct";
   return normalizedValue.trim().toLowerCase() === "ratio" ? "Ratio" : "Direct";
+};
+
+const getCanonicalKpiSubmissionFrequency = (value) => {
+  const normalizedValue = normalizeOptionalTextInput(value);
+  if (!normalizedValue) return "Weekly";
+
+  const key = normalizedValue.toLowerCase().replace(/\s+/g, " ").trim();
+
+  if (["daily", "day"].includes(key) || key.includes("day")) return "Daily";
+  if (["by weekly", "biweekly", "bi-weekly", "every 2 weeks", "every two weeks"].includes(key)) {
+    return "By Weekly";
+  }
+  if (key.includes("week")) return "Weekly";
+  if (["quarterly", "quarter"].includes(key) || key.includes("quarter")) return "Quarterly";
+  if (["by monthly", "bimonthly", "bi-monthly", "every 2 months", "every two months"].includes(key)) {
+    return "By Monthly";
+  }
+  if (key.includes("month")) return "Monthly";
+  if (["by yearly", "bi-yearly", "every 2 years", "every two years", "biennial"].includes(key)) {
+    return "By Yearly";
+  }
+  if (["yearly", "annual", "year"].includes(key) || key.includes("year")) return "Yearly";
+
+  return normalizedValue;
+};
+
+const formatKpiSubmissionPeriodLabel = (periodLabel, frequencyLabel = null) => {
+  const normalizedPeriodLabel = normalizeOptionalTextInput(periodLabel) || "";
+  const canonicalFrequency = frequencyLabel
+    ? getCanonicalKpiSubmissionFrequency(frequencyLabel)
+    : null;
+
+  if (!normalizedPeriodLabel) return "Current period";
+
+  if (canonicalFrequency === "Daily" && /^\d{4}-\d{2}-\d{2}$/.test(normalizedPeriodLabel)) {
+    return new Date(`${normalizedPeriodLabel}T00:00:00Z`).toLocaleDateString("en-US", {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC"
+    });
+  }
+
+  const weekMatch = normalizedPeriodLabel.match(/^(\d{4})-Week(\d{1,2})$/i);
+  if (weekMatch) {
+    return `Week ${Number(weekMatch[2])}, ${weekMatch[1]}`;
+  }
+
+  const monthMatch = normalizedPeriodLabel.match(/^(\d{4})-(\d{2})$/);
+  if (monthMatch) {
+    return new Date(`${normalizedPeriodLabel}-01T00:00:00Z`).toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC"
+    });
+  }
+
+  const quarterMatch = normalizedPeriodLabel.match(/^(\d{4})-Q([1-4])$/i);
+  if (quarterMatch) {
+    return `Q${quarterMatch[2]} ${quarterMatch[1]}`;
+  }
+
+  if (/^\d{4}$/.test(normalizedPeriodLabel)) {
+    return normalizedPeriodLabel;
+  }
+
+  return normalizedPeriodLabel;
+};
+
+const getKpiSubmissionTargetPeriodLabel = ({
+  timeContext = {},
+  frequencyLabel = "Weekly"
+} = {}) => {
+  const canonicalFrequency = getCanonicalKpiSubmissionFrequency(frequencyLabel);
+  const year = Number(timeContext.year || 0);
+  const month = Number(timeContext.month || 1);
+  const localDate = normalizeOptionalTextInput(timeContext.localDate);
+
+  if (canonicalFrequency === "Daily" && localDate) {
+    return localDate;
+  }
+
+  if (canonicalFrequency === "Monthly" || canonicalFrequency === "By Monthly") {
+    return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`;
+  }
+
+  if (canonicalFrequency === "Quarterly") {
+    return `${String(year).padStart(4, "0")}-Q${Math.floor((month - 1) / 3) + 1}`;
+  }
+
+  if (canonicalFrequency === "Yearly" || canonicalFrequency === "By Yearly") {
+    return String(year).padStart(4, "0");
+  }
+
+  return getCurrentFormWeekFromPseudoDate(timeContext.pseudoDate || new Date());
+};
+
+const isKpiSubmissionFrequencyDue = (timeContext = {}, frequencyLabel = "Weekly") => {
+  const canonicalFrequency = getCanonicalKpiSubmissionFrequency(frequencyLabel);
+  const dayOfWeek = Number(timeContext.dayOfWeek);
+  const dayOfMonth = Number(timeContext.day);
+  const month = Number(timeContext.month);
+  const year = Number(timeContext.year);
+  const currentWeekLabel = getCurrentWeekFromPseudoDate(timeContext.pseudoDate || new Date());
+  const weekNumber = Number(currentWeekLabel.match(/Week(\d+)/i)?.[1] || 0);
+
+  if (canonicalFrequency === "Daily") return true;
+  if (canonicalFrequency === "Weekly") return dayOfWeek === 1;
+  if (canonicalFrequency === "By Weekly") return dayOfWeek === 1 && weekNumber % 2 === 1;
+  if (canonicalFrequency === "Monthly") return dayOfMonth === 1;
+  if (canonicalFrequency === "By Monthly") return dayOfMonth === 1 && month % 2 === 1;
+  if (canonicalFrequency === "Quarterly") {
+    return dayOfMonth === 1 && [1, 4, 7, 10].includes(month);
+  }
+  if (canonicalFrequency === "Yearly") return dayOfMonth === 1 && month === 1;
+  if (canonicalFrequency === "By Yearly") {
+    return dayOfMonth === 1 && month === 1 && year % 2 === 1;
+  }
+
+  return dayOfWeek === 1;
 };
 
 const resolveKpiSubmissionRecipientTimeZone = (recipient = {}) => {
@@ -33865,6 +34290,7 @@ const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
       year,
       month,
       day,
+      dayOfWeek: pseudoDate.getUTCDay(),
       hour,
       minute,
       second,
@@ -33901,10 +34327,12 @@ const hasReachedKpiSubmissionLocalSendWindow = (
 const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
   peopleId,
   calculationMode,
+  frequencyLabel,
   localDispatchDate
 }) => {
   const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
   const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+  const canonicalFrequency = getCanonicalKpiSubmissionFrequency(frequencyLabel);
   const normalizedLocalDate = normalizeOptionalTextInput(localDispatchDate);
 
   if (!normalizedPeopleId || !normalizedLocalDate) {
@@ -33917,10 +34345,11 @@ const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
     FROM public.kpi_submission_email_dispatch_log
     WHERE people_id = $1
       AND calculation_mode = $2
-      AND local_dispatch_date = $3::date
+      AND frequency_label = $3
+      AND local_dispatch_date = $4::date
     LIMIT 1
     `,
-    [normalizedPeopleId, canonicalMode, normalizedLocalDate]
+    [normalizedPeopleId, canonicalMode, canonicalFrequency, normalizedLocalDate]
   );
 
   return Boolean(result.rows.length);
@@ -33929,6 +34358,7 @@ const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
 const recordKpiSubmissionEmailDispatch = async ({
   peopleId,
   calculationMode,
+  frequencyLabel,
   targetWeek,
   localDispatchDate,
   unitId = null,
@@ -33938,6 +34368,7 @@ const recordKpiSubmissionEmailDispatch = async ({
 }) => {
   const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
   const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
+  const canonicalFrequency = getCanonicalKpiSubmissionFrequency(frequencyLabel);
   const normalizedTargetWeek = normalizeOptionalTextInput(targetWeek);
   const normalizedLocalDate = normalizeOptionalTextInput(localDispatchDate);
 
@@ -33950,6 +34381,7 @@ const recordKpiSubmissionEmailDispatch = async ({
     INSERT INTO public.kpi_submission_email_dispatch_log (
       people_id,
       calculation_mode,
+      frequency_label,
       target_week,
       local_dispatch_date,
       unit_id,
@@ -33957,12 +34389,13 @@ const recordKpiSubmissionEmailDispatch = async ({
       unit_short_name,
       unit_timezone
     )
-    VALUES ($1, $2, $3, $4::date, $5, $6, $7, $8)
-    ON CONFLICT (people_id, calculation_mode, local_dispatch_date) DO NOTHING
+    VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9)
+    ON CONFLICT (people_id, calculation_mode, frequency_label, local_dispatch_date) DO NOTHING
     `,
     [
       normalizedPeopleId,
       canonicalMode,
+      canonicalFrequency,
       normalizedTargetWeek,
       normalizedLocalDate,
       normalizeOptionalIntegerInput(unitId),
@@ -35543,9 +35976,7 @@ const generateWeeklyReportEmail = async (responsibleId, reportWeek, deliveryOver
     throw error;
   }
 };
-// ---------- Cron: weekly KPI submission email ----------
-const DIRECT_KPI_SUBMISSION_CRON = "0 10 * * *";   // Example: Monday 08:00 UTC
-const RATIO_KPI_SUBMISSION_CRON  = "0 8 * * *";   // Example: Monday 09:00 UTC
+// ---------- Cron: KPI submission email ----------
 const weeklyKpiSubmissionCronState = {
   direct: false,
   ratio: false
@@ -35583,18 +36014,30 @@ const runWeeklyKpiSubmissionCron = async ({
     for (const recipient of recipients) {
       const recipientTimeZone = resolveKpiSubmissionRecipientTimeZone(recipient);
       const timeContext = buildTimeZoneDateContext(recipientTimeZone, dispatchDate);
-      const currentWeek = getCurrentFormWeekFromPseudoDate(timeContext.pseudoDate);
+      const frequencyLabel = getCanonicalKpiSubmissionFrequency(
+        recipient.frequency_label || recipient.frequency
+      );
+      const targetPeriodLabel = getKpiSubmissionTargetPeriodLabel({
+        timeContext,
+        frequencyLabel
+      });
 
-   if (!hasReachedKpiSubmissionLocalSendWindow(timeContext, calculationMode)) {
-      notDueCount += 1;
-      continue;
-   } 
+      if (!hasReachedKpiSubmissionLocalSendWindow(timeContext, calculationMode)) {
+        notDueCount += 1;
+        continue;
+      }
+
+      if (!isKpiSubmissionFrequencyDue(timeContext, frequencyLabel)) {
+        notDueCount += 1;
+        continue;
+      }
 
       eligibleCount += 1;
 
       const alreadySent = await hasKpiSubmissionEmailBeenSentForLocalDate({
         peopleId: recipient.people_id,
         calculationMode: canonicalMode,
+        frequencyLabel,
         localDispatchDate: timeContext.localDate
       });
 
@@ -35604,8 +36047,9 @@ const runWeeklyKpiSubmissionCron = async ({
       }
 
       try {
-        const emailSent = await sendKPIEmail(recipient.people_id, currentWeek, {
-          calculationMode
+        const emailSent = await sendKPIEmail(recipient.people_id, targetPeriodLabel, {
+          calculationMode,
+          frequency: frequencyLabel
         });
 
         if (!emailSent) {
@@ -35616,7 +36060,8 @@ const runWeeklyKpiSubmissionCron = async ({
         await recordKpiSubmissionEmailDispatch({
           peopleId: recipient.people_id,
           calculationMode: canonicalMode,
-          targetWeek: currentWeek,
+          frequencyLabel,
+          targetWeek: targetPeriodLabel,
           localDispatchDate: timeContext.localDate,
           unitId: recipient.unit_id,
           unitName: recipient.unit_name,
@@ -35645,7 +36090,6 @@ const runWeeklyKpiSubmissionCron = async ({
     await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
   }
 };
-
 
 
 cron.schedule("*/5 * * * *", async () => {
