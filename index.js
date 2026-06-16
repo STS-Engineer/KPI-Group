@@ -4189,6 +4189,7 @@ const loadKpiTargetAllocationRowsByIdsForUi = async (allocationIds = []) => {
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 // ========== KPI ADMIN API ==========
 
@@ -8849,6 +8850,101 @@ textarea {
         color: #64748b;
       }
 
+      .parameter-subject-row td {
+        padding: 0;
+        background: transparent;
+        border: none;
+      }
+
+      .parameter-subject-row:hover td {
+        background: transparent;
+      }
+
+      .parameter-subject-toggle {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 18px 20px;
+        border: 1px solid rgba(191, 219, 254, 0.72);
+        border-radius: 20px;
+        background:
+          radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 34%),
+          linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(244,248,255,0.98) 100%);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.92),
+          0 14px 26px rgba(15,23,42,0.06);
+        cursor: pointer;
+        text-align: left;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+      }
+
+      .parameter-subject-toggle:hover {
+        transform: translateY(-1px);
+        border-color: rgba(96,165,250,0.88);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.92),
+          0 18px 30px rgba(37,99,235,0.10);
+      }
+
+      .parameter-subject-chevron {
+        flex: 0 0 auto;
+        width: 34px;
+        height: 34px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: rgba(37,99,235,0.10);
+        color: #1d4ed8;
+        font-size: 16px;
+        font-weight: 900;
+      }
+
+      .parameter-subject-summary {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .parameter-subject-title {
+        font-size: 15px;
+        font-weight: 900;
+        color: #0f172a;
+        line-height: 1.35;
+      }
+
+      .parameter-subject-path {
+        font-size: 12px;
+        color: #64748b;
+        line-height: 1.6;
+      }
+
+      .parameter-subject-count {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(14,165,233,0.10);
+        color: #0369a1;
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+
+      .parameter-subject-child-row td:first-child {
+        padding-left: 30px;
+      }
+
+      .parameter-subject-child-row .parameter-matrix-kpi-path {
+        margin-top: 4px;
+      }
+
       .kpi-matrix-owner {
         display: inline-flex;
         align-items: center;
@@ -12664,16 +12760,16 @@ textarea {
             <div class="parameter-matrix-hero">
               <div class="parameter-matrix-title">
                 <h2>Target Allocation Matrix</h2>
-                <p>View and manage every KPI target allocation with direct visibility on KPI name, type, role, frequency, and target value.</p>
+                <p>View and manage KPI target allocations grouped by subject first, then open each subject to see the related KPIs, roles, frequencies, and target values.</p>
               </div>
               <button class="btn btn-primary parameter-matrix-add-btn" type="button" onclick="openCreateParameterModal()">+ Add Target Allocation</button>
             </div>
 
             <div class="parameter-matrix-toolbar">
               <div class="search-wrap parameter-matrix-search">
-                <input id="parameterSearch" class="search" placeholder="Filter by KPI name, role, type, or frequency..." />
+                <input id="parameterSearch" class="search" placeholder="Filter by subject, KPI name, role, type, or frequency..." />
               </div>
-              <div class="parameter-results-meta" id="parameterResultsMeta">0 allocations</div>
+              <div class="parameter-results-meta" id="parameterResultsMeta">0 subjects</div>
             </div>
 
             <div id="parameterGrid"></div>
@@ -13058,6 +13154,7 @@ textarea {
                   <option value="Individual">Individual</option>
                   <option value="Zone">Zone</option>
                   <option value="Product Line">Product Line</option>
+                  <option value="Role">Role</option>
                 </select>
               </div>
               <div class="field col-2" id="parameter_unit_type_field">
@@ -13093,7 +13190,13 @@ textarea {
                   </div>
 
            
-        
+             <div class="field col-2 is-hidden" id="parameter_role_mode_field">
+              <label><span>Role Target Mode</span></label>
+             <select id="parameter_role_target_mode">
+             <option value="apply_all">Apply All</option>
+             <option value="individual">Individual</option>
+             </select>
+            </div>
               <div class="field col-12">
                 <label><span>KPI Definition</span><span class="hint">Read only</span></label>
                 <textarea
@@ -13233,6 +13336,7 @@ textarea {
       let referenceKpiRows = [];
       let currentParameterRows = [];
       let parameterSourceRows = [];
+      let expandedParameterSubjectKeys = new Set();
       let parameterKpiCatalog = [];
       let parameterUnitTargetState = {};
       let parameterLockedUnitId = "";
@@ -13277,7 +13381,8 @@ textarea {
         "parameter_target_end_date",
         "parameter_set_by_people_id",
         "parameter_approved_by_people_id",
-        "parameter_comments"
+        "parameter_comments",
+        "parameter_role_target_mode"
       ];
 
       function showToast(message) {
@@ -13494,6 +13599,17 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
         return String(getParameterFieldValue("parameter_kpi_type") || "").trim().toLowerCase() === "individual";
       }
 
+     function isRoleParameterScope() {
+       return String(getParameterFieldValue("parameter_kpi_type") || "")
+       .trim()
+       .toLowerCase() === "role";
+      }
+
+    function isRoleApplyAllMode() {
+      return isRoleParameterScope() &&
+      String(getParameterFieldValue("parameter_role_target_mode") || "apply_all") === "apply_all";
+     }
+
       function syncParameterPlantOptions(preferredValue = "") {
         const plantSelect = document.getElementById("parameter_plant_id");
         if (!plantSelect) return;
@@ -13517,15 +13633,16 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
         setLookupSelectOptions("parameter_plant_id", unitOptions, "Select unit", selectedValue);
       }
 
-       function getParameterScopeKind() {
-         const type = String(getParameterFieldValue("parameter_kpi_type") || "")
-         .trim()
-         .toLowerCase();
+function getParameterScopeKind() {
+  const type = String(getParameterFieldValue("parameter_kpi_type") || "")
+    .trim()
+    .toLowerCase();
 
-        if (type === "zone") return "zone";
-        if (type === "product line") return "product_line";
-         return "unit";
-        }
+  if (type === "zone") return "zone";
+  if (type === "product line") return "product_line";
+  if (type === "role") return "role";
+  return "unit";
+}
 
       function getParameterRowStateKey(scopeType, scopeId) {
         const normalizedScopeType = String(scopeType || "unit").trim().toLowerCase() || "unit";
@@ -13559,11 +13676,15 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
       function resetParameterUnitTargetState() {
         parameterUnitTargetState = {};
       }
+        
+    function getRoleRowScopeId(unitId, peopleId) {
+    return String(unitId || "").trim() + ":" + String(peopleId || "").trim();
+   }
 
-function initializeParameterUnitTargetState(rows = []) {
-  resetParameterUnitTargetState();
+  function initializeParameterUnitTargetState(rows = []) {
+    resetParameterUnitTargetState();
 
-  (Array.isArray(rows) ? rows : []).forEach((row) => {
+   (Array.isArray(rows) ? rows : []).forEach((row) => {
     const isProductLine =
       String(row?.kpi_type || "").trim().toLowerCase() === "product line";
 
@@ -13595,13 +13716,19 @@ function initializeParameterUnitTargetState(rows = []) {
       }
     }
 
-    const scopeType = row?.product_line_id
-      ? "product_line"
-      : row?.zone_id
-        ? "zone"
-        : "unit";
+const normalizedKpiType = String(row?.kpi_type || "").trim().toLowerCase();
 
-    const scopeId = row?.product_line_id ?? row?.zone_id ?? row?.plant_id ?? row?.unit_id;
+const scopeType = normalizedKpiType === "role"
+  ? "role"
+  : row?.product_line_id
+    ? "product_line"
+    : row?.zone_id
+      ? "zone"
+      : "unit";
+
+const scopeId = normalizedKpiType === "role"
+  ? getRoleRowScopeId(row?.plant_id || row?.unit_id, row?.set_by_people_id)
+  : row?.product_line_id ?? row?.zone_id ?? row?.plant_id ?? row?.unit_id;
     if (!scopeId) return;
 
     setParameterUnitState(scopeType, scopeId, {
@@ -14225,12 +14352,14 @@ if (scopeKind !== "zone" && !parameterLockedUnitId) {
                 '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>' +
  
                 /* ── Target Value ── */
-                '<td>' +
-                  '<input class="parameter-unit-target-input"' +
-                    ' data-scope-kind="' + dk + '" data-scope-id="' + ds + '"' +
-                    ' type="number" step="any" placeholder="Enter target value"' +
-                    ' value="' + escapeHtml(state.target_value ?? "") + '" />' +
-                '</td>' +
+             '<td>' +
+            '<input class="parameter-unit-target-input"' +
+            ' data-scope-kind="' + dk + '" data-scope-id="' + ds + '"' +
+            ' type="number" step="any" placeholder="Enter target value"' +
+            ' value="' + escapeHtml(targetInputValue) + '"' +
+             targetInputReadonly +
+            ' />' +
+            '</td>' +
  
                 /* ── Setup Date ── */
                 '<td>' +
@@ -14383,6 +14512,42 @@ function populateAllocationLookupOptions(values = {}) {
 
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
+    if (scopeKind === "role") {
+    const roleId = getNormalizedParameterRoleId();
+    if (!roleId) return [];
+
+    const unitsById = new Map(
+      getParameterAllocationUnits().map(unit => [String(unit.value), unit])
+    );
+
+    return (allocationLookups.peopleRoleAssignments || [])
+      .filter(a => String(a.role_id || "") === String(roleId))
+      .filter(a => a.unit_id)
+      .map(a => {
+        const unit = unitsById.get(String(a.unit_id));
+        if (!unit) return null;
+
+        return {
+          row_kind: "role",
+          value: String(a.people_id),
+          people_id: String(a.people_id),
+          label: unit.label || "Unit " + a.unit_id,
+          unit_id: String(a.unit_id),
+          unit_type_id: unit.unit_type_id || null,
+          local_currency: unit.selling_currency || unit.operating_currency || "",
+          responsible_people_id: String(a.people_id),
+          responsible_label: a.label || getParameterPeopleLabel(a.people_id),
+          responsibles: [{
+            people_id: String(a.people_id),
+            label: a.label || getParameterPeopleLabel(a.people_id),
+            role_id: a.role_id,
+            role_name: a.role_name || "",
+            is_primary: Boolean(a.is_primary)
+          }]
+        };
+      });
+  }
+
 
   if (scopeKind === "zone") {
     const normalizedRoleId = getNormalizedParameterRoleId();
@@ -14499,6 +14664,43 @@ function getParameterUnitAllocationRows() {
     getParameterFieldValue("parameter_target_setup_date") ||
     getLocalDateInputValue();
 
+    if (isRoleParameterScope()) {
+  const applyAllTarget = String(getParameterFieldValue("parameter_target_value") || "").trim();
+
+  return getParameterVisibleUnitRows()
+    .map(scopeEntry => {
+      const state = getParameterUnitState("role", scopeEntry.value);
+      const targetValue = isRoleApplyAllMode()
+        ? applyAllTarget
+        : String(state.target_value ?? "").trim();
+
+      if (!targetValue) return null;
+
+      return {
+        kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
+        plant_id: scopeKind === "unit"
+          ? scopeId
+          : scopeKind === "role"
+          ? scopeEntry.unit_id
+          : null,
+        unit_id: null,
+        zone_id: null,
+        product_line_id: null,
+        product_id: null,
+        unit_type_id: scopeEntry.unit_type_id || null,
+        role_id: getNormalizedParameterRoleId() || null,
+        target_value: targetValue,
+        target_setup_date: normalizeParameterDateValue(state.target_setup_date) || fallbackSetupDate,
+        target_unit: kpiUnit,
+        local_currency: scopeEntry.local_currency || "",
+        set_by_people_id: scopeEntry.people_id || null,
+        last_best_target: String(state.last_best_target ?? "").trim(),
+        approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
+      };
+    })
+    .filter(Boolean);
+}
+
   return getParameterVisibleUnitRows()
     .map(function(scopeEntry) {
       const scopeKind = scopeEntry.row_kind || "unit";
@@ -14606,6 +14808,43 @@ function autoFillSetByFromUnit() {
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
+  if (scopeKind === "role") {
+    const roleId = getNormalizedParameterRoleId();
+    if (!roleId) return [];
+
+    const unitsById = new Map(
+      getParameterAllocationUnits().map(unit => [String(unit.value), unit])
+    );
+
+    return (allocationLookups.peopleRoleAssignments || [])
+      .filter(a => String(a.role_id || "") === String(roleId))
+      .filter(a => a.unit_id)
+      .map(a => {
+        const unit = unitsById.get(String(a.unit_id));
+         if (!unit) return null;
+        const peopleId = String(a.people_id || "").trim();
+
+        return {
+          row_kind: "role",
+          value: getRoleRowScopeId(a.unit_id, peopleId),
+          people_id: peopleId,
+          label: unit.label || "Unit " + a.unit_id,
+          unit_id: String(a.unit_id),
+          unit_type_id: unit.unit_type_id || null,
+          local_currency: unit.selling_currency || unit.operating_currency || "",
+          responsible_people_id: peopleId,
+          responsible_label: a.label || getParameterPeopleLabel(peopleId),
+          responsibles: [{
+            people_id: peopleId,
+            label: a.label || getParameterPeopleLabel(peopleId),
+            role_id: a.role_id,
+            role_name: a.role_name || "",
+            is_primary: Boolean(a.is_primary)
+          }]
+        };
+      })
+     .filter(Boolean);
+  }
 if (scopeKind === "product_line") {
   return (allocationLookups.productLines || []).map(productLine => ({
     row_kind: "product_line",
@@ -15130,6 +15369,16 @@ function getParameterUnitMetaText(unitEntry) {
   return parts.filter(Boolean).join(" • ");
 }
 
+
+function isValidParameterPlantId(unitId) {
+  const normalizedUnitId = String(unitId || "").trim();
+  if (!normalizedUnitId) return false;
+
+  return getParameterAllocationUnits().some(unit =>
+    String(unit.value || "") === normalizedUnitId
+  );
+}
+
 function getParameterUnitAllocationRows() {
   const kpiUnit = getParameterSelectedKpiUnit();
   const sharedSetByPeopleId = getParameterFieldValue("parameter_set_by_people_id") || "";
@@ -15147,6 +15396,49 @@ if (isIndividualParameterScope()) {
 
   if (!targetValue) return [];
 
+
+ if (isRoleParameterScope()) {
+  const applyAllTarget = String(getParameterFieldValue("parameter_target_value") || "").trim();
+
+  return getParameterVisibleUnitRows()
+    .map((scopeEntry) => {
+      const scopeId = String(scopeEntry.value || "").trim();
+      const state = getParameterUnitState("role", scopeId);
+
+      if (parameterEditMode && !state.kpi_target_allocation_id) {
+        return null;
+      }
+
+      if (!isValidParameterPlantId(scopeEntry.unit_id)) {
+        return null;
+      }
+
+      const targetValue = isRoleApplyAllMode()
+        ? (applyAllTarget || String(state.target_value ?? "").trim())
+        : String(state.target_value ?? "").trim();
+
+      if (!targetValue) return null;
+
+      return {
+        kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
+        plant_id: scopeEntry.unit_id,
+        zone_id: null,
+        unit_id: null,
+        product_line_id: null,
+        product_id: null,
+        unit_type_id: String(scopeEntry.unit_type_id || "").trim() || null,
+        role_id: getNormalizedParameterRoleId() || null,
+        target_value: targetValue,
+        target_setup_date: normalizeParameterDateValue(state.target_setup_date) || fallbackSetupDate,
+        target_unit: kpiUnit,
+        local_currency: scopeEntry.local_currency || "",
+        set_by_people_id: scopeEntry.people_id || null,
+        last_best_target: String(state.last_best_target ?? "").trim() || null,
+        approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
+      };
+    })
+    .filter(Boolean);
+}
   return [{
     kpi_target_allocation_id: String(existingState.kpi_target_allocation_id ?? "").trim() || null,
     plant_id: plantId || null,
@@ -15170,6 +15462,55 @@ if (isIndividualParameterScope()) {
   }];
 }
 
+if (isRoleParameterScope()) {
+  const applyAllTarget = String(getParameterFieldValue("parameter_target_value") || "").trim();
+
+  return getParameterVisibleUnitRows()
+    .map((scopeEntry) => {
+      const scopeId = String(scopeEntry.value || "").trim();
+      const state = getParameterUnitState("role", scopeId);
+
+      // In edit, update existing rows only. Do not insert new role rows.
+      if (parameterEditMode && !state.kpi_target_allocation_id) {
+        return null;
+      }
+
+      if (!isValidParameterPlantId(scopeEntry.unit_id)) {
+       console.warn("Invalid role unit_id skipped:", scopeEntry);
+       return null;
+      }
+
+      const targetValue = isRoleApplyAllMode()
+        ? (applyAllTarget || String(state.target_value ?? "").trim())
+        : String(state.target_value ?? "").trim();
+
+      if (!targetValue) return null;
+
+      return {
+        kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
+        plant_id: isValidParameterPlantId(scopeEntry.unit_id)
+         ? String(scopeEntry.unit_id)
+         : null,
+        zone_id: null,
+        unit_id: null,
+        product_line_id: null,
+        product_id: null,
+        unit_type_id: String(scopeEntry.unit_type_id || "").trim() || null,
+        role_id: getNormalizedParameterRoleId() || null,
+        target_value: targetValue,
+        target_setup_date:
+          normalizeParameterDateValue(state.target_setup_date) ||
+          fallbackSetupDate,
+        target_unit: kpiUnit,
+        local_currency: scopeEntry.local_currency || "",
+        set_by_people_id: scopeEntry.people_id || null,
+        last_best_target: String(state.last_best_target ?? "").trim() || null,
+        approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
+      };
+    })
+    .filter(Boolean);
+}
+
   return getParameterVisibleUnitRows()
     .map((scopeEntry) => {
       const scopeKind = scopeEntry.row_kind || "unit";
@@ -15190,8 +15531,10 @@ if (isIndividualParameterScope()) {
       product_line_id: null,
        unit_id: null,
         product_id: scopeKind === "zone" || scopeKind === "product_line" ? null : getParameterFieldValue("parameter_product_id"),
-        unit_type_id: scopeKind === "unit" ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || "")) : null,
-        role_id: scopeKind === "zone" ? null : (sharedRoleId || null),
+        unit_type_id: scopeKind === "unit" || scopeKind === "role"
+        ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
+        : null,
+         role_id: scopeKind === "zone" ? null : (sharedRoleId || null),
         target_value: targetValue,
         target_setup_date: targetSetupDate,
         target_unit: kpiUnit,
@@ -15350,7 +15693,14 @@ async function lookupZoneFromManufacturingStrategy() {
 function syncParameterScopePresentation() {
   const scopeKind   = getParameterScopeKind();
   const isZoneScope = scopeKind === "zone";
- 
+ const isRoleScope = scopeKind === "role";
+const selectedRoleId = getNormalizedParameterRoleId();
+
+toggleScopedParameterField(
+  "parameter_role_mode_field",
+  isRoleScope,
+  { clearOnHide: false }
+);
   const kpiType      = getParameterFieldValue("parameter_kpi_type").toLowerCase();
   const hasKpiType   = Boolean(String(getParameterFieldValue("parameter_kpi_type") || "").trim());
   const isIndividual = kpiType === "individual";
@@ -15370,6 +15720,7 @@ function syncParameterScopePresentation() {
   if (allocSection) {
     allocSection.classList.toggle("is-hidden", !isIndividual);
     allocSection.classList.toggle("is-individual-layout", isIndividual);
+    allocSection.classList.toggle("is-hidden", isRoleScope || !isIndividual);
     allocSection.setAttribute("aria-hidden", String(!isIndividual));
     Array.from(allocSection.querySelectorAll("input, select, textarea")).forEach((field) => {
       field.disabled = !isIndividual;
@@ -15380,7 +15731,11 @@ function syncParameterScopePresentation() {
   toggleScopedParameterField("parameter_multisite_matrix_field", !isIndividual);
  
   /* ── scope fields: Multisite only in the latest Individual layout ── */
-  toggleScopedParameterField("parameter_unit_type_field", !isZoneScope && !isIndividual && !isProductLineScope, { clearOnHide: false });
+  toggleScopedParameterField(
+  "parameter_unit_type_field",
+  !isZoneScope && !isIndividual && !isProductLineScope && !isRoleScope,
+  { clearOnHide: false }
+   );
   toggleScopedParameterField("parameter_role_field", hasKpiType && !isZoneScope && !isProductLineScope, { clearOnHide: false });
   toggleScopedParameterField("parameter_product_line_field", isProductLineScope, { clearOnHide: false });
   toggleScopedParameterField("parameter_plant_field",     false, { clearOnHide: false });
@@ -15449,6 +15804,18 @@ if (isZoneScope) {
     if (tableBadge) tableBadge.textContent = "Zone View";
     return;
   }
+
+  if (isRoleScope) {
+  parameterLockedZoneId = "";
+
+  if (tableLabel) tableLabel.textContent = "Role Target Table";
+  if (tableHint) tableHint.textContent = "Select a role, then enter targets for related people.";
+  if (tableCopy) tableCopy.textContent =
+    "The table below lists all units that have the selected role assigned. Apply All uses one shared target. Individual mode lets you enter a different target for each person.";
+  if (tableBadge) tableBadge.textContent = "Role View";
+
+  return;
+}
  
   parameterLockedZoneId = "";
   if (tableLabel) tableLabel.textContent = "Unit Target Table";
@@ -15477,12 +15844,15 @@ function renderMultisiteUnitMatrix() {
   const selectedUnitTypeId = getParameterFieldValue("parameter_unit_type_id");
   const selectedRoleId = getParameterFieldValue("parameter_role_id");
   const selectedKpiUnit = getParameterSelectedKpiUnit();
-  const scopeLabel =
+  
+ const scopeLabel =
   scopeKind === "zone"
     ? "Zone"
     : scopeKind === "product_line"
       ? "Product Line"
-      : "Unit";
+      : scopeKind === "role"
+        ? "Unit"
+        : "Unit";
 
   if (!selectedKpiId) {
     renderParameterTableEmptyState("Select a KPI name to load the KPI unit and available target rows.");
@@ -15492,6 +15862,7 @@ function renderMultisiteUnitMatrix() {
 if (
   scopeKind !== "zone" &&
   scopeKind !== "product_line" &&
+  scopeKind !== "role" &&
   !selectedUnitTypeId &&
   !parameterLockedUnitId
 ) {
@@ -15536,6 +15907,14 @@ if (
             const scopeId = String(scopeEntry.value || "");
             const scopeEntryKind = scopeEntry.row_kind || "unit";
             const state = getParameterUnitState(scopeEntryKind, scopeId);
+            const targetInputValue = isRoleApplyAllMode()
+            ? (
+            getParameterFieldValue("parameter_target_value") ||
+            state.target_value ||
+             ""
+             )
+            : (state.target_value ?? "");
+            const targetInputReadonly = "";
             const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
             const responsibleLabel = resolvedResponsible?.label || "";
             const responsibleNote = getParameterResponsibleCellNote(scopeEntry, resolvedResponsible);
@@ -15562,8 +15941,7 @@ if (
                 '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>' +
                 '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
                 '<td>' +
-                  '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(state.target_value ?? "") + '" />' +
-                '</td>' +
+                  '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(targetInputValue) + '" />' +
                 '<td>' +
                   '<input class="parameter-unit-setup-date-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="date" value="' + escapeHtml(normalizeParameterDateValue(state.target_setup_date ?? getParameterFieldValue("parameter_target_setup_date")) || getLocalDateInputValue()) + '" />' +
                 '</td>' +
@@ -15577,14 +15955,40 @@ if (
       '</table>' +
     '</div>';
 
-  Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((input) => {
-    input.addEventListener("input", (event) => {
-      const scopeKind = event.target.getAttribute("data-scope-kind");
-      const scopeId = event.target.getAttribute("data-scope-id");
-      setParameterUnitState(scopeKind, scopeId, { target_value: event.target.value });
+Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((input) => {
+  input.addEventListener("input", (event) => {
+    const value = event.target.value;
+
+    if (isRoleApplyAllMode()) {
+      matrixEl.querySelectorAll(".parameter-unit-target-input").forEach((targetInput) => {
+        targetInput.value = value;
+      });
+
+      const mainTargetInput = document.getElementById("parameter_target_value");
+      if (mainTargetInput) {
+        mainTargetInput.value = value;
+      }
+
+      getParameterVisibleUnitRows().forEach((row) => {
+        setParameterUnitState(row.row_kind || "unit", row.value, {
+          target_value: value
+        });
+      });
+
       syncPrimaryParameterFieldsFromTable();
+      return;
+    }
+
+    const scopeKind = event.target.getAttribute("data-scope-kind");
+    const scopeId = event.target.getAttribute("data-scope-id");
+
+    setParameterUnitState(scopeKind, scopeId, {
+      target_value: value
     });
+
+    syncPrimaryParameterFieldsFromTable();
   });
+});
 
   Array.from(matrixEl.querySelectorAll(".parameter-unit-setup-date-input")).forEach((input) => {
     input.addEventListener("change", (event) => {
@@ -16658,24 +17062,45 @@ function getCurrentKpiRowById(kpiId) {
         parameterSearchInput.dataset.bound = "true";
       }
 
-      function buildParameterAllocationGroupKey(row) {
-        return [
-          row.kpi_id || "",
-          String(row.kpi_type || "").trim().toLowerCase(),
-          row.unit_type_id || "",
-          row.role_id || "",
-          String(row.function || "").trim().toLowerCase(),
-          row.product_id || "",
-          row.product_line_id || "",
-          row.market_id || "",
-          row.customer_id || "",
-          row.created_by_people_id || "",
-          row.created_at || ""
-        ].join("::");
-      }
+function buildParameterAllocationGroupKey(row) {
+  const type = String(row.kpi_type || "").trim().toLowerCase();
+  const creationMarker =
+    String(row.created_at || "").trim() ||
+    normalizeParameterDateValue(row.target_setup_date) ||
+    ("allocation:" + String(row.kpi_target_allocation_id || "").trim());
+
+  return [
+    row.kpi_id || "",
+    type,
+    row.unit_type_id || "",
+    row.role_id || "",
+    String(row.function || "").trim().toLowerCase(),
+    row.product_id || "",
+    row.product_line_id || "",
+    row.market_id || "",
+    row.customer_id || "",
+    row.created_by_people_id || "",
+    creationMarker
+  ].join("::");
+}
 
       function buildParameterAllocationScopeKey(row) {
         if (!row || typeof row !== "object") return "";
+
+        const normalizedType = String(row.kpi_type || "").trim().toLowerCase();
+        if (normalizedType === "role") {
+          const roleUnitId = String(row.plant_id || row.unit_id || "").trim();
+          const rolePeopleId = String(
+            row.set_by_people_id || row.responsible_people_id || ""
+          ).trim();
+
+          if (roleUnitId || rolePeopleId) {
+            return ["role", roleUnitId, rolePeopleId].join(":");
+          }
+        }
+
+        const productLineId = String(row.product_line_id || "").trim();
+        if (productLineId) return "product_line:" + productLineId;
 
         const zoneId = String(row.zone_id || "").trim();
         if (zoneId) return "zone:" + zoneId;
@@ -16787,6 +17212,7 @@ function getCurrentKpiRowById(kpiId) {
 
       function buildParameterSearchFields(row) {
         const primaryFields = [
+          row.kpi_subject,
           row.kpi_name,
           row.kpi_group,
           row.role_name,
@@ -16796,6 +17222,7 @@ function getCurrentKpiRowById(kpiId) {
 
         const relatedFields = Array.isArray(row.related_allocations)
           ? row.related_allocations.flatMap((allocationRow) => [
+              allocationRow?.kpi_subject,
               allocationRow?.kpi_name,
               allocationRow?.kpi_group,
               allocationRow?.role_name,
@@ -16898,6 +17325,61 @@ function getCurrentKpiRowById(kpiId) {
         return "General";
       }
 
+      function getParameterSubjectPath(row) {
+        return String(row?.kpi_subject || row?.kpi_group || row?.kpi_name || "").trim();
+      }
+
+      function getParameterSubjectGroupKey(row) {
+        const subjectPath = getParameterSubjectPath(row);
+        if (subjectPath) {
+          return "subject:" + subjectPath.toLowerCase();
+        }
+
+        return "subject:unassigned:" + String(row?.kpi_id || row?.kpi_target_allocation_id || "");
+      }
+
+      function getParameterSubjectDisplayName(row) {
+        const subjectPath = getParameterSubjectPath(row);
+        return getLastPathSegment(subjectPath) || subjectPath || "No KPI hierarchy attached";
+      }
+
+      function groupParameterRowsBySubject(rows) {
+        const sourceRows = Array.isArray(rows) ? rows : [];
+        const groupedSubjects = new Map();
+
+        sourceRows.forEach((row) => {
+          const subjectKey = getParameterSubjectGroupKey(row);
+          if (!groupedSubjects.has(subjectKey)) {
+            groupedSubjects.set(subjectKey, {
+              key: subjectKey,
+              subject_path: getParameterSubjectPath(row),
+              subject_name: getParameterSubjectDisplayName(row),
+              rows: []
+            });
+          }
+
+          groupedSubjects.get(subjectKey).rows.push(row);
+        });
+
+        return Array.from(groupedSubjects.values()).map((group) => ({
+          ...group,
+          allocation_count: group.rows.length
+        }));
+      }
+
+      function toggleParameterSubjectGroup(subjectKey) {
+        const normalizedKey = String(subjectKey || "").trim();
+        if (!normalizedKey) return;
+
+        if (expandedParameterSubjectKeys.has(normalizedKey)) {
+          expandedParameterSubjectKeys.delete(normalizedKey);
+        } else {
+          expandedParameterSubjectKeys.add(normalizedKey);
+        }
+
+        renderParameterKpis(currentParameterRows);
+      }
+
       function buildParameterScopeSummary(row) {
         const groupedRowCount = Number(
           row.group_row_count ||
@@ -16955,15 +17437,34 @@ function getCurrentKpiRowById(kpiId) {
         return parts.map((part) => part.charAt(0).toUpperCase()).join("");
       }
 
-      function updateParameterResultsMeta(visibleCount, totalCount = visibleCount) {
+      function updateParameterResultsMeta(
+        visibleCount,
+        totalCount = visibleCount,
+        visibleSubjectCount = null,
+        totalSubjectCount = visibleSubjectCount
+      ) {
         const metaEl = document.getElementById("parameterResultsMeta");
         if (!metaEl) return;
 
         const shown = Number.isFinite(visibleCount) ? visibleCount : 0;
         const total = Number.isFinite(totalCount) ? totalCount : shown;
+        const shownSubjects = Number.isFinite(visibleSubjectCount) ? visibleSubjectCount : null;
+        const totalSubjects = Number.isFinite(totalSubjectCount) ? totalSubjectCount : shownSubjects;
 
         if (!shown) {
+          if (shownSubjects !== null) {
+            metaEl.textContent = totalSubjects && totalSubjects > 0 ? "No matching subjects" : "0 subjects";
+            return;
+          }
+
           metaEl.textContent = total > 0 ? "No matching allocations" : "0 allocations";
+          return;
+        }
+
+        if (shownSubjects !== null) {
+          metaEl.textContent = shown === total
+            ? shownSubjects + " subject" + (shownSubjects === 1 ? "" : "s") + " • " + shown + " allocation" + (shown === 1 ? "" : "s")
+            : shownSubjects + " subject" + (shownSubjects === 1 ? "" : "s") + " • " + shown + " of " + total + " allocations";
           return;
         }
 
@@ -16991,9 +17492,14 @@ function getExpectedMultisiteTargetCount(row = {}) {
         currentParameterRows = rows || [];
         const parameterGrid = document.getElementById("parameterGrid");
         if (!parameterGrid) return;
+        const subjectGroups = groupParameterRowsBySubject(currentParameterRows);
+        const totalAllocationCount = Array.isArray(parameterSourceRows) ? parameterSourceRows.length : currentParameterRows.length;
+        const totalSubjectCount = groupParameterRowsBySubject(parameterSourceRows).length;
         updateParameterResultsMeta(
           currentParameterRows.length,
-          Array.isArray(parameterSourceRows) ? parameterSourceRows.length : currentParameterRows.length
+          totalAllocationCount,
+          subjectGroups.length,
+          totalSubjectCount
         );
 
         if (!currentParameterRows.length) {
@@ -17002,10 +17508,11 @@ function getExpectedMultisiteTargetCount(row = {}) {
         }
 
         const visibleCount = currentParameterRows.length;
-        const totalCount = Array.isArray(parameterSourceRows) ? parameterSourceRows.length : visibleCount;
+        const totalCount = totalAllocationCount;
+        const visibleSubjectCount = subjectGroups.length;
         const footerText = visibleCount === totalCount
-          ? 'Showing ' + visibleCount + ' allocation' + (visibleCount === 1 ? '' : 's')
-          : 'Showing ' + visibleCount + ' of ' + totalCount + ' allocations';
+          ? 'Showing ' + visibleSubjectCount + ' subject' + (visibleSubjectCount === 1 ? '' : 's') + ' • ' + visibleCount + ' allocation' + (visibleCount === 1 ? '' : 's')
+          : 'Showing ' + visibleSubjectCount + ' subject' + (visibleSubjectCount === 1 ? '' : 's') + ' • ' + visibleCount + ' of ' + totalCount + ' allocations';
 
         parameterGrid.innerHTML = \`
           <div class="parameter-matrix-table-shell">
@@ -17013,7 +17520,7 @@ function getExpectedMultisiteTargetCount(row = {}) {
               <table class="parameter-matrix-table">
                 <thead>
                   <tr>
-                    <th>KPI Name</th>
+                    <th>Subject / KPI</th>
                     <th>Type</th>
                     <th>Role</th>
                     <th>Frequency</th>
@@ -17022,89 +17529,112 @@ function getExpectedMultisiteTargetCount(row = {}) {
                   </tr>
                 </thead>
                 <tbody>
-                  \${currentParameterRows.map(row => \`
-                    <tr>
-                      <td>
-                        <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_name || row.kpi_group || "Linked KPI")}</div>
-                        <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_subject || row.kpi_group || "No KPI hierarchy attached")}</div>
-                      </td>
-                      <td>
-                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.kpi_type || "Not Set")}</div>
-                        <div class="parameter-matrix-cell-sub">\${escapeHtml([
-                          buildParameterScopeSummary(row),
-                          row.local_currency
-                        ].filter(Boolean).join(" • ") || "No KPI type context")}</div>
-                      </td>
-                      <td>
-                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.role_name || "Not Set")}</div>
-                        <div class="parameter-matrix-cell-sub">\${escapeHtml([
-                          row.unit_type_name,
-                          row.function
-                        ].filter(Boolean).join(" • ") || "No role linked")}</div>
-                      </td>
-                      <td>
-                        <div class="parameter-matrix-cell-main">\${escapeHtml(row.frequency || "-")}</div>
-                        <div class="parameter-matrix-cell-sub">\${escapeHtml(row.frequency ? "Frequency from selected KPI" : "No frequency linked")}</div>
-                      </td>
-                      <td>
-               <div class="parameter-matrix-target-main">\${escapeHtml(
-              String(row.kpi_type || "").trim().toLowerCase() === "multisite"
-               ? String(getExpectedMultisiteTargetCount(row)) + " unit targets"
-                : (
-               Number(row.group_row_count || 0) > 1
-               ? String(row.group_row_count) + " " + getParameterGroupedScopeKindLabel(row, 1) + " targets"
-               : (formatParameterDisplayValue(row.target_value) + (row.target_unit ? " " + row.target_unit : ""))
-                )
-              )}</div>
-                        <div class="parameter-matrix-target-sub">\${escapeHtml([
-                          row.kpi_type,
-                          String(row.kpi_type || "").trim().toLowerCase() === "multisite"
-                         ? String(getExpectedMultisiteTargetCount(row)) + " linked rows"
-                         : (Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " linked rows" : ''),
-                          row.target_setup_date ? 'Setup ' + formatParameterDisplayDate(row.target_setup_date) : '',
-                          row.target_start_date ? 'Start ' + formatParameterDisplayDate(row.target_start_date) : '',
-                          row.target_end_date ? 'End ' + formatParameterDisplayDate(row.target_end_date) : ''
-                        ].filter(Boolean).join(" • ") || "Target allocation")}</div>
-                      </td>
-                      <td class="parameter-table-actions">
-                        <div class="parameter-actions">
-                          <button
-                            type="button"
-                            class="action-btn edit-btn parameter-action-btn"
-                            onclick="openEditParameterModal(\${row.kpi_target_allocation_id})"
-                            aria-label="Edit allocation"
-                            title="Edit allocation"
-                          >
-                            <svg viewBox="0 0 24 24" aria-hidden="true">
-                              <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
-                              <path d="M13.5 6.5l4 4"></path>
-                            </svg>
-                          </button>
-                          <button
-                            type="button"
-                            class="action-btn delete-btn parameter-action-btn"
-                            onclick="deleteGroupedParameterKpi(\${row.kpi_target_allocation_id})"
-                            aria-label="Delete allocation"
-                            title="Delete allocation"
-                          >
-                            <svg viewBox="0 0 24 24" aria-hidden="true">
-                              <path d="M3 6h18"></path>
-                              <path d="M8 6V4h8v2"></path>
-                              <path d="M19 6l-1 14H6L5 6"></path>
-                              <path d="M10 11v6"></path>
-                              <path d="M14 11v6"></path>
-                            </svg>
-                          </button>
-                        </div>
+                  \${subjectGroups.map(group => {
+                    const isExpanded = expandedParameterSubjectKeys.has(group.key);
+                    return \`
+                    <tr class="parameter-subject-row">
+                      <td colspan="6">
+                        <button
+                          type="button"
+                          class="parameter-subject-toggle"
+                          data-subject-key="\${escapeHtml(group.key)}"
+                          onclick="toggleParameterSubjectGroup(this.dataset.subjectKey)"
+                          aria-expanded="\${isExpanded ? "true" : "false"}"
+                        >
+                          <span class="parameter-subject-chevron">\${isExpanded ? "▾" : "▸"}</span>
+                          <span class="parameter-subject-summary">
+                            <span class="parameter-subject-title">\${escapeHtml(group.subject_name || "No KPI hierarchy attached")}</span>
+                            <span class="parameter-subject-path">\${escapeHtml(group.subject_path || "No KPI hierarchy attached")}</span>
+                          </span>
+                          <span class="parameter-subject-count">\${escapeHtml(group.allocation_count + " KPI" + (group.allocation_count === 1 ? "" : "s"))}</span>
+                        </button>
                       </td>
                     </tr>
-                  \`).join("")}
+                    \${isExpanded ? group.rows.map(row => \`
+                      <tr class="parameter-subject-child-row">
+                        <td>
+                          <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_group || row.kpi_name || "Linked KPI")}</div>
+                          <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_name && row.kpi_group && row.kpi_name !== row.kpi_group ? row.kpi_name : (row.kpi_subject || row.kpi_group || "No KPI hierarchy attached"))}</div>
+                        </td>
+                        <td>
+                          <div class="parameter-matrix-cell-main">\${escapeHtml(row.kpi_type || "Not Set")}</div>
+                          <div class="parameter-matrix-cell-sub">\${escapeHtml([
+                            buildParameterScopeSummary(row),
+                            row.local_currency
+                          ].filter(Boolean).join(" • ") || "No KPI type context")}</div>
+                        </td>
+                        <td>
+                          <div class="parameter-matrix-cell-main">\${escapeHtml(row.role_name || "Not Set")}</div>
+                          <div class="parameter-matrix-cell-sub">\${escapeHtml([
+                            row.unit_type_name,
+                            row.function
+                          ].filter(Boolean).join(" • ") || "No role linked")}</div>
+                        </td>
+                        <td>
+                          <div class="parameter-matrix-cell-main">\${escapeHtml(row.frequency || "-")}</div>
+                          <div class="parameter-matrix-cell-sub">\${escapeHtml(row.frequency ? "Frequency from selected KPI" : "No frequency linked")}</div>
+                        </td>
+                        <td>
+                          <div class="parameter-matrix-target-main">\${escapeHtml(
+                            String(row.kpi_type || "").trim().toLowerCase() === "multisite"
+                              ? String(getExpectedMultisiteTargetCount(row)) + " unit targets"
+                              : (
+                                Number(row.group_row_count || 0) > 1
+                                  ? String(row.group_row_count) + " " + getParameterGroupedScopeKindLabel(row, 1) + " targets"
+                                  : (formatParameterDisplayValue(row.target_value) + (row.target_unit ? " " + row.target_unit : ""))
+                              )
+                          )}</div>
+                          <div class="parameter-matrix-target-sub">\${escapeHtml([
+                            row.kpi_type,
+                            String(row.kpi_type || "").trim().toLowerCase() === "multisite"
+                              ? String(getExpectedMultisiteTargetCount(row)) + " linked rows"
+                              : (Number(row.group_row_count || 0) > 1 ? String(row.group_row_count) + " linked rows" : ''),
+                            row.target_setup_date ? 'Setup ' + formatParameterDisplayDate(row.target_setup_date) : '',
+                            row.target_start_date ? 'Start ' + formatParameterDisplayDate(row.target_start_date) : '',
+                            row.target_end_date ? 'End ' + formatParameterDisplayDate(row.target_end_date) : ''
+                          ].filter(Boolean).join(" • ") || "Target allocation")}</div>
+                        </td>
+                        <td class="parameter-table-actions">
+                          <div class="parameter-actions">
+                            <button
+                              type="button"
+                              class="action-btn edit-btn parameter-action-btn"
+                              onclick="openEditParameterModal(\${row.kpi_target_allocation_id})"
+                              aria-label="Edit allocation"
+                              title="Edit allocation"
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
+                                <path d="M13.5 6.5l4 4"></path>
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              class="action-btn delete-btn parameter-action-btn"
+                              onclick="deleteGroupedParameterKpi(\${row.kpi_target_allocation_id})"
+                              aria-label="Delete allocation"
+                              title="Delete allocation"
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M3 6h18"></path>
+                                <path d="M8 6V4h8v2"></path>
+                                <path d="M19 6l-1 14H6L5 6"></path>
+                                <path d="M10 11v6"></path>
+                                <path d="M14 11v6"></path>
+                              </svg>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    \`).join("") : ""}
+                  \`;
+                  }).join("")}
                 </tbody>
               </table>
             </div>
             <div class="parameter-matrix-footer">
               <span>\${escapeHtml(footerText)}</span>
-              <span>Target allocation matrix</span>
+              <span>Target allocation matrix grouped by subject</span>
             </div>
           </div>
         \`;
@@ -19027,6 +19557,21 @@ updateParameterOverview();
 updateParameterKpiSummary();
       }
 
+      function inferRoleTargetMode(rows = []) {
+  const roleRows = (Array.isArray(rows) ? rows : [])
+    .filter(row => String(row?.kpi_type || "").trim().toLowerCase() === "role");
+
+  if (roleRows.length <= 1) {
+    return "individual";
+  }
+
+  const targetValues = new Set(
+    roleRows.map(row => String(row?.target_value ?? "").trim())
+  );
+
+  return targetValues.size === 1 ? "apply_all" : "individual";
+}
+
       function fillParameterForm(data) {
         const relatedAllocations = Array.isArray(data?.related_allocations) && data.related_allocations.length
           ? data.related_allocations
@@ -19036,10 +19581,11 @@ updateParameterKpiSummary();
             (row) => String(row?.kpi_target_allocation_id || "") === String(data?.kpi_target_allocation_id || "")
           ) || relatedAllocations[0] || data;
          const normalizedKpiType = String(primaryRow?.kpi_type || "").trim().toLowerCase();
-         const isGroupedScope =
-          normalizedKpiType === "multisite" ||
-          normalizedKpiType === "zone" ||
-          normalizedKpiType === "product line";
+        const isGroupedScope =
+        normalizedKpiType === "multisite" ||
+        normalizedKpiType === "zone" ||
+        normalizedKpiType === "product line" ||
+        normalizedKpiType === "role";
 
         const mappings = {
           parameter_object_id: primaryRow.kpi_target_allocation_id,
@@ -19047,6 +19593,10 @@ updateParameterKpiSummary();
           parameter_kpi_type: primaryRow.kpi_type,
           parameter_unit_type_id: primaryRow.unit_type_id,
           parameter_role_id: primaryRow.role_id,
+          parameter_role_target_mode:
+          primaryRow.role_target_mode ||
+          primaryRow.assignment_mode ||
+          inferRoleTargetMode(relatedAllocations),
           parameter_target_status: primaryRow.target_status,
           parameter_plant_id: primaryRow.plant_id,
           parameter_zone_id: primaryRow.zone_id,
@@ -19088,6 +19638,19 @@ updateParameterKpiSummary();
       parameterResolvedZoneId = "";
      }
       initializeParameterUnitTargetState(relatedAllocations);
+      if (normalizedKpiType === "role") {
+      parameterLockedUnitId = "";
+      parameterLockedZoneId = "";
+      parameterLockedZoneIds = [];
+
+    const modeEl = document.getElementById("parameter_role_target_mode");
+     if (modeEl) {
+      modeEl.value =
+      primaryRow.role_target_mode ||
+      primaryRow.assignment_mode ||
+      inferRoleTargetMode(relatedAllocations);
+     }
+   }
        populateAllocationLookupOptions(mappings);
 
      if (normalizedKpiType === "zone") {
@@ -19277,13 +19840,12 @@ function buildParameterPayload() {
   const scopeKind = getParameterScopeKind();
   const isIndividualScope = isIndividualParameterScope();
 
- let unitAllocations =
-  scopeKind === "product_line"
-    ? [buildSingleProductLineAllocationRow()]
-    : getParameterUnitAllocationRows();
+  let unitAllocations =
+    scopeKind === "product_line"
+      ? [buildSingleProductLineAllocationRow()]
+      : getParameterUnitAllocationRows();
 
   const primaryAllocation = unitAllocations[0] || null;
-
   const existingAllocationIds = getParameterAllocationIdsForDelete(
     getParameterFieldValue("parameter_object_id"),
     { preferFormState: true }
@@ -19304,8 +19866,13 @@ function buildParameterPayload() {
         ? null
         : getParameterFieldValue("parameter_unit_type_id"),
 
-    role_id: roleId,
-    target_status: getParameterFieldValue("parameter_target_status"),
+     role_id: roleId,
+
+     role_target_mode: isRoleParameterScope()
+       ? getParameterFieldValue("parameter_role_target_mode")
+       : null,
+
+     target_status: getParameterFieldValue("parameter_target_status"),
 
     plant_id:
       scopeKind === "product_line"
@@ -19395,8 +19962,9 @@ function buildParameterPayload() {
      return;
     } 
 
-  if (
+if (
   !isIndividualParameterScope() &&
+  !isRoleParameterScope() &&
   scopeKind !== "zone" &&
   scopeKind !== "product_line" &&
   !getParameterFieldValue("parameter_unit_type_id") &&
@@ -19431,10 +19999,44 @@ const rowsToValidate =
     ? visibleRows.slice(0, 1)
     : visibleRows;
 
-const missingRow = rowsToValidate.find((row) => {
-  const state = getParameterUnitState(row.row_kind || "unit", row.value);
-  return !String(state.target_value ?? "").trim();
-});
+let missingRow = null;
+
+if (isRoleParameterScope() && isRoleApplyAllMode()) {
+  const targetVal = String(getParameterFieldValue("parameter_target_value") || "").trim();
+
+  if (!targetVal || isNaN(Number(targetVal))) {
+    showToast("Target Value is required for Apply All mode.");
+    const tvInput = document.getElementById("parameter_target_value");
+    if (tvInput) tvInput.focus();
+    return;
+  }
+} else {
+  missingRow = rowsToValidate.find((row) => {
+    const state = getParameterUnitState(row.row_kind || "unit", row.value);
+    return !String(state.target_value ?? "").trim();
+  });
+
+  if (missingRow) {
+    showToast(
+      isRoleParameterScope()
+        ? "Target Value is required for every role row."
+        : scopeKind === "zone"
+          ? "Target Value is required for every zone."
+          : "Target Value is required for every unit."
+    );
+
+    const input = document.querySelector(
+      '.parameter-unit-target-input[data-scope-id="' + CSS.escape(String(missingRow.value)) + '"]'
+    );
+
+    if (input) {
+      input.focus();
+      input.reportValidity();
+    }
+
+    return;
+  }
+}
 
 if (missingRow) {
   showToast(
@@ -19458,6 +20060,11 @@ if (missingRow) {
     }
 
     const payload = buildParameterPayload();
+
+    if (isRoleParameterScope() && !payload.unit_allocations.length) {
+     showToast("No valid unit found for this role. Check people-role assignment unit_id.");
+      return;
+     }
     parameterSavePending = true;
     setParameterSaveLoading(true);
 
@@ -19659,6 +20266,14 @@ const parameterRoleSelect = document.getElementById("parameter_role_id");
   });
 
   syncParameterRoleDropdown();
+}
+
+const parameterRoleTargetModeSelect = document.getElementById("parameter_role_target_mode");
+if (parameterRoleTargetModeSelect) {
+  parameterRoleTargetModeSelect.addEventListener("change", () => {
+    syncParameterScopePresentation();
+    renderMultisiteUnitMatrix();
+  });
 }
 
 const parameterProductLineSelect = document.getElementById("parameter_product_line_id");
@@ -20195,8 +20810,12 @@ const getDotColor = (value, lowLimit, highLimit, direction = 'up') =>
   getKpiStatus(value, lowLimit, highLimit, direction).color;
 
 const getDashboardSubmissionStatus = (kpi) => {
-  const currentValue = parseMetricNumber(kpi?.value);
-  const targetValue = parseMetricNumber(kpi?.target);
+  const currentValue = normalizeMetricNumberByUnit(kpi?.value, kpi?.unit);
+  const targetValue = normalizeMetricNumberByUnit(kpi?.target, kpi?.unit);
+  const lowLimit = normalizeMetricNumberByUnit(kpi?.low_limit, kpi?.unit);
+  const highLimit = normalizeMetricNumberByUnit(kpi?.high_limit, kpi?.unit);
+  const resolvedDirection = inferKpiDirection(kpi);
+  const { lowerBound, upperBound } = getKpiBounds(lowLimit, highLimit);
 
   if (currentValue === null) {
     return {
@@ -20204,7 +20823,30 @@ const getDashboardSubmissionStatus = (kpi) => {
       isGood: null,
       minimumTargetValue: null,
       targetValue,
+      lowerBound,
+      upperBound,
+      direction: resolvedDirection,
       mode: "pending"
+    };
+  }
+
+  const canUseDirectionalLimit =
+    resolvedDirection === "down"
+      ? upperBound !== null
+      : lowerBound !== null;
+
+  if (canUseDirectionalLimit) {
+    const limitStatus = getKpiStatus(currentValue, lowLimit, highLimit, resolvedDirection);
+
+    return {
+      color: limitStatus.color,
+      isGood: limitStatus.isGood,
+      minimumTargetValue: null,
+      targetValue,
+      lowerBound: limitStatus.lowerBound,
+      upperBound: limitStatus.upperBound,
+      direction: limitStatus.direction,
+      mode: "limit"
     };
   }
 
@@ -20220,16 +20862,14 @@ const getDashboardSubmissionStatus = (kpi) => {
       isGood: currentValue >= minimumTargetValue,
       minimumTargetValue,
       targetValue,
+      lowerBound,
+      upperBound,
+      direction: resolvedDirection,
       mode: "target"
     };
   }
 
-  const fallbackStatus = getKpiStatus(
-    currentValue,
-    parseMetricNumber(kpi?.low_limit),
-    parseMetricNumber(kpi?.high_limit),
-    inferKpiDirection(kpi)
-  );
+  const fallbackStatus = getKpiStatus(currentValue, lowLimit, highLimit, resolvedDirection);
 
   return {
     ...fallbackStatus,
@@ -25760,6 +26400,9 @@ app.post("/redirect", async (req, res) => {
           COALESCE(kta.target_unit, k.unit) AS effective_unit,
           k.low_limit,
           k.high_limit,
+          k.tolerance_type,
+          k.low_tolerance,
+          k.up_tolerance,
           k.target_direction,
           COALESCE(k.kpi_name, k.kpi_sub_title, 'KPI') AS kpi_name,
           COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject_name
@@ -25783,6 +26426,23 @@ app.post("/redirect", async (req, res) => {
 
       const allocation = allocationRes.rows[0];
       const kpiId = allocation.kpi_id;
+      const submissionStatusInfo = getDashboardSubmissionStatus({
+        value: numericValue,
+        target: allocation.effective_target_value,
+        unit: allocation.effective_unit,
+        low_limit: allocation.low_limit,
+        high_limit: allocation.high_limit,
+        tolerance_type: allocation.tolerance_type,
+        low_tolerance: allocation.low_tolerance,
+        up_tolerance: allocation.up_tolerance,
+        target_direction: allocation.target_direction,
+        subject: allocation.subject_name,
+        indicator_sub_title: allocation.kpi_name,
+        kpi_id: allocation.kpi_id
+      });
+      const computedResultStatus = submissionStatusInfo.isGood === false
+        ? "Needs attention"
+        : "On track";
       const submittedActions = correctiveActionsEnabled
         ? getSubmittedCorrectiveActions(
           values,
@@ -25841,7 +26501,7 @@ app.post("/redirect", async (req, res) => {
             allocation.last_best_target,
             allocation.effective_unit,
             allocation.kpi_type,
-            "Recorded",
+            computedResultStatus,
             "Manual form",
             recordedByPeopleId,
             commentText
@@ -25885,7 +26545,7 @@ app.post("/redirect", async (req, res) => {
             allocation.last_best_target,
             allocation.effective_unit,
             allocation.kpi_type,
-            "Recorded",
+            computedResultStatus,
             "Manual form",
             recordedByPeopleId,
             commentText
@@ -25924,11 +26584,12 @@ app.post("/redirect", async (req, res) => {
       .sc{background:#fff;padding:40px;border-radius:10px;text-align:center;max-width:600px;}
       .ni{display:flex;align-items:center;margin:10px 0;padding:10px;background:white;border-radius:6px;}
       .btn{display:inline-block;padding:12px 25px;background:#0078D7;color:white;
-           text-decoration:none;border-radius:6px;font-weight:bold;margin:5px;}</style></head>
+           text-decoration:none;border-radius:6px;font-weight:bold;margin:5px;}
+      .btn-secondary{background:#0f172a;}</style></head>
       <body><div class="sc">
         <h1 style="color:#28a745;">KPI Submitted Successfully!</h1>
         <p>Your KPI values for ${normalizedWeek} have been saved.</p>
-     
+        <a href="/form?responsible_id=${encodeURIComponent(responsible_id)}&week=${encodeURIComponent(normalizedWeek)}" class="btn btn-secondary">Back to KPI Form</a>
         <a href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}" class="btn">Go to Dashboard</a>
       </div></body></html>`);
   } catch (err) {
@@ -31950,6 +32611,18 @@ app.get("/dashboard", async (req, res) => {
     const monthSummaryByKey = new Map(monthSummaries.map((summary) => [summary.monthKey, summary]));
     const selectedMonthSummary = monthSummaries[0] || null;
     const selectedMonthKey = selectedMonthSummary?.monthKey || "";
+    const latestSubmittedRow = kpiRes.rows
+      .slice()
+      .sort((left, right) => {
+        const leftTime = new Date(left?.updated_at || left?.result_date || 0).getTime();
+        const rightTime = new Date(right?.updated_at || right?.result_date || 0).getTime();
+        return rightTime - leftTime;
+      })
+      .find((row) => normalizeOptionalTextInput(row?.week || row?.period_label));
+    const dashboardFormWeek =
+      normalizeOptionalTextInput(latestSubmittedRow?.week || latestSubmittedRow?.period_label) ||
+      getCurrentFormWeek();
+    const kpiFormUrl = `/form?responsible_id=${encodeURIComponent(responsible_id)}&week=${encodeURIComponent(dashboardFormWeek)}`;
     const monthOptionsHtml = monthSummaries
       .map((summary) =>
         `<option value="${escapeHtml(summary.monthKey)}"${summary.monthKey === selectedMonthKey ? " selected" : ""}>${escapeHtml(summary.monthLabel)}${summary.isLatest ? " - Latest" : ""}</option>`
@@ -32048,6 +32721,31 @@ app.get("/dashboard", async (req, res) => {
       grid-template-columns:repeat(3,minmax(0,1fr));
       gap:14px;
       margin-bottom:20px;
+    }
+    .content-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:12px;
+      margin-bottom:20px;
+    }
+    .content-action-btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      min-height:48px;
+      padding:0 18px;
+      border-radius:16px;
+      background:linear-gradient(135deg, var(--brand) 0%, #2894ff 100%);
+      color:#ffffff;
+      text-decoration:none;
+      font-size:14px;
+      font-weight:700;
+      box-shadow:0 14px 24px rgba(15,108,189,0.18);
+      transition:transform 0.18s ease, box-shadow 0.18s ease;
+    }
+    .content-action-btn:hover{
+      transform:translateY(-1px);
+      box-shadow:0 18px 30px rgba(15,108,189,0.22);
     }
     .identity-card{
       padding:18px 18px 16px;
@@ -32393,6 +33091,12 @@ app.get("/dashboard", async (req, res) => {
         flex-direction:column;
         align-items:flex-start;
       }
+      .content-actions{
+        justify-content:stretch;
+      }
+      .content-action-btn{
+        width:100%;
+      }
       .month-filter{
         width:100%;
         min-width:0;
@@ -32430,6 +33134,10 @@ app.get("/dashboard", async (req, res) => {
           <div class="identity-label">Department</div>
           <div class="identity-value">${escapeHtml(responsible.department_name || "-")}</div>
         </div>
+      </div>
+
+      <div class="content-actions">
+        <a class="content-action-btn" href="${escapeHtml(kpiFormUrl)}">Back to KPI Form</a>
       </div>`;
 
     if (sortedMonthEntries.length === 0) {
@@ -32463,12 +33171,12 @@ app.get("/dashboard", async (req, res) => {
           <div class="active-stat">
             <div class="active-stat-label">Needs Attention</div>
             <strong id="activeMonthAlertCount">${selectedMonthSummary?.alertCount ?? 0}</strong>
-            <small>KPIs currently outside their expected direction</small>
+            <small>Submitted KPI cards currently shown in red</small>
           </div>
           <div class="active-stat">
             <div class="active-stat-label">On Track</div>
             <strong id="activeMonthHealthyCount">${selectedMonthSummary?.onTrackCount ?? 0}</strong>
-            <small>KPIs aligned with their expected direction</small>
+            <small>Submitted KPI cards currently shown in green</small>
           </div>
           <div class="active-stat">
             <div class="active-stat-label">Last Update</div>
@@ -32495,7 +33203,7 @@ app.get("/dashboard", async (req, res) => {
               </div>
             </div>
             <div class="month-badges">
-              <div class="month-badge"><strong>${summary?.alertCount ?? 0}</strong> need attention</div>
+              <div class="month-badge"><strong>${summary?.alertCount ?? 0}</strong> needs attention</div>
               <div class="month-badge"><strong>${summary?.onTrackCount ?? 0}</strong> on track</div>
               <div class="month-badge"><strong>${escapeHtml(summary?.lastUpdated || "No updates")}</strong></div>
             </div>
@@ -36726,6 +37434,56 @@ ensureCorrectiveActionEscalationSchema()
   });
 
 const KPI_TRAINING_DEFAULT_TEST_DUE_DAYS = 7;
+const KPI_TRAINING_REMINDER_INTERVAL_DAYS = 7;
+const KPI_TRAINING_RESPONSIBLE_REMINDER_COUNT = 3;
+const KPI_TRAINING_EXECUTIVE_ESCALATION_DELAY_DAYS = 15;
+const KPI_TRAINING_MIN_VALIDATION_SCORE = 80;
+const KPI_TRAINING_PENDING_VALIDATION_STATUSES = [
+  "training_assigned",
+  "training_sent",
+  "training_done",
+  "test_sent",
+  "test_overdue",
+  "completed_fail",
+  "escalated"
+];
+const KPI_TRAINING_PENDING_VALIDATION_STATUS_SET = new Set(
+  KPI_TRAINING_PENDING_VALIDATION_STATUSES
+);
+const KPI_TRAINING_EXECUTIVE_ROLE_LOOKUP_NAMES = [
+  "ceo",
+  "vp finance"
+];
+const KPI_TRAINING_RESPONSIBLE_REMINDER_STAGES = [
+  {
+    key: "responsible_reminder_1",
+    label: "Reminder 1/3",
+    reminderNumber: 1,
+    escalationLevel: 1
+  },
+  {
+    key: "responsible_reminder_2",
+    label: "Reminder 2/3",
+    reminderNumber: 2,
+    escalationLevel: 2
+  },
+  {
+    key: "responsible_reminder_3",
+    label: "Reminder 3/3",
+    reminderNumber: 3,
+    escalationLevel: 3
+  }
+];
+const KPI_TRAINING_MANAGER_ESCALATION_STAGE = {
+  key: "direct_manager_escalation",
+  label: "Direct manager escalation",
+  escalationLevel: 4
+};
+const KPI_TRAINING_EXECUTIVE_ESCALATION_STAGE = {
+  key: "executive_escalation",
+  label: "Executive escalation",
+  escalationLevel: 5
+};
 const KPI_TRAINING_COMPLETED_STATUSES = new Set([
   "training_assigned",
   "training_sent",
@@ -36750,6 +37508,7 @@ const KPI_TRAINING_TEST_COMPLETED_STATUSES = new Set([
   "completed_pass",
   "completed_fail"
 ]);
+let kpiTrainingEscalationSchemaPromise = null;
 
 const formatIsoTimestampValue = (value) => {
   if (!value) return null;
@@ -37731,7 +38490,14 @@ const loadKpiTrainingPortalRows = async ({
       ktr.answers_json,
       ktr.status,
       ktr.score,
-      ktr.passed,
+      COALESCE(
+        ktr.passed,
+        CASE
+          WHEN ktr.score IS NULL THEN NULL
+          WHEN ktr.score >= GREATEST(COALESCE(ktest.pass_score, 80), 80) THEN TRUE
+          ELSE FALSE
+        END
+      ) AS passed,
       ktr.escalation_level,
       ktr.test_due_date,
       ktr.training_sent_at,
@@ -37951,8 +38717,13 @@ app.post("/api/kpi-training/results/:resultId/test-submit", async (req, res) => 
         test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
         answers_json = $3::jsonb,
         score = $4,
+        passed = $5,
         test_completed_at = NOW(),
-        status = $5,
+        next_reminder_due_at = CASE
+          WHEN $5::boolean = TRUE THEN NULL
+          ELSE COALESCE(next_reminder_due_at, NOW() + ($2::int * INTERVAL '1 day'))
+        END,
+        status = $6,
         updated_at = NOW()
       WHERE result_id = $1
       `,
@@ -37961,6 +38732,7 @@ app.post("/api/kpi-training/results/:resultId/test-submit", async (req, res) => 
         KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
         JSON.stringify(answersPayload),
         grading.score,
+        passed,
         passed ? "completed_pass" : "completed_fail"
       ]
     );
@@ -37986,6 +38758,16 @@ app.get("/api/kpi-training/results", async (req, res) => {
     const { status, kpi_id, people_id, passed } = req.query;
     const conditions = [];
     const params = [];
+    const passedExpression = `
+      COALESCE(
+        ktr.passed,
+        CASE
+          WHEN ktr.score IS NULL THEN NULL
+          WHEN ktr.score >= GREATEST(COALESCE(ktest.pass_score, 80), 80) THEN TRUE
+          ELSE FALSE
+        END
+      )
+    `;
 
     if (normalizeOptionalTextInput(status)) {
       params.push(status); conditions.push(`ktr.status = $${params.length}`);
@@ -37996,8 +38778,8 @@ app.get("/api/kpi-training/results", async (req, res) => {
     if (normalizeOptionalIntegerInput(people_id)) {
       params.push(parseInt(people_id)); conditions.push(`ktr.people_id = $${params.length}`);
     }
-    if (passed === "true") conditions.push(`ktr.passed = true`);
-    if (passed === "false") conditions.push(`ktr.passed = false`);
+    if (passed === "true") conditions.push(`${passedExpression} = TRUE`);
+    if (passed === "false") conditions.push(`${passedExpression} = FALSE`);
 
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -38020,7 +38802,14 @@ app.get("/api/kpi-training/results", async (req, res) => {
         ktest.pass_score,
         ktr.status,
         ktr.score,
-        ktr.passed,
+        COALESCE(
+          ktr.passed,
+          CASE
+            WHEN ktr.score IS NULL THEN NULL
+            WHEN ktr.score >= GREATEST(COALESCE(ktest.pass_score, 80), 80) THEN TRUE
+            ELSE FALSE
+          END
+        ) AS passed,
         ktr.escalation_level,
         ktr.test_due_date,
         ktr.training_sent_at,
@@ -38080,12 +38869,29 @@ app.get("/api/kpi-training/stats", async (req, res) => {
     const { rows } = await pool.query(`
       SELECT
         COUNT(*)                                                               AS total,
-        COUNT(*) FILTER (WHERE passed = true)                                 AS passed_count,
+        COUNT(*) FILTER (
+          WHERE (
+            CASE
+              WHEN ktr.score IS NULL THEN COALESCE(ktr.passed, false)
+              WHEN ktr.score >= GREATEST(COALESCE(ktest.pass_score, 80), 80) THEN TRUE
+              ELSE FALSE
+            END
+          ) = TRUE
+        )                                                                     AS passed_count,
         COUNT(*) FILTER (WHERE score IS NOT NULL)                             AS tested_count,
         ROUND(AVG(score) FILTER (WHERE score IS NOT NULL), 1)                 AS avg_score,
         COUNT(*) FILTER (WHERE status IN ('test_overdue','escalated'))         AS overdue_escalated,
-        COUNT(*) FILTER (WHERE status IN ('training_sent','training_done','test_sent')) AS pending
-      FROM public.kpi_training_result
+        COUNT(*) FILTER (
+          WHERE status IN ('training_assigned','training_sent','training_done','test_sent','completed_fail')
+            AND NOT (
+              status = 'training_done'
+              AND ktr.test_id IS NULL
+              AND ktr.training_completed_at IS NOT NULL
+            )
+        )                                                                     AS pending
+      FROM public.kpi_training_result ktr
+      LEFT JOIN public.kpi_test ktest
+        ON ktest.test_id = ktr.test_id
     `);
     const r = rows[0] || {};
     res.json({
@@ -38104,11 +38910,961 @@ app.get("/api/kpi-training/stats", async (req, res) => {
   }
 });
 
-async function sendKpiTrainingLinksToResponsibles() {
-  const appBaseUrl = (
+const getKpiTrainingAppBaseUrl = () =>
+  (
     normalizeOptionalTextInput(process.env.APP_BASE_URL) ||
-    "https://kpi-form.azurewebsites.net"
+    `http://localhost:${port}`
   ).replace(/\/+$/, "");
+
+const normalizeKpiTrainingRoleLookupName = (value) =>
+  String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const getKpiTrainingRequiredValidationScore = (row = {}) => {
+  const configuredPassScore = Number(row.pass_score);
+  return Number.isFinite(configuredPassScore)
+    ? Math.max(KPI_TRAINING_MIN_VALIDATION_SCORE, configuredPassScore)
+    : KPI_TRAINING_MIN_VALIDATION_SCORE;
+};
+
+const isKpiTrainingValidationPending = (row = {}) => {
+  const status = normalizeOptionalTextInput(row.status) || "";
+  const hasLinkedTest = Boolean(normalizeOptionalIntegerInput(row.test_id));
+  const score = row.score === null || row.score === undefined ? null : Number(row.score);
+  const requiredScore = getKpiTrainingRequiredValidationScore(row);
+
+  if (!hasLinkedTest && (status === "training_done" || row.training_completed_at)) {
+    return false;
+  }
+
+  if (Number.isFinite(score)) {
+    return score < requiredScore;
+  }
+
+  if (row.passed === true || status === "completed_pass") {
+    return false;
+  }
+
+  return KPI_TRAINING_PENDING_VALIDATION_STATUS_SET.has(status) || !status;
+};
+
+const getKpiTrainingLifecycleAnchor = (row = {}) =>
+  row.training_sent_at || row.created_at || null;
+
+const addDaysToTimestamp = (value, days) => {
+  if (!value) return null;
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setDate(date.getDate() + Number(days || 0));
+  return date;
+};
+
+const isTimestampDue = (value, now = new Date()) => {
+  if (!value) return false;
+  const date = value instanceof Date ? value : new Date(value);
+  return !Number.isNaN(date.getTime()) && date.getTime() <= now.getTime();
+};
+
+const formatKpiTrainingPercent = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Number.isInteger(parsed) ? `${parsed}%` : `${parsed.toFixed(1)}%`;
+};
+
+const buildKpiTrainingValidationStatusText = (row = {}) => {
+  const scoreLabel = formatKpiTrainingPercent(row.score);
+  const requiredScore = getKpiTrainingRequiredValidationScore(row);
+  const status = normalizeOptionalTextInput(row.status) || "training_assigned";
+
+  if (scoreLabel) {
+    return `Latest result: ${scoreLabel}. Minimum required score: ${requiredScore}%.`;
+  }
+
+  if (status === "training_done") {
+    return "Training content is complete, but validation is still pending.";
+  }
+
+  if (status === "test_sent" || status === "test_overdue") {
+    return "The assessment is still pending.";
+  }
+
+  return "The training has not been validated yet.";
+};
+
+const buildKpiTrainingPortalUrl = (row = {}) => {
+  const peopleId = normalizeOptionalIntegerInput(row.people_id);
+  const resultId = normalizeOptionalIntegerInput(row.result_id);
+  const params = new URLSearchParams();
+
+  if (peopleId) {
+    params.set("people_id", String(peopleId));
+  }
+
+  if (resultId) {
+    params.set("result_id", String(resultId));
+  }
+
+  const baseUrl = `${getKpiTrainingAppBaseUrl()}/kpi-training-center`;
+  const queryString = params.toString();
+  return queryString ? `${baseUrl}?${queryString}` : baseUrl;
+};
+
+const buildKpiTrainingDashboardUrl = () =>
+  `${getKpiTrainingAppBaseUrl()}/kpi-training-dashboard`;
+
+const buildKpiTrainingNotificationRowsHtml = (rows = []) =>
+  rows
+    .filter((row) => normalizeOptionalTextInput(row?.value))
+    .map(
+      (row) => `
+        <tr>
+          <td style="padding:11px 14px;background:#f8fafc;color:#475569;font-weight:700;width:180px;border-top:1px solid #e2e8f0;">${escapeHtml(row.label)}</td>
+          <td style="padding:11px 14px;color:#0f172a;border-top:1px solid #e2e8f0;">${escapeHtml(row.value)}</td>
+        </tr>`
+    )
+    .join("");
+
+const buildKpiTrainingNotificationEmailHtml = ({
+  eyebrow,
+  title,
+  greeting,
+  introHtml,
+  summaryRows = [],
+  actionLabel = null,
+  actionUrl = null,
+  accentStart = "#1d4ed8",
+  accentEnd = "#0f766e",
+  footerHtml = null
+}) => {
+  const summaryRowsHtml = buildKpiTrainingNotificationRowsHtml(summaryRows);
+  const actionBlock =
+    normalizeOptionalTextInput(actionLabel) && normalizeOptionalTextInput(actionUrl)
+      ? `
+        <div style="margin:26px 0 0;">
+          <a href="${escapeHtml(actionUrl)}" style="display:inline-block;background:${accentStart};color:#ffffff;text-decoration:none;padding:13px 20px;border-radius:999px;font-weight:700;font-size:14px;">
+            ${escapeHtml(actionLabel)}
+          </a>
+        </div>
+        <div style="margin-top:10px;font-size:12px;line-height:1.6;color:#64748b;">${escapeHtml(actionUrl)}</div>`
+      : "";
+  const summaryBlock = summaryRowsHtml
+    ? `
+      <div style="margin-top:22px;font-size:12px;font-weight:800;letter-spacing:0.10em;text-transform:uppercase;color:#64748b;">
+        Summary
+      </div>
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin-top:12px;border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;">
+        ${summaryRowsHtml}
+      </table>`
+    : "";
+
+  return `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+      <title>${escapeHtml(title)}</title>
+    </head>
+    <body style="margin:0;padding:0;background:#edf2f7;font-family:'Segoe UI',Arial,sans-serif;color:#0f172a;">
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;background:#edf2f7;">
+        <tr>
+          <td align="center" style="padding:26px 16px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width:760px;width:100%;border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #dbe3ee;border-radius:26px;overflow:hidden;box-shadow:0 24px 60px rgba(15,23,42,0.10);">
+              <tr>
+                <td style="padding:0;background:${accentStart};background-image:linear-gradient(135deg, ${accentStart}, ${accentEnd});">
+                  <div style="padding:30px 32px 28px;">
+                    <div style="display:inline-block;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,0.16);border:1px solid rgba(255,255,255,0.18);font-size:11px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;color:#ffffff;">
+                      ${escapeHtml(eyebrow)}
+                    </div>
+                    <h1 style="margin:18px 0 0;font-size:30px;line-height:1.18;color:#ffffff;letter-spacing:-0.03em;">
+                      ${escapeHtml(title)}
+                    </h1>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:28px 32px 32px;">
+                  <div style="font-size:15px;line-height:1.8;color:#1e293b;">
+                    <div style="font-weight:700;margin-bottom:12px;">${escapeHtml(greeting)}</div>
+                    ${introHtml}
+                  </div>
+                  ${summaryBlock}
+                  ${actionBlock}
+                  <div style="margin-top:26px;padding-top:18px;border-top:1px solid #e2e8f0;font-size:13px;line-height:1.8;color:#64748b;">
+                    ${footerHtml || "This notification was sent automatically by the AVOCarbon KPI Training workflow."}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>`;
+};
+
+const buildResponsibleTrainingReminderEmailHtml = ({
+  row,
+  stage,
+  responsibleName,
+  portalUrl
+}) => {
+  const requiredScore = getKpiTrainingRequiredValidationScore(row);
+  const sentOnLabel = formatDisplayDate(row.training_sent_at || row.created_at);
+
+  return buildKpiTrainingNotificationEmailHtml({
+    eyebrow: stage.label,
+    title: "KPI training validation pending",
+    greeting: `Hello ${responsibleName},`,
+    introHtml: `
+      <p style="margin:0 0 12px;">${escapeHtml(stage.label)}. Your KPI training assignment is still waiting for validation.</p>
+      <p style="margin:0 0 12px;">${escapeHtml(buildKpiTrainingValidationStatusText(row))}</p>
+      <p style="margin:0;">If the training is still not validated after 3 weekly reminders, your direct manager will be notified automatically.</p>`,
+    summaryRows: [
+      {
+        label: "Training",
+        value: normalizeOptionalTextInput(row.training_name) || `Training #${row.training_id}`
+      },
+      {
+        label: "KPI",
+        value: normalizeOptionalTextInput(row.kpi_name) || `KPI #${row.kpi_id}`
+      },
+      {
+        label: "Current status",
+        value: normalizeOptionalTextInput(row.status) || "training_assigned"
+      },
+      {
+        label: "Required score",
+        value: `${requiredScore}%`
+      },
+      {
+        label: "Assignment sent",
+        value: sentOnLabel
+      }
+    ],
+    actionLabel: "Open My KPI Training",
+    actionUrl: portalUrl,
+    accentStart: "#1d4ed8",
+    accentEnd: "#0f766e"
+  });
+};
+
+const buildManagerTrainingEscalationEmailHtml = ({
+  row,
+  managerName,
+  dashboardUrl
+}) => {
+  const responsibleName =
+    normalizeOptionalTextInput(row.people_name) ||
+    `Responsible #${row.people_id}`;
+  const trainingName =
+    normalizeOptionalTextInput(row.training_name) ||
+    `Training #${row.training_id}`;
+
+  return buildKpiTrainingNotificationEmailHtml({
+    eyebrow: KPI_TRAINING_MANAGER_ESCALATION_STAGE.label,
+    title: "Training escalation requires your action",
+    greeting: `Bonjour ${managerName},`,
+    introHtml: `
+      <p style="margin:0 0 12px;">${escapeHtml(responsibleName)} n'a pas valide la formation ${escapeHtml(trainingName)} apres 3 relances.</p>
+      <p style="margin:0 0 12px;">Ceci demande une action de votre part.</p>
+      <p style="margin:0;">Sans validation sous ${KPI_TRAINING_EXECUTIVE_ESCALATION_DELAY_DAYS} jours, le cas sera remonte a la direction generale du groupe.</p>`,
+    summaryRows: [
+      {
+        label: "Responsible",
+        value: responsibleName
+      },
+      {
+        label: "Training",
+        value: trainingName
+      },
+      {
+        label: "KPI",
+        value: normalizeOptionalTextInput(row.kpi_name) || `KPI #${row.kpi_id}`
+      },
+      {
+        label: "Current result",
+        value: buildKpiTrainingValidationStatusText(row)
+      },
+      {
+        label: "Last reminder sent",
+        value: formatDisplayDate(row.last_reminder_sent_at || row.updated_at)
+      }
+    ],
+    actionLabel: "Open Training Dashboard",
+    actionUrl: dashboardUrl,
+    accentStart: "#b45309",
+    accentEnd: "#dc2626",
+    footerHtml: "Merci d'avance pour votre support.<br />Training manager"
+  });
+};
+
+const buildExecutiveTrainingEscalationEmailHtml = ({
+  row,
+  executiveAnchorDate,
+  dashboardUrl
+}) => {
+  const responsibleName =
+    normalizeOptionalTextInput(row.people_name) ||
+    `Responsible #${row.people_id}`;
+  const trainingName =
+    normalizeOptionalTextInput(row.training_name) ||
+    `Training #${row.training_id}`;
+
+  return buildKpiTrainingNotificationEmailHtml({
+    eyebrow: KPI_TRAINING_EXECUTIVE_ESCALATION_STAGE.label,
+    title: "Final KPI training escalation",
+    greeting: "Bonjour,",
+    introHtml: `
+      <p style="margin:0 0 12px;">${escapeHtml(responsibleName)} n'a toujours pas valide la formation ${escapeHtml(trainingName)}.</p>
+      <p style="margin:0 0 12px;">Le dossier reste ouvert ${KPI_TRAINING_EXECUTIVE_ESCALATION_DELAY_DAYS} jours apres l'escalade manageriale.</p>
+      <p style="margin:0;">Merci de prendre les actions necessaires au niveau groupe.</p>`,
+    summaryRows: [
+      {
+        label: "Responsible",
+        value: responsibleName
+      },
+      {
+        label: "Training",
+        value: trainingName
+      },
+      {
+        label: "KPI",
+        value: normalizeOptionalTextInput(row.kpi_name) || `KPI #${row.kpi_id}`
+      },
+      {
+        label: "Current result",
+        value: buildKpiTrainingValidationStatusText(row)
+      },
+      {
+        label: "Manager escalation sent",
+        value: formatDisplayDate(executiveAnchorDate)
+      }
+    ],
+    actionLabel: "Open Training Dashboard",
+    actionUrl: dashboardUrl,
+    accentStart: "#7f1d1d",
+    accentEnd: "#991b1b"
+  });
+};
+
+const ensureKpiTrainingEscalationSchema = async () => {
+  if (!kpiTrainingEscalationSchemaPromise) {
+    kpiTrainingEscalationSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS public.kpi_training_escalation_log (
+          training_escalation_id BIGSERIAL PRIMARY KEY,
+          result_id BIGINT NOT NULL,
+          people_id BIGINT,
+          escalation_stage TEXT NOT NULL,
+          sent_to_email TEXT NOT NULL,
+          sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          CONSTRAINT uq_kpi_training_escalation_log
+            UNIQUE (result_id, escalation_stage, sent_to_email)
+        )
+      `);
+
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_kpi_training_escalation_log_result
+        ON public.kpi_training_escalation_log (result_id, sent_at DESC)
+      `);
+    })().catch((error) => {
+      kpiTrainingEscalationSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return kpiTrainingEscalationSchemaPromise;
+};
+
+const loadKpiTrainingEscalationLogMap = async (resultIds = []) => {
+  const normalizedResultIds = resultIds
+    .map((value) => normalizeOptionalIntegerInput(value))
+    .filter(Boolean);
+
+  if (!normalizedResultIds.length) {
+    return new Map();
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      result_id,
+      escalation_stage,
+      sent_to_email,
+      sent_at
+    FROM public.kpi_training_escalation_log
+    WHERE result_id = ANY($1::bigint[])
+    ORDER BY sent_at ASC
+    `,
+    [normalizedResultIds]
+  );
+
+  return result.rows.reduce((accumulator, row) => {
+    const resultId = Number(row.result_id);
+    if (!accumulator.has(resultId)) {
+      accumulator.set(resultId, {});
+    }
+
+    const stageLogMap = accumulator.get(resultId);
+    if (!Array.isArray(stageLogMap[row.escalation_stage])) {
+      stageLogMap[row.escalation_stage] = [];
+    }
+
+    stageLogMap[row.escalation_stage].push({
+      sent_to_email: normalizeOptionalTextInput(row.sent_to_email),
+      sent_at: row.sent_at
+    });
+
+    return accumulator;
+  }, new Map());
+};
+
+const getKpiTrainingStageLogEntries = (stageLogMap = {}, stageKey = "") =>
+  Array.isArray(stageLogMap?.[stageKey]) ? stageLogMap[stageKey] : [];
+
+const getLatestKpiTrainingStageSentAt = (stageLogMap = {}, stageKey = "") => {
+  const entries = getKpiTrainingStageLogEntries(stageLogMap, stageKey);
+  if (!entries.length) return null;
+
+  return entries.reduce((latest, entry) => {
+    if (!latest) return entry.sent_at;
+    return new Date(entry.sent_at).getTime() > new Date(latest).getTime()
+      ? entry.sent_at
+      : latest;
+  }, null);
+};
+
+const getKpiTrainingReminderCount = (stageLogMap = {}) =>
+  KPI_TRAINING_RESPONSIBLE_REMINDER_STAGES.reduce(
+    (count, stage) =>
+      count + (getKpiTrainingStageLogEntries(stageLogMap, stage.key).length ? 1 : 0),
+    0
+  );
+
+const loadKpiTrainingReminderCandidates = async () => {
+  await ensureKpiTrainingEscalationSchema();
+
+  const result = await pool.query(
+    `
+    SELECT
+      ktr.result_id,
+      ktr.people_id,
+      ktr.training_id,
+      ktr.test_id,
+      ktr.kpi_id,
+      NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
+      p.email AS people_email,
+      COALESCE(k.kpi_sub_title, k.kpi_name, 'KPI #' || ktr.kpi_id) AS kpi_name,
+      COALESCE(kt.training_name, 'Training #' || ktr.training_id) AS training_name,
+      COALESCE(ktest.pass_score, $2::numeric) AS pass_score,
+      COALESCE(ktr.status, 'training_assigned') AS status,
+      ktr.score,
+      COALESCE(
+        ktr.passed,
+        CASE
+          WHEN ktr.score IS NULL THEN NULL
+          WHEN ktr.score >= GREATEST(COALESCE(ktest.pass_score, 80), 80) THEN TRUE
+          ELSE FALSE
+        END
+      ) AS passed,
+      ktr.escalation_level,
+      ktr.training_sent_at,
+      ktr.training_completed_at,
+      ktr.test_sent_at,
+      ktr.test_completed_at,
+      ktr.last_reminder_sent_at,
+      ktr.next_reminder_due_at,
+      ktr.created_at,
+      ktr.updated_at
+    FROM public.kpi_training_result ktr
+    LEFT JOIN public.people p
+      ON p.people_id = ktr.people_id
+    LEFT JOIN public.kpi k
+      ON k.kpi_id = ktr.kpi_id
+    LEFT JOIN public.kpi_training kt
+      ON kt.training_id = ktr.training_id
+    LEFT JOIN public.kpi_test ktest
+      ON ktest.test_id = ktr.test_id
+    WHERE COALESCE(ktr.status, 'training_assigned') = ANY($1::text[])
+    ORDER BY
+      COALESCE(ktr.next_reminder_due_at, ktr.training_sent_at, ktr.created_at) ASC NULLS LAST,
+      ktr.result_id ASC
+    `,
+    [
+      KPI_TRAINING_PENDING_VALIDATION_STATUSES,
+      KPI_TRAINING_MIN_VALIDATION_SCORE
+    ]
+  );
+
+  return result.rows;
+};
+
+const getDirectManagerRecipient = async (peopleId) => {
+  const hierarchy = await getPeopleHierarchy(peopleId);
+  const directManager = Array.isArray(hierarchy) ? hierarchy[1] : null;
+  const managerEmail = normalizeOptionalTextInput(directManager?.email);
+
+  if (!directManager || !managerEmail) {
+    return null;
+  }
+
+  return {
+    people_id: normalizeOptionalIntegerInput(directManager.people_id),
+    name:
+      getPeopleDisplayName(directManager) ||
+      managerEmail,
+    email: managerEmail,
+    role_name: normalizeOptionalTextInput(directManager.role_name) || "Manager"
+  };
+};
+
+const loadKpiTrainingRoleRecipients = async (roleLookupNames = []) => {
+  const normalizedTargets = new Set(
+    roleLookupNames
+      .map((entry) => normalizeKpiTrainingRoleLookupName(entry))
+      .filter(Boolean)
+  );
+
+  if (!normalizedTargets.size) {
+    return [];
+  }
+
+  const result = await pool.query(`
+    SELECT
+      p.people_id,
+      p.first_name,
+      p.name,
+      p.email,
+      r.role_name,
+      r.normalized_role_name,
+      pra.assignment_id,
+      COALESCE(pra.is_primary, false) AS is_primary
+    FROM public.people_role_assignment pra
+    JOIN public.people p
+      ON p.people_id = pra.people_id
+    JOIN public.role r
+      ON r.role_id = pra.role_id
+    WHERE COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+      AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      AND COALESCE(TRIM(p.email), '') <> ''
+    ORDER BY
+      COALESCE(pra.is_primary, false) DESC,
+      pra.allocation_percentage DESC NULLS LAST,
+      pra.start_date DESC NULLS LAST,
+      pra.assignment_id DESC
+  `);
+
+  const recipientsByEmail = new Map();
+
+  result.rows.forEach((row) => {
+    const email = normalizeOptionalTextInput(row.email);
+    if (!email) return;
+
+    const normalizedRoleNames = [
+      normalizeKpiTrainingRoleLookupName(row.normalized_role_name),
+      normalizeKpiTrainingRoleLookupName(row.role_name)
+    ].filter(Boolean);
+
+    if (!normalizedRoleNames.some((name) => normalizedTargets.has(name))) {
+      return;
+    }
+
+    const emailKey = email.toLowerCase();
+    if (recipientsByEmail.has(emailKey)) {
+      return;
+    }
+
+    recipientsByEmail.set(emailKey, {
+      people_id: normalizeOptionalIntegerInput(row.people_id),
+      name: getPeopleDisplayName(row) || email,
+      email,
+      role_name: normalizeOptionalTextInput(row.role_name) || ""
+    });
+  });
+
+  return [...recipientsByEmail.values()];
+};
+
+const resolveNextKpiTrainingNotification = async ({
+  row,
+  stageLogMap = {},
+  executiveRecipients = [],
+  managerRecipientCache,
+  now = new Date()
+}) => {
+  if (!isKpiTrainingValidationPending(row)) {
+    return null;
+  }
+
+  const anchor = getKpiTrainingLifecycleAnchor(row);
+  if (!anchor) {
+    return null;
+  }
+
+  const reminderCount = getKpiTrainingReminderCount(stageLogMap);
+  const responsibleEmail = normalizeOptionalTextInput(row.people_email);
+  const responsibleName =
+    normalizeOptionalTextInput(row.people_name) ||
+    `Responsible #${row.people_id}`;
+
+  if (reminderCount < KPI_TRAINING_RESPONSIBLE_REMINDER_COUNT) {
+    const stage = KPI_TRAINING_RESPONSIBLE_REMINDER_STAGES[reminderCount];
+    const defaultDueAt = reminderCount === 0
+      ? addDaysToTimestamp(anchor, KPI_TRAINING_REMINDER_INTERVAL_DAYS)
+      : addDaysToTimestamp(
+        row.last_reminder_sent_at || anchor,
+        KPI_TRAINING_REMINDER_INTERVAL_DAYS
+      );
+    const dueAt = row.next_reminder_due_at || defaultDueAt;
+
+    if (responsibleEmail && isTimestampDue(dueAt, now)) {
+      return {
+        stage,
+        recipients: [
+          {
+            people_id: normalizeOptionalIntegerInput(row.people_id),
+            name: responsibleName,
+            email: responsibleEmail,
+            role_name: "Responsible"
+          }
+        ]
+      };
+    }
+  }
+
+  const managerFallbackDueAt = addDaysToTimestamp(
+    anchor,
+    KPI_TRAINING_REMINDER_INTERVAL_DAYS * KPI_TRAINING_RESPONSIBLE_REMINDER_COUNT
+  );
+  const canEscalateToManager =
+    reminderCount >= KPI_TRAINING_RESPONSIBLE_REMINDER_COUNT ||
+    (!responsibleEmail && isTimestampDue(managerFallbackDueAt, now));
+
+  if (
+    canEscalateToManager &&
+    !getKpiTrainingStageLogEntries(stageLogMap, KPI_TRAINING_MANAGER_ESCALATION_STAGE.key).length
+  ) {
+    const peopleId = normalizeOptionalIntegerInput(row.people_id);
+    let managerRecipient = managerRecipientCache.get(peopleId);
+
+    if (managerRecipient === undefined) {
+      managerRecipient = peopleId
+        ? await getDirectManagerRecipient(peopleId)
+        : null;
+      managerRecipientCache.set(peopleId, managerRecipient || null);
+    }
+
+    if (managerRecipient?.email) {
+      return {
+        stage: KPI_TRAINING_MANAGER_ESCALATION_STAGE,
+        recipients: [managerRecipient]
+      };
+    }
+  }
+
+  const executiveAnchorDate =
+    getLatestKpiTrainingStageSentAt(stageLogMap, KPI_TRAINING_MANAGER_ESCALATION_STAGE.key) ||
+    row.last_reminder_sent_at ||
+    managerFallbackDueAt;
+
+  if (
+    canEscalateToManager &&
+    executiveRecipients.length &&
+    isTimestampDue(
+      addDaysToTimestamp(executiveAnchorDate, KPI_TRAINING_EXECUTIVE_ESCALATION_DELAY_DAYS),
+      now
+    )
+  ) {
+    const alreadySentEmailSet = new Set(
+      getKpiTrainingStageLogEntries(stageLogMap, KPI_TRAINING_EXECUTIVE_ESCALATION_STAGE.key)
+        .map((entry) => String(entry.sent_to_email || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const pendingRecipients = executiveRecipients.filter((recipient) => {
+      const email = String(recipient.email || "").trim().toLowerCase();
+      return email && !alreadySentEmailSet.has(email);
+    });
+
+    if (pendingRecipients.length) {
+      return {
+        stage: KPI_TRAINING_EXECUTIVE_ESCALATION_STAGE,
+        recipients: pendingRecipients,
+        executiveAnchorDate
+      };
+    }
+  }
+
+  return null;
+};
+
+const recordKpiTrainingStageLog = async ({
+  resultId,
+  peopleId = null,
+  stageKey,
+  recipientEmail
+}) => {
+  await pool.query(
+    `
+    INSERT INTO public.kpi_training_escalation_log (
+      result_id,
+      people_id,
+      escalation_stage,
+      sent_to_email
+    )
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (result_id, escalation_stage, sent_to_email) DO NOTHING
+    `,
+    [resultId, peopleId, stageKey, recipientEmail]
+  );
+};
+
+const updateKpiTrainingResultAfterNotification = async ({
+  resultId,
+  stage
+}) => {
+  if (stage?.reminderNumber) {
+    await pool.query(
+      `
+      UPDATE public.kpi_training_result
+      SET
+        training_sent_at = COALESCE(training_sent_at, NOW()),
+        last_reminder_sent_at = NOW(),
+        next_reminder_due_at = CASE
+          WHEN $2::int < $3::int THEN NOW() + ($4::int * INTERVAL '1 day')
+          ELSE NULL
+        END,
+        escalation_level = GREATEST(COALESCE(escalation_level, 0), $5::int),
+        status = CASE
+          WHEN COALESCE(status, 'training_assigned') = 'training_assigned' THEN 'training_sent'
+          ELSE status
+        END,
+        updated_at = NOW()
+      WHERE result_id = $1
+      `,
+      [
+        resultId,
+        stage.reminderNumber,
+        KPI_TRAINING_RESPONSIBLE_REMINDER_COUNT,
+        KPI_TRAINING_REMINDER_INTERVAL_DAYS,
+        stage.escalationLevel
+      ]
+    );
+    return;
+  }
+
+  await pool.query(
+    `
+    UPDATE public.kpi_training_result
+    SET
+      status = 'escalated',
+      escalation_level = GREATEST(COALESCE(escalation_level, 0), $2::int),
+      next_reminder_due_at = NULL,
+      updated_at = NOW()
+    WHERE result_id = $1
+    `,
+    [resultId, stage.escalationLevel]
+  );
+};
+
+const buildKpiTrainingNotificationPayload = ({
+  row,
+  stage,
+  recipient,
+  executiveAnchorDate = null
+}) => {
+  const portalUrl = buildKpiTrainingPortalUrl(row);
+  const dashboardUrl = buildKpiTrainingDashboardUrl();
+  const trainingLabel =
+    normalizeOptionalTextInput(row.training_name) ||
+    `Training #${row.training_id}`;
+  const responsibleName =
+    normalizeOptionalTextInput(row.people_name) ||
+    `Responsible #${row.people_id}`;
+
+  if (stage?.reminderNumber) {
+    return {
+      subject: `${stage.label}: KPI training validation pending - ${trainingLabel}`,
+      html: buildResponsibleTrainingReminderEmailHtml({
+        row,
+        stage,
+        responsibleName,
+        portalUrl
+      })
+    };
+  }
+
+  if (stage?.key === KPI_TRAINING_MANAGER_ESCALATION_STAGE.key) {
+    return {
+      subject: `Escalation: ${responsibleName} has not validated ${trainingLabel} after 3 reminders`,
+      html: buildManagerTrainingEscalationEmailHtml({
+        row,
+        managerName: recipient.name || "Manager",
+        dashboardUrl
+      })
+    };
+  }
+
+  return {
+    subject: `Final escalation: ${responsibleName} still has not validated ${trainingLabel}`,
+    html: buildExecutiveTrainingEscalationEmailHtml({
+      row,
+      executiveAnchorDate,
+      dashboardUrl
+    })
+  };
+};
+
+const sendKpiTrainingNotification = async ({
+  transporter,
+  row,
+  notification
+}) => {
+  const sent = [];
+  const failed = [];
+  const normalizedResultId = normalizeOptionalIntegerInput(row.result_id);
+  const normalizedPeopleId = normalizeOptionalIntegerInput(row.people_id);
+
+  for (const recipient of notification.recipients) {
+    const recipientEmail = normalizeOptionalTextInput(recipient?.email);
+    if (!recipientEmail) {
+      continue;
+    }
+
+    const payload = buildKpiTrainingNotificationPayload({
+      row,
+      stage: notification.stage,
+      recipient,
+      executiveAnchorDate: notification.executiveAnchorDate || null
+    });
+
+    try {
+      const info = await transporter.sendMail({
+        from: '"AVOCarbon KPI Training" <administration.STS@avocarbon.com>',
+        to: recipientEmail,
+        subject: payload.subject,
+        html: payload.html
+      });
+
+      await recordKpiTrainingStageLog({
+        resultId: normalizedResultId,
+        peopleId: normalizedPeopleId,
+        stageKey: notification.stage.key,
+        recipientEmail
+      });
+
+      sent.push({
+        result_id: normalizedResultId,
+        people_id: normalizedPeopleId,
+        stage: notification.stage.key,
+        email: recipientEmail,
+        message_id: info.messageId
+      });
+    } catch (error) {
+      failed.push({
+        result_id: normalizedResultId,
+        people_id: normalizedPeopleId,
+        stage: notification.stage.key,
+        email: recipientEmail,
+        error: error.message
+      });
+    }
+  }
+
+  if (sent.length) {
+    await updateKpiTrainingResultAfterNotification({
+      resultId: normalizedResultId,
+      stage: notification.stage
+    });
+  }
+
+  return { sent, failed };
+};
+
+const runKpiTrainingReminderEscalationJob = async () => {
+  await ensureKpiTrainingEscalationSchema();
+
+  const candidates = await loadKpiTrainingReminderCandidates();
+  if (!candidates.length) {
+    console.log("[KPI Training Reminder] No training candidates found.");
+    return {
+      ok: true,
+      candidate_count: 0,
+      sent_count: 0,
+      failed_count: 0,
+      sent: [],
+      failed: []
+    };
+  }
+
+  const stageLogMapByResultId = await loadKpiTrainingEscalationLogMap(
+    candidates.map((row) => row.result_id)
+  );
+  const executiveRecipients = await loadKpiTrainingRoleRecipients(
+    KPI_TRAINING_EXECUTIVE_ROLE_LOOKUP_NAMES
+  );
+  const managerRecipientCache = new Map();
+  const sent = [];
+  const failed = [];
+  let transporter = null;
+
+  for (const row of candidates) {
+    const resultId = normalizeOptionalIntegerInput(row.result_id);
+    const stageLogMap = stageLogMapByResultId.get(resultId) || {};
+    const notification = await resolveNextKpiTrainingNotification({
+      row,
+      stageLogMap,
+      executiveRecipients,
+      managerRecipientCache
+    });
+
+    if (!notification) {
+      continue;
+    }
+
+    transporter = transporter || createTransporter();
+    const deliveryResult = await sendKpiTrainingNotification({
+      transporter,
+      row,
+      notification
+    });
+
+    sent.push(...deliveryResult.sent);
+    failed.push(...deliveryResult.failed);
+
+    if (deliveryResult.sent.length) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  if (!sent.length && !failed.length) {
+    console.log("[KPI Training Reminder] No pending reminders or escalations.");
+  }
+
+  return {
+    ok: true,
+    candidate_count: candidates.length,
+    sent_count: sent.length,
+    failed_count: failed.length,
+    sent,
+    failed
+  };
+};
+
+ensureKpiTrainingEscalationSchema()
+  .then(() => {
+    console.log("[KPI Training Reminder] Escalation tracking table is ready.");
+  })
+  .catch((error) => {
+    console.error("[KPI Training Reminder] Escalation tracking setup failed:", error.message);
+  });
+
+async function sendKpiTrainingLinksToResponsibles() {
+  const appBaseUrl = getKpiTrainingAppBaseUrl();
 
   const result = await pool.query(`
     SELECT
@@ -38122,12 +39878,11 @@ async function sendKpiTrainingLinksToResponsibles() {
       ON p.people_id = ktr.people_id
     WHERE p.email IS NOT NULL
       AND TRIM(p.email) <> ''
-      AND ktr.status IN (
-        'training_sent',
-        'training_done',
-        'test_sent',
-        'test_overdue',
-        'escalated'
+      AND COALESCE(ktr.status, 'training_assigned') = ANY($1::text[])
+      AND NOT (
+        COALESCE(ktr.status, 'training_assigned') = 'training_done'
+        AND ktr.test_id IS NULL
+        AND ktr.training_completed_at IS NOT NULL
       )
     GROUP BY
       ktr.people_id,
@@ -38135,7 +39890,7 @@ async function sendKpiTrainingLinksToResponsibles() {
       p.name,
       p.email
     ORDER BY people_name, ktr.people_id
-  `);
+  `, [KPI_TRAINING_PENDING_VALIDATION_STATUSES]);
 
   const transporter = createTransporter();
   const sent = [];
@@ -38189,20 +39944,22 @@ async function sendKpiTrainingLinksToResponsibles() {
         UPDATE public.kpi_training_result
         SET
           training_sent_at = COALESCE(training_sent_at, NOW()),
+          next_reminder_due_at = COALESCE(
+            next_reminder_due_at,
+            COALESCE(training_sent_at, NOW()) + ($2::int * INTERVAL '1 day')
+          ),
           status = CASE
             WHEN status IN ('completed_pass', 'completed_fail') THEN status
             ELSE 'training_sent'
           END,
           updated_at = NOW()
         WHERE people_id = $1
-          AND status IN (
-            'training_sent',
-            'training_done',
-            'test_sent',
-            'test_overdue',
-            'escalated'
-          )
-      `, [peopleId]);
+          AND COALESCE(status, 'training_assigned') = ANY($3::text[])
+      `, [
+        peopleId,
+        KPI_TRAINING_REMINDER_INTERVAL_DAYS,
+        KPI_TRAINING_PENDING_VALIDATION_STATUSES
+      ]);
 
       sent.push({
         people_id: peopleId,
@@ -38238,6 +39995,16 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
   }
 });
 
+app.post("/api/kpi-training/process-reminders", async (req, res) => {
+  try {
+    const result = await runKpiTrainingReminderEscalationJob();
+    res.json(result);
+  } catch (error) {
+    console.error("[KPI Training Reminder] Error:", error.message);
+    res.status(500).json({ error: "Failed to process KPI training reminders." });
+  }
+});
+
 //Training cron 
 
 // cron.schedule("15 12 * * *", async () => {
@@ -38249,6 +40016,18 @@ app.post("/api/kpi-training/send-responsible-links", async (req, res) => {
 //     console.error("[KPI Training Cron] Failed:", error.message);
 //   }
 // });
+
+// cron.schedule("30 12 * * *", async () => {
+//   try {
+//     await runWithJobLock("kpi_training_reminder_escalation_job", async () => {
+//       console.log("[KPI Training Reminder] Processing weekly reminders and escalations...");
+//       const result = await runKpiTrainingReminderEscalationJob();
+//       console.log("[KPI Training Reminder] Done:", result);
+//     });
+//   } catch (error) {
+//     console.error("[KPI Training Reminder] Failed:", error.message);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 
 //kpi tree endpoint 
