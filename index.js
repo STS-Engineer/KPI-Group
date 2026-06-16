@@ -14296,9 +14296,9 @@ function renderMultisiteUnitMatrix() {
     return;
   }
  
-if (scopeKind !== "zone" && !parameterLockedUnitId) {
+ if (scopeKind !== "zone" && !parameterLockedUnitId) {
   // Factory units are loaded by default from backend.
-}
+ }
  
   const visibleRows = getParameterVisibleUnitRows();
   if (!visibleRows.length) {
@@ -14331,7 +14331,7 @@ if (scopeKind !== "zone" && !parameterLockedUnitId) {
             '<th>Target Value</th>' +
             '<th>Setup Date</th>' +
             '<th>KPI Unit</th>' +
-            '<th>Responsible</th>' +
+            '<th>' + escapeHtml(scopeKind === "role" && !isRoleApplyAllMode() ? "Role" : "Responsible") + '</th>' +
           '</tr>' +
         '</thead>' +
         '<tbody>' +
@@ -16103,7 +16103,7 @@ if (
             '<th>KPI Unit</th>' +
             '<th>Target Value</th>' +
             '<th>Setup Date</th>' +
-            '<th>Responsible</th>' +
+            '<th>' + escapeHtml(scopeKind === "role" && !isRoleApplyAllMode() ? "Role" : "Responsible") + '</th>' +
           '</tr>' +
         '</thead>' +
         '<tbody>' +
@@ -16143,10 +16143,13 @@ if (
                 '<td>' +
                   '<input class="parameter-unit-setup-date-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="date" value="' + escapeHtml(normalizeParameterDateValue(state.target_setup_date ?? getParameterFieldValue("parameter_target_setup_date")) || getLocalDateInputValue()) + '" />' +
                 '</td>' +
-                '<td>' +
-                  '<input class="' + responsibleInputClass + '" type="text" readonly tabindex="-1" value="' + escapeHtml(responsibleLabel) + '" placeholder="' + escapeHtml(responsiblePlaceholder) + '" />' +
-                  responsibleNoteMarkup +
-                '</td>' +
+               '<td>' +
+                  (
+               scopeKind === "role" && !isRoleApplyAllMode()
+               ? '<input class="readonly-input parameter-unit-responsible-input" type="text" readonly tabindex="-1" value="' + escapeHtml(getParameterRoleLabel(selectedRoleId) || "Selected role") + '" />'
+               : '<input class="' + responsibleInputClass + '" type="text" readonly tabindex="-1" value="' + escapeHtml(responsibleLabel) + '" placeholder="' + escapeHtml(responsiblePlaceholder) + '" />' + responsibleNoteMarkup
+               ) +
+              '</td>' +
               '</tr>';
           }).join("") +
         '</tbody>' +
@@ -35645,24 +35648,24 @@ const runWeeklyKpiSubmissionCron = async ({
 
 
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
