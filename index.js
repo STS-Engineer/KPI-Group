@@ -13192,10 +13192,11 @@ textarea {
            
              <div class="field col-2 is-hidden" id="parameter_role_mode_field">
               <label><span>Role Target Mode</span></label>
-             <select id="parameter_role_target_mode">
-             <option value="apply_all">Apply All</option>
-             <option value="individual">Individual</option>
-             </select>
+             <select id="parameter_role_target_mode" onchange="renderMultisiteUnitMatrix()">
+              <option value="">Select mode</option>
+              <option value="apply_all">Apply All</option>
+              <option value="individual">Individual</option>
+           </select>
             </div>
               <div class="field col-12">
                 <label><span>KPI Definition</span><span class="hint">Read only</span></label>
@@ -13330,6 +13331,7 @@ textarea {
       const roleOptions = ${JSON.stringify(roleOptions)};
       const allocationLookups = ${JSON.stringify(allocationLookups)};
       let currentRows = [];
+      let expandedKpiSubjectKeys = new Set();
       let kpiSourceRows = [];
       let selectedKpiNameFilter = "";
       let selectedKpiSubjectFilter = ""; 
@@ -13605,10 +13607,10 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
        .toLowerCase() === "role";
       }
 
-    function isRoleApplyAllMode() {
-      return isRoleParameterScope() &&
-      String(getParameterFieldValue("parameter_role_target_mode") || "apply_all") === "apply_all";
-     }
+   function isRoleApplyAllMode() {
+     return isRoleParameterScope() &&
+    String(getParameterFieldValue("parameter_role_target_mode") || "") === "apply_all";
+    }
 
       function syncParameterPlantOptions(preferredValue = "") {
         const plantSelect = document.getElementById("parameter_plant_id");
@@ -14513,8 +14515,24 @@ function populateAllocationLookupOptions(values = {}) {
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
     if (scopeKind === "role") {
-    const roleId = getNormalizedParameterRoleId();
-    if (!roleId) return [];
+const roleId = getNormalizedParameterRoleId();
+
+if (!roleId && isRoleApplyAllMode()) {
+  return getParameterAllocationUnits().map(unit => ({
+    row_kind: "role",
+    value: getRoleRowScopeId(unit.value, ""),
+    people_id: "",
+    label: unit.label || "Unit " + unit.value,
+    unit_id: String(unit.value),
+    unit_type_id: unit.unit_type_id || null,
+    local_currency: unit.selling_currency || unit.operating_currency || "",
+    responsible_people_id: "",
+    responsible_label: "",
+    responsibles: []
+  }));
+}
+
+if (!roleId) return [];
 
     const unitsById = new Map(
       getParameterAllocationUnits().map(unit => [String(unit.value), unit])
@@ -14809,8 +14827,24 @@ function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
   if (scopeKind === "role") {
-    const roleId = getNormalizedParameterRoleId();
-    if (!roleId) return [];
+const roleId = getNormalizedParameterRoleId();
+
+if (!roleId && isRoleApplyAllMode()) {
+  return getParameterAllocationUnits().map(unit => ({
+    row_kind: "role",
+    value: getRoleRowScopeId(unit.value, ""),
+    people_id: "",
+    label: unit.label || "Unit " + unit.value,
+    unit_id: String(unit.value),
+    unit_type_id: unit.unit_type_id || null,
+    local_currency: unit.selling_currency || unit.operating_currency || "",
+    responsible_people_id: "",
+    responsible_label: "",
+    responsibles: []
+  }));
+}
+
+if (!roleId) return [];
 
     const unitsById = new Map(
       getParameterAllocationUnits().map(unit => [String(unit.value), unit])
@@ -15807,11 +15841,18 @@ if (isZoneScope) {
 
   if (isRoleScope) {
   parameterLockedZoneId = "";
+  const isApplyAllMode = isRoleApplyAllMode();
 
   if (tableLabel) tableLabel.textContent = "Role Target Table";
-  if (tableHint) tableHint.textContent = "Select a role, then enter targets for related people.";
+  if (tableHint) {
+    tableHint.textContent = isApplyAllMode
+      ? "Apply one shared target and setup date to every unit linked to the selected role."
+      : "Select a role, then enter targets for related people.";
+  }
   if (tableCopy) tableCopy.textContent =
-    "The table below lists all units that have the selected role assigned. Apply All uses one shared target. Individual mode lets you enter a different target for each person.";
+    isApplyAllMode
+      ? "The table below shows one shared row for all units linked to the selected role. The same target value and setup date will be applied to every related allocation."
+      : "The table below lists all units that have the selected role assigned. Apply All uses one shared target. Individual mode lets you enter a different target for each person.";
   if (tableBadge) tableBadge.textContent = "Role View";
 
   return;
@@ -15832,6 +15873,98 @@ function handleParameterKpiTypeChange() {
 
   if (!isIndividualParameterScope()) {
     renderMultisiteUnitMatrix();
+  }
+}
+
+function getRoleApplyAllSharedTargetValue(visibleRows = []) {
+  const primaryTargetValue = String(getParameterFieldValue("parameter_target_value") || "").trim();
+  if (primaryTargetValue) return primaryTargetValue;
+
+  for (const row of (Array.isArray(visibleRows) ? visibleRows : [])) {
+    const state = getParameterUnitState(row.row_kind || "role", row.value);
+    const stateTargetValue = String(state.target_value ?? "").trim();
+    if (stateTargetValue) return stateTargetValue;
+  }
+
+  return "";
+}
+
+function getRoleApplyAllSharedSetupDateValue(visibleRows = []) {
+  const primarySetupDate = normalizeParameterDateValue(getParameterFieldValue("parameter_target_setup_date"));
+  if (primarySetupDate) return primarySetupDate;
+
+  for (const row of (Array.isArray(visibleRows) ? visibleRows : [])) {
+    const state = getParameterUnitState(row.row_kind || "role", row.value);
+    const stateSetupDate = normalizeParameterDateValue(state.target_setup_date);
+    if (stateSetupDate) return stateSetupDate;
+  }
+
+  return getLocalDateInputValue();
+}
+
+function getRoleApplyAllCurrencyLabel(visibleRows = []) {
+  const currencies = Array.from(
+    new Set(
+      (Array.isArray(visibleRows) ? visibleRows : [])
+        .map((row) => String(row?.local_currency || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!currencies.length) return "-";
+  return currencies.length === 1 ? currencies[0] : "Mixed";
+}
+
+function getRoleApplyAllUnitSummary(visibleRows = []) {
+  const unitNames = Array.from(
+    new Set(
+      (Array.isArray(visibleRows) ? visibleRows : [])
+        .map((row) => String(row?.label || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const unitCount = unitNames.length;
+  const preview = unitNames.length > 3
+    ? unitNames.slice(0, 3).join(", ") + " +" + (unitNames.length - 3)
+    : unitNames.join(", ");
+
+  return {
+    title: unitCount ? unitCount + " unit" + (unitCount === 1 ? "" : "s") : "Related units",
+    detail: preview || "Units linked to the selected role"
+  };
+}
+
+function syncRoleApplyAllRowState(visibleRows = [], patch = {}) {
+  const normalizedRows = Array.isArray(visibleRows) ? visibleRows : [];
+  const hasTargetValue = Object.prototype.hasOwnProperty.call(patch, "target_value");
+  const hasSetupDate = Object.prototype.hasOwnProperty.call(patch, "target_setup_date");
+  const nextTargetValue = hasTargetValue ? String(patch.target_value ?? "") : "";
+  const nextSetupDate = hasSetupDate
+    ? (normalizeParameterDateValue(patch.target_setup_date) || "")
+    : "";
+
+  normalizedRows.forEach((row) => {
+    const rowPatch = {};
+    if (hasTargetValue) rowPatch.target_value = nextTargetValue;
+    if (hasSetupDate) rowPatch.target_setup_date = nextSetupDate;
+    if (Object.keys(rowPatch).length) {
+      setParameterUnitState(row.row_kind || "role", row.value, rowPatch);
+    }
+  });
+
+  if (hasTargetValue) {
+    const mainTargetInput = document.getElementById("parameter_target_value");
+    if (mainTargetInput) {
+      mainTargetInput.value = nextTargetValue;
+    }
+  }
+
+  if (hasSetupDate) {
+    const mainSetupDateInput = document.getElementById("parameter_target_setup_date");
+    if (mainSetupDateInput) {
+      mainSetupDateInput.value = nextSetupDate;
+    }
   }
 }
 
@@ -15871,11 +16004,19 @@ if (
 }
 
 if (
-  scopeKind !== "zone" &&
-  scopeKind !== "product_line" &&
+  scopeKind === "role" &&
+  !isRoleApplyAllMode() &&
   !selectedRoleId
 ) {
-  renderParameterTableEmptyState("Enter the role please to load the target table and resolve the related responsible for each unit.");
+  renderParameterTableEmptyState("Enter the role please to load the target table.");
+  return;
+}
+
+if (
+  scopeKind === "role" &&
+  !String(getParameterFieldValue("parameter_role_target_mode") || "").trim()
+) {
+  renderParameterTableEmptyState("Select Role Target Mode to display the role view.");
   return;
 }
 
@@ -15886,6 +16027,69 @@ if (
         ? "No zones were found in the zone table."
         : "No units were found for the selected unit type."
     );
+    return;
+  }
+
+  if (scopeKind === "role" && isRoleApplyAllMode()) {
+    const sharedTargetValue = getRoleApplyAllSharedTargetValue(visibleRows);
+    const sharedSetupDate = getRoleApplyAllSharedSetupDateValue(visibleRows);
+    const unitSummary = getRoleApplyAllUnitSummary(visibleRows);
+    const roleLabel = getParameterRoleLabel(selectedRoleId) || "Selected role";
+   
+
+    matrixEl.innerHTML =
+      '<div class="multisite-table-wrap">' +
+        '<table class="multisite-table">' +
+          '<thead>' +
+            '<tr>' +
+              '<th>' + escapeHtml(scopeLabel) + '</th>' +
+
+              '<th>KPI Unit</th>' +
+              '<th>Target Value</th>' +
+              '<th>Setup Date</th>' +
+              '<th>Role</th>' +
+            '</tr>' +
+          '</thead>' +
+          '<tbody>' +
+            '<tr>' +
+              '<td>' +
+                '<div class="parameter-unit-name">' + escapeHtml(unitSummary.title) + '</div>' +
+                '<div class="parameter-unit-meta">' + escapeHtml(unitSummary.detail) + '</div>' +
+              '</td>' +
+              '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
+              '<td>' +
+                '<input class="parameter-unit-target-input" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(sharedTargetValue) + '" />' +
+              '</td>' +
+              '<td>' +
+                '<input class="parameter-unit-setup-date-input" type="date" value="' + escapeHtml(sharedSetupDate) + '" />' +
+              '</td>' +
+              '<td>' +
+                '<input class="readonly-input parameter-unit-responsible-input" type="text" readonly tabindex="-1" value="' + escapeHtml(roleLabel) + '" />' +
+              '</td>' +
+            '</tr>' +
+          '</tbody>' +
+        '</table>' +
+      '</div>';
+
+    Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((input) => {
+      input.addEventListener("input", (event) => {
+        syncRoleApplyAllRowState(visibleRows, {
+          target_value: event.target.value
+        });
+        syncPrimaryParameterFieldsFromTable();
+      });
+    });
+
+    Array.from(matrixEl.querySelectorAll(".parameter-unit-setup-date-input")).forEach((input) => {
+      input.addEventListener("change", (event) => {
+        syncRoleApplyAllRowState(visibleRows, {
+          target_setup_date: event.target.value
+        });
+        syncPrimaryParameterFieldsFromTable();
+      });
+    });
+
+    syncPrimaryParameterFieldsFromTable();
     return;
   }
 
@@ -15907,14 +16111,7 @@ if (
             const scopeId = String(scopeEntry.value || "");
             const scopeEntryKind = scopeEntry.row_kind || "unit";
             const state = getParameterUnitState(scopeEntryKind, scopeId);
-            const targetInputValue = isRoleApplyAllMode()
-            ? (
-            getParameterFieldValue("parameter_target_value") ||
-            state.target_value ||
-             ""
-             )
-            : (state.target_value ?? "");
-            const targetInputReadonly = "";
+            const targetInputValue = state.target_value ?? "";
             const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
             const responsibleLabel = resolvedResponsible?.label || "";
             const responsibleNote = getParameterResponsibleCellNote(scopeEntry, resolvedResponsible);
@@ -15942,6 +16139,7 @@ if (
                 '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
                 '<td>' +
                   '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(targetInputValue) + '" />' +
+                '</td>' +
                 '<td>' +
                   '<input class="parameter-unit-setup-date-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="date" value="' + escapeHtml(normalizeParameterDateValue(state.target_setup_date ?? getParameterFieldValue("parameter_target_setup_date")) || getLocalDateInputValue()) + '" />' +
                 '</td>' +
@@ -15957,30 +16155,9 @@ if (
 
 Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((input) => {
   input.addEventListener("input", (event) => {
-    const value = event.target.value;
-
-    if (isRoleApplyAllMode()) {
-      matrixEl.querySelectorAll(".parameter-unit-target-input").forEach((targetInput) => {
-        targetInput.value = value;
-      });
-
-      const mainTargetInput = document.getElementById("parameter_target_value");
-      if (mainTargetInput) {
-        mainTargetInput.value = value;
-      }
-
-      getParameterVisibleUnitRows().forEach((row) => {
-        setParameterUnitState(row.row_kind || "unit", row.value, {
-          target_value: value
-        });
-      });
-
-      syncPrimaryParameterFieldsFromTable();
-      return;
-    }
-
     const scopeKind = event.target.getAttribute("data-scope-kind");
     const scopeId = event.target.getAttribute("data-scope-id");
+    const value = event.target.value;
 
     setParameterUnitState(scopeKind, scopeId, {
       target_value: value
@@ -16903,12 +17080,95 @@ function fmtTolerance(value) {
   if (contentEl) contentEl.innerHTML = html || '<div style="padding:20px;color:#64748b;text-align:center;">No KPI data available.</div>';
 }
 
-function updateKpiResultsMeta(visibleCount) {
+function getKpiSubjectPath(row) {
+  return String(row?.full_subject_path || row?.subject || row?.indicator_title || "").trim();
+}
+
+function getKpiSubjectGroupKey(row) {
+  const subjectPath = getKpiSubjectPath(row);
+  if (subjectPath) {
+    return "subject:" + subjectPath.toLowerCase();
+  }
+
+  return "subject:unassigned:" + String(row?.kpi_id || "");
+}
+
+function getKpiSubjectDisplayName(row) {
+  const subjectPath = getKpiSubjectPath(row);
+  return getLastPathSegment(subjectPath) || subjectPath || "No KPI hierarchy attached";
+}
+
+function groupKpiRowsBySubject(rows) {
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  const groupedSubjects = new Map();
+
+  sourceRows.forEach((row) => {
+    const subjectKey = getKpiSubjectGroupKey(row);
+    if (!groupedSubjects.has(subjectKey)) {
+      groupedSubjects.set(subjectKey, {
+        key: subjectKey,
+        subject_path: getKpiSubjectPath(row),
+        subject_name: getKpiSubjectDisplayName(row),
+        rows: []
+      });
+    }
+
+    groupedSubjects.get(subjectKey).rows.push(row);
+  });
+
+  return Array.from(groupedSubjects.values()).map((group) => ({
+    ...group,
+    kpi_count: group.rows.length
+  }));
+}
+
+function toggleKpiSubjectGroup(subjectKey) {
+  const normalizedKey = String(subjectKey || "").trim();
+  if (!normalizedKey) return;
+
+  if (expandedKpiSubjectKeys.has(normalizedKey)) {
+    expandedKpiSubjectKeys.delete(normalizedKey);
+  } else {
+    expandedKpiSubjectKeys.add(normalizedKey);
+  }
+
+  renderKpis(currentRows);
+}
+
+function updateKpiResultsMeta(
+  visibleCount,
+  totalCount = visibleCount,
+  visibleSubjectCount = null,
+  totalSubjectCount = visibleSubjectCount
+) {
   const metaEl = document.getElementById("kpiResultsMeta");
   if (!metaEl) return;
 
   const shown = Number.isFinite(visibleCount) ? visibleCount : 0;
-  metaEl.textContent = shown + " KPI" + (shown === 1 ? "" : "s");
+  const total = Number.isFinite(totalCount) ? totalCount : shown;
+  const shownSubjects = Number.isFinite(visibleSubjectCount) ? visibleSubjectCount : null;
+  const totalSubjects = Number.isFinite(totalSubjectCount) ? totalSubjectCount : shownSubjects;
+
+  if (!shown) {
+    if (shownSubjects !== null) {
+      metaEl.textContent = totalSubjects && totalSubjects > 0 ? "No matching subjects" : "0 subjects";
+      return;
+    }
+
+    metaEl.textContent = total > 0 ? "No matching KPIs" : "0 KPIs";
+    return;
+  }
+
+  if (shownSubjects !== null) {
+    metaEl.textContent = shown === total
+      ? shownSubjects + " subject" + (shownSubjects === 1 ? "" : "s") + " • " + shown + " KPI" + (shown === 1 ? "" : "s")
+      : shownSubjects + " subject" + (shownSubjects === 1 ? "" : "s") + " • " + shown + " of " + total + " KPIs";
+    return;
+  }
+
+  metaEl.textContent = shown === total
+    ? shown + " KPI" + (shown === 1 ? "" : "s")
+    : shown + " of " + total + " KPIs";
 }
 
 function isKpiOwnedByResponsible(kpi = {}) {
@@ -16936,7 +17196,15 @@ function getCurrentKpiRowById(kpiId) {
 
   currentRows = sortedRows;
   updateStats(currentRows);
-  updateKpiResultsMeta(currentRows.length);
+  const subjectGroups = groupKpiRowsBySubject(currentRows);
+  const totalKpiCount = Array.isArray(kpiSourceRows) ? kpiSourceRows.length : currentRows.length;
+  const totalSubjectCount = groupKpiRowsBySubject(kpiSourceRows).length;
+  updateKpiResultsMeta(
+    currentRows.length,
+    totalKpiCount,
+    subjectGroups.length,
+    totalSubjectCount
+  );
 
   const grid = document.getElementById("grid");
 
@@ -16944,6 +17212,11 @@ function getCurrentKpiRowById(kpiId) {
     grid.innerHTML = '<div class="empty">No KPI found.</div>';
     return;
   }
+
+  const visibleCount = currentRows.length;
+  const footerText = visibleCount === totalKpiCount
+    ? 'Showing ' + subjectGroups.length + ' subject' + (subjectGroups.length === 1 ? '' : 's') + ' • ' + visibleCount + ' KPI' + (visibleCount === 1 ? '' : 's')
+    : 'Showing ' + subjectGroups.length + ' subject' + (subjectGroups.length === 1 ? '' : 's') + ' • ' + visibleCount + ' of ' + totalKpiCount + ' KPIs';
 
   grid.innerHTML = \`
     <div class="kpi-matrix-table-shell">
@@ -16959,87 +17232,110 @@ function getCurrentKpiRowById(kpiId) {
             </tr>
           </thead>
           <tbody>
-            \${currentRows.map(row => {
-              const isOwnedByResponsible = isKpiOwnedByResponsible(row);
-              const ownerActionsHtml = \`
-                <button
-                  type="button"
-                  class="action-btn edit-btn kpi-matrix-action-btn"
-                  onclick="openEditModal(\${row.kpi_id})"
-                  aria-label="Edit KPI"
-                  title="Edit KPI"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
-                    <path d="M13.5 6.5l4 4"></path>
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  class="action-btn delete-btn kpi-matrix-action-btn"
-                  onclick="deleteKpi(\${row.kpi_id})"
-                  aria-label="Delete KPI"
-                  title="Delete KPI"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M3 6h18"></path>
-                    <path d="M8 6V4h8v2"></path>
-                    <path d="M19 6l-1 14H6L5 6"></path>
-                    <path d="M10 11v6"></path>
-                    <path d="M14 11v6"></path>
-                  </svg>
-                </button>
-                \`;
-
+            \${subjectGroups.map(group => {
+              const isExpanded = expandedKpiSubjectKeys.has(group.key);
               return \`
-              <tr>
-                <td>
-                  <div class="kpi-matrix-kpi-title">\${escapeHtml(row.indicator_sub_title || "Untitled KPI")}</div>
-                  <div class="kpi-matrix-cell-sub">\${escapeHtml([
-                    row.status ? "Status: " + row.status : "",
-                    row.frequency ? "Frequency: " + row.frequency : "",
-                    isOwnedByResponsible ? "My KPI" : "",
-                    !isOwnedByResponsible ? "Visible in consult mode" : ""
-                  ].filter(Boolean).join(" • ") || "No KPI details")}</div>
-                </td>
-                <td>
-                  <div class="kpi-matrix-kpi-title">\${escapeHtml(getLastPathSegment(row.full_subject_path || row.subject || row.indicator_title) || "No subject")}</div>
-                  <div class="kpi-matrix-kpi-path">\${escapeHtml(row.full_subject_path || row.subject || "No KPI hierarchy attached")}</div>
-                </td>
-                <td>
-                  <div class="kpi-matrix-cell-main">\${escapeHtml(row.unit || "-")}</div>
-                  <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target !== null && row.target !== undefined && String(row.target).trim() !== "" ? "Target: " + formatParameterDisplayValue(row.target) : "No unit target")}</div>
-                </td>
-                <td>
-                  <div class="kpi-matrix-cell-main">\${escapeHtml(row.target_direction || "-")}</div>
-                  <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target_auto_adjustment ? "Auto adjust: " + row.target_auto_adjustment : "No direction setting")}</div>
-                </td>
-                <td class="parameter-table-actions">
-                  <div class="kpi-matrix-actions">
-                    <button
-                      type="button"
-                      class="action-btn kpi-view-btn kpi-matrix-action-btn"
-                      onclick="openKpiDetailsModal(\${row.kpi_id})"
-                      aria-label="View KPI details"
-                      title="View KPI details"
-                    >
-                      <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M1.5 12s3.8-7 10.5-7 10.5 7 10.5 7-3.8 7-10.5 7S1.5 12 1.5 12z"></path>
-                        <circle cx="12" cy="12" r="3.2"></circle>
-                      </svg>
-                    </button>
-                    \${ownerActionsHtml}
-                  </div>
+              <tr class="parameter-subject-row">
+                <td colspan="5">
+                  <button
+                    type="button"
+                    class="parameter-subject-toggle"
+                    data-subject-key="\${escapeHtml(group.key)}"
+                    onclick="toggleKpiSubjectGroup(this.dataset.subjectKey)"
+                    aria-expanded="\${isExpanded ? "true" : "false"}"
+                  >
+                    <span class="parameter-subject-chevron">\${isExpanded ? "▾" : "▸"}</span>
+                    <span class="parameter-subject-summary">
+                      <span class="parameter-subject-title">\${escapeHtml(group.subject_name || "No KPI hierarchy attached")}</span>
+                      <span class="parameter-subject-path">\${escapeHtml(group.subject_path || "No KPI hierarchy attached")}</span>
+                    </span>
+                    <span class="parameter-subject-count">\${escapeHtml(group.kpi_count + " KPI" + (group.kpi_count === 1 ? "" : "s"))}</span>
+                  </button>
                 </td>
               </tr>
+              \${isExpanded ? group.rows.map(row => {
+                const isOwnedByResponsible = isKpiOwnedByResponsible(row);
+                const ownerActionsHtml = \`
+                  <button
+                    type="button"
+                    class="action-btn edit-btn kpi-matrix-action-btn"
+                    onclick="openEditModal(\${row.kpi_id})"
+                    aria-label="Edit KPI"
+                    title="Edit KPI"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M4 20h4l10-10a2.12 2.12 0 1 0-4-4L4 16v4"></path>
+                      <path d="M13.5 6.5l4 4"></path>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="action-btn delete-btn kpi-matrix-action-btn"
+                    onclick="deleteKpi(\${row.kpi_id})"
+                    aria-label="Delete KPI"
+                    title="Delete KPI"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M3 6h18"></path>
+                      <path d="M8 6V4h8v2"></path>
+                      <path d="M19 6l-1 14H6L5 6"></path>
+                      <path d="M10 11v6"></path>
+                      <path d="M14 11v6"></path>
+                    </svg>
+                  </button>
+                  \`;
+
+                return \`
+                <tr class="parameter-subject-child-row">
+                  <td>
+                    <div class="kpi-matrix-kpi-title">\${escapeHtml(row.indicator_sub_title || "Untitled KPI")}</div>
+                    <div class="kpi-matrix-cell-sub">\${escapeHtml([
+                      row.status ? "Status: " + row.status : "",
+                      row.frequency ? "Frequency: " + row.frequency : "",
+                      isOwnedByResponsible ? "My KPI" : "",
+                      !isOwnedByResponsible ? "Visible in consult mode" : ""
+                    ].filter(Boolean).join(" • ") || "No KPI details")}</div>
+                  </td>
+                  <td>
+                    <div class="kpi-matrix-kpi-title">\${escapeHtml(getKpiSubjectDisplayName(row) || "No subject")}</div>
+                    <div class="kpi-matrix-kpi-path">\${escapeHtml(getKpiSubjectPath(row) || "No KPI hierarchy attached")}</div>
+                  </td>
+                  <td>
+                    <div class="kpi-matrix-cell-main">\${escapeHtml(row.unit || "-")}</div>
+                    <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target !== null && row.target !== undefined && String(row.target).trim() !== "" ? "Target: " + formatParameterDisplayValue(row.target) : "No unit target")}</div>
+                  </td>
+                  <td>
+                    <div class="kpi-matrix-cell-main">\${escapeHtml(row.target_direction || "-")}</div>
+                    <div class="kpi-matrix-cell-sub">\${escapeHtml(row.target_auto_adjustment ? "Auto adjust: " + row.target_auto_adjustment : "No direction setting")}</div>
+                  </td>
+                  <td class="parameter-table-actions">
+                    <div class="kpi-matrix-actions">
+                      <button
+                        type="button"
+                        class="action-btn kpi-view-btn kpi-matrix-action-btn"
+                        onclick="openKpiDetailsModal(\${row.kpi_id})"
+                        aria-label="View KPI details"
+                        title="View KPI details"
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M1.5 12s3.8-7 10.5-7 10.5 7 10.5 7-3.8 7-10.5 7S1.5 12 1.5 12z"></path>
+                          <circle cx="12" cy="12" r="3.2"></circle>
+                        </svg>
+                      </button>
+                      \${ownerActionsHtml}
+                    </div>
+                  </td>
+                </tr>
+              \`;
+              }).join("") : ""}
             \`;
             }).join("")}
           </tbody>
         </table>
       </div>
       <div class="kpi-matrix-footer">
-        <span>\${escapeHtml("Showing " + currentRows.length + " KPI" + (currentRows.length === 1 ? "" : "s"))}</span>
-        <span>KPI definition matrix</span>
+        <span>\${escapeHtml(footerText)}</span>
+        <span>KPI definition matrix grouped by subject</span>
       </div>
     </div>
   \`;
