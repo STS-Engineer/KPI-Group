@@ -18066,9 +18066,9 @@ function getExpectedMultisiteTargetCount(row = {}) {
                     </tr>
                     \${isExpanded ? group.rows.map(row => \`
                       <tr class="parameter-subject-child-row">
-                        <td>
-                          <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_group || row.kpi_name || "Linked KPI")}</div>
-                          <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_name && row.kpi_group && row.kpi_name !== row.kpi_group ? row.kpi_name : (row.kpi_subject || row.kpi_group || "No KPI hierarchy attached"))}</div>
+                       <td>
+                          <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_name && row.kpi_group && row.kpi_name !== row.kpi_group ? row.kpi_name : (row.kpi_subject || row.kpi_group || "No KPI hierarchy attached"))}</div>
+                           <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_group || row.kpi_name || "Linked KPI")}</div>
                         </td>
                         <td>
                           <div class="parameter-matrix-cell-main">\${escapeHtml(row.kpi_type || "Not Set")}</div>
