@@ -27504,16 +27504,14 @@ app.get("/form", async (req, res) => {
       .map((kpi) => normalizeOptionalIntegerInput(kpi.kpi_values_id))
       .filter((value) => Number.isInteger(value));
 
-  const histRes = await pool.query(
+const histRes = await pool.query(
   `
-  SELECT DISTINCT ON (
-    kr.kpi_target_allocation_id,
-    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD'))
-  )
+  SELECT
     kr.kpi_target_allocation_id AS kpi_values_id,
     kr.kpi_id,
-    kr.result_date,
-    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+    TO_CHAR(kr.result_date, 'YYYY-MM-DD') AS result_date,
+    kr.week,
+    kr.period_label,
     kr.raw_value AS new_value,
     kr.recorded_at AS updated_at
   FROM public.kpi_result kr
@@ -27521,9 +27519,10 @@ app.get("/form", async (req, res) => {
     AND kr.raw_value IS NOT NULL
   ORDER BY
     kr.kpi_target_allocation_id,
-    COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
-    kr.recorded_at DESC,
-    kr.kpi_result_id DESC
+    kr.result_date ASC NULLS LAST,
+    kr.week ASC,
+    kr.period_label ASC,
+    kr.recorded_at ASC
   `,
   [allocationIds]
 );
@@ -27532,11 +27531,10 @@ app.get("/form", async (req, res) => {
     histRes.rows.forEach((row) => {
       const historyKey = String(row.kpi_values_id || row.kpi_id);
       if (!historyByKpi[historyKey]) historyByKpi[historyKey] = [];
-   historyByKpi[historyKey].push({
+historyByKpi[historyKey].push({
   week: row.week,
-  result_date: row.result_date
-    ? new Date(row.result_date).toISOString().slice(0, 10)
-    : null,
+  period_label: row.period_label,
+  result_date: row.result_date,
   value: parseFloat(row.new_value)
 });
     });
@@ -27742,24 +27740,34 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
       // â”€â”€ Corrective actions section (no footer add-btn inside) â”€â”€
 
 
-      const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
-      const sortedHistory = rawHistory
-        .filter((h) => !isNaN(h.value))
-        .sort((a, b) => weekLabelToDate(a.week) - weekLabelToDate(b.week));
-
+const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
 const frequencyMode = normalizeKpiFrequency(kpi.frequency);
 
-const currentPeriodLabel =
-  frequencyMode === "daily"
-    ? new Date().toISOString().slice(0, 10)
-    : frequencyMode === "monthly"
-      ? weekToMonthLabel(week)
-      : week;
+function getChartPeriod(item) {
+  if (frequencyMode === "daily") {
+    return item.result_date || item.period_label || item.week;
+  }
+
+  if (frequencyMode === "weekly") {
+    return item.week || item.period_label || item.result_date;
+  }
+
+  return item.period_label || weekToMonthLabel(item.week) || item.result_date;
+}
+
+function getChartSortValue(label) {
+  if (frequencyMode === "daily") return new Date(label).getTime();
+  if (frequencyMode === "monthly") return monthLabelToDate(label).getTime();
+  return weekLabelToDate(label).getTime();
+}
 
 const periodMap = {};
 
-sortedHistory.forEach((item) => {
-  const periodLabel = getPeriodLabelForFrequency(item, kpi.frequency);
+rawHistory.forEach((item) => {
+  if (isNaN(item.value)) return;
+
+  const periodLabel = getChartPeriod(item);
+  if (!periodLabel) return;
 
   if (!periodMap[periodLabel]) {
     periodMap[periodLabel] = { sum: 0, count: 0 };
@@ -27769,6 +27777,13 @@ sortedHistory.forEach((item) => {
   periodMap[periodLabel].count += 1;
 });
 
+const currentPeriodLabel =
+  frequencyMode === "daily"
+    ? week
+    : frequencyMode === "monthly"
+      ? weekToMonthLabel(week)
+      : week;
+
 if (currentValue !== null) {
   periodMap[currentPeriodLabel] = {
     sum: currentValue,
@@ -27776,7 +27791,9 @@ if (currentValue !== null) {
   };
 }
 
-let historyLabels = Object.keys(periodMap);
+let historyLabels = Object.keys(periodMap)
+  .sort((a, b) => getChartSortValue(a) - getChartSortValue(b))
+  .slice(-4);
 
 let historyValues = historyLabels.map((label) => {
   const p = periodMap[label];
