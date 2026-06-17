@@ -27311,11 +27311,11 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       return d.toLocaleString("en-US", { month: "short", year: "numeric" });
     }
 
-    function periodLabelToDate(label, frequencyMode) {
-      if (frequencyMode === "daily") return new Date(label);
-      if (frequencyMode === "monthly") return new Date("1 " + label);
+   function periodLabelToDate(label, frequencyMode) {
+     if (frequencyMode === "daily") return new Date(label + "T00:00:00Z");
+     if (frequencyMode === "monthly") return new Date("1 " + label);
       return weekLabelToDate(label);
-    }
+     }
 
     function getPeriodLabel(row) {
       if (frequencyMode === "daily") {
@@ -27876,9 +27876,10 @@ let historyValues = historyLabels.map((label) => {
        data-target="${targetValue !== null ? targetValue : ""}"
        data-history-labels='${JSON.stringify(historyLabels)}'
        data-history-values='${JSON.stringify(historyValues)}'
-       data-current-week="${week}"
-       data-current-month-label="${currentPeriodLabel}"
-       data-unit="${displayUnit}"
+      data-current-week="${week}"
+      data-current-month-label="${currentPeriodLabel}"
+      data-frequency="${formFrequencyLabel}"
+      data-unit="${displayUnit}"
       data-history-actions="${encodeModalPayload(allHistoryActions)}"
       data-history-comments="${encodeModalPayload(allHistoryComments)}">
 
