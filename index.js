@@ -9774,7 +9774,7 @@ textarea {
 
    #modalBackdrop {
      align-items: center;
-     padding: 16px;
+     padding: 12px;
      overflow: auto;
     }
 
@@ -11161,7 +11161,7 @@ textarea {
 }
 
 .kpi-attributes-modal {
-  width: min(1540px, calc(100vw - 56px)) !important;
+  width: min(1620px, calc(100vw - 44px)) !important;
   max-height: calc(100vh - 30px) !important;
   height: auto !important;
   border-radius: 24px !important;
@@ -11408,7 +11408,7 @@ textarea {
 
 /* Keep the KPI modal polished, compact, and content-driven */
 .kpi-attributes-modal {
-  width: min(1480px, calc(100vw - 48px)) !important;
+  width: min(1580px, calc(100vw - 32px)) !important;
   height: auto !important;
   max-height: calc(100vh - 24px) !important;
   overflow: hidden !important;
