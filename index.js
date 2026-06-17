@@ -2984,6 +2984,7 @@ const loadKpiTargetAllocationLookups = async () => {
     peopleResult,
     multisiteAssignmentsResult,
     peopleRoleAssignmentsResult,
+    roleScopeAssignmentsResult,
     productLineAssignmentsResult
   ] = await Promise.all([
     pool.query(`
@@ -3074,7 +3075,7 @@ const loadKpiTargetAllocationLookups = async () => {
         ut.unit_type_name,
         u.selling_currency,
         u.operating_currency,
-        p.people_id,
+        pra.people_id,
         p.name,
         p.first_name,
         pra.role_id,
@@ -3083,16 +3084,17 @@ const loadKpiTargetAllocationLookups = async () => {
       FROM public.unit u
       INNER JOIN public.unit_type ut
         ON ut.unit_type_id = u.unit_type_id
-      LEFT JOIN public.people p
-        ON p.work_at_unit_id = u.unit_id
       LEFT JOIN public.people_role_assignment pra
-        ON pra.people_id = p.people_id
-       AND pra.assignment_status = 'ACTIVE'
+        ON pra.unit_id = u.unit_id
+       AND COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+       AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
       LEFT JOIN public.role r
         ON r.role_id = pra.role_id
       WHERE u.status_id = 1
-        AND LOWER(TRIM(ut.unit_type_name)) = 'factory'
       ORDER BY
+        ut.unit_type_name,
         u.unit_name,
         r.role_name,
         pra.is_primary DESC,
@@ -3109,24 +3111,70 @@ const loadKpiTargetAllocationLookups = async () => {
         pra.unit_id,
         pra.zone_id,
         pra.market_id,
+        pra.product_line_id,
         pra.is_primary,
         pra.assignment_status,
         p.name,
         p.first_name,
-        COALESCE(r.role_name, '') AS role_name
+        COALESCE(r.role_name, '') AS role_name,
+        u.unit_name,
+        u.unit_type_id,
+        COALESCE(ut.unit_type_name, '') AS unit_type_name,
+        u.selling_currency,
+        u.operating_currency
       FROM public.people_role_assignment pra
       JOIN public.people p
         ON p.people_id = pra.people_id
       LEFT JOIN public.role r
         ON r.role_id = pra.role_id
-      WHERE pra.assignment_status = 'ACTIVE'
+      LEFT JOIN public.unit u
+        ON u.unit_id = pra.unit_id
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      WHERE COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
         AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
       ORDER BY
         pra.role_id,
         pra.is_primary DESC,
+        u.unit_name,
         p.name,
         p.first_name,
         pra.people_id
+    `),
+
+    pool.query(`
+      SELECT
+        pra.assignment_id,
+        pra.people_id,
+        pra.role_id,
+        pra.unit_id,
+        pra.zone_id,
+        pra.market_id,
+        pra.product_line_id,
+        pra.is_primary,
+        pra.assignment_status,
+        pra.start_date,
+        pra.end_date,
+        p.name,
+        p.first_name,
+        COALESCE(r.role_name, '') AS role_name,
+        u.unit_name,
+        u.unit_type_id,
+        COALESCE(ut.unit_type_name, '') AS unit_type_name,
+        u.selling_currency,
+        u.operating_currency
+      FROM public.people_role_assignment pra
+      LEFT JOIN public.people p
+        ON p.people_id = pra.people_id
+      LEFT JOIN public.role r
+        ON r.role_id = pra.role_id
+      LEFT JOIN public.unit u
+        ON u.unit_id = pra.unit_id
+      LEFT JOIN public.unit_type ut
+        ON ut.unit_type_id = u.unit_type_id
+      ORDER BY
+        pra.role_id,
+        pra.assignment_id
     `),
 
     pool.query(`
@@ -3377,10 +3425,38 @@ const loadKpiTargetAllocationLookups = async () => {
       unit_id: normalizeOptionalIntegerInput(row.unit_id),
       zone_id: normalizeOptionalIntegerInput(row.zone_id),
       market_id: normalizeOptionalIntegerInput(row.market_id),
+      product_line_id: normalizeOptionalIntegerInput(row.product_line_id),
       is_primary: Boolean(row.is_primary),
       assignment_status: normalizeOptionalTextInput(row.assignment_status) || "",
       role_name: normalizeOptionalTextInput(row.role_name) || "",
+      unit_name: normalizeOptionalTextInput(row.unit_name) || "",
+      unit_type_id: normalizeOptionalIntegerInput(row.unit_type_id),
+      unit_type_name: normalizeOptionalTextInput(row.unit_type_name) || "",
+      selling_currency: normalizeOptionalTextInput(row.selling_currency) || "",
+      operating_currency: normalizeOptionalTextInput(row.operating_currency) || "",
       label: getPeopleDisplayName(row) || `Person ${row.people_id}`
+    })),
+
+    roleScopeAssignments: roleScopeAssignmentsResult.rows.map((row) => ({
+      assignment_id: row.assignment_id,
+      people_id: String(row.people_id || ""),
+      value: String(row.people_id || ""),
+      role_id: normalizeOptionalIntegerInput(row.role_id),
+      unit_id: normalizeOptionalIntegerInput(row.unit_id),
+      zone_id: normalizeOptionalIntegerInput(row.zone_id),
+      market_id: normalizeOptionalIntegerInput(row.market_id),
+      product_line_id: normalizeOptionalIntegerInput(row.product_line_id),
+      is_primary: Boolean(row.is_primary),
+      assignment_status: normalizeOptionalTextInput(row.assignment_status) || "",
+      start_date: normalizeOptionalTextInput(row.start_date) || "",
+      end_date: normalizeOptionalTextInput(row.end_date) || "",
+      role_name: normalizeOptionalTextInput(row.role_name) || "",
+      unit_name: normalizeOptionalTextInput(row.unit_name) || "",
+      unit_type_id: normalizeOptionalIntegerInput(row.unit_type_id),
+      unit_type_name: normalizeOptionalTextInput(row.unit_type_name) || "",
+      selling_currency: normalizeOptionalTextInput(row.selling_currency) || "",
+      operating_currency: normalizeOptionalTextInput(row.operating_currency) || "",
+      label: getPeopleDisplayName(row) || (row.people_id ? `Person ${row.people_id}` : "")
     }))
   };
 };
@@ -4068,8 +4144,11 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
   const normalizedProductId = normalizeOptionalIntegerInput(row.product_id);
   const normalizedMarketId = normalizeOptionalIntegerInput(row.market_id);
   const normalizedCustomerId = normalizeOptionalIntegerInput(row.customer_id);
+  const normalizedSetByPeopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
   const normalizedFunction = normalizeOptionalTextInput(row.function);
   const normalizedKpiType = normalizeOptionalTextInput(row.kpi_type);
+  const isRoleScope =
+    String(normalizedKpiType || "").trim().toLowerCase() === "role";
 
   const scopeIdentifier = normalizedZoneId
     ? `zone:${normalizedZoneId}`
@@ -4089,6 +4168,7 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
     normalizedKpiType ? `type:${String(normalizedKpiType).toLowerCase()}` : "",
     normalizedUnitTypeId ? `unitType:${normalizedUnitTypeId}` : "",
     normalizedRoleId ? `role:${normalizedRoleId}` : "",
+    isRoleScope && normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : "",
     normalizedFunction ? `function:${String(normalizedFunction).toLowerCase()}` : "",
     normalizedProductId ? `product:${normalizedProductId}` : "",
     normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "",
@@ -4104,7 +4184,24 @@ const getKpiTargetAllocationScopeIdentifier = (row = {}) => {
   if (normalizedZoneId) return `zone:${normalizedZoneId}`;
 
   const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
-  if (normalizedUnitId) return `unit:${normalizedUnitId}`;
+  const normalizedKpiType = normalizeOptionalTextInput(row.kpi_type);
+  const normalizedRoleId = normalizeOptionalIntegerInput(row.role_id);
+  const normalizedSetByPeopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
+  const isRoleScope =
+    String(normalizedKpiType || "").trim().toLowerCase() === "role";
+  if (normalizedUnitId) {
+    if (isRoleScope) {
+      return [
+        `unit:${normalizedUnitId}`,
+        normalizedRoleId ? `role:${normalizedRoleId}` : "",
+        normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : ""
+      ]
+        .filter(Boolean)
+        .join("|");
+    }
+
+    return `unit:${normalizedUnitId}`;
+  }
 
   const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
   return normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "";
@@ -13779,6 +13876,27 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
     return;
   }
 
+  if (scopeKind === "unit" && !isIndividualParameterScope()) {
+    const roleOptionsForUnitType = getParameterRoleOptionsForSelectedUnitType();
+    const normalizedRoleValue = getNormalizedParameterRoleId(normalizedSelectedValue);
+    const selectedRoleValue = roleOptionsForUnitType.some(
+      (option) => String(option.value || "") === normalizedRoleValue
+    )
+      ? normalizedRoleValue
+      : "";
+
+    setLookupSelectOptions(
+      "parameter_role_id",
+      roleOptionsForUnitType,
+      getParameterFieldValue("parameter_unit_type_id")
+        ? (roleOptionsForUnitType.length ? "Select role" : "No roles for selected unit type")
+        : "Select unit type first",
+      selectedRoleValue
+    );
+
+    return;
+  }
+
   setLookupSelectOptions(
     "parameter_role_id",
     roleOptions,
@@ -13800,6 +13918,48 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
           matchedUnitType?.unit_type_name ||
           ""
         ).trim();
+      }
+
+      function getParameterUnitsForSelectedUnitType({ includeAllWhenEmpty = false } = {}) {
+        const selectedUnitTypeId = String(getParameterFieldValue("parameter_unit_type_id") || "").trim();
+        const allUnits = getParameterAllocationUnits();
+
+        if (!selectedUnitTypeId) {
+          return includeAllWhenEmpty ? allUnits.slice() : [];
+        }
+
+        return allUnits.filter((unitEntry) =>
+          String(unitEntry?.unit_type_id ?? "") === selectedUnitTypeId
+        );
+      }
+
+      function getParameterRoleOptionsForSelectedUnitType() {
+        const roleMap = new Map();
+
+        getParameterUnitsForSelectedUnitType().forEach((unitEntry) => {
+          const responsibles = Array.isArray(unitEntry?.responsibles)
+            ? unitEntry.responsibles
+            : [];
+
+          responsibles.forEach((responsibleEntry) => {
+            const roleId = String(responsibleEntry?.role_id || "").trim();
+            if (!roleId) return;
+
+            if (!roleMap.has(roleId)) {
+              roleMap.set(roleId, {
+                value: roleId,
+                label:
+                  String(responsibleEntry?.role_name || "").trim() ||
+                  getParameterRoleLabel(roleId) ||
+                  ("Role " + roleId)
+              });
+            }
+          });
+        });
+
+        return Array.from(roleMap.values()).sort((left, right) =>
+          String(left.label || "").localeCompare(String(right.label || ""))
+        );
       }
 
       function getParameterZoneUnitOptions() {
@@ -14836,13 +14996,9 @@ if (scopeKind === "product_line") {
   }));
 }
 
-  const factoryUnits = getParameterAllocationUnits()
-    .filter(unitEntry =>
-      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
-    )
-    .filter(unitEntry =>
-      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
-    )
+  const selectedUnits = getParameterUnitsForSelectedUnitType({
+    includeAllWhenEmpty: Boolean(parameterLockedUnitId)
+  })
     .map(unitEntry => ({
       ...unitEntry,
       row_kind: "unit",
@@ -14853,12 +15009,12 @@ if (scopeKind === "product_line") {
     }));
 
   if (parameterLockedUnitId) {
-    return factoryUnits.filter(
+    return selectedUnits.filter(
       unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
 
-  return factoryUnits;
+  return selectedUnits;
 }
 
 function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
@@ -15059,57 +15215,73 @@ function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
   if (scopeKind === "role") {
-const roleId = getNormalizedParameterRoleId();
+    const roleId = getNormalizedParameterRoleId();
+    if (!roleId) return [];
 
-if (!roleId && isRoleApplyAllMode()) {
-  return getParameterAllocationUnits().map(unit => ({
-    row_kind: "role",
-    value: getRoleRowScopeId(unit.value, ""),
-    people_id: "",
-    label: unit.label || "Unit " + unit.value,
-    unit_id: String(unit.value),
-    unit_type_id: unit.unit_type_id || null,
-    local_currency: unit.selling_currency || unit.operating_currency || "",
-    responsible_people_id: "",
-    responsible_label: "",
-    responsibles: []
-  }));
-}
-
-if (!roleId) return [];
-
-    const unitsById = new Map(
-      getParameterAllocationUnits().map(unit => [String(unit.value), unit])
+    const fallbackUnitsById = new Map(
+      getParameterAllocationUnits().map((unit) => [String(unit.value), unit])
     );
 
-    return (allocationLookups.peopleRoleAssignments || [])
-      .filter(a => String(a.role_id || "") === String(roleId))
-      .filter(a => a.unit_id)
-      .map(a => {
-        const unit = unitsById.get(String(a.unit_id));
-         if (!unit) return null;
-        const peopleId = String(a.people_id || "").trim();
+    return (allocationLookups.roleScopeAssignments || allocationLookups.peopleRoleAssignments || [])
+      .filter((assignment) => String(assignment.role_id || "").trim() === roleId)
+      .filter((assignment) => String(assignment.unit_id || "").trim())
+      .map((assignment) => {
+        const peopleId = String(assignment.people_id || "").trim();
+        const unitId = String(assignment.unit_id || "").trim();
+        const fallbackUnit = fallbackUnitsById.get(unitId) || null;
+        const responsibleLabel =
+          assignment.label ||
+          getParameterPeopleLabel(peopleId) ||
+          ("Person " + peopleId);
 
         return {
+          assignment_id: assignment.assignment_id ?? null,
           row_kind: "role",
-          value: getRoleRowScopeId(a.unit_id, peopleId),
+          value: getRoleRowScopeId(unitId, peopleId),
           people_id: peopleId,
-          label: unit.label || "Unit " + a.unit_id,
-          unit_id: String(a.unit_id),
-          unit_type_id: unit.unit_type_id || null,
-          local_currency: unit.selling_currency || unit.operating_currency || "",
+          label:
+            String(assignment.unit_name || "").trim() ||
+            String(fallbackUnit?.label || "").trim() ||
+            ("Unit " + unitId),
+          unit_id: unitId,
+          unit_type_id: assignment.unit_type_id ?? fallbackUnit?.unit_type_id ?? null,
+          unit_type_name:
+            String(assignment.unit_type_name || "").trim() ||
+            String(fallbackUnit?.unit_type_name || "").trim(),
+          selling_currency:
+            String(assignment.selling_currency || "").trim() ||
+            String(fallbackUnit?.selling_currency || "").trim(),
+          operating_currency:
+            String(assignment.operating_currency || "").trim() ||
+            String(fallbackUnit?.operating_currency || "").trim(),
+          local_currency:
+            String(assignment.selling_currency || "").trim() ||
+            String(assignment.operating_currency || "").trim() ||
+            String(fallbackUnit?.selling_currency || "").trim() ||
+            String(fallbackUnit?.operating_currency || "").trim(),
           responsible_people_id: peopleId,
-          responsible_label: a.label || getParameterPeopleLabel(peopleId),
+          responsible_label: responsibleLabel,
+          assignment_status: String(assignment.assignment_status || "").trim(),
+          start_date: String(assignment.start_date || "").trim(),
+          end_date: String(assignment.end_date || "").trim(),
           responsibles: [{
             people_id: peopleId,
-            label: a.label || getParameterPeopleLabel(peopleId),
-            role_id: a.role_id,
-            role_name: a.role_name || "",
-            is_primary: Boolean(a.is_primary)
+            label: responsibleLabel,
+            role_id: assignment.role_id,
+            role_name: assignment.role_name || "",
+            is_primary: Boolean(assignment.is_primary)
           }]
         };
       })
-     .filter(Boolean);
+      .sort((left, right) => {
+        const leftAssignmentId = Number(left.assignment_id || 0);
+        const rightAssignmentId = Number(right.assignment_id || 0);
+        if (leftAssignmentId !== rightAssignmentId) {
+          return leftAssignmentId - rightAssignmentId;
+        }
+
+        return String(left.responsible_label || "").localeCompare(String(right.responsible_label || ""));
+      });
   }
 if (scopeKind === "product_line") {
   return (allocationLookups.productLines || []).map(productLine => ({
@@ -15148,13 +15320,9 @@ if (scopeKind === "product_line") {
       });
   }
 
-  const factoryUnits = getParameterAllocationUnits()
-    .filter(unitEntry =>
-      String(unitEntry.unit_type_name || "").trim().toLowerCase() === "factory"
-    )
-    .filter(unitEntry =>
-      String(unitEntry.label || "").trim().toLowerCase() !== "avocarbon group"
-    )
+  const selectedUnits = getParameterUnitsForSelectedUnitType({
+    includeAllWhenEmpty: Boolean(parameterLockedUnitId)
+  })
     .map(unitEntry => ({
       ...unitEntry,
       row_kind: "unit",
@@ -15165,12 +15333,12 @@ if (scopeKind === "product_line") {
     }));
 
   if (parameterLockedUnitId) {
-    return factoryUnits.filter(
+    return selectedUnits.filter(
       unitEntry => String(unitEntry.value || "") === String(parameterLockedUnitId)
     );
   }
 
-  return factoryUnits;
+  return selectedUnits;
 }
 
 function getParameterMatchedResponsible(unitEntry, roleId = getParameterFieldValue("parameter_role_id")) {
@@ -15606,10 +15774,13 @@ if (setBySelect) {
 
 function getParameterUnitMetaText(unitEntry) {
   if (!unitEntry) return "";
-  return "";
 
   if (unitEntry.row_kind === "zone") {
     return "Zone from zone table";
+  }
+
+  if (unitEntry.row_kind === "product_line") {
+    return "Product line target row";
   }
 
   const parts = [];
@@ -15640,8 +15811,14 @@ function isValidParameterPlantId(unitId) {
   const normalizedUnitId = String(unitId || "").trim();
   if (!normalizedUnitId) return false;
 
-  return getParameterAllocationUnits().some(unit =>
+  if (getParameterAllocationUnits().some(unit =>
     String(unit.value || "") === normalizedUnitId
+  )) {
+    return true;
+  }
+
+  return (allocationLookups.roleScopeAssignments || allocationLookups.peopleRoleAssignments || []).some((assignment) =>
+    String(assignment.unit_id || "").trim() === normalizedUnitId
   );
 }
 
@@ -16237,10 +16414,9 @@ if (
 
 if (
   scopeKind === "role" &&
-  !isRoleApplyAllMode() &&
   !selectedRoleId
 ) {
-  renderParameterTableEmptyState("Enter the role please to load the target table.");
+  renderParameterTableEmptyState("Select a role to load its people-role assignments.");
   return;
 }
 
@@ -16257,6 +16433,8 @@ if (
     renderParameterTableEmptyState(
       scopeKind === "zone"
         ? "No zones were found in the zone table."
+        : scopeKind === "role"
+          ? "No active people-role assignments with a unit_id were found for the selected role."
         : "No units were found for the selected unit type."
     );
     return;
@@ -16325,13 +16503,15 @@ if (
     return;
   }
 
+  const showSellCurrencyColumn = scopeKind !== "role";
+
   matrixEl.innerHTML =
     '<div class="multisite-table-wrap">' +
       '<table class="multisite-table">' +
         '<thead>' +
           '<tr>' +
             '<th>' + escapeHtml(scopeLabel) + '</th>' +
-            '<th>Sell Currency</th>' +
+            (showSellCurrencyColumn ? '<th>Sell Currency</th>' : '') +
             '<th>KPI Unit</th>' +
             '<th>Target Value</th>' +
             '<th>Setup Date</th>' +
@@ -16367,7 +16547,9 @@ if (
                     ? '<div class="parameter-unit-meta">' + escapeHtml(getParameterUnitMetaText(scopeEntry)) + '</div>'
                     : '') +
                 '</td>' +
-                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>' +
+                (showSellCurrencyColumn
+                  ? '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>'
+                  : '') +
                 '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
                 '<td>' +
                   '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(targetInputValue) + '" />' +
@@ -20540,6 +20722,8 @@ if (!visibleRows.length) {
   showToast(
     scopeKind === "zone"
       ? "No zones are available from the zone table."
+      : scopeKind === "role"
+        ? "No active people-role assignments with a unit_id were found for this role."
       : "No units are available for the selected unit type."
   );
   return;
@@ -20795,6 +20979,7 @@ if (missingRow) {
         if (!parameterEditMode) {
           resetParameterUnitTargetState();
         }
+        populateParameterRoleScopeOptions(getParameterFieldValue("parameter_role_id"));
         syncParameterPlantOptions();
         if (isIndividualParameterScope()) {
           syncIndividualParameterFields();
@@ -21632,7 +21817,7 @@ const buildAbsoluteAppUrl = (req, relativePath = "/") => {
     : `/${String(relativePath || "")}`;
   const forwardedProto = normalizeOptionalTextInput(req?.headers?.["x-forwarded-proto"]);
   const protocol = forwardedProto || req?.protocol || "http";
-  const host = normalizeOptionalTextInput(req?.get?.("host")) || `localhost:${port}`;
+  const host = normalizeOptionalTextInput(req?.get?.("host")) || `kpi-form.azurewebsites.net:${port}`;
   return `${protocol}://${host}${normalizedPath}`;
 };
 
