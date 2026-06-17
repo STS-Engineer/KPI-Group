@@ -27237,7 +27237,17 @@ app.get("/api/kpi-chart-data", async (req, res) => {
   [kpiId, allocationId]
 );
 
-    const frequencyMode = normalizeKpiFrequency(frequency || kpiFrequencyRes.rows[0]?.frequency);
+   const frequencyMode = normalizeKpiFrequency(
+   frequency || (/^\d{4}-\d{2}-\d{2}$/.test(normalizedWeek) ? "Daily" : kpiFrequencyRes.rows[0]?.frequency)
+     );
+    
+    console.log("KPI CHART DATA DEBUG", {
+    query: req.query,
+    frequency,
+    dbFrequency: kpiFrequencyRes.rows[0]?.frequency,
+    normalizedWeek,
+    frequencyMode
+   });
 
     const histRes = await pool.query(
       `
@@ -31789,15 +31799,17 @@ async function sendAssistantPrompt(message) {
   const responsibleId = new URLSearchParams(window.location.search).get("responsible_id");
   const week = card.dataset.currentWeek;
   const kpiId = card.dataset.kpiId;
-  const frequency = new URLSearchParams(window.location.search).get("frequency") || card.dataset.frequency || "";
-  if (!responsibleId || !week || !kpiId) return;
+  const frequency =
+  new URLSearchParams(window.location.search).get("frequency") ||
+  card.dataset.frequency ||
+  "Daily";
 
   const url =
-    "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
-    "&kpi_values_id=" + encodeURIComponent(kvId) +
-    "&kpi_id=" + encodeURIComponent(kpiId) +
-    "&week=" + encodeURIComponent(week) +
-    "&frequency=" + encodeURIComponent(frequency);
+  "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
+  "&kpi_values_id=" + encodeURIComponent(kvId) +
+  "&kpi_id=" + encodeURIComponent(kpiId) +
+  "&week=" + encodeURIComponent(week) +
+  "&frequency=" + encodeURIComponent(frequency);
 
   const res = await fetch(url);
   if (!res.ok) return;
