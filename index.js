@@ -27209,7 +27209,7 @@ app.post("/redirect", async (req, res) => {
 
 app.get("/api/kpi-chart-data", async (req, res) => {
   try {
-    const { kpi_id, week, kpi_values_id } = req.query;
+   const { kpi_id, week, kpi_values_id, frequency } = req.query;
     const allocationId = normalizeOptionalIntegerInput(kpi_values_id);
     const kpiId = normalizeOptionalIntegerInput(kpi_id);
     const normalizedWeek = normalizeOptionalTextInput(week);
@@ -27237,7 +27237,7 @@ app.get("/api/kpi-chart-data", async (req, res) => {
   [kpiId, allocationId]
 );
 
-    const frequencyMode = normalizeKpiFrequency(kpiFrequencyRes.rows[0]?.frequency);
+    const frequencyMode = normalizeKpiFrequency(frequency || kpiFrequencyRes.rows[0]?.frequency);
 
     const histRes = await pool.query(
       `
@@ -27761,7 +27761,7 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
 
 
 const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
-const frequencyMode = normalizeKpiFrequency(kpi.frequency);
+const frequencyMode = normalizeKpiFrequency(requestedFrequency || kpi.frequency);
 
 function getChartPeriod(item) {
   if (frequencyMode === "daily") {
@@ -31778,14 +31778,15 @@ async function sendAssistantPrompt(message) {
   const responsibleId = new URLSearchParams(window.location.search).get("responsible_id");
   const week = card.dataset.currentWeek;
   const kpiId = card.dataset.kpiId;
-
+  const frequency = new URLSearchParams(window.location.search).get("frequency") || card.dataset.frequency || "";
   if (!responsibleId || !week || !kpiId) return;
 
   const url =
     "/api/kpi-chart-data?responsible_id=" + encodeURIComponent(responsibleId) +
     "&kpi_values_id=" + encodeURIComponent(kvId) +
     "&kpi_id=" + encodeURIComponent(kpiId) +
-    "&week=" + encodeURIComponent(week);
+    "&week=" + encodeURIComponent(week) +
+    "&frequency=" + encodeURIComponent(frequency);
 
   const res = await fetch(url);
   if (!res.ok) return;
