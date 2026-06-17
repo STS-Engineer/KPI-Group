@@ -27761,7 +27761,17 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
 
 
 const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
-const frequencyMode = normalizeKpiFrequency(requestedFrequency || kpi.frequency);
+const frequencyMode = normalizeKpiFrequency(formFrequencyLabel || requestedFrequency || kpi.frequency);
+
+console.log("===== KPI CHART DEBUG =====");
+console.log("kpi:", kpi.kpi_name || kpi.indicator_sub_title);
+console.log("requestedFrequency:", requestedFrequency);
+console.log("formFrequencyLabel:", formFrequencyLabel);
+console.log("kpi.frequency:", kpi.frequency);
+console.log("frequencyMode:", frequencyMode);
+console.log("week:", week);
+console.log("rawHistory:", rawHistory);
+console.log("===========================");
 
 function getChartPeriod(item) {
   if (frequencyMode === "daily") {
@@ -27820,7 +27830,8 @@ let historyValues = historyLabels.map((label) => {
   return Number((p.sum / p.count).toFixed(2));
 });
 
-     
+ console.log("historyLabels:", historyLabels);
+ console.log("historyValues:", historyValues);    
     
 
       const allHistoryActions = sortHistoryEntries(
