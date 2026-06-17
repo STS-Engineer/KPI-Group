@@ -814,6 +814,20 @@ const formatDateOnlyValue = (value = new Date()) => {
   return `${year}-${month}-${day}`;
 };
 
+const parseDateOnlyValue = (value) => {
+  const normalizedDate = formatDateOnlyValue(value);
+  if (!normalizedDate) return null;
+
+  const match = normalizedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(year, month - 1, day);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
 const prepareResponsibleParameterKpiPayload = (payload = {}) => {
   const rawKpiId = normalizeOptionalTextInput(payload.kpi_id);
   const rawValue = normalizeOptionalTextInput(payload.value);
@@ -21797,10 +21811,7 @@ const getOpenAIClient = () => {
 };
 
 const formatInputDate = (dateValue) => {
-  if (!dateValue) return "";
-  const d = new Date(dateValue);
-  if (isNaN(d.getTime())) return "";
-  return d.toISOString().split("T")[0];
+  return formatDateOnlyValue(dateValue) || "";
 };
 
 const formatDisplayDate = (
@@ -21809,8 +21820,8 @@ const formatDisplayDate = (
   options = { day: "2-digit", month: "short", year: "numeric" }
 ) => {
   if (!dateValue) return "N/A";
-  const d = new Date(dateValue);
-  if (isNaN(d.getTime())) return "N/A";
+  const d = parseDateOnlyValue(dateValue);
+  if (!d || isNaN(d.getTime())) return "N/A";
   return d.toLocaleDateString(locale, options);
 };
 
@@ -22350,8 +22361,8 @@ const ensureCorrectiveActionEscalationSchema = async () => {
 const getCorrectiveActionOverdueDays = (dateValue, now = new Date()) => {
   if (!dateValue) return 0;
 
-  const dueDate = new Date(dateValue);
-  if (isNaN(dueDate.getTime())) return 0;
+  const dueDate = parseDateOnlyValue(dateValue);
+  if (!dueDate || isNaN(dueDate.getTime())) return 0;
 
   const currentDay = new Date(now);
   currentDay.setHours(0, 0, 0, 0);
@@ -24849,7 +24860,7 @@ const mapActionPlanActionRow = (row = {}) => {
     root_cause: normalizeOptionalTextInput(row.description) || "",
     implemented_solution: normalizeOptionalTextInput(row.titre) || "",
     status,
-    due_date: formatIsoDateValue(row.due_date),
+    due_date: formatDateOnlyValue(row.due_date),
     estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(row.estimated_duration_days),
     importance: normalizeCorrectiveActionImportance(row.importance),
     urgency: normalizeCorrectiveActionUrgency(row.urgency),
@@ -26097,14 +26108,11 @@ app.get("/corrective-actions-list", async (req, res) => {
     const latestSubmittedActionId = actions[0]?.corrective_action_id ?? null;
 
     const formatDate = (dateValue) => {
-      if (!dateValue) return "â€”";
-      const d = new Date(dateValue);
-      if (isNaN(d.getTime())) return "â€”";
-      return d.toLocaleDateString("en-GB", {
+      return formatDisplayDate(dateValue, "en-GB", {
         day: "2-digit",
         month: "short",
         year: "numeric"
-      });
+      }).replace(/^N\/A$/, "â€”");
     };
 
     const escapeHtml = (value) =>
@@ -26127,7 +26135,7 @@ app.get("/corrective-actions-list", async (req, res) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
 
-        const dueDate = a.due_date ? new Date(a.due_date) : null;
+        const dueDate = a.due_date ? parseDateOnlyValue(a.due_date) : null;
         const isOverdue =
           dueDate &&
           !isNaN(dueDate.getTime()) &&
@@ -29187,8 +29195,8 @@ let historyValues = historyLabels.map((label) => {
             pointer-events: auto;
           }
           .ca-modal-box {
-            width: min(98.6vw, 1460px);
-            max-height: min(92vh, 900px);
+            width: min(98.4vw, 1440px);
+            max-height: min(90vh, 840px);
             background:
               radial-gradient(circle at top right, rgba(59,130,246,0.08), transparent 28%),
               linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
@@ -29209,7 +29217,7 @@ let historyValues = historyLabels.map((label) => {
             align-items: flex-start;
             justify-content: space-between;
             gap: 16px;
-            padding: 24px 28px 18px;
+            padding: 20px 24px 16px;
             border-bottom: 1px solid rgba(226,232,240,0.92);
             background:
               radial-gradient(circle at top right, rgba(239,68,68,0.10), transparent 32%),
@@ -29217,7 +29225,7 @@ let historyValues = historyLabels.map((label) => {
           }
           .ca-modal-title {
             margin: 0;
-            font-size: 28px;
+            font-size: 24px;
             font-weight: 900;
             letter-spacing: -0.04em;
             color: #991b1b;
@@ -29249,7 +29257,7 @@ let historyValues = historyLabels.map((label) => {
             flex: 1;
             min-height: 0;
             overflow: auto;
-            padding: 20px 20px 24px;
+            padding: 16px 18px 18px;
             background:
               radial-gradient(circle at top right, rgba(59,130,246,0.05), transparent 24%),
               linear-gradient(180deg, #fbfdff 0%, #f4f8ff 100%);
@@ -29264,7 +29272,7 @@ let historyValues = historyLabels.map((label) => {
 }
 
           .ca-table-wrap {
-            max-height: 320px;
+            max-height: 268px;
             overflow-y: auto;
           }
 
@@ -29294,7 +29302,7 @@ let historyValues = historyLabels.map((label) => {
 
           .ca-table th,
           .ca-entry-editor-table th {
-            padding: 14px 16px;
+            padding: 11px 12px;
             text-align: left;
             font-size: 11px;
             font-weight: 900;
@@ -29307,11 +29315,11 @@ let historyValues = historyLabels.map((label) => {
 
           .ca-table td,
           .ca-entry-editor-table td {
-            padding: 14px 16px;
+            padding: 11px 12px;
             border-bottom: 1px solid rgba(241,245,249,0.96);
             vertical-align: top;
             color: #334155;
-            line-height: 1.55;
+            line-height: 1.45;
             background: rgba(255,255,255,0.98);
           }
 
@@ -29360,7 +29368,7 @@ let historyValues = historyLabels.map((label) => {
           .ca-table-copy {
             display: flex;
             flex-direction: column;
-            gap: 6px;
+            gap: 3px;
             min-width: 0;
           }
 
@@ -29368,7 +29376,7 @@ let historyValues = historyLabels.map((label) => {
             font-size: 13px;
             font-weight: 800;
             color: #172033;
-            line-height: 1.55;
+            line-height: 1.42;
             display: -webkit-box;
             -webkit-line-clamp: 2;
             -webkit-box-orient: vertical;
@@ -29387,27 +29395,36 @@ let historyValues = historyLabels.map((label) => {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            min-height: 36px;
-            padding: 0 12px;
+            min-height: 32px;
+            padding: 0 11px;
             border-radius: 999px;
             background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(14,165,233,0.08));
             color: #1d4ed8;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 900;
             letter-spacing: 0.02em;
             border: 1px solid rgba(147,197,253,0.48);
           }
 
+          .ca-table td:nth-child(3) .ca-date-chip {
+          min-width: 92px;
+          white-space: nowrap;
+         }
+
+       .ca-entry-editor-table td:first-child .ca-modal-input {
+         min-width: 118px;
+}
+
           .ca-responsible-cell {
             display: inline-flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             min-width: 0;
           }
 
           .ca-responsible-avatar {
-            width: 34px;
-            height: 34px;
+            width: 30px;
+            height: 30px;
             border-radius: 50%;
             display: inline-flex;
             align-items: center;
@@ -29423,12 +29440,12 @@ let historyValues = historyLabels.map((label) => {
           .ca-responsible-copy {
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: 0;
             min-width: 0;
           }
 
           .ca-responsible-name {
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 800;
             color: #172033;
             white-space: nowrap;
@@ -29445,7 +29462,7 @@ let historyValues = historyLabels.map((label) => {
             display: inline-flex;
             align-items: center;
             justify-content: flex-end;
-            gap: 8px;
+            gap: 6px;
             flex-wrap: wrap;
           }
 
@@ -29578,8 +29595,8 @@ let historyValues = historyLabels.map((label) => {
             align-items: center;
             justify-content: space-between;
             gap: 12px;
-            margin-top: 18px;
-            margin-bottom: 14px;
+            margin-top: 14px;
+            margin-bottom: 10px;
             flex-wrap: wrap;
             padding: 0 4px;
           }
@@ -29621,9 +29638,9 @@ let historyValues = historyLabels.map((label) => {
 }
 
           .ca-modal-form-section {
-            margin-top: 10px;
+            margin-top: 8px;
             border: 1px solid rgba(147,197,253,0.42);
-            border-radius: 24px;
+            border-radius: 20px;
             overflow: hidden;
             background:
               radial-gradient(circle at top right, rgba(59,130,246,0.08), transparent 24%),
@@ -29638,7 +29655,7 @@ let historyValues = historyLabels.map((label) => {
             align-items: center;
             justify-content: space-between;
             gap: 16px;
-            padding: 18px 20px;
+            padding: 14px 18px;
             background:
               radial-gradient(circle at top right, rgba(59,130,246,0.10), transparent 24%),
               linear-gradient(180deg, #ffffff 0%, #f1f7ff 100%);
@@ -29648,19 +29665,19 @@ let historyValues = historyLabels.map((label) => {
           .ca-modal-form-header-main {
             display: flex;
             flex-direction: column;
-            gap: 7px;
+            gap: 4px;
           }
 
           .ca-modal-form-title {
             display: block;
-            font-size: 17px;
+            font-size: 16px;
             font-weight: 900;
             color: #0f172a;
             letter-spacing: -0.02em;
           }
 
           .ca-modal-form-caption {
-            font-size: 12px;
+            font-size: 11px;
             color: #64748b;
           }
 
@@ -29729,9 +29746,9 @@ let historyValues = historyLabels.map((label) => {
             min-width: 94px;
           }
 
-          .ca-entry-editor-table th,
+.ca-entry-editor-table th,
 .ca-entry-editor-table td {
-  padding: 10px 8px;
+  padding: 8px 7px;
 }
 
 .ca-entry-editor-table th {
@@ -29742,14 +29759,14 @@ let historyValues = historyLabels.map((label) => {
 .ca-entry-editor-table .ca-modal-input,
 .ca-entry-editor-table .ca-modal-select,
 .ca-entry-editor-table .ca-responsible-trigger {
-  min-height: 44px;
-  padding: 10px 9px;
+  min-height: 40px;
+  padding: 9px 10px;
   font-size: 12px;
 }
 
 .ca-entry-editor-table .ca-modal-textarea {
-  min-height: 82px;
-  padding: 10px 9px;
+  min-height: 72px;
+  padding: 9px 10px;
   font-size: 12px;
   resize: none;
 }
@@ -29783,7 +29800,7 @@ let historyValues = historyLabels.map((label) => {
           .ca-editor-cell {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
           }
 
           .ca-responsible-select {
@@ -29793,13 +29810,13 @@ let historyValues = historyLabels.map((label) => {
 
           .ca-responsible-trigger {
             width: 100%;
-            min-height: 46px;
-            padding: 12px 40px 12px 13px;
+            min-height: 40px;
+            padding: 9px 38px 9px 11px;
             border: 1px solid rgba(191,219,254,0.7);
-            border-radius: 14px;
+            border-radius: 12px;
             background: #ffffff;
             color: #0f172a;
-            font-size: 13px;
+            font-size: 12px;
             font-family: inherit;
             display: flex;
             align-items: center;
@@ -29843,14 +29860,31 @@ let historyValues = historyLabels.map((label) => {
             pointer-events: none;
           }
 
+          .ca-responsible-menu-head {
+            padding: 4px 4px 8px;
+          }
+
+          .ca-responsible-menu-title {
+            font-size: 12px;
+            font-weight: 900;
+            color: #0f172a;
+          }
+
+          .ca-responsible-menu-note {
+            margin-top: 3px;
+            font-size: 11px;
+            color: #64748b;
+            line-height: 1.4;
+          }
+
           .ca-responsible-menu {
             position: fixed;
             z-index: 12050;
             background: #ffffff;
             border: 1px solid rgba(191,219,254,0.95);
-            border-radius: 16px;
-            box-shadow: 0 22px 44px rgba(15,23,42,0.18);
-            padding: 8px;
+            border-radius: 18px;
+            box-shadow: 0 24px 48px rgba(15,23,42,0.18);
+            padding: 10px;
           }
 
           .ca-responsible-menu[hidden] {
@@ -29890,8 +29924,8 @@ let historyValues = historyLabels.map((label) => {
           .ca-responsible-options {
             display: flex;
             flex-direction: column;
-            gap: 6px;
-            max-height: 340px;
+            gap: 5px;
+            max-height: 280px;
             overflow: auto;
           }
 
@@ -29901,9 +29935,12 @@ let historyValues = historyLabels.map((label) => {
             border-radius: 12px;
             background: transparent;
             color: #0f172a;
-            font-size: 13px;
+            font-size: 12px;
             font-family: inherit;
-            padding: 10px 12px;
+            padding: 9px 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
             text-align: left;
             cursor: pointer;
             transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease;
@@ -29918,6 +29955,41 @@ let historyValues = historyLabels.map((label) => {
             background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.10));
             color: #1d4ed8;
             font-weight: 700;
+          }
+
+          .ca-responsible-option-avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.10));
+            color: #1d4ed8;
+            font-size: 11px;
+            font-weight: 900;
+          }
+
+          .ca-responsible-option-name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 700;
+          }
+
+          .ca-responsible-option-check {
+            flex-shrink: 0;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: rgba(37,99,235,0.10);
+            color: #1d4ed8;
+            font-size: 10px;
+            font-weight: 900;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
           }
 
           .ca-responsible-option.is-placeholder {
@@ -29950,10 +30022,10 @@ let historyValues = historyLabels.map((label) => {
           .ca-editor-status-panel {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
             min-height: 100%;
-            padding: 12px;
-            border-radius: 16px;
+            padding: 10px;
+            border-radius: 14px;
             background: rgba(255,255,255,0.88);
             border: 1px solid rgba(226,232,240,0.9);
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
@@ -29997,14 +30069,14 @@ let historyValues = historyLabels.map((label) => {
           }
 
 .ca-entry-actions-cell {
-    min-width: 280px;
+    min-width: 248px;
 }
 .ca-entry-actions-stack {
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: 12px;
+    gap: 10px;
     white-space: nowrap;
 }
 
@@ -30020,7 +30092,7 @@ let historyValues = historyLabels.map((label) => {
             width: auto;
             flex: 1 1 0;
             min-width: 104px;
-            min-height: 44px;
+            min-height: 40px;
             padding: 0 18px;
             border-radius: 14px;
             font-size: 13px;
@@ -30632,17 +30704,17 @@ let historyValues = historyLabels.map((label) => {
               </div>
               <div class="ca-table-wrap" data-ca-filter-table-wrap>
                 <table class="ca-table" id="caModalTable">
-       <colgroup>
-  <col style="width:8%">
-  <col style="width:11%">
-  <col style="width:6%">
-  <col style="width:16%">
-  <col style="width:17%">
-  <col style="width:8%">
-  <col style="width:8%">
-  <col style="width:7%">
-  <col style="width:19%">
-</colgroup>
+      <colgroup>
+       <col style="width:8%">
+       <col style="width:11%">
+      <col style="width:10%">
+       <col style="width:15%">
+       <col style="width:13%">
+      <col style="width:8%">
+      <col style="width:8%">
+       <col style="width:7%">
+       <col style="width:20%">
+      </colgroup>
                   <thead>
                     <tr>
                       <th>Root Cause</th>
@@ -30674,7 +30746,7 @@ let historyValues = historyLabels.map((label) => {
                 <div class="ca-modal-form-header">
                   <div class="ca-modal-form-header-main">
                     <span class="ca-modal-form-title" id="caModalFormTitle">New Corrective Action</span>
-                    <div class="ca-modal-form-caption" id="caModalFormCaption">Inline action editor in professional table format.</div>
+                    <div class="ca-modal-form-caption" id="caModalFormCaption">Use the owner search to assign the action clearly and save faster.</div>
                 
                   </div>
                   <button type="button" class="ca-tbl-btn ca-tbl-delete" id="caModalFormCollapse">&times; Cancel</button>
@@ -30683,20 +30755,20 @@ let historyValues = historyLabels.map((label) => {
                 <div class="ca-entry-editor-wrap">
                   <table class="ca-entry-editor-table">
 <colgroup>
-  <col style="width:8%">
-  <col style="width:11%">
+  <col style="width:9%">
+  <col style="width:14%">
   <col style="width:6%">
+  <col style="width:14%">
   <col style="width:16%">
-  <col style="width:17%">
   <col style="width:8%">
   <col style="width:8%">
   <col style="width:7%">
-  <col style="width:19%">
+  <col style="width:18%">
 </colgroup>
                     <thead>
                       <tr>
                         <th>Due Date <span class="ca-required">*</span></th>
-                        <th>Responsible <span class="ca-required">*</span></th>
+                        <th>Responsible / Owner <span class="ca-required">*</span></th>
                         <th>Est. Days <span class="ca-required">*</span></th>
                         <th>Root Cause <span class="ca-required">*</span></th>
                         <th>Immediate Action / Solution <span class="ca-required">*</span></th>
@@ -30723,22 +30795,26 @@ let historyValues = historyLabels.map((label) => {
                                 id="caModalResponsibleTrigger"
                                 aria-haspopup="listbox"
                                 aria-expanded="false">
-                                <span class="ca-responsible-trigger-label" id="caModalResponsibleTriggerLabel">Select responsible</span>
+                                <span class="ca-responsible-trigger-label" id="caModalResponsibleTriggerLabel">Choose action owner</span>
                                 <span class="ca-responsible-trigger-chevron" aria-hidden="true">▾</span>
                               </button>
                               <div class="ca-responsible-menu" id="caModalResponsibleMenu" hidden>
+                                <div class="ca-responsible-menu-head">
+                                  <div class="ca-responsible-menu-title">Select responsible</div>
+                                  <div class="ca-responsible-menu-note">Search by colleague name and choose the action owner.</div>
+                                </div>
                                 <div class="ca-responsible-search">
                                   <input
                                     id="caModalResponsibleSearch"
                                     type="text"
-                                    placeholder="Type to filter responsibles..."
+                                    placeholder="Search by colleague name..."
                                     autocomplete="off"
                                   />
                                 </div>
                                 <div class="ca-responsible-options" id="caModalResponsibleOptions" role="listbox" aria-label="Responsible options"></div>
                               </div>
                               <select id="caModalResponsible" class="ca-modal-select ca-modal-select-native" tabindex="-1" aria-hidden="true">
-                                <option value="">Select responsible</option>
+                                <option value="">Choose action owner</option>
                                 ${correctiveActionResponsibleOptionsHtml}
                               </select>
                             </div>
@@ -31081,7 +31157,7 @@ function getCaModalActions(kvId) {
        tbody.innerHTML = actions.map((a, i) => {
       const sc = statusClass(a.status);
       const responsibleName = String(a.responsible || "").trim();
-      const responsibleInitial = responsibleName ? responsibleName.charAt(0).toUpperCase() : "?";
+      const responsibleInitial = getCaResponsibleInitials(responsibleName);
       const filterDueDate = getHistoryDueDateFilterValue(a.due_date);
       const dueDateDisplay = filterDueDate || String(a.due_date || "").trim();
       const estimatedDurationDays = a.estimated_duration_days ?? "";
@@ -31091,13 +31167,11 @@ function getCaModalActions(kvId) {
       <td title="\${escapeHtml(a.root_cause)}">
         <div class="ca-table-copy">
           <div class="ca-table-copy-title">\${escapeHtml(truncate(a.root_cause, 110))}</div>
-          <div class="ca-table-copy-meta">Cause analysis</div>
         </div>
       </td>
       <td title="\${escapeHtml(a.implemented_solution)}">
         <div class="ca-table-copy">
           <div class="ca-table-copy-title">\${escapeHtml(truncate(a.implemented_solution, 110))}</div>
-          <div class="ca-table-copy-meta">Immediate response</div>
         </div>
       </td>
       <td><span class="ca-date-chip">\${escapeHtml(dueDateDisplay)}</span></td>
@@ -31106,11 +31180,10 @@ function getCaModalActions(kvId) {
           <span class="ca-responsible-avatar">\${escapeHtml(responsibleInitial)}</span>
           <span class="ca-responsible-copy">
             <span class="ca-responsible-name">\${escapeHtml(responsibleName || "Not assigned")}</span>
-            <span class="ca-responsible-role">Action owner</span>
           </span>
         </div>
       </td>
-      <td>\${estimatedDurationDays !== "" ? \`<span class="ca-date-chip">\${escapeHtml(String(estimatedDurationDays))} d</span>\` : "&mdash;"}</td>
+      <td>\${estimatedDurationDays !== "" ? \`<span class="ca-date-chip">\${escapeHtml(String(estimatedDurationDays))}</span>\` : "&mdash;"}</td>
       <td>\${importance ? \`<span class="ca-date-chip">\${escapeHtml(importance)}</span>\` : "&mdash;"}</td>
       <td>\${urgency ? \`<span class="ca-date-chip">\${escapeHtml(urgency)}</span>\` : "&mdash;"}</td>
       <td>\${a.status ? \`<span class="ca-table-status \${sc}">\${escapeHtml(a.status)}</span>\` : "&mdash;"}</td>
@@ -31155,8 +31228,8 @@ function getCaModalActions(kvId) {
 
       if (formCaption) {
         formCaption.textContent = isEditing
-          ? "Refine the selected corrective action directly inside the table editor."
-          : "Add a new corrective action directly inside the structured draft row.";
+          ? "Update the owner, timing, and details in one compact editor."
+          : "Search the owner, complete the action details, and save.";
       }
 
       if (formChip) {
@@ -31386,22 +31459,26 @@ function syncDomFromStore(kvId) {
 
   const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
 
-  if (card) {
-    const historyActions = decodeModalPayload(card.dataset.historyActions, []);
-    if (Array.isArray(historyActions) && historyActions.length) {
-      caModalStore[kvId] = historyActions
-        .filter(a => getCanonicalCorrectiveActionStatus(a.status) !== "Closed")
-        .map(a => ({
-          id: a.corrective_action_id || a.id || "",
-          root_cause: a.root_cause || "",
-          implemented_solution: a.implemented_solution || "",
-          due_date: a.due_date || "",
-          estimated_duration_days: a.estimated_duration_days ?? null,
-          responsible: a.responsible || "",
-          importance: normalizeCorrectiveActionImportance(a.importance) || "",
-          urgency: normalizeCorrectiveActionUrgency(a.urgency) || "",
-          status: getCanonicalCorrectiveActionStatus(a.status)
-        }));
+  if (!Object.prototype.hasOwnProperty.call(caModalStore, kvId)) {
+    const liveActions = getCaModalActions(kvId);
+
+    if ((!Array.isArray(liveActions) || !liveActions.length) && card) {
+      const historyActions = decodeModalPayload(card.dataset.historyActions, []);
+      if (Array.isArray(historyActions) && historyActions.length) {
+        caModalStore[kvId] = historyActions
+          .filter(a => getCanonicalCorrectiveActionStatus(a.status) !== "Closed")
+          .map(a => ({
+            id: a.corrective_action_id || a.id || "",
+            root_cause: a.root_cause || "",
+            implemented_solution: a.implemented_solution || "",
+            due_date: a.due_date || "",
+            estimated_duration_days: a.estimated_duration_days ?? null,
+            responsible: a.responsible || "",
+            importance: normalizeCorrectiveActionImportance(a.importance) || "",
+            urgency: normalizeCorrectiveActionUrgency(a.urgency) || "",
+            status: getCanonicalCorrectiveActionStatus(a.status)
+          }));
+      }
     }
   }
 
@@ -32327,8 +32404,18 @@ async function sendAssistantPrompt(message) {
           let expandedChartKpiValuesId = null;
           const CA_RESPONSIBLE_OPTIONS = ${JSON.stringify(correctiveActionResponsibleOptions)};
           const DEFAULT_CA_RESPONSIBLE = ${JSON.stringify(defaultCorrectiveActionResponsible)};
-          const CA_RESPONSIBLE_DROPDOWN_WIDTH_REDUCTION = 18;
-          const CA_RESPONSIBLE_DROPDOWN_MIN_WIDTH = 156;
+          const CA_RESPONSIBLE_DROPDOWN_MIN_WIDTH = 290;
+          const CA_RESPONSIBLE_DROPDOWN_MAX_WIDTH = 380;
+
+          function getCaResponsibleInitials(label = "") {
+            const parts = String(label || "").trim().split(/\s+/).filter(Boolean);
+            if (!parts.length) return "?";
+            if (parts.length === 1) {
+              return parts[0].slice(0, 2).toUpperCase();
+            }
+
+            return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
+          }
 
           function getCaResponsibleDropdownElements() {
             return {
@@ -32377,7 +32464,7 @@ async function sendAssistantPrompt(message) {
             const normalizedFilter = String(filterText || "").trim().toLowerCase();
             const visibleOptions = nativeOptions.filter((option, index) => {
               const value = String(option.value || "");
-              const label = String(option.text || option.label || value || "Select responsible");
+              const label = String(option.text || option.label || value || "Choose action owner");
 
               if (!normalizedFilter) return value !== "";
               if (index === 0 && value === "") return false;
@@ -32392,14 +32479,17 @@ async function sendAssistantPrompt(message) {
 
             options.innerHTML = visibleOptions.map((option) => {
               const value = String(option.value || "");
-              const label = String(option.text || option.label || value || "Select responsible");
+              const label = String(option.text || option.label || value || "Choose action owner");
               const isSelected = value === selectedValue;
+              const initials = getCaResponsibleInitials(label);
 
               return '<button type="button" class="ca-responsible-option' +
                 (isSelected ? ' is-selected' : '') +
                 '" role="option" aria-selected="' + (isSelected ? "true" : "false") +
                 '" data-value="' + escapeHtml(value) + '">' +
-                escapeHtml(label) +
+                '<span class="ca-responsible-option-avatar">' + escapeHtml(initials) + '</span>' +
+                '<span class="ca-responsible-option-name">' + escapeHtml(label) + '</span>' +
+                (isSelected ? '<span class="ca-responsible-option-check">Selected</span>' : '') +
               '</button>';
             }).join("");
           }
@@ -32409,36 +32499,32 @@ async function sendAssistantPrompt(message) {
             if (!trigger || !menu || !options || menu.hidden) return;
 
             const triggerRect = trigger.getBoundingClientRect();
-            const availableBelow = Math.max(window.innerHeight - triggerRect.bottom - 18, 180);
-            const dropdownWidth = Math.max(
-              CA_RESPONSIBLE_DROPDOWN_MIN_WIDTH,
-              Math.round(triggerRect.width - CA_RESPONSIBLE_DROPDOWN_WIDTH_REDUCTION)
+            const availableBelow = Math.max(window.innerHeight - triggerRect.bottom - 18, 0);
+            const availableAbove = Math.max(triggerRect.top - 18, 0);
+            const openUpward = availableBelow < 250 && availableAbove > availableBelow;
+            const availableHeight = Math.max(openUpward ? availableAbove : availableBelow, 220);
+            const dropdownWidth = Math.min(
+              Math.max(
+                CA_RESPONSIBLE_DROPDOWN_MIN_WIDTH,
+                Math.round(triggerRect.width + 40)
+              ),
+              Math.round(Math.min(window.innerWidth - 24, CA_RESPONSIBLE_DROPDOWN_MAX_WIDTH))
             );
-            const centeredLeft = Math.round(triggerRect.left + ((triggerRect.width - dropdownWidth) / 2));
             const safeLeft = Math.max(
               12,
-              Math.min(centeredLeft, Math.round(window.innerWidth - dropdownWidth - 12))
+              Math.min(Math.round(triggerRect.left), Math.round(window.innerWidth - dropdownWidth - 12))
             );
+            const menuMaxHeight = Math.round(Math.min(availableHeight, 380));
+            const optionsMaxHeight = Math.round(Math.min(Math.max(menuMaxHeight - 96, 150), 280));
 
-            menu.style.top = Math.round(triggerRect.bottom + 8) + "px";
+            menu.classList.toggle("is-upward", openUpward);
             menu.style.left = safeLeft + "px";
             menu.style.width = dropdownWidth + "px";
-            menu.style.maxHeight = Math.round(Math.min(availableBelow, 360)) + "px";
-            options.style.maxHeight = Math.round(Math.min(Math.max(availableBelow - 16, 164), 340)) + "px";
-          }
-
-          function ensureCaResponsibleDropdownSpace() {
-            const { trigger, menu } = getCaResponsibleDropdownElements();
-            const modalBody = trigger?.closest(".ca-modal-body");
-            if (!trigger || !menu || !modalBody) return;
-
-            const triggerRect = trigger.getBoundingClientRect();
-            const desiredHeight = Math.min(menu.scrollHeight || 320, 360);
-            const overflow = triggerRect.bottom + desiredHeight + 16 - window.innerHeight;
-
-            if (overflow > 0) {
-              modalBody.scrollTop += overflow;
-            }
+            menu.style.maxHeight = menuMaxHeight + "px";
+            menu.style.top = openUpward
+              ? Math.max(12, Math.round(triggerRect.top - menuMaxHeight - 8)) + "px"
+              : Math.round(triggerRect.bottom + 8) + "px";
+            options.style.maxHeight = optionsMaxHeight + "px";
           }
 
           function syncCaResponsibleDropdown() {
@@ -32450,7 +32536,7 @@ async function sendAssistantPrompt(message) {
             const selectedOption = nativeOptions.find(
               (option) => String(option.value || "") === selectedValue
             );
-            const placeholderText = nativeOptions[0]?.text || "Select responsible";
+            const placeholderText = nativeOptions[0]?.text || "Choose action owner";
 
             triggerLabel.textContent = selectedOption?.text || placeholderText;
             trigger.classList.toggle("is-placeholder", !selectedValue);
@@ -32495,7 +32581,6 @@ async function sendAssistantPrompt(message) {
             shell.classList.add("is-open");
             menu.hidden = false;
             trigger.setAttribute("aria-expanded", "true");
-            ensureCaResponsibleDropdownSpace();
             positionCaResponsibleDropdown();
             requestAnimationFrame(positionCaResponsibleDropdown);
             if (search) {
@@ -33159,10 +33244,6 @@ function getFallbackCurrentMonthLabel(card, labels) {
 
               if (isVisible) {
                 visibleCount += 1;
-                const numberCell = row.querySelector(".history-row-number");
-                if (numberCell) {
-                  numberCell.textContent = String(visibleCount);
-                }
               }
             });
 
@@ -33591,8 +33672,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
                   '<table class="history-table">' +
                   '<thead>' +
                     '<tr>' +
-                      '<th>#</th>' +
-                      '<th>Month</th>' +
+                      '<th>Day</th>' +
                       '<th>Root Cause</th>' +
                       '<th>Implemented Solution</th>' +
                       '<th>Due Date</th>' +
@@ -33604,7 +33684,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
                       '</tr>' +
                     '</thead>' +
                     '<tbody>' +
-                      actions.map(function(action, index) {
+                      actions.map(function(action) {
                         const filterDueDate = getHistoryDueDateFilterValue(action.due_date);
                         const dueDateDisplay = filterDueDate || String(action.due_date || "").trim();
                         const estimatedDurationDays =
@@ -33613,12 +33693,11 @@ function getFallbackCurrentMonthLabel(card, labels) {
                             : String(action.estimated_duration_days).trim();
                         return '' +
                           '<tr data-history-due-date="' + escapeHistoryHtml(filterDueDate) + '">' +
-                            '<td class="history-row-number">' + (index + 1) + '</td>' +
                             '<td>' + escapeHistoryHtml(getHistoryPeriodLabel(action)) + '</td>' +
                             '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
                             '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
                             '<td>' + escapeHistoryHtml(dueDateDisplay) + '</td>' +
-                            '<td>' + escapeHistoryHtml(estimatedDurationDays ? (estimatedDurationDays + ' d') : '') + '</td>' +
+                            '<td>' + escapeHistoryHtml(estimatedDurationDays || '') + '</td>' +
                             '<td>' + escapeHistoryHtml(action.importance || "") + '</td>' +
                             '<td>' + escapeHistoryHtml(action.urgency || "") + '</td>' +
                             '<td>' + escapeHistoryHtml(action.responsible || "") + '</td>' +
