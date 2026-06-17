@@ -36392,24 +36392,24 @@ const runWeeklyKpiSubmissionCron = async ({
 };
 
 
-// cron.schedule("*/5 * * * *", async () => {
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Ratio",
-//     lockId: "send_kpi_weekly_email_ratio_job",
-//     stateKey: "ratio",
-//     logLabel: "Ratio"
-//   });
+cron.schedule("*/5 * * * *", async () => {
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Ratio",
+    lockId: "send_kpi_weekly_email_ratio_job",
+    stateKey: "ratio",
+    logLabel: "Ratio"
+  });
 
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Direct",
-//     lockId: "send_kpi_weekly_email_direct_job",
-//     stateKey: "direct",
-//     logLabel: "Direct"
-//   });
-// }, {
-//   scheduled: true,
-//   timezone: "UTC"
-// });
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Direct",
+    lockId: "send_kpi_weekly_email_direct_job",
+    stateKey: "direct",
+    logLabel: "Direct"
+  });
+}, {
+  scheduled: true,
+  timezone: "UTC"
+});
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
