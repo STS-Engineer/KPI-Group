@@ -9774,7 +9774,7 @@ textarea {
 
    #modalBackdrop {
      align-items: center;
-     padding: 8px;
+     padding: 16px;
      overflow: auto;
     }
 
@@ -11161,20 +11161,20 @@ textarea {
 }
 
 .kpi-attributes-modal {
-  width: min(1860px, calc(100vw - 48px)) !important;
-  max-height: calc(100vh - 32px) !important;
+  width: min(1540px, calc(100vw - 56px)) !important;
+  max-height: calc(100vh - 30px) !important;
   height: auto !important;
-  border-radius: 32px !important;
+  border-radius: 24px !important;
   overflow: hidden !important;
   background:
     radial-gradient(circle at top right, rgba(37, 99, 235, 0.12), transparent 34%),
     linear-gradient(180deg, #ffffff 0%, #f8fbff 100%) !important;
   border: 1px solid rgba(255,255,255,0.9) !important;
-  box-shadow: 0 40px 100px rgba(15, 23, 42, 0.32) !important;
+  box-shadow: 0 32px 84px rgba(15, 23, 42, 0.28) !important;
 }
 
 .kpi-attributes-modal .modal-header {
-  padding: 16px 22px 12px !important;
+  padding: 10px 16px 8px !important;
   background: rgba(255,255,255,0.96) !important;
   border-bottom: 1px solid rgba(148,163,184,0.18) !important;
 }
@@ -11187,24 +11187,21 @@ textarea {
 }
 
 .kpi-attributes-modal .modal-subtitle {
-  margin-top: 4px !important;
-  color: #64748b !important;
-  font-size: 12px !important;
-  line-height: 1.45 !important;
+  display: none !important;
 }
 
 .kpi-attributes-modal .modal-body {
   display: block !important;
-  max-height: calc(100vh - 190px) !important;
+  max-height: calc(100vh - 182px) !important;
   overflow-y: auto !important;
-  padding: 12px 20px 14px !important;
+  padding: 8px 12px 8px !important;
   background: linear-gradient(180deg, #fbfdff 0%, #f4f8fd 100%) !important;
 }
 
 .kpi-attributes-modal .form-section {
-  margin: 0 0 10px 0 !important;
-  padding: 12px !important;
-  border-radius: 22px !important;
+  margin: 0 0 8px 0 !important;
+  padding: 10px !important;
+  border-radius: 20px !important;
   background: rgba(255,255,255,0.9) !important;
   border: 1px solid rgba(148,163,184,0.20) !important;
   box-shadow: 0 14px 32px rgba(15,23,42,0.06) !important;
@@ -11212,7 +11209,7 @@ textarea {
 
 /* Keep tree clear and visible */
 .kpi-attributes-modal .form-section:first-of-type {
-  padding: 14px !important;
+  padding: 9px 10px !important;
 }
 
 .kpi-attributes-modal .tree-select-panel {
@@ -11349,7 +11346,7 @@ textarea {
 
 /* Footer */
 .kpi-attributes-modal .modal-footer {
-  padding: 18px 24px !important;
+  padding: 10px 14px !important;
   background: rgba(255,255,255,0.96) !important;
   border-top: 1px solid rgba(148,163,184,0.18) !important;
 }
@@ -11411,12 +11408,13 @@ textarea {
 
 /* Keep the KPI modal polished, compact, and content-driven */
 .kpi-attributes-modal {
-  width: min(1860px, calc(100vw - 32px)) !important;
+  width: min(1480px, calc(100vw - 48px)) !important;
   height: auto !important;
-  max-height: calc(100vh - 2px) !important;
+  max-height: calc(100vh - 24px) !important;
   overflow: hidden !important;
   display: flex !important;
   flex-direction: column !important;
+  margin: 0 auto !important;
 }
 
 .kpi-attributes-modal .modal-body {
@@ -11424,7 +11422,7 @@ textarea {
   display: grid !important;
   align-content: start !important;
   gap: 6px !important;
-  max-height: calc(100vh - 108px) !important;
+  max-height: calc(100vh - 96px) !important;
   height: auto !important;
   min-height: 0 !important;
   overflow-y: auto !important;
@@ -11462,8 +11460,8 @@ textarea {
 /* Make sections compact so everything fits */
 .kpi-attributes-modal .form-section {
   margin: 0 !important;
-  padding: 7px 10px !important;
-  border-radius: 18px !important;
+  padding: 7px 9px !important;
+  border-radius: 14px !important;
   box-shadow: 0 14px 28px rgba(15, 23, 42, 0.05) !important;
 }
 
@@ -11561,7 +11559,7 @@ textarea {
 }
 
 .kpi-attributes-modal .modal-footer {
-  padding: 6px 12px 8px !important;
+  padding: 8px 12px 10px !important;
   margin-top: 0 !important;
 }
 
@@ -11584,6 +11582,23 @@ textarea {
 }
 
 @media (max-width: 960px) {
+  #modalBackdrop {
+    padding: 12px;
+  }
+
+  .kpi-attributes-modal {
+    width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 24px) !important;
+  }
+
+  .tolerance-wrap {
+    flex-direction: column;
+  }
+
+  .tolerance-options {
+    flex-direction: column;
+  }
+
   .kpi-attributes-modal .kpi-inline-row {
     grid-template-columns: 1fr !important;
   }
@@ -12429,15 +12444,15 @@ textarea {
 
 /* ── New KPI modal layout ── */
 .kpi-main-row {
-  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+  display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap;
 }
-.kpi-main-row .field { display: flex; flex-direction: column; gap: 4px; }
+.kpi-main-row .field { display: flex; flex-direction: column; gap: 3px; }
 .kpi-three-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
-.kpi-three-row .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.kpi-three-row .field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .kpi-main-row .field.f-name { flex: 2.5; min-width: 160px; }
 .kpi-main-row .field.f-kfs {
   flex: 0.7;
@@ -12525,15 +12540,16 @@ textarea {
 .kpi-three-row .field textarea {
   width: 100%; border: 1px solid rgba(148,163,184,0.28);
   background: #fff; color: #0f172a; border-radius: 10px;
-  padding: 7px 10px; font-size: 13px; font-family: inherit; outline: none;
+  padding: 6px 9px; font-size: 12px; font-family: inherit; outline: none;
 }
 .kpi-main-row .field textarea,
-.kpi-three-row .field textarea { min-height: 56px; resize: none; line-height: 1.45; }
+.kpi-three-row .field textarea { min-height: 48px; resize: none; line-height: 1.4; }
 
 .calc-section-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 8px;
+  align-items: start;
 }
 
 .calc-logic-row {
@@ -12541,10 +12557,10 @@ textarea {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
+  gap: 4px;
   min-height: auto;
-  padding: 9px 11px;
-  border-radius: 16px;
+  padding: 7px 9px;
+  border-radius: 14px;
   border: 1px solid rgba(191,219,254,0.7);
   background:
     radial-gradient(circle at top right, rgba(37,99,235,0.10), transparent 42%),
@@ -12624,12 +12640,12 @@ textarea {
 .calc-logic-row .field input,
 .calc-logic-row .field select {
   width: 100%;
-  min-height: 32px;
+  min-height: 30px;
   border: 1px solid rgba(148,163,184,0.28);
   background: rgba(255,255,255,0.96);
   color: #0f172a;
   border-radius: 10px;
-  padding: 5px 8px;
+  padding: 4px 7px;
   font-size: 11px;
   font-family: inherit;
   outline: none;
@@ -12658,11 +12674,12 @@ textarea {
 }
 
 .calc-section-rows > .f-def {
+  grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  padding: 10px 12px;
-  border-radius: 16px;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 14px;
   border: 1px solid rgba(191,219,254,0.7);
   background:
     radial-gradient(circle at top right, rgba(6,182,212,0.08), transparent 38%),
@@ -12691,16 +12708,20 @@ textarea {
 }
 
 .calc-section-rows > .f-def textarea {
-  min-height: 62px;
+  min-height: 50px;
   border: 1px solid rgba(148,163,184,0.24);
   border-radius: 14px;
-  padding: 8px 10px;
+  padding: 7px 9px;
   background: rgba(255,255,255,0.96);
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.92);
 }
 
 @media (max-width: 1180px) {
   .kpi-three-row {
+    grid-template-columns: 1fr;
+  }
+
+  .calc-section-rows {
     grid-template-columns: 1fr;
   }
 
@@ -12718,24 +12739,29 @@ textarea {
 
 .tolerance-wrap {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  align-items: flex-start;
+  gap: 8px;
 }
 
 
 .tolerance-option-row {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 8px;
+  flex: 1 1 320px;
+  padding: 6px 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(191,219,254,0.62);
+  background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(246,250,255,0.98) 100%);
 }
 .tolerance-type-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 .tol-type-label {
-  min-width: 88px;
+  min-width: 76px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  align-self: center;
+  align-self: flex-start;
 
   padding: 0;
   border-radius: 0;
@@ -12755,7 +12781,8 @@ textarea {
 
 .tolerance-options {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  flex-wrap: wrap;
   gap: 8px;
   flex: 1;
 }
@@ -12763,15 +12790,16 @@ textarea {
 
 
 .tol-radio-label {
-  width: 96px;
+  width: auto;
+  min-width: 88px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   color: #334155;
-  padding: 6px 10px;
+  padding: 5px 8px;
   border-radius: 10px;
   border: 1.5px solid rgba(148,163,184,0.28);
   background: #fff;
@@ -12789,12 +12817,14 @@ textarea {
 
 .tolerance-fields-row {
   display: flex;
+  flex: 1;
   gap: 8px;
   align-items: flex-end;
+  flex-wrap: wrap;
 }
 .tolerance-fields-row .field {
-  flex: 1; min-width: 120px; max-width: 200px;
-  display: flex; flex-direction: column; gap: 4px;
+  flex: 1 1 140px; min-width: 110px; max-width: none;
+  display: flex; flex-direction: column; gap: 3px;
 }
 .tolerance-fields-row .field label {
   display: flex; align-items: center; justify-content: space-between;
@@ -12804,7 +12834,7 @@ textarea {
 .tolerance-fields-row .field input {
   width: 100%; border: 1px solid rgba(148,163,184,0.28);
   background: #fff; color: #0f172a; border-radius: 10px;
-  padding: 5px 8px; font-size: 11px; font-family: inherit; outline: none; min-height: 32px;
+  padding: 4px 7px; font-size: 11px; font-family: inherit; outline: none; min-height: 30px;
 }
 
 
