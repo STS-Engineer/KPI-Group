@@ -30126,7 +30126,7 @@ let historyValues = historyLabels.map((label) => {
             </div>
 
             <div class="kpi-section">
-              <h3 style="color:#0078D7;margin-bottom:20px;border-bottom:2px solid #0078D7;padding-bottom:8px;">KPI Values</h3>
+              <h3 style="color:#0078D7;margin-bottom:20px;border-bottom:2px solid #0078D7;padding-bottom:8px;">KPI Value</h3>
               <form action="/redirect" method="POST" id="kpiForm" novalidate>
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
                 <input type="hidden" name="week" value="${week}" />
@@ -36347,24 +36347,24 @@ const runWeeklyKpiSubmissionCron = async ({
 };
 
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
