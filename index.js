@@ -516,8 +516,35 @@ const getPeopleDisplayName = (row = {}) => {
 };
 
 const KPI_REACTIVITY_STATUS_OPTIONS = Object.freeze(["Anticipated", "Reactive"]);
-const KPI_IMPORTANCE_OPTIONS = Object.freeze(["High", "Not Important"]);
+const KPI_IMPORTANCE_OPTIONS = Object.freeze(["High", "Medium", "Low"]);
 const KPI_REACTIVITY_NEED_OPTIONS = Object.freeze(["Urgent", "Not Urgent"]);
+const KPI_PRICING_TYPE_OPTIONS = Object.freeze(["Operational", "Selling"]);
+
+const normalizeKpiImportanceValue = (value, fallback = null) => {
+  const text = normalizeOptionalTextInput(value);
+  if (!text) return fallback;
+
+  if (text.toLowerCase() === "not important") {
+    return "Low";
+  }
+
+  const matchedOption = KPI_IMPORTANCE_OPTIONS.find(
+    (option) => option.toLowerCase() === text.toLowerCase()
+  );
+
+  return matchedOption || fallback;
+};
+
+const normalizeKpiPricingTypeValue = (value, fallback = null) => {
+  const text = normalizeOptionalTextInput(value);
+  if (!text) return fallback;
+
+  const matchedOption = KPI_PRICING_TYPE_OPTIONS.find(
+    (option) => option.toLowerCase() === text.toLowerCase()
+  );
+
+  return matchedOption || fallback;
+};
 
 const prepareKpiWritePayload = (payload = {}) => {
   const rawSubjectNodeId = normalizeOptionalTextInput(payload.subject_node_id ?? payload.subject_id);
@@ -552,7 +579,10 @@ const prepareKpiWritePayload = (payload = {}) => {
   const nombrePeriode = normalizeOptionalTextInput(payload.nombre_periode);
   const targetAutoAdjustment = normalizeOptionalTextInput(payload.target_auto_adjustment);
   const reactivityStatus = normalizeOptionalTextInput(payload.reactivity_status);
-  const importance = normalizeOptionalTextInput(payload.importance);
+  const rawImportance = normalizeOptionalTextInput(payload.importance);
+  const importance = normalizeKpiImportanceValue(rawImportance);
+  const rawPricingType = normalizeOptionalTextInput(payload.pricing_type);
+  const pricingType = normalizeKpiPricingTypeValue(rawPricingType);
   const reactivityNeed = normalizeOptionalTextInput(payload.reactivity_need);
   const referenceKpiId = rawReferenceKpiId === null ? null : Number(rawReferenceKpiId);
   const ownerRoleId = rawOwnerRoleId === null ? null : Number(rawOwnerRoleId);
@@ -654,7 +684,13 @@ const prepareKpiWritePayload = (payload = {}) => {
     throw createHttpError(400, "Reactivity status is invalid.");
   }
 
- 
+  if (rawImportance !== null && importance === null) {
+    throw createHttpError(400, "Importance is invalid.");
+  }
+
+  if (rawPricingType !== null && pricingType === null) {
+    throw createHttpError(400, "Pricing type is invalid.");
+  }
 
   if (reactivityNeed !== null && !KPI_REACTIVITY_NEED_OPTIONS.includes(reactivityNeed)) {
     throw createHttpError(400, "Reactivity need is invalid.");
@@ -737,6 +773,7 @@ const prepareKpiWritePayload = (payload = {}) => {
     target_auto_adjustment: targetAutoAdjustment,
     reactivity_status: reactivityStatus,
     importance,
+    pricing_type: pricingType,
     reactivity_need: reactivityNeed,
     kfs,
     reference_kpi_id: normalizedCalculationMode === "ratio" ? referenceKpiId : null,
@@ -870,6 +907,11 @@ const ensureKpiRatioSchema = async () => {
       await pool.query(`
         ALTER TABLE public.kpi
         ADD COLUMN IF NOT EXISTS importance VARCHAR(255)
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS pricing_type VARCHAR(255)
       `);
 
       await pool.query(`
@@ -2299,6 +2341,7 @@ const loadKpiKnowledgeBaseSourceData = async (db, kpiId) => {
         k.target_auto_adjustment,
         k.reactivity_status,
         k.importance,
+        k.pricing_type,
         k.reactivity_need,
         k.min_value,
         k.min_type,
@@ -2684,7 +2727,8 @@ const buildKpiKnowledgeBaseDocument = (
       },
       classification: {
         reactivity_status: kpi.reactivity_status || null,
-        importance: kpi.importance || null,
+        importance: normalizeKpiImportanceValue(kpi.importance),
+        pricing_type: normalizeKpiPricingTypeValue(kpi.pricing_type),
         reactivity_need: kpi.reactivity_need || null
       },
       thresholds: {
@@ -3626,7 +3670,8 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     reference_kpi_id: row.reference_kpi_id,
     target_auto_adjustment: row.target_auto_adjustment || "",
     reactivity_status: row.reactivity_status || "",
-    importance: row.importance || "",
+    importance: normalizeKpiImportanceValue(row.importance) || "",
+    pricing_type: normalizeKpiPricingTypeValue(row.pricing_type) || "",
     reactivity_need: row.reactivity_need || "",
     high_limit: row.high_limit,
     low_limit: row.low_limit,
@@ -3687,6 +3732,7 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
       k.target_auto_adjustment,
       k.reactivity_status,
       k.importance,
+      k.pricing_type,
       k.reactivity_need,
       k.min_value,
       k.min_type,
@@ -4730,6 +4776,7 @@ app.post("/api/kpis", async (req, res) => {
       target_auto_adjustment,
       reactivity_status,
       importance,
+      pricing_type,
       reactivity_need,
       owner_role_id,
       status,
@@ -4777,6 +4824,7 @@ app.post("/api/kpis", async (req, res) => {
         target_auto_adjustment,
         reactivity_status,
         importance,
+        pricing_type,
         reactivity_need,
         display_trend,
         regression,
@@ -4789,7 +4837,7 @@ app.post("/api/kpis", async (req, res) => {
         kfs
       )
       VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34
       )
       RETURNING *;
       `,
@@ -4817,6 +4865,7 @@ app.post("/api/kpis", async (req, res) => {
         target_auto_adjustment,
         reactivity_status,
         importance,
+        pricing_type,
         reactivity_need,
         display_trend,
         regression,
@@ -4885,6 +4934,7 @@ app.put("/api/kpis/:id", async (req, res) => {
       target_auto_adjustment,
       reactivity_status,
       importance,
+      pricing_type,
       reactivity_need,
       owner_role_id,
       status,
@@ -4939,10 +4989,11 @@ app.put("/api/kpis/:id", async (req, res) => {
         low_limit = $28,
         reactivity_status = $29,
         importance = $30,
-        reactivity_need = $31,
-        kfs = $32,
+        pricing_type = $31,
+        reactivity_need = $32,
+        kfs = $33,
         updated_at = NOW()
-      WHERE kpi_id = $33
+      WHERE kpi_id = $34
       RETURNING *;
       `,
       [
@@ -4976,6 +5027,7 @@ app.put("/api/kpis/:id", async (req, res) => {
         low_limit,
         reactivity_status,
         importance,
+        pricing_type,
         reactivity_need,
         kfs,
         req.params.id
@@ -6448,6 +6500,7 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
       target_auto_adjustment,
       reactivity_status,
       importance,
+      pricing_type,
       reactivity_need,
       reference_kpi_id,
       owner_role_id,
@@ -6496,6 +6549,7 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   target_auto_adjustment,
   reactivity_status,
   importance,
+  pricing_type,
   reactivity_need,
   reference_kpi_id,
   owner_role_id,
@@ -6508,7 +6562,7 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
 )
 VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
-  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
+  $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
 )
       RETURNING *
       `,
@@ -6537,6 +6591,7 @@ VALUES (
         target_auto_adjustment,
         reactivity_status,
         importance,
+        pricing_type,
         reactivity_need,
         reference_kpi_id,
         owner_role_id,
@@ -6663,6 +6718,7 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
       target_auto_adjustment,
       reactivity_status,
       importance,
+      pricing_type,
       reactivity_need,
       kfs,
       reference_kpi_id,
@@ -6718,11 +6774,12 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
           low_limit = $28,
           reactivity_status = $29,
           importance = $30,
-          reactivity_need = $31,
-          kfs = $32,
+          pricing_type = $31,
+          reactivity_need = $32,
+          kfs = $33,
           updated_at = NOW()
-      WHERE kpi_id = $33
-        AND created_by_people_id = $34
+      WHERE kpi_id = $34
+        AND created_by_people_id = $35
       RETURNING *
       `,
       [
@@ -6756,6 +6813,7 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
         low_limit,
         reactivity_status,
         importance,
+        pricing_type,
         reactivity_need,
         kfs,
         kpiId,
@@ -12546,7 +12604,7 @@ textarea {
 .kpi-main-row .field { display: flex; flex-direction: column; gap: 3px; }
 .kpi-three-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 .kpi-three-row .field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
@@ -13208,6 +13266,14 @@ textarea {
                   <option value="" selected>Select reactivity status</option>
                   <option value="Anticipated">Anticipated</option>
                   <option value="Reactive">Reactive</option>
+                </select>
+              </div>
+              <div class="field">
+                <label><span>Pricing Type</span></label>
+                <select id="pricing_type">
+                  <option value="" selected>Select pricing type</option>
+                  <option value="Operational">Operational</option>
+                  <option value="Selling">Selling</option>
                 </select>
               </div>
               <div class="field">
@@ -14235,6 +14301,7 @@ const KPI_MODAL_FIELD_IDS = new Set([
   "target_auto_adjustment",
   "reactivity_status",
   "importance",
+  "pricing_type",
   "reactivity_need",
   "high_limit",
   "low_limit",
@@ -17401,12 +17468,14 @@ const identityHtml = row("Identity", colClass(identityFields),
 
   const classificationFields = [
     kpi.reactivity_status,
+    kpi.pricing_type,
     kpi.importance,
     kpi.reactivity_need
   ];
   const classificationHtml = classificationFields.some(hasValue)
     ? row("Priority", colClass(classificationFields),
       field("Reactivity Status", kpi.reactivity_status),
+      field("Pricing Type",      kpi.pricing_type),
       field("Importance",        kpi.importance),
       field("Reactivity Need",   kpi.reactivity_need)
     )
@@ -19889,6 +19958,7 @@ function resetForm() {
     "target_auto_adjustment",
     "reactivity_status",
     "importance",
+    "pricing_type",
     "reactivity_need",
     "high_limit",
     "low_limit",
@@ -20004,6 +20074,7 @@ function fillForm(data) {
   setFieldValue("target_auto_adjustment", data.target_auto_adjustment);
   setFieldValue("reactivity_status", data.reactivity_status);
   setFieldValue("importance", data.importance);
+  setFieldValue("pricing_type", data.pricing_type);
   setFieldValue("reactivity_need", data.reactivity_need);
   setFieldValue("kfs", data.kfs || "KPI");
   setFieldValue("min_type", data.min_type || inferValueType(data.min));
@@ -20130,6 +20201,7 @@ function fillForm(data) {
     target_auto_adjustment: getSafeValue("target_auto_adjustment"),
     reactivity_status: getSafeValue("reactivity_status", { optional: true }) || null,
     importance: getSafeValue("importance", { optional: true }) || null,
+    pricing_type: getSafeValue("pricing_type", { optional: true }) || null,
     reactivity_need: getSafeValue("reactivity_need", { optional: true }) || null,
     target_direction: getSafeValue("direction"),
     nombre_periode: getSafeValue("nombre_periode"),
@@ -21753,6 +21825,12 @@ const CORRECTIVE_ACTION_STATUS_OPTIONS = [
   "Completed",
   "Closed"
 ];
+const CORRECTIVE_ACTION_IMPORTANCE_OPTIONS = KPI_IMPORTANCE_OPTIONS;
+const CORRECTIVE_ACTION_URGENCY_OPTIONS = Object.freeze([
+  "Flexible",
+  "Urgent",
+  "Secondary"
+]);
 
 const OPEN_CORRECTIVE_ACTION_STATUS = "Open";
 const CLOSED_CORRECTIVE_ACTION_STATUS = "Closed";
@@ -21803,6 +21881,36 @@ const normalizeCorrectiveActionStatus = (value, fallback = null) => {
   return matchedStatus || fallback;
 };
 
+const normalizeCorrectiveActionChoice = (value, options, fallback = null) => {
+  const text = normalizeText(value);
+  if (!text) return fallback;
+
+  const matchedOption = (Array.isArray(options) ? options : []).find(
+    (option) => String(option).toLowerCase() === text.toLowerCase()
+  );
+
+  return matchedOption || fallback;
+};
+
+const normalizeCorrectiveActionImportance = (value, fallback = null) =>
+  normalizeCorrectiveActionChoice(value, CORRECTIVE_ACTION_IMPORTANCE_OPTIONS, fallback);
+
+const normalizeCorrectiveActionUrgency = (value, fallback = null) =>
+  normalizeCorrectiveActionChoice(value, CORRECTIVE_ACTION_URGENCY_OPTIONS, fallback);
+
+const normalizeCorrectiveActionEstimatedDurationDays = (value) => {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return null;
+  }
+
+  const normalizedValue = normalizeOptionalIntegerInput(value);
+  if (!Number.isInteger(normalizedValue) || normalizedValue < 0) {
+    return null;
+  }
+
+  return normalizedValue;
+};
+
 const escapeHtml = (value) =>
   String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -21817,7 +21925,7 @@ const buildAbsoluteAppUrl = (req, relativePath = "/") => {
     : `/${String(relativePath || "")}`;
   const forwardedProto = normalizeOptionalTextInput(req?.headers?.["x-forwarded-proto"]);
   const protocol = forwardedProto || req?.protocol || "http";
-  const host = normalizeOptionalTextInput(req?.get?.("host")) || `kpi-form.azurewebsites.net:${port}`;
+  const host = normalizeOptionalTextInput(req?.get?.("host")) || `kpi-form.azurewebsites.net${port}`;
   return `${protocol}://${host}${normalizedPath}`;
 };
 
@@ -22175,7 +22283,10 @@ const getSubmittedCorrectiveActions = (formData, kpiValuesId, defaultResponsible
   const rootCauses = readSubmittedFieldList(formData, `root_cause_${kpiValuesId}`);
   const implementedSolutions = readSubmittedFieldList(formData, `implemented_solution_${kpiValuesId}`);
   const dueDates = readSubmittedFieldList(formData, `due_date_${kpiValuesId}`);
+  const estimatedDurationDays = readSubmittedFieldList(formData, `estimated_duration_days_${kpiValuesId}`);
   const responsibleNames = readSubmittedFieldList(formData, `responsible_${kpiValuesId}`);
+  const importances = readSubmittedFieldList(formData, `ca_importance_${kpiValuesId}`);
+  const urgencies = readSubmittedFieldList(formData, `ca_urgency_${kpiValuesId}`);
   const statuses = readSubmittedFieldList(formData, `ca_status_${kpiValuesId}`);
 
   const actionCount = Math.max(
@@ -22183,7 +22294,10 @@ const getSubmittedCorrectiveActions = (formData, kpiValuesId, defaultResponsible
     rootCauses.length,
     implementedSolutions.length,
     dueDates.length,
+    estimatedDurationDays.length,
     responsibleNames.length,
+    importances.length,
+    urgencies.length,
     statuses.length
   );
 
@@ -22192,9 +22306,12 @@ const getSubmittedCorrectiveActions = (formData, kpiValuesId, defaultResponsible
     rootCause: normalizeText(rootCauses[index]),
     implementedSolution: normalizeText(implementedSolutions[index]),
     dueDate: normalizeText(dueDates[index]),
+    estimatedDurationDays: normalizeCorrectiveActionEstimatedDurationDays(estimatedDurationDays[index]),
     responsibleName:
       normalizeText(responsibleNames[index]) ||
       normalizeText(defaultResponsibleName),
+    importance: normalizeCorrectiveActionImportance(importances[index]),
+    urgency: normalizeCorrectiveActionUrgency(urgencies[index]),
     status: normalizeText(statuses[index]) || "Open"
   }));
 };
@@ -22626,7 +22743,13 @@ const buildCorrectiveActionEntryHtml = ({
   const rootCause = action.root_cause ?? action.rootCause ?? "";
   const implementedSolution = action.implemented_solution ?? action.implementedSolution ?? "";
   const dueDate = formatInputDate(action.due_date ?? action.dueDate);
+  const estimatedDurationDays =
+    normalizeCorrectiveActionEstimatedDurationDays(
+      action.estimated_duration_days ?? action.estimatedDurationDays
+    ) ?? "";
   const responsibleName = action.responsible ?? action.responsibleName ?? defaultResponsibleName ?? "";
+  const importance = normalizeCorrectiveActionImportance(action.importance) || "";
+  const urgency = normalizeCorrectiveActionUrgency(action.urgency) || "";
   const statusText = normalizeCorrectiveActionStatus(action.status, "Open");
   const safeStatusClass = String(statusText || "")
     .toLowerCase()
@@ -22667,6 +22790,22 @@ const buildCorrectiveActionEntryHtml = ({
 
         <div class="ca-field">
           <label class="ca-label">
+            Estimated Duration (Days) <span class="ca-required">*</span>
+          </label>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            name="estimated_duration_days_${kpiValuesId}[]"
+            class="ca-text-input ca-required-field"
+            data-ca-field="estimated_duration_days"
+            value="${escapeHtml(estimatedDurationDays)}"
+            ${requiredAttr}
+          />
+        </div>
+
+        <div class="ca-field">
+          <label class="ca-label">
             Responsible <span class="ca-required">*</span>
           </label>
           <input
@@ -22677,6 +22816,42 @@ const buildCorrectiveActionEntryHtml = ({
             value="${escapeHtml(responsibleName)}"
             ${requiredAttr}
           />
+        </div>
+      </div>
+
+      <div class="ca-dates-grid">
+        <div class="ca-field">
+          <label class="ca-label">
+            Importance <span class="ca-required">*</span>
+          </label>
+          <select
+            name="ca_importance_${kpiValuesId}[]"
+            class="ca-select-input ca-required-field"
+            data-ca-field="importance"
+            ${requiredAttr}
+          >
+            <option value="">Select importance</option>
+            ${CORRECTIVE_ACTION_IMPORTANCE_OPTIONS.map((option) => `
+              <option value="${escapeHtml(option)}"${importance === option ? " selected" : ""}>${escapeHtml(option)}</option>
+            `).join("")}
+          </select>
+        </div>
+
+        <div class="ca-field">
+          <label class="ca-label">
+            Urgency <span class="ca-required">*</span>
+          </label>
+          <select
+            name="ca_urgency_${kpiValuesId}[]"
+            class="ca-select-input ca-required-field"
+            data-ca-field="urgency"
+            ${requiredAttr}
+          >
+            <option value="">Select urgency</option>
+            ${CORRECTIVE_ACTION_URGENCY_OPTIONS.map((option) => `
+              <option value="${escapeHtml(option)}"${urgency === option ? " selected" : ""}>${escapeHtml(option)}</option>
+            `).join("")}
+          </select>
         </div>
       </div>
 
@@ -22729,6 +22904,11 @@ const buildAssistantKpiContext = (kpis = []) =>
     evidence: normalizeText(kpi.evidence),
     good_direction: normalizeText(kpi.good_direction) || inferKpiDirection(kpi),
     due_date: normalizeText(kpi.due_date),
+    estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(
+      kpi.estimated_duration_days
+    ),
+    importance: normalizeCorrectiveActionImportance(kpi.importance),
+    urgency: normalizeCorrectiveActionUrgency(kpi.urgency),
     responsible: normalizeText(kpi.responsible),
     corrective_actions: Array.isArray(kpi.corrective_actions)
       ? kpi.corrective_actions.slice(0, 5).map((action) => ({
@@ -22737,6 +22917,11 @@ const buildAssistantKpiContext = (kpis = []) =>
         implemented_solution: normalizeText(action.implemented_solution ?? action.implementedSolution),
         evidence: normalizeText(action.evidence),
         due_date: normalizeText(action.due_date ?? action.dueDate),
+        estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(
+          action.estimated_duration_days ?? action.estimatedDurationDays
+        ),
+        importance: normalizeCorrectiveActionImportance(action.importance),
+        urgency: normalizeCorrectiveActionUrgency(action.urgency),
         responsible: normalizeText(action.responsible ?? action.responsibleName),
         status: normalizeText(action.status)
       }))
@@ -24305,6 +24490,73 @@ const canUseActionPlanCorrectiveActions = async () => {
   return hasActionTable && hasSujetTable;
 };
 
+let legacyCorrectiveActionsSchemaPromise = null;
+let actionPlanCorrectiveActionSchemaPromise = null;
+
+const ensureLegacyCorrectiveActionsSchema = async () => {
+  if (!legacyCorrectiveActionsSchemaPromise) {
+    legacyCorrectiveActionsSchemaPromise = (async () => {
+      if (!(await hasPublicTable("corrective_actions"))) {
+        return false;
+      }
+
+      await pool.query(`
+        ALTER TABLE public.corrective_actions
+        ADD COLUMN IF NOT EXISTS estimated_duration_days INTEGER
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.corrective_actions
+        ADD COLUMN IF NOT EXISTS importance VARCHAR(50)
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.corrective_actions
+        ADD COLUMN IF NOT EXISTS urgency VARCHAR(50)
+      `);
+
+      return true;
+    })().catch((error) => {
+      legacyCorrectiveActionsSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return legacyCorrectiveActionsSchemaPromise;
+};
+
+const ensureActionPlanCorrectiveActionSchema = async () => {
+  if (!actionPlanCorrectiveActionSchemaPromise) {
+    actionPlanCorrectiveActionSchemaPromise = (async () => {
+      if (!(await canUseActionPlanCorrectiveActions())) {
+        return false;
+      }
+
+      await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS estimated_duration_days INTEGER
+      `);
+
+      await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS importance VARCHAR(50)
+      `);
+
+      await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS urgency VARCHAR(50)
+      `);
+
+      return true;
+    })().catch((error) => {
+      actionPlanCorrectiveActionSchemaPromise = null;
+      throw error;
+    });
+  }
+
+  return actionPlanCorrectiveActionSchemaPromise;
+};
+
 const encodeActionPlanPeriodToken = (value) => {
   const normalizedValue = normalizeOptionalTextInput(value) || "period";
   return Buffer.from(normalizedValue, "utf8")
@@ -24598,6 +24850,9 @@ const mapActionPlanActionRow = (row = {}) => {
     implemented_solution: normalizeOptionalTextInput(row.titre) || "",
     status,
     due_date: formatIsoDateValue(row.due_date),
+    estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(row.estimated_duration_days),
+    importance: normalizeCorrectiveActionImportance(row.importance),
+    urgency: normalizeCorrectiveActionUrgency(row.urgency),
     responsible: normalizeOptionalTextInput(row.responsable) || "",
     email_responsable: normalizeOptionalTextInput(row.email_responsable),
     created_date: row.created_at,
@@ -24642,6 +24897,8 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
   }
 
   try {
+    await ensureActionPlanCorrectiveActionSchema();
+
     const actionsRes = await actionPlanPool.query(
       `
       SELECT
@@ -24654,6 +24911,9 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
         a.responsable,
         a.email_responsable,
         a.due_date,
+        a.estimated_duration_days,
+        a.importance,
+        a.urgency,
         a.created_at,
         a.updated_at,
         a.closed_date,
@@ -24797,6 +25057,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
     return { savedCount: 0, deletedCount: 0 };
   }
 
+  await ensureActionPlanCorrectiveActionSchema();
+
   const submittedActions = Array.isArray(actions) ? actions : [];
   const meaningfulActions = submittedActions.filter(hasMeaningfulCorrectiveActionInput);
 
@@ -24886,17 +25148,25 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution);
     const rootCause =
       normalizeOptionalTextInput(action.rootCause ?? action.root_cause);
-   const values = [
-     implementedSolution,
-     rootCause,
-     status,
-     responsibleName,
-     normalizeOptionalDateInput(action.dueDate ?? action.due_date),
-     index + 1,
-     responsibleEmail,
-     demandeur,
-     emailDemandeur
-   ];
+    const estimatedDurationDays = normalizeCorrectiveActionEstimatedDurationDays(
+      action.estimatedDurationDays ?? action.estimated_duration_days
+    );
+    const importance = normalizeCorrectiveActionImportance(action.importance);
+    const urgency = normalizeCorrectiveActionUrgency(action.urgency);
+    const values = [
+      implementedSolution,
+      rootCause,
+      status,
+      responsibleName,
+      normalizeOptionalDateInput(action.dueDate ?? action.due_date),
+      estimatedDurationDays,
+      importance,
+      urgency,
+      index + 1,
+      responsibleEmail,
+      demandeur,
+      emailDemandeur
+    ];
 
     if (actionId && existingActionIds.has(actionId)) {
       const updatedActionRes = await actionPlanPool.query(
@@ -24908,10 +25178,13 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
           status = $4,
           responsable = $5,
           due_date = $6,
-          ordre = $7,
-          email_responsable = $8,
-          demandeur = $9,
-          email_demandeur = $10,
+          estimated_duration_days = $7,
+          importance = $8,
+          urgency = $9,
+          ordre = $10,
+          email_responsable = $11,
+          demandeur = $12,
+          email_demandeur = $13,
           type = 'action',
           updated_at = NOW(),
           closed_date = CASE
@@ -24919,7 +25192,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
             ELSE NULL
           END
         WHERE id = $1
-         AND sujet_id = $11
+         AND sujet_id = $14
         RETURNING id
         `,
         [actionId, ...values, sujetId]
@@ -24943,11 +25216,14 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       status,
       responsable,
       due_date,
-     ordre,
-     email_responsable,
-     demandeur,
-     email_demandeur,
-     closed_date
+      estimated_duration_days,
+      importance,
+      urgency,
+      ordre,
+      email_responsable,
+      demandeur,
+      email_demandeur,
+      closed_date
     )
       VALUES (
         $1,
@@ -24961,6 +25237,9 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
         $8,
         $9,
         $10,
+        $11,
+        $12,
+        $13,
         CASE
           WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
           ELSE NULL
@@ -25292,16 +25571,32 @@ const upsertCorrectiveAction = async (
   responsibleId,
   kpiId,
   week,
-  { correctiveActionId, rootCause, implementedSolution, dueDate, responsibleName, status, demandeur }
+  {
+    correctiveActionId,
+    rootCause,
+    implementedSolution,
+    dueDate,
+    estimatedDurationDays,
+    responsibleName,
+    importance,
+    urgency,
+    status,
+    demandeur
+  }
 ) => {
   try {
+    await ensureLegacyCorrectiveActionsSchema();
+
     const normalizedPayload = {
       rootCause: normalizeText(rootCause),
       implementedSolution: normalizeText(implementedSolution),
       dueDate: normalizeText(dueDate),
+      estimatedDurationDays: normalizeCorrectiveActionEstimatedDurationDays(estimatedDurationDays),
       responsibleName: normalizeText(responsibleName),
+      importance: normalizeCorrectiveActionImportance(importance),
+      urgency: normalizeCorrectiveActionUrgency(urgency),
       status: normalizeCorrectiveActionStatus(status),
-      demandeur: normalizeText(demandeur),
+      demandeur: normalizeText(demandeur)
     };
     let resolvedStatus = normalizedPayload.status || "Open";
 
@@ -25322,9 +25617,12 @@ const upsertCorrectiveAction = async (
      SET root_cause = $2::text,
        implemented_solution = $3::text,
        due_date = $4::date,
-       responsible = $5::text,
-       status = $6::text,
-       demandeur = $7::text,
+       estimated_duration_days = $5::integer,
+       responsible = $6::text,
+       importance = $7::text,
+       urgency = $8::text,
+       status = $9::text,
+       demandeur = $10::text,
        updated_date = NOW()
       WHERE corrective_action_id = $1
        RETURNING corrective_action_id`,
@@ -25333,9 +25631,12 @@ const upsertCorrectiveAction = async (
           normalizedPayload.rootCause,
           normalizedPayload.implementedSolution,
           normalizedPayload.dueDate,
+          normalizedPayload.estimatedDurationDays,
           normalizedPayload.responsibleName,
-          normalizedPayload.demandeur,
-          resolvedStatus
+          normalizedPayload.importance,
+          normalizedPayload.urgency,
+          resolvedStatus,
+          normalizedPayload.demandeur
         ]
       );
 
@@ -25349,10 +25650,10 @@ const upsertCorrectiveAction = async (
    (
      responsible_id, kpi_id, week,
      root_cause, implemented_solution,
-     due_date, responsible, status
+     due_date, estimated_duration_days, responsible, importance, urgency, status, demandeur
    )
    VALUES (
-     $1,$2,$3,$4::text,$5::text,$6::date,$7::text,$8::text
+     $1,$2,$3,$4::text,$5::text,$6::date,$7::integer,$8::text,$9::text,$10::text,$11::text,$12::text
    )`,
       [
         responsibleId,
@@ -25361,8 +25662,12 @@ const upsertCorrectiveAction = async (
         normalizedPayload.rootCause,
         normalizedPayload.implementedSolution,
         normalizedPayload.dueDate,
+        normalizedPayload.estimatedDurationDays,
         normalizedPayload.responsibleName,
-        resolvedStatus
+        normalizedPayload.importance,
+        normalizedPayload.urgency,
+        resolvedStatus,
+        normalizedPayload.demandeur
       ]
     );
 
@@ -25738,6 +26043,8 @@ app.get("/corrective-actions-list", async (req, res) => {
       return res.status(400).send(`<p style="color:red;">Missing responsible_id</p>`);
     }
 
+    await ensureLegacyCorrectiveActionsSchema();
+
     const responsibleRes = await pool.query(
       `SELECT r.responsible_id, r.name, r.email,
               p.name AS plant_name,
@@ -25902,6 +26209,18 @@ app.get("/corrective-actions-list", async (req, res) => {
                 <div class="meta-item">
                   <span>Updated</span>
                   <strong>${formatDate(a.updated_date)}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Estimated Days</span>
+                  <strong>${a.estimated_duration_days ?? "—"}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Importance</span>
+                  <strong>${escapeHtml(a.importance || "—")}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>Urgency</span>
+                  <strong>${escapeHtml(a.urgency || "—")}</strong>
                 </div>
               </div>
 
@@ -26209,6 +26528,8 @@ app.get("/corrective-action-form", async (req, res) => {
       return res.status(400).send("Missing responsible_id, kpi_id, or week");
     }
 
+    await ensureLegacyCorrectiveActionsSchema();
+
     const resResp = await pool.query(
       `SELECT r.*, p.name AS plant_name, d.name AS department_name
        FROM public."Responsible" r
@@ -26290,7 +26611,11 @@ app.get("/corrective-action-form", async (req, res) => {
       return d.toISOString().split("T")[0];
     })();
 
+    const defaultEstimatedDurationDays =
+      normalizeCorrectiveActionEstimatedDurationDays(ed.estimated_duration_days) ?? "";
     const defaultResponsibleName = escapeHtml(ed.responsible || responsible.name || "");
+    const defaultImportance = normalizeCorrectiveActionImportance(ed.importance) || "";
+    const defaultUrgency = normalizeCorrectiveActionUrgency(ed.urgency) || "";
     const actionTitle = ed.corrective_action_id
       ? `Corrective Action #${escapeHtml(ed.corrective_action_id)}`
       : "New Corrective Action";
@@ -26382,7 +26707,7 @@ app.get("/corrective-action-form", async (req, res) => {
             color:#374151;
             font-size:14px;
           }
-          textarea,input[type="date"],input[type="text"]{
+          textarea,input[type="date"],input[type="text"],input[type="number"],select{
             width:100%;
             padding:14px 15px;
             border:1px solid #d1d5db;
@@ -26396,14 +26721,14 @@ app.get("/corrective-action-form", async (req, res) => {
             min-height:120px;
             resize:vertical;
           }
-          textarea:focus,input[type="date"]:focus,input[type="text"]:focus{
+          textarea:focus,input[type="date"]:focus,input[type="text"]:focus,input[type="number"]:focus,select:focus{
             outline:none;
             border-color:#2563eb;
             box-shadow:0 0 0 4px rgba(37,99,235,0.10);
           }
           .dates-grid{
             display:grid;
-            grid-template-columns:repeat(2,1fr);
+            grid-template-columns:repeat(3,1fr);
             gap:14px;
           }
           .status-line{
@@ -26560,6 +26885,41 @@ app.get("/corrective-action-form", async (req, res) => {
                     value="${defaultResponsibleName}"
                   >
                 </div>
+
+                <div class="form-group">
+                  <label for="estimated_duration_days">Estimated Duration (Days) *</label>
+                  <input
+                    type="number"
+                    id="estimated_duration_days"
+                    name="estimated_duration_days"
+                    min="0"
+                    step="1"
+                    required
+                    value="${escapeHtml(defaultEstimatedDurationDays)}"
+                  >
+                </div>
+              </div>
+
+              <div class="dates-grid">
+                <div class="form-group">
+                  <label for="importance">Importance *</label>
+                  <select id="importance" name="importance" required>
+                    <option value="">Select importance</option>
+                    <option value="High"${defaultImportance === "High" ? " selected" : ""}>High</option>
+                    <option value="Medium"${defaultImportance === "Medium" ? " selected" : ""}>Medium</option>
+                    <option value="Low"${defaultImportance === "Low" ? " selected" : ""}>Low</option>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="urgency">Urgency *</label>
+                  <select id="urgency" name="urgency" required>
+                    <option value="">Select urgency</option>
+                    <option value="Flexible"${defaultUrgency === "Flexible" ? " selected" : ""}>Flexible</option>
+                    <option value="Urgent"${defaultUrgency === "Urgent" ? " selected" : ""}>Urgent</option>
+                    <option value="Secondary"${defaultUrgency === "Secondary" ? " selected" : ""}>Secondary</option>
+                  </select>
+                </div>
               </div>
 
 <div class="form-group">
@@ -26615,7 +26975,10 @@ app.post("/submit-corrective-action", async (req, res) => {
       root_cause,
       implemented_solution,
       due_date,
-      responsible
+      estimated_duration_days,
+      responsible,
+      importance,
+      urgency
     } = req.body || {};
 
     if (!responsible_id || !kpi_id || !week) {
@@ -26627,9 +26990,12 @@ app.post("/submit-corrective-action", async (req, res) => {
       rootCause: normalizeText(root_cause),
       implementedSolution: normalizeText(implemented_solution),
       dueDate: due_date || null,
+      estimatedDurationDays: estimated_duration_days,
       responsibleName: normalizeText(responsible),
+      importance,
+      urgency,
       status: normalizeCorrectiveActionStatus(req.body?.status),
-      demandeur
+      demandeur: normalizeText(req.body?.demandeur)
     });
 
     if (!saved) {
@@ -27069,6 +27435,8 @@ app.get("/corrective-actions-bulk", async (req, res) => {
 
 app.post("/submit-bulk-corrective-actions", async (req, res) => {
   try {
+    await ensureLegacyCorrectiveActionsSchema();
+
     const { responsible_id, week, corrective_action_ids, ...formData } = req.body;
     const ids = Array.isArray(corrective_action_ids) ? corrective_action_ids : [corrective_action_ids];
     let completedCount = 0;
@@ -27076,25 +27444,50 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
       const rootCause = normalizeText(formData[`root_cause_${caId}`]);
       const solution = normalizeText(formData[`solution_${caId}`]);
       const dueDate = formData[`due_date_${caId}`] || null;
+      const estimatedDurationDays = normalizeCorrectiveActionEstimatedDurationDays(
+        formData[`estimated_duration_days_${caId}`]
+      );
       const responsibleName = normalizeText(formData[`responsible_${caId}`]);
-      if (rootCause || solution || dueDate || responsibleName) {
+      const importance = normalizeCorrectiveActionImportance(formData[`importance_${caId}`]);
+      const urgency = normalizeCorrectiveActionUrgency(formData[`urgency_${caId}`]);
+      if (
+        rootCause ||
+        solution ||
+        dueDate ||
+        responsibleName ||
+        estimatedDurationDays !== null ||
+        importance ||
+        urgency
+      ) {
         await pool.query(
           `UPDATE public.corrective_actions
            SET root_cause=$1,
                implemented_solution=$2,
                due_date=$3::date,
-               responsible=$4::text,
+               estimated_duration_days=$4::integer,
+               responsible=$5::text,
+               importance=$6::text,
+               urgency=$7::text,
                status = CASE
                  WHEN $1::text IS NOT NULL
                   AND $2::text IS NOT NULL
                   AND $3::date IS NOT NULL
-                  AND NULLIF(BTRIM($4::text), '') IS NOT NULL
+                  AND NULLIF(BTRIM($5::text), '') IS NOT NULL
                  THEN 'Waiting for validation'
                  ELSE status
                END,
                updated_date=NOW()
-           WHERE corrective_action_id=$5`,
-          [rootCause, solution, dueDate, responsibleName, caId]
+           WHERE corrective_action_id=$8`,
+          [
+            rootCause,
+            solution,
+            dueDate,
+            estimatedDurationDays,
+            responsibleName,
+            importance,
+            urgency,
+            caId
+          ]
         );
         if (rootCause && solution && dueDate && responsibleName) {
           completedCount++;
@@ -27864,6 +28257,9 @@ historyByKpi[historyKey].push({
         implemented_solution: row.implemented_solution || "",
         evidence: row.evidence || "",
         due_date: row.due_date || "",
+        estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(row.estimated_duration_days),
+        importance: normalizeCorrectiveActionImportance(row.importance) || "",
+        urgency: normalizeCorrectiveActionUrgency(row.urgency) || "",
         responsible: row.responsible || "",
         updated_at: updatedAt
       });
@@ -28631,10 +29027,10 @@ let historyValues = historyLabels.map((label) => {
           .ca-action-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
           .ca-remove-btn{border:none;border-radius:999px;padding:8px 12px;background:#fee2e2;color:#b91c1c;font-size:11px;font-weight:800;cursor:pointer;}
           .ca-remove-btn.is-hidden{display:none;}
-          .ca-dates-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:0 14px 14px;align-items:start;}
+          .ca-dates-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:0 14px 14px;align-items:start;}
           .ca-dates-grid .ca-field{margin-top:0 !important;margin-bottom:0;padding:0;}
-          .ca-date-input,.ca-text-input{width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:6px;font-size:13px;font-family:inherit;background:#fff;box-sizing:border-box;}
-          .ca-date-input:focus,.ca-text-input:focus{border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.12);}
+          .ca-date-input,.ca-text-input,.ca-select-input{width:100%;padding:10px 12px;border:1.5px solid #f28b82;border-radius:6px;font-size:13px;font-family:inherit;background:#fff;box-sizing:border-box;}
+          .ca-date-input:focus,.ca-text-input:focus,.ca-select-input:focus{border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.12);}
           .ca-field{margin-bottom:14px;padding:0 14px;}
           .ca-label{display:block;font-weight:600;font-size:13px;color:#555;margin-bottom:6px;}
           .ca-required{color:#dc3545;}
@@ -28644,7 +29040,7 @@ let historyValues = historyLabels.map((label) => {
             background:#fff;box-sizing:border-box;transition:border-color 0.2s;
           }
           .ca-textarea:focus{border-color:#d32f2f;outline:none;box-shadow:0 0 0 3px rgba(211,47,47,0.12);}
-          .ca-textarea.error,.ca-date-input.error,.ca-text-input.error{border-color:#dc3545;background:#fff5f5;}
+          .ca-textarea.error,.ca-date-input.error,.ca-text-input.error,.ca-select-input.error{border-color:#dc3545;background:#fff5f5;}
           .ca-textarea.highlight{animation:caHighlight 1.8s forwards;}
           @keyframes caHighlight{0%{background:#dcfce7;border-color:#16a34a;}100%{background:#fff;border-color:#f28b82;}}
 
@@ -28859,16 +29255,13 @@ let historyValues = historyLabels.map((label) => {
               linear-gradient(180deg, #fbfdff 0%, #f4f8ff 100%);
           }
 
-          .ca-table-wrap,
-          .ca-entry-editor-wrap {
-            overflow-x: auto;
-            border-radius: 22px;
-            border: 1px solid rgba(191,219,254,0.6);
-            background: rgba(255,255,255,0.96);
-            box-shadow:
-              inset 0 1px 0 rgba(255,255,255,0.92),
-              0 18px 42px rgba(15,23,42,0.07);
-          }
+   .ca-table-wrap {
+  overflow-x: auto;
+}
+
+.ca-entry-editor-wrap {
+  overflow-x: hidden;
+}
 
           .ca-table-wrap {
             max-height: 320px;
@@ -29310,7 +29703,9 @@ let historyValues = historyLabels.map((label) => {
           }
 
           .ca-entry-editor-table {
-            min-width: 1040px;
+            width: 100%;
+            min-width: 0;
+            table-layout: fixed;
           }
 
           .ca-entry-editor-table tbody tr {
@@ -29333,6 +29728,31 @@ let historyValues = historyLabels.map((label) => {
           .ca-draft-cell {
             min-width: 94px;
           }
+
+          .ca-entry-editor-table th,
+.ca-entry-editor-table td {
+  padding: 10px 8px;
+}
+
+.ca-entry-editor-table th {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.ca-entry-editor-table .ca-modal-input,
+.ca-entry-editor-table .ca-modal-select,
+.ca-entry-editor-table .ca-responsible-trigger {
+  min-height: 44px;
+  padding: 10px 9px;
+  font-size: 12px;
+}
+
+.ca-entry-editor-table .ca-modal-textarea {
+  min-height: 82px;
+  padding: 10px 9px;
+  font-size: 12px;
+  resize: none;
+}
 
           .ca-draft-badge {
             display: flex;
@@ -29576,20 +29996,24 @@ let historyValues = historyLabels.map((label) => {
             transform: translateY(-1px);
           }
 
-          .ca-entry-actions-cell {
-            min-width: 210px;
-          }
+.ca-entry-actions-cell {
+    min-width: 280px;
+}
+.ca-entry-actions-stack {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    white-space: nowrap;
+}
 
-          .ca-entry-actions-stack {
-            display: flex;
-            flex-direction: row;
-            width: 100%;
-            min-width: 200px;
-            justify-content: stretch;
-            gap: 12px;
-            align-items: center;
-            padding: 2px 0;
-          }
+.ca-modal-cancel-btn,
+.ca-modal-save-btn {
+  min-width: 0;
+  padding: 0 10px;
+  font-size: 12px;
+}
 
           .ca-modal-cancel-btn,
           .ca-modal-save-btn {
@@ -29607,6 +30031,7 @@ let historyValues = historyLabels.map((label) => {
           }
 
           .ca-modal-cancel-btn {
+            min-width: 100px;
             border: 1px solid rgba(203,213,225,0.96);
             background: #ffffff;
             color: #334155;
@@ -29617,6 +30042,7 @@ let historyValues = historyLabels.map((label) => {
           }
 
           .ca-modal-save-btn {
+            min-width: 130px;
             border: none;
             background: linear-gradient(135deg, #2563eb, #0ea5e9);
             color: white;
@@ -30206,26 +30632,32 @@ let historyValues = historyLabels.map((label) => {
               </div>
               <div class="ca-table-wrap" data-ca-filter-table-wrap>
                 <table class="ca-table" id="caModalTable">
-                  <colgroup>
-                    <col style="width:25%;">
-                    <col style="width:29%;">
-                    <col style="width:12%;">
-                    <col style="width:16%;">
-                    <col style="width:8%;">
-                    <col style="width:10%;">
-                  </colgroup>
+       <colgroup>
+  <col style="width:8%">
+  <col style="width:11%">
+  <col style="width:6%">
+  <col style="width:16%">
+  <col style="width:17%">
+  <col style="width:8%">
+  <col style="width:8%">
+  <col style="width:7%">
+  <col style="width:19%">
+</colgroup>
                   <thead>
                     <tr>
                       <th>Root Cause</th>
                       <th>Immediate Action</th>
                       <th>Due Date</th>
                       <th>Responsible</th>
+                      <th>Estimated Days</th>
+                      <th>Importance</th>
+                      <th>Urgency</th>
                       <th>Status</th>
                       <th class="ca-col-actions">Actions</th>
                     </tr>
                   </thead>
                   <tbody id="caModalTableBody">
-                    <tr><td colspan="6" class="ca-table-empty">No corrective actions yet.</td></tr>
+                    <tr><td colspan="9" class="ca-table-empty">No corrective actions yet.</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -30250,20 +30682,26 @@ let historyValues = historyLabels.map((label) => {
                 <input type="hidden" id="caModalEditIndex" value="">
                 <div class="ca-entry-editor-wrap">
                   <table class="ca-entry-editor-table">
-                    <colgroup>
-                      <col style="width:10%;">
-                      <col style="width:14%;">
-                      <col style="width:18%;">
-                      <col style="width:24%;">
-                      <col style="width:12%;">
-                      <col style="width:22%;">
-                    </colgroup>
+<colgroup>
+  <col style="width:8%">
+  <col style="width:11%">
+  <col style="width:6%">
+  <col style="width:16%">
+  <col style="width:17%">
+  <col style="width:8%">
+  <col style="width:8%">
+  <col style="width:7%">
+  <col style="width:19%">
+</colgroup>
                     <thead>
                       <tr>
                         <th>Due Date <span class="ca-required">*</span></th>
                         <th>Responsible <span class="ca-required">*</span></th>
+                        <th>Est. Days <span class="ca-required">*</span></th>
                         <th>Root Cause <span class="ca-required">*</span></th>
                         <th>Immediate Action / Solution <span class="ca-required">*</span></th>
+                        <th>Importance <span class="ca-required">*</span></th>
+                        <th>Urgency <span class="ca-required">*</span></th>
                         <th>Status</th>
                         <th class="ca-entry-actions-col">Actions</th>
                       </tr>
@@ -30308,6 +30746,18 @@ let historyValues = historyLabels.map((label) => {
                         </td>
                         <td>
                           <div class="ca-editor-cell">
+                            <input
+                              type="number"
+                              min="0"
+                              step="1"
+                              id="caModalEstimatedDurationDays"
+                              class="ca-modal-input"
+                              placeholder="Days"
+                            >
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-cell">
                             <textarea id="caModalRootCause" class="ca-modal-textarea" placeholder="Describe the root cause..."></textarea>
                           </div>
                         </td>
@@ -30317,9 +30767,29 @@ let historyValues = historyLabels.map((label) => {
                           </div>
                         </td>
                         <td>
+                          <div class="ca-editor-cell">
+                            <select id="caModalImportance" class="ca-modal-select">
+                              <option value="">Select importance</option>
+                              <option value="High">High</option>
+                              <option value="Medium">Medium</option>
+                              <option value="Low">Low</option>
+                            </select>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="ca-editor-cell">
+                            <select id="caModalUrgency" class="ca-modal-select">
+                              <option value="">Select urgency</option>
+                              <option value="Flexible">Flexible</option>
+                              <option value="Urgent">Urgent</option>
+                              <option value="Secondary">Secondary</option>
+                            </select>
+                          </div>
+                        </td>
+                        <td>
                           <div class="ca-editor-status-panel">
                             <span class="ca-entry-status-pill open" id="caModalStatusBadge">Open</span>
-                            <div class="ca-editor-cell-note" id="caModalStatusNote">New actions start with Open status.</div>
+                           
                           </div>
                         </td>
                         <td class="ca-entry-actions-cell">
@@ -30431,7 +30901,10 @@ function getCaModalActions(kvId) {
       const rootCause = getTrimmedValue(getCorrectiveActionField(card, "root_cause"));
       const implSolution = getTrimmedValue(getCorrectiveActionField(card, "implemented_solution"));
       const dueDate = getInputValue(getCorrectiveActionField(card, "due_date"));
+      const estimatedDurationDays = getInputValue(getCorrectiveActionField(card, "estimated_duration_days"));
       const responsible = getTrimmedValue(getCorrectiveActionField(card, "responsible"));
+      const importance = getTrimmedValue(getCorrectiveActionField(card, "importance"));
+      const urgency = getTrimmedValue(getCorrectiveActionField(card, "urgency"));
       const actionId = getTrimmedValue(
         card.querySelector('input[name="ca_action_id_' + kvId + '[]"]')
       );
@@ -30441,13 +30914,16 @@ function getCaModalActions(kvId) {
 
       if (rootCause || implSolution || dueDate || actionId) {
         caModalStore[kvId].push({
-        id: actionId,
-        root_cause: rootCause,
-       implemented_solution: implSolution, //FIXED
-       due_date: dueDate,
-       responsible: responsible,
-       status: getCanonicalCorrectiveActionStatus(status)
-      });
+          id: actionId,
+          root_cause: rootCause,
+          implemented_solution: implSolution,
+          due_date: dueDate,
+          estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(estimatedDurationDays),
+          responsible: responsible,
+          importance: normalizeCorrectiveActionImportance(importance),
+          urgency: normalizeCorrectiveActionUrgency(urgency),
+          status: getCanonicalCorrectiveActionStatus(status)
+        });
       }
     });
   }
@@ -30597,7 +31073,7 @@ function getCaModalActions(kvId) {
        if (!tbody) return;
        const actions = getCaModalActions(kvId);
        if (!actions.length) {
-       tbody.innerHTML = '<tr><td colspan="6" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
+       tbody.innerHTML = '<tr><td colspan="9" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
        applyCaModalTableFilters();
        return;
        }
@@ -30608,6 +31084,9 @@ function getCaModalActions(kvId) {
       const responsibleInitial = responsibleName ? responsibleName.charAt(0).toUpperCase() : "?";
       const filterDueDate = getHistoryDueDateFilterValue(a.due_date);
       const dueDateDisplay = filterDueDate || String(a.due_date || "").trim();
+      const estimatedDurationDays = a.estimated_duration_days ?? "";
+      const importance = String(a.importance || "").trim();
+      const urgency = String(a.urgency || "").trim();
       return \`<tr data-ca-row="true" data-ca-responsible="\${escapeHtml(responsibleName)}" data-ca-due-date="\${escapeHtml(filterDueDate)}">
       <td title="\${escapeHtml(a.root_cause)}">
         <div class="ca-table-copy">
@@ -30631,6 +31110,9 @@ function getCaModalActions(kvId) {
           </span>
         </div>
       </td>
+      <td>\${estimatedDurationDays !== "" ? \`<span class="ca-date-chip">\${escapeHtml(String(estimatedDurationDays))} d</span>\` : "&mdash;"}</td>
+      <td>\${importance ? \`<span class="ca-date-chip">\${escapeHtml(importance)}</span>\` : "&mdash;"}</td>
+      <td>\${urgency ? \`<span class="ca-date-chip">\${escapeHtml(urgency)}</span>\` : "&mdash;"}</td>
       <td>\${a.status ? \`<span class="ca-table-status \${sc}">\${escapeHtml(a.status)}</span>\` : "&mdash;"}</td>
       <td class="ca-col-actions">
         <div class="ca-table-actions">
@@ -30706,13 +31188,16 @@ function getCaModalActions(kvId) {
     if (editIdx) editIdx.value = String(editIndex);
     document.getElementById("caModalDueDate").value = a.due_date || "";
     setCaModalResponsibleValue(a.responsible || "");
+    document.getElementById("caModalEstimatedDurationDays").value = a.estimated_duration_days ?? "";
     document.getElementById("caModalRootCause").value = a.root_cause || "";
     document.getElementById("caModalSolution").value = a.implemented_solution || "";
+    document.getElementById("caModalImportance").value = a.importance || "";
+    document.getElementById("caModalUrgency").value = a.urgency || "";
     updateCaModalEditorMeta(a, editIndex);
   } else {
     if (formTitle) formTitle.textContent = "New Corrective Action";
     if (editIdx) editIdx.value = "";
-    ["caModalDueDate","caModalRootCause","caModalSolution"].forEach(id => {
+    ["caModalDueDate","caModalEstimatedDurationDays","caModalRootCause","caModalSolution","caModalImportance","caModalUrgency"].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.value = "";
     });
@@ -30734,23 +31219,56 @@ function getCaModalActions(kvId) {
             updateCaModalEditorMeta(null, null);
           }
 
+          function normalizeCorrectiveActionEstimatedDurationDays(value) {
+            if (value === null || value === undefined || String(value).trim() === "") {
+            return null;
+           }
+
+        const numberValue = Number(String(value).trim());
+
+        if (!Number.isInteger(numberValue) || numberValue < 0) {
+         return null;
+       }
+ 
+        return numberValue;
+    }
+
+    function normalizeCorrectiveActionImportance(value) {
+  const text = String(value || "").trim();
+  const allowed = ["High", "Medium", "Low"];
+  return allowed.find(v => v.toLowerCase() === text.toLowerCase()) || "";
+}
+
+function normalizeCorrectiveActionUrgency(value) {
+  const text = String(value || "").trim();
+  const allowed = ["Flexible", "Urgent", "Secondary"];
+  return allowed.find(v => v.toLowerCase() === text.toLowerCase()) || "";
+}
+
 function caModalSaveForm() {
   if (!caModalKvId) return;
 
   const rootCauseEl = document.getElementById("caModalRootCause");
   const solutionEl = document.getElementById("caModalSolution");
   const dueDateEl = document.getElementById("caModalDueDate");
+  const estimatedDurationDaysEl = document.getElementById("caModalEstimatedDurationDays");
   const responsibleEl = document.getElementById("caModalResponsible");
+  const importanceEl = document.getElementById("caModalImportance");
+  const urgencyEl = document.getElementById("caModalUrgency");
   const editIndexEl = document.getElementById("caModalEditIndex");
 
   const rootCause = rootCauseEl ? rootCauseEl.value.trim() : "";
   const solution = solutionEl ? solutionEl.value.trim() : "";
   const dueDate = dueDateEl ? dueDateEl.value : "";
+  const estimatedDurationDaysRaw = estimatedDurationDaysEl ? estimatedDurationDaysEl.value : "";
+  const estimatedDurationDays = normalizeCorrectiveActionEstimatedDurationDays(estimatedDurationDaysRaw);
   const responsible = responsibleEl ? responsibleEl.value.trim() : "";
+  const importance = importanceEl ? importanceEl.value.trim() : "";
+  const urgency = urgencyEl ? urgencyEl.value.trim() : "";
   const editIndex = editIndexEl ? editIndexEl.value : "";
 
-  if (!rootCause || !solution || !dueDate || !responsible) {
-    alert("Please fill in Root Cause, Corrective Action, Due Date, and Responsible.");
+  if (!rootCause || !solution || !dueDate || estimatedDurationDays === null || !responsible || !importance || !urgency) {
+    alert("Please fill in Root Cause, Corrective Action, Due Date, Estimated Duration Days, Responsible, Importance, and Urgency.");
     return;
   }
 
@@ -30761,11 +31279,14 @@ function caModalSaveForm() {
       : null;
 
   const entry = {
-   id: "",
-   root_cause: rootCause,
-    implemented_solution: solution, // FIXED
+    id: "",
+    root_cause: rootCause,
+    implemented_solution: solution,
     due_date: dueDate,
+    estimated_duration_days: estimatedDurationDays,
     responsible: responsible,
+    importance: normalizeCorrectiveActionImportance(importance),
+    urgency: normalizeCorrectiveActionUrgency(urgency),
     status: getCanonicalCorrectiveActionStatus(existingAction && existingAction.status)
   };
 
@@ -30820,12 +31341,18 @@ function syncDomFromStore(kvId) {
     if (statusInput) statusInput.value = getCanonicalCorrectiveActionStatus(action.status);
 
     const dueDateField = getCorrectiveActionField(newCard, "due_date");
+    const estimatedDurationDaysField = getCorrectiveActionField(newCard, "estimated_duration_days");
     const responsibleField = getCorrectiveActionField(newCard, "responsible");
+    const importanceField = getCorrectiveActionField(newCard, "importance");
+    const urgencyField = getCorrectiveActionField(newCard, "urgency");
     const rootCauseField = getCorrectiveActionField(newCard, "root_cause");
     const implSolutionField = getCorrectiveActionField(newCard, "implemented_solution");
 
     if (dueDateField) dueDateField.value = action.due_date || "";
+    if (estimatedDurationDaysField) estimatedDurationDaysField.value = action.estimated_duration_days ?? "";
     if (responsibleField) responsibleField.value = action.responsible || "";
+    if (importanceField) importanceField.value = action.importance || "";
+    if (urgencyField) urgencyField.value = action.urgency || "";
     if (rootCauseField) rootCauseField.value = action.root_cause || "";
     if (implSolutionField) implSolutionField.value = action.implemented_solution || "";
 
@@ -30869,7 +31396,10 @@ function syncDomFromStore(kvId) {
           root_cause: a.root_cause || "",
           implemented_solution: a.implemented_solution || "",
           due_date: a.due_date || "",
+          estimated_duration_days: a.estimated_duration_days ?? null,
           responsible: a.responsible || "",
+          importance: normalizeCorrectiveActionImportance(a.importance) || "",
+          urgency: normalizeCorrectiveActionUrgency(a.urgency) || "",
           status: getCanonicalCorrectiveActionStatus(a.status)
         }));
     }
@@ -31171,6 +31701,9 @@ function updateSubmitButtonState(showPopup = false) {
                 implemented_solution: getTrimmedValue(getCorrectiveActionField(ac, "implemented_solution")),
                 evidence: getTrimmedValue(getCorrectiveActionField(ac, "evidence")),
                 due_date: getInputValue(getCorrectiveActionField(ac, "due_date")),
+                estimated_duration_days: getInputValue(getCorrectiveActionField(ac, "estimated_duration_days")),
+                importance: getTrimmedValue(getCorrectiveActionField(ac, "importance")),
+                urgency: getTrimmedValue(getCorrectiveActionField(ac, "urgency")),
                 responsible: getTrimmedValue(getCorrectiveActionField(ac, "responsible"))
               }));
               const latestAction = correctiveActions.length ? correctiveActions[0] : {};
@@ -31191,6 +31724,9 @@ function updateSubmitButtonState(showPopup = false) {
                 implemented_solution: latestAction.implemented_solution || "",
                 evidence: latestAction.evidence || "",
                 due_date: latestAction.due_date || "",
+                estimated_duration_days: latestAction.estimated_duration_days ?? "",
+                importance: latestAction.importance || "",
+                urgency: latestAction.urgency || "",
                 responsible: latestAction.responsible || "",
                 corrective_action_status: getTrimmedText(statusBadge),
                 corrective_actions: correctiveActions
@@ -33060,6 +33596,9 @@ function getFallbackCurrentMonthLabel(card, labels) {
                       '<th>Root Cause</th>' +
                       '<th>Implemented Solution</th>' +
                       '<th>Due Date</th>' +
+                      '<th>Estimated Days</th>' +
+                      '<th>Importance</th>' +
+                      '<th>Urgency</th>' +
                       '<th>Responsible</th>' +
                       '<th>Status</th>' +
                       '</tr>' +
@@ -33068,6 +33607,10 @@ function getFallbackCurrentMonthLabel(card, labels) {
                       actions.map(function(action, index) {
                         const filterDueDate = getHistoryDueDateFilterValue(action.due_date);
                         const dueDateDisplay = filterDueDate || String(action.due_date || "").trim();
+                        const estimatedDurationDays =
+                          action.estimated_duration_days === null || action.estimated_duration_days === undefined || action.estimated_duration_days === ""
+                            ? ""
+                            : String(action.estimated_duration_days).trim();
                         return '' +
                           '<tr data-history-due-date="' + escapeHistoryHtml(filterDueDate) + '">' +
                             '<td class="history-row-number">' + (index + 1) + '</td>' +
@@ -33075,6 +33618,9 @@ function getFallbackCurrentMonthLabel(card, labels) {
                             '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
                             '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
                             '<td>' + escapeHistoryHtml(dueDateDisplay) + '</td>' +
+                            '<td>' + escapeHistoryHtml(estimatedDurationDays ? (estimatedDurationDays + ' d') : '') + '</td>' +
+                            '<td>' + escapeHistoryHtml(action.importance || "") + '</td>' +
+                            '<td>' + escapeHistoryHtml(action.urgency || "") + '</td>' +
                             '<td>' + escapeHistoryHtml(action.responsible || "") + '</td>' +
                             '<td>' + renderHistoryStatusContent(action, options) + '</td>' +
                           '</tr>';
