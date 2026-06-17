@@ -27238,17 +27238,29 @@ app.get("/api/kpi-chart-data", async (req, res) => {
     const histRes = await pool.query(
       `
       SELECT DISTINCT ON (
-        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD'))
+        CASE
+       WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
+       WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
+       WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
+      END
       )
         kr.result_date,
-        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')) AS week,
+       CASE
+       WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
+       WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
+       WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
+       END AS week,
         kr.raw_value AS new_value,
         kr.recorded_at AS updated_at
       FROM public.kpi_result kr
       WHERE ${baseWhereClause}
         AND kr.raw_value IS NOT NULL
       ORDER BY
-        COALESCE(kr.week, kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM-DD')),
+        CASE
+        WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
+        WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
+        WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
+       END,
         kr.recorded_at DESC,
         kr.kpi_result_id DESC
       `,
@@ -27315,9 +27327,9 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       periodMap[periodLabel].count += 1;
     }
 
-    const currentPeriodLabel =
-      frequencyMode === "daily"
-        ? new Date().toISOString().slice(0, 10)
+  const currentPeriodLabel =
+     frequencyMode === "daily"
+      ? normalizedWeek
         : frequencyMode === "monthly"
           ? weekToMonthLabel(normalizedWeek)
           : normalizedWeek;
