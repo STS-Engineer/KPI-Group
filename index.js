@@ -18066,7 +18066,7 @@ function getExpectedMultisiteTargetCount(row = {}) {
                     </tr>
                     \${isExpanded ? group.rows.map(row => \`
                       <tr class="parameter-subject-child-row">
-                       <td>
+                        <td>
                           <div class="parameter-matrix-kpi-title">\${escapeHtml(row.kpi_name && row.kpi_group && row.kpi_name !== row.kpi_group ? row.kpi_name : (row.kpi_subject || row.kpi_group || "No KPI hierarchy attached"))}</div>
                            <div class="parameter-matrix-kpi-path">\${escapeHtml(row.kpi_group || row.kpi_name || "Linked KPI")}</div>
                         </td>
@@ -18284,20 +18284,15 @@ function getExpectedMultisiteTargetCount(row = {}) {
         const numericValue = normalizeChartLimitValue(value);
         const low = normalizeChartLimitValue(lowLimit);
         const high = normalizeChartLimitValue(highLimit);
-        const resolvedDirection = normalizeChartDirection(direction);
 
         if (numericValue === null) return "rgba(148, 163, 184, 0.85)";
 
         const lowerBound = low !== null && high !== null ? Math.min(low, high) : low;
         const upperBound = low !== null && high !== null ? Math.max(low, high) : high;
+        const isBelowLower = lowerBound !== null && numericValue < lowerBound;
+        const isAboveUpper = upperBound !== null && numericValue > upperBound;
 
-        if (resolvedDirection === "down") {
-          return upperBound !== null && numericValue > upperBound
-            ? "rgba(239, 68, 68, 0.88)"
-            : "rgba(74, 222, 128, 0.88)";
-        }
-
-        return lowerBound !== null && numericValue < lowerBound
+        return isBelowLower || isAboveUpper
           ? "rgba(239, 68, 68, 0.88)"
           : "rgba(74, 222, 128, 0.88)";
       }
@@ -18313,7 +18308,6 @@ function getExpectedMultisiteTargetCount(row = {}) {
         beforeDatasetsDraw(chart, args, pluginOptions) {
           const low = normalizeChartLimitValue(pluginOptions?.lowLimit);
           const high = normalizeChartLimitValue(pluginOptions?.highLimit);
-          const direction = normalizeChartDirection(pluginOptions?.direction);
           const yScale = chart.scales?.y;
           const area = chart.chartArea;
 
@@ -18346,13 +18340,13 @@ function getExpectedMultisiteTargetCount(row = {}) {
           chart.ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
           chart.ctx.clip();
 
-          if (direction === "down") {
-            if (upperBound !== null) {
-              drawBand(yScale.max, upperBound, "rgba(254, 226, 226, 0.55)");
-              drawBand(upperBound, yScale.min, "rgba(220, 252, 231, 0.55)");
-            } else {
-              fillWholeArea("rgba(220, 252, 231, 0.55)");
-            }
+          if (lowerBound !== null && upperBound !== null) {
+            drawBand(yScale.max, upperBound, "rgba(254, 226, 226, 0.55)");
+            drawBand(upperBound, lowerBound, "rgba(220, 252, 231, 0.55)");
+            drawBand(lowerBound, yScale.min, "rgba(254, 226, 226, 0.55)");
+          } else if (upperBound !== null) {
+            drawBand(yScale.max, upperBound, "rgba(254, 226, 226, 0.55)");
+            drawBand(upperBound, yScale.min, "rgba(220, 252, 231, 0.55)");
           } else if (lowerBound !== null) {
             drawBand(yScale.max, lowerBound, "rgba(220, 252, 231, 0.55)");
             drawBand(lowerBound, yScale.min, "rgba(254, 226, 226, 0.55)");
@@ -21312,19 +21306,13 @@ const getKpiStatus = (value, lowLimit, highLimit, direction = 'up') => {
     };
   }
 
-  if (resolvedDirection === 'down') {
-    return {
-      color: upperBound !== null && val > upperBound ? '#dc3545' : '#28a745',
-      isGood: !(upperBound !== null && val > upperBound),
-      direction: resolvedDirection,
-      lowerBound,
-      upperBound
-    };
-  }
+  const isBelowLower = lowerBound !== null && val < lowerBound;
+  const isAboveUpper = upperBound !== null && val > upperBound;
+  const isOutsideBounds = isBelowLower || isAboveUpper;
 
   return {
-    color: lowerBound !== null && val < lowerBound ? '#dc3545' : '#28a745',
-    isGood: !(lowerBound !== null && val < lowerBound),
+    color: isOutsideBounds ? '#dc3545' : '#28a745',
+    isGood: !isOutsideBounds,
     direction: resolvedDirection,
     lowerBound,
     upperBound
@@ -21358,12 +21346,9 @@ const getDashboardSubmissionStatus = (kpi) => {
     };
   }
 
-  const canUseDirectionalLimit =
-    resolvedDirection === "down"
-      ? upperBound !== null
-      : lowerBound !== null;
+  const hasLimitBand = lowerBound !== null || upperBound !== null;
 
-  if (canUseDirectionalLimit) {
+  if (hasLimitBand) {
     const limitStatus = getKpiStatus(currentValue, lowLimit, highLimit, resolvedDirection);
 
     return {
@@ -23000,11 +22985,11 @@ const buildSelectedKpiSummary = (selectedKpi = null) => {
   }
 
   let thresholdAssessment = "Threshold status is not available.";
-  if (status.isGood === false) {
-    if (goodDirection === "down" && status.upperBound !== null && currentValue !== null) {
-      thresholdAssessment = `${Number((currentValue - status.upperBound).toFixed(2))} above the acceptable limit.`;
-    } else if (goodDirection === "up" && status.lowerBound !== null && currentValue !== null) {
+  if (status.isGood === false && currentValue !== null) {
+    if (status.lowerBound !== null && currentValue < status.lowerBound) {
       thresholdAssessment = `${Number((status.lowerBound - currentValue).toFixed(2))} below the acceptable limit.`;
+    } else if (status.upperBound !== null && currentValue > status.upperBound) {
+      thresholdAssessment = `${Number((currentValue - status.upperBound).toFixed(2))} above the acceptable limit.`;
     } else {
       thresholdAssessment = "Outside the acceptable threshold.";
     }
@@ -24917,17 +24902,16 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
   FROM public.kpi_result kr
   WHERE kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
     AND (
-      $1::text IS NULL
-      OR kr.week <= $1
-      OR kr.period_label <= $1
-    )
-    AND (
       kr.target_value IS NOT NULL
       OR kr.upper_limit IS NOT NULL
       OR kr.lower_limit IS NOT NULL
     )
   ORDER BY
-    COALESCE(kr.week, kr.period_label) DESC,
+    CASE
+      WHEN $1::text IS NOT NULL AND (kr.week = $1 OR kr.period_label = $1) THEN 0
+      ELSE 1
+    END,
+    COALESCE(kr.result_date::timestamp, kr.recorded_at) DESC,
     kr.recorded_at DESC,
     kr.kpi_result_id DESC
   LIMIT 1
@@ -26972,8 +26956,8 @@ app.post("/redirect", async (req, res) => {
           kta.last_best_target,
           COALESCE(kta.target_value, k.target_value) AS effective_target_value,
           COALESCE(kta.target_unit, k.unit) AS effective_unit,
-          k.low_limit,
-          k.high_limit,
+          COALESCE(latest_limits.lower_limit, k.low_limit) AS low_limit,
+          COALESCE(latest_limits.upper_limit, k.high_limit) AS high_limit,
           k.tolerance_type,
           k.low_tolerance,
           k.up_tolerance,
@@ -26982,6 +26966,26 @@ app.post("/redirect", async (req, res) => {
           COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject_name
         FROM public.kpi_target_allocation kta
         JOIN public.kpi k ON k.kpi_id = kta.kpi_id
+        LEFT JOIN LATERAL (
+          SELECT
+            kr.lower_limit,
+            kr.upper_limit
+          FROM public.kpi_result kr
+          WHERE kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
+            AND (
+              kr.lower_limit IS NOT NULL
+              OR kr.upper_limit IS NOT NULL
+            )
+          ORDER BY
+            CASE
+              WHEN $2::text IS NOT NULL AND (kr.week = $2 OR kr.period_label = $2) THEN 0
+              ELSE 1
+            END,
+            COALESCE(kr.result_date::timestamp, kr.recorded_at) DESC,
+            kr.recorded_at DESC,
+            kr.kpi_result_id DESC
+          LIMIT 1
+        ) latest_limits ON TRUE
         LEFT JOIN LATERAL (
           SELECT s.subject_name
           FROM public.subject_kpi sk
@@ -26994,7 +26998,7 @@ app.post("/redirect", async (req, res) => {
         WHERE kta.kpi_target_allocation_id = $1
         LIMIT 1
         `,
-        [allocationId]
+        [allocationId, normalizedWeek]
       );
       if (!allocationRes.rows.length) continue;
 
@@ -27320,16 +27324,16 @@ app.get("/api/kpi-chart-data", async (req, res) => {
     FROM public.kpi_result kr
     WHERE kr.kpi_target_allocation_id = COALESCE($1::integer, kta.kpi_target_allocation_id)
       AND (
-        kr.week <= $3
-        OR kr.period_label <= $3
-      )
-      AND (
         kr.target_value IS NOT NULL
         OR kr.upper_limit IS NOT NULL
         OR kr.lower_limit IS NOT NULL
       )
     ORDER BY
-      COALESCE(kr.week, kr.period_label) DESC,
+      CASE
+        WHEN $3::text IS NOT NULL AND (kr.week = $3 OR kr.period_label = $3) THEN 0
+        ELSE 1
+      END,
+      COALESCE(kr.result_date::timestamp, kr.recorded_at) DESC,
       kr.recorded_at DESC,
       kr.kpi_result_id DESC
     LIMIT 1
@@ -30674,14 +30678,12 @@ function syncDomFromStore(kvId) {
             const hasLow = !isNaN(rawLow), hasHigh = !isNaN(rawHigh);
             const lowerBound = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : hasHigh ? rawHigh : null;
             const upperBound = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : hasLow ? rawLow : null;
-            const goodDirection = String(card.dataset.goodDirection || "up").toLowerCase() === "down" ? "down" : "up";
             const val = parseFloat(input.value);
             const kvId = input.dataset.kpiValuesId;
             const caPanel = document.getElementById("ca_container_" + kvId);
             const isOutside = !isNaN(val) && (
-              goodDirection === "down"
-                ? upperBound !== null && val > upperBound
-                : lowerBound !== null && val < lowerBound
+              (lowerBound !== null && val < lowerBound) ||
+              (upperBound !== null && val > upperBound)
             );
             if (!caPanel) return;
             caPanel.classList.toggle("visible", isOutside);
@@ -30712,17 +30714,29 @@ function needsCorrectiveAction(value, lowLimit, highLimit, goodDirection) {
   }
 
   const numericValue = Number(value);
-  const direction = String(goodDirection || "up").toLowerCase();
+  const numericLowLimit = Number.isFinite(Number(lowLimit)) ? Number(lowLimit) : null;
+  const numericHighLimit = Number.isFinite(Number(highLimit)) ? Number(highLimit) : null;
+  const lowerBound =
+    numericLowLimit !== null && numericHighLimit !== null
+      ? Math.min(numericLowLimit, numericHighLimit)
+      : numericLowLimit !== null
+        ? numericLowLimit
+        : numericHighLimit;
+  const upperBound =
+    numericLowLimit !== null && numericHighLimit !== null
+      ? Math.max(numericLowLimit, numericHighLimit)
+      : numericHighLimit !== null
+        ? numericHighLimit
+        : numericLowLimit;
 
-  if (direction === "down") {
-    return highLimit !== null && highLimit !== undefined && numericValue > Number(highLimit);
-  }
-
-  return lowLimit !== null && lowLimit !== undefined && numericValue < Number(lowLimit);
+  return (
+    (lowerBound !== null && numericValue < lowerBound) ||
+    (upperBound !== null && numericValue > upperBound)
+  );
 }
  
 
-function isKpiUnderLowerLimit(card) {
+function isKpiOutsideLimits(card) {
   const input = card.querySelector(".value-input");
   const value = toNumber(input ? input.value : "");
 
@@ -30807,9 +30821,9 @@ function updateSubmitButtonState(showPopup = false) {
   document.querySelectorAll(".kpi-card").forEach(card => {
     const kvId = card.dataset.kpiValuesId;
  
-    // Check if value is below low limit and no valid corrective action exists
+    // Check if the value is outside the accepted limit band and no valid corrective action exists
     const needsCA =
-      isKpiUnderLowerLimit(card) &&
+      isKpiOutsideLimits(card) &&
       !hasValidCorrectiveAction(kvId);
  
     // Track previous state to detect transitions
@@ -31954,7 +31968,6 @@ if (input && !preserveDraftValue) {
             const rawLow = parseFloat(lowLimit);
             const rawHigh = parseFloat(highLimit);
             const rawTarget = parseFloat(target);
-            const resolvedDirection = normalizePointDirection(direction);
             const hasLow = !isNaN(rawLow);
             const hasHigh = !isNaN(rawHigh);
             const hasTarget = !isNaN(rawTarget);
@@ -31963,14 +31976,14 @@ if (input && !preserveDraftValue) {
 
             if (isNaN(val)) return "#94a3b8";
 
-            const isOutside = resolvedDirection === "down"
-              ? (upper !== null && val > upper)
-              : (lower !== null && val < lower);
+            const isOutside =
+              (lower !== null && val < lower) ||
+              (upper !== null && val > upper);
 
             if (isOutside) return "#e34b24";
 
             // Above target AND within (at/below) the upper limit -> dark green
-            if (hasTarget && val > rawTarget && (!hasHigh || val <= rawHigh)) {
+            if (hasTarget && val > rawTarget && (upper === null || val <= upper)) {
               return "#15803d";
             }
 
