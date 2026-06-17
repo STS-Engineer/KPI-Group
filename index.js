@@ -27223,15 +27223,19 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       : "kr.kpi_id = $1";
     const baseWhereValue = allocationId || kpiId;
 
-    const kpiFrequencyRes = await pool.query(
-      `
-      SELECT frequency
-      FROM public.kpi
-      WHERE kpi_id = $1
-      LIMIT 1
-      `,
-      [kpiId]
-    );
+  const kpiFrequencyRes = await pool.query(
+  `
+   SELECT k.frequency
+   FROM public.kpi k
+  LEFT JOIN public.kpi_target_allocation kta
+    ON kta.kpi_id = k.kpi_id
+  WHERE
+    ($1::integer IS NOT NULL AND k.kpi_id = $1)
+    OR ($2::integer IS NOT NULL AND kta.kpi_target_allocation_id = $2)
+  LIMIT 1
+  `,
+  [kpiId, allocationId]
+);
 
     const frequencyMode = normalizeKpiFrequency(kpiFrequencyRes.rows[0]?.frequency);
 
@@ -27264,7 +27268,7 @@ app.get("/api/kpi-chart-data", async (req, res) => {
         kr.recorded_at DESC,
         kr.kpi_result_id DESC
       `,
-      [baseWhereValue]
+      [baseWhereValue, frequencyMode]
     );
 
     const currentRes = await pool.query(
@@ -27272,7 +27276,11 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       SELECT kr.raw_value AS value
       FROM public.kpi_result kr
       WHERE ${baseWhereClause}
-        AND (kr.period_label = $2 OR kr.week = $2)
+        AND (
+        kr.period_label = $2
+        OR kr.week = $2
+        OR TO_CHAR(kr.result_date, 'YYYY-MM-DD') = $2
+       )
       ORDER BY kr.recorded_at DESC, kr.kpi_result_id DESC
       LIMIT 1
       `,
@@ -27339,9 +27347,9 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       periodMap[currentPeriodLabel] = { sum: currentValue, count: 1 };
     }
 
-    const labels = Object.keys(periodMap).sort(
-      (a, b) => periodLabelToDate(a, frequencyMode) - periodLabelToDate(b, frequencyMode)
-    );
+   const labels = Object.keys(periodMap)
+    .sort((a, b) => periodLabelToDate(a, frequencyMode) - periodLabelToDate(b, frequencyMode))
+    .slice(-4);
 
     const values = labels.map((label) => {
       const p = periodMap[label];
