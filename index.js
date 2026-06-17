@@ -39932,7 +39932,7 @@ app.get("/api/kpi-training/stats", async (req, res) => {
 const getKpiTrainingAppBaseUrl = () =>
   (
     normalizeOptionalTextInput(process.env.APP_BASE_URL) ||
-    `http://localhost:${port}`
+    `https://kpi-form.azurewebsites.net:${port}`
   ).replace(/\/+$/, "");
 
 const normalizeKpiTrainingRoleLookupName = (value) =>
