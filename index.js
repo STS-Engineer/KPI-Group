@@ -28714,6 +28714,12 @@ let historyValues = historyLabels.map((label) => {
               linear-gradient(180deg, #fbfdff 0%, #f8fbff 100%);
           }
 
+          .ca-table-filter-empty {
+            margin: 0 0 14px;
+            border-radius: 22px;
+            border: 1px dashed rgba(191,219,254,0.9);
+          }
+
           .ca-table-copy {
             display: flex;
             flex-direction: column;
@@ -29930,20 +29936,42 @@ let historyValues = historyLabels.map((label) => {
             </div>
             <div class="ca-modal-body">
               <!-- Table of existing actions -->
-              <div class="ca-table-wrap">
+              <div class="history-filter-bar">
+                <div class="history-filter-group">
+                  <label class="history-filter-label" for="caModalResponsibleFilter">Responsible</label>
+                  <input
+                    id="caModalResponsibleFilter"
+                    class="history-filter-input"
+                    type="text"
+                    placeholder="Filter by responsible"
+                    autocomplete="off"
+                  >
+                </div>
+                <div class="history-filter-group">
+                  <label class="history-filter-label" for="caModalDueFromFilter">Due Date From</label>
+                  <input id="caModalDueFromFilter" class="history-filter-input" type="date">
+                </div>
+                <div class="history-filter-group">
+                  <label class="history-filter-label" for="caModalDueToFilter">Due Date To</label>
+                  <input id="caModalDueToFilter" class="history-filter-input" type="date">
+                </div>
+                <button type="button" class="history-filter-clear" id="caModalFilterClear">Clear Filter</button>
+              </div>
+              <div class="ca-table-empty ca-table-filter-empty" data-ca-filter-empty hidden>
+                No corrective actions match the selected responsible or due date filters.
+              </div>
+              <div class="ca-table-wrap" data-ca-filter-table-wrap>
                 <table class="ca-table" id="caModalTable">
                   <colgroup>
-                    <col style="width:5%;">
-                    <col style="width:24%;">
-                    <col style="width:26%;">
-                    <col style="width:11%;">
+                    <col style="width:25%;">
+                    <col style="width:29%;">
+                    <col style="width:12%;">
                     <col style="width:16%;">
-                    <col style="width:9%;">
-                    <col style="width:9%;">
+                    <col style="width:8%;">
+                    <col style="width:10%;">
                   </colgroup>
                   <thead>
                     <tr>
-                      <th class="ca-col-num">#</th>
                       <th>Root Cause</th>
                       <th>Immediate Action</th>
                       <th>Due Date</th>
@@ -29953,7 +29981,7 @@ let historyValues = historyLabels.map((label) => {
                     </tr>
                   </thead>
                   <tbody id="caModalTableBody">
-                    <tr><td colspan="7" class="ca-table-empty">No corrective actions yet.</td></tr>
+                    <tr><td colspan="6" class="ca-table-empty">No corrective actions yet.</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -30325,7 +30353,8 @@ function getCaModalActions(kvId) {
        if (!tbody) return;
        const actions = getCaModalActions(kvId);
        if (!actions.length) {
-       tbody.innerHTML = '<tr><td colspan="7" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
+       tbody.innerHTML = '<tr><td colspan="6" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
+       applyCaModalTableFilters();
        return;
        }
 
@@ -30333,8 +30362,9 @@ function getCaModalActions(kvId) {
       const sc = statusClass(a.status);
       const responsibleName = String(a.responsible || "").trim();
       const responsibleInitial = responsibleName ? responsibleName.charAt(0).toUpperCase() : "?";
-      return \`<tr>
-      <td class="ca-col-num">\${i + 1}</td>
+      const filterDueDate = getHistoryDueDateFilterValue(a.due_date);
+      const dueDateDisplay = filterDueDate || String(a.due_date || "").trim();
+      return \`<tr data-ca-row="true" data-ca-responsible="\${escapeHtml(responsibleName)}" data-ca-due-date="\${escapeHtml(filterDueDate)}">
       <td title="\${escapeHtml(a.root_cause)}">
         <div class="ca-table-copy">
           <div class="ca-table-copy-title">\${escapeHtml(truncate(a.root_cause, 110))}</div>
@@ -30347,7 +30377,7 @@ function getCaModalActions(kvId) {
           <div class="ca-table-copy-meta">Immediate response</div>
         </div>
       </td>
-      <td><span class="ca-date-chip">\${escapeHtml(a.due_date)}</span></td>
+      <td><span class="ca-date-chip">\${escapeHtml(dueDateDisplay)}</span></td>
       <td>
         <div class="ca-responsible-cell">
           <span class="ca-responsible-avatar">\${escapeHtml(responsibleInitial)}</span>
@@ -30366,6 +30396,7 @@ function getCaModalActions(kvId) {
       </td>
        </tr>\`;
         }).join("");
+      applyCaModalTableFilters();
       }
 
     function updateCaModalEditorMeta(action = null, editIndex = null) {
@@ -30601,6 +30632,7 @@ function syncDomFromStore(kvId) {
   }
 
   caModalCollapseForm();
+  clearCaModalFilters();
   renderCaModalTable(kvId);
 
   overlay.classList.add("active");
@@ -32287,6 +32319,22 @@ function getFallbackCurrentMonthLabel(card, labels) {
               return isoMatch[1];
             }
 
+            const dayFirstMatch = text.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
+            if (dayFirstMatch) {
+              const day = String(dayFirstMatch[1]).padStart(2, "0");
+              const month = String(dayFirstMatch[2]).padStart(2, "0");
+              const year = String(dayFirstMatch[3]);
+              return year + "-" + month + "-" + day;
+            }
+
+            const yearFirstMatch = text.match(/^(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})$/);
+            if (yearFirstMatch) {
+              const year = String(yearFirstMatch[1]);
+              const month = String(yearFirstMatch[2]).padStart(2, "0");
+              const day = String(yearFirstMatch[3]).padStart(2, "0");
+              return year + "-" + month + "-" + day;
+            }
+
             const parsedDate = new Date(text);
             if (isNaN(parsedDate.getTime())) {
               return "";
@@ -32400,6 +32448,152 @@ function getFallbackCurrentMonthLabel(card, labels) {
 
               syncInputsAndApply();
             });
+          }
+
+          function syncCaModalDateRangeInputs() {
+            const fromInput = document.getElementById("caModalDueFromFilter");
+            const toInput = document.getElementById("caModalDueToFilter");
+            if (!fromInput || !toInput) return;
+
+            if (toInput.value) {
+              fromInput.max = toInput.value;
+            } else {
+              fromInput.removeAttribute("max");
+            }
+
+            if (fromInput.value) {
+              toInput.min = fromInput.value;
+            } else {
+              toInput.removeAttribute("min");
+            }
+          }
+
+          function applyCaModalTableFilters() {
+            const tbody = document.getElementById("caModalTableBody");
+            const tableWrap = document.querySelector("[data-ca-filter-table-wrap]");
+            const emptyState = document.querySelector("[data-ca-filter-empty]");
+            const responsibleInput = document.getElementById("caModalResponsibleFilter");
+            const fromInput = document.getElementById("caModalDueFromFilter");
+            const toInput = document.getElementById("caModalDueToFilter");
+            const clearButton = document.getElementById("caModalFilterClear");
+            const rows = tbody ? Array.from(tbody.querySelectorAll('tr[data-ca-row="true"]')) : [];
+
+            const responsibleValue = String(responsibleInput?.value || "").trim().toLowerCase();
+            const fromValue = String(fromInput?.value || "").trim();
+            const toValue = String(toInput?.value || "").trim();
+
+            syncCaModalDateRangeInputs();
+
+            if (!rows.length) {
+              if (tableWrap) {
+                tableWrap.hidden = false;
+              }
+              if (emptyState) {
+                emptyState.hidden = true;
+              }
+              if (clearButton) {
+                clearButton.disabled = !(responsibleValue || fromValue || toValue);
+              }
+              return;
+            }
+
+            let visibleCount = 0;
+
+            rows.forEach(function(row) {
+              const responsible = String(row.dataset.caResponsible || "").trim().toLowerCase();
+              const dueDate = String(row.dataset.caDueDate || "").trim();
+              let isVisible = true;
+
+              if (responsibleValue) {
+                isVisible = responsible.includes(responsibleValue);
+              }
+
+              if (isVisible && fromValue) {
+                isVisible = Boolean(dueDate) && dueDate >= fromValue;
+              }
+
+              if (isVisible && toValue) {
+                isVisible = Boolean(dueDate) && dueDate <= toValue;
+              }
+
+              row.hidden = !isVisible;
+              if (isVisible) {
+                visibleCount += 1;
+              }
+            });
+
+            if (tableWrap) {
+              tableWrap.hidden = visibleCount === 0;
+            }
+
+            if (emptyState) {
+              emptyState.hidden = visibleCount !== 0;
+            }
+
+            if (clearButton) {
+              clearButton.disabled = !(responsibleValue || fromValue || toValue);
+            }
+          }
+
+          function clearCaModalFilters() {
+            const responsibleInput = document.getElementById("caModalResponsibleFilter");
+            const fromInput = document.getElementById("caModalDueFromFilter");
+            const toInput = document.getElementById("caModalDueToFilter");
+
+            if (responsibleInput) responsibleInput.value = "";
+            if (fromInput) fromInput.value = "";
+            if (toInput) toInput.value = "";
+
+            syncCaModalDateRangeInputs();
+            applyCaModalTableFilters();
+          }
+
+          function bindCaModalFilters() {
+            const responsibleInput = document.getElementById("caModalResponsibleFilter");
+            const fromInput = document.getElementById("caModalDueFromFilter");
+            const toInput = document.getElementById("caModalDueToFilter");
+            const clearButton = document.getElementById("caModalFilterClear");
+
+            if (responsibleInput) {
+              responsibleInput.oninput = function() {
+                applyCaModalTableFilters();
+              };
+            }
+
+            const syncAndApply = function(source) {
+              if (!fromInput || !toInput) return;
+
+              if (fromInput.value && toInput.value && fromInput.value > toInput.value) {
+                if (source === "from") {
+                  toInput.value = fromInput.value;
+                } else if (source === "to") {
+                  fromInput.value = toInput.value;
+                }
+              }
+
+              applyCaModalTableFilters();
+            };
+
+            if (fromInput) {
+              fromInput.oninput = function() {
+                syncAndApply("from");
+              };
+            }
+
+            if (toInput) {
+              toInput.oninput = function() {
+                syncAndApply("to");
+              };
+            }
+
+            if (clearButton) {
+              clearButton.onclick = function() {
+                clearCaModalFilters();
+              };
+            }
+
+            syncCaModalDateRangeInputs();
+            applyCaModalTableFilters();
           }
 
           function renderHistoryStatusContent(action, options) {
@@ -32874,6 +33068,7 @@ startRealtimeCharts();
             if (caModalCancelForm) caModalCancelForm.addEventListener("click", caModalCollapseForm);
             const caModalSaveFormBtn = document.getElementById("caModalSaveForm");
             if (caModalSaveFormBtn) caModalSaveFormBtn.addEventListener("click", caModalSaveForm);
+            bindCaModalFilters();
             const caModalResponsibleTrigger = document.getElementById("caModalResponsibleTrigger");
             const caModalResponsibleSearch = document.getElementById("caModalResponsibleSearch");
             const caModalResponsibleOptions = document.getElementById("caModalResponsibleOptions");
