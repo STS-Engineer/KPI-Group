@@ -27837,34 +27837,23 @@ app.get("/api/kpi-chart-data", async (req, res) => {
 
     const histRes = await pool.query(
       `
-      SELECT DISTINCT ON (
-        CASE
-       WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
-       WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
-       WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
-      END
-      )
-        kr.result_date,
-       CASE
-       WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
-       WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
-       WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
-       END AS week,
+      SELECT
+        TO_CHAR(kr.result_date, 'YYYY-MM-DD') AS result_date,
+        kr.week,
+        kr.period_label,
         kr.raw_value AS new_value,
         kr.recorded_at AS updated_at
       FROM public.kpi_result kr
       WHERE ${baseWhereClause}
         AND kr.raw_value IS NOT NULL
       ORDER BY
-        CASE
-        WHEN $2 = 'daily' THEN TO_CHAR(kr.result_date, 'YYYY-MM-DD')
-        WHEN $2 = 'weekly' THEN COALESCE(kr.week, kr.period_label)
-        WHEN $2 = 'monthly' THEN COALESCE(kr.period_label, TO_CHAR(kr.result_date, 'YYYY-MM'))
-       END,
-        kr.recorded_at DESC,
-        kr.kpi_result_id DESC
+        kr.result_date ASC NULLS LAST,
+        kr.week ASC,
+        kr.period_label ASC,
+        kr.recorded_at ASC,
+        kr.kpi_result_id ASC
       `,
-      [baseWhereValue, frequencyMode]
+      [baseWhereValue]
     );
 
     const currentRes = await pool.query(
@@ -27883,73 +27872,13 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       [baseWhereValue, normalizedWeek]
     );
 
-    function weekLabelToDate(weekStr) {
-      const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
-      if (!m) return new Date(0);
-      const year = parseInt(m[1], 10);
-      const weekNum = parseInt(m[2], 10);
-      return new Date(year, 0, 1 + (weekNum - 1) * 7);
-    }
-
-    function weekToMonthLabel(weekStr) {
-      const d = weekLabelToDate(weekStr);
-      if (isNaN(d.getTime())) return weekStr || "";
-      return d.toLocaleString("en-US", { month: "short", year: "numeric" });
-    }
-
-   function periodLabelToDate(label, frequencyMode) {
-     if (frequencyMode === "daily") return new Date(label + "T00:00:00Z");
-     if (frequencyMode === "monthly") return new Date("1 " + label);
-      return weekLabelToDate(label);
-     }
-
-    function getPeriodLabel(row) {
-      if (frequencyMode === "daily") {
-        return row.result_date
-          ? new Date(row.result_date).toISOString().slice(0, 10)
-          : row.week;
-      }
-
-      if (frequencyMode === "weekly") {
-        return row.week;
-      }
-
-      return weekToMonthLabel(row.week);
-    }
-
-    const periodMap = {};
-
-    for (const row of histRes.rows) {
-      const value = parseFloat(row.new_value);
-      if (isNaN(value)) continue;
-
-      const periodLabel = getPeriodLabel(row);
-      if (!periodLabel) continue;
-
-      if (!periodMap[periodLabel]) periodMap[periodLabel] = { sum: 0, count: 0 };
-      periodMap[periodLabel].sum += value;
-      periodMap[periodLabel].count += 1;
-    }
-
-  const currentPeriodLabel =
-     frequencyMode === "daily"
-      ? normalizedWeek
-        : frequencyMode === "monthly"
-          ? weekToMonthLabel(normalizedWeek)
-          : normalizedWeek;
     const currentValue = parseFloat(currentRes.rows[0]?.value);
-
-    if (!isNaN(currentValue)) {
-      periodMap[currentPeriodLabel] = { sum: currentValue, count: 1 };
-    }
-
-   const labels = Object.keys(periodMap)
-    .sort((a, b) => periodLabelToDate(a, frequencyMode) - periodLabelToDate(b, frequencyMode))
-    .slice(-4);
-
-    const values = labels.map((label) => {
-      const p = periodMap[label];
-      return Number((p.sum / p.count).toFixed(2));
+    const chartSeries = buildKpiChartHistorySeries({
+      historyItems: histRes.rows,
+      frequencyMode,
+      currentPeriodLabel: normalizedWeek,
+      currentValue,
+      windowSize: KPI_CHART_HISTORY_WINDOW
     });
 
     const limitsRes = await pool.query(
@@ -27991,9 +27920,9 @@ app.get("/api/kpi-chart-data", async (req, res) => {
 );
 
 res.json({
-  labels,
-  values,
-  currentMonthLabel: currentPeriodLabel,
+  labels: chartSeries.labels,
+  values: chartSeries.values,
+  currentMonthLabel: chartSeries.currentPeriodLabel,
   currentValue: isNaN(currentValue) ? null : currentValue,
   target: limitsRes.rows[0]?.target ?? null,
   highLimit: limitsRes.rows[0]?.high_limit ?? null,
@@ -28016,18 +27945,269 @@ function normalizeKpiFrequency(frequency) {
   return "weekly";
 }
 
+const KPI_CHART_HISTORY_WINDOW = 12;
+const KPI_CHART_FUTURE_WINDOW = 3;
+const KPI_CHART_DAY_MS = 24 * 60 * 60 * 1000;
+
+function parseKpiChartMonthDate(value) {
+  const text = normalizeOptionalTextInput(value);
+  if (!text) return null;
+
+  const isoMonthMatch = text.match(/^(\d{4})-(\d{2})$/);
+  if (isoMonthMatch) {
+    const year = Number(isoMonthMatch[1]);
+    const month = Number(isoMonthMatch[2]);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+      return null;
+    }
+
+    return new Date(Date.UTC(year, month - 1, 1));
+  }
+
+  const parsedDate = new Date(`01 ${text} UTC`);
+  if (Number.isNaN(parsedDate.getTime())) return null;
+
+  return new Date(Date.UTC(parsedDate.getUTCFullYear(), parsedDate.getUTCMonth(), 1));
+}
+
+function formatKpiChartMonthKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  return [
+    String(date.getUTCFullYear()).padStart(4, "0"),
+    String(date.getUTCMonth() + 1).padStart(2, "0")
+  ].join("-");
+}
+
+function parseKpiChartPeriodKey(value, frequencyMode) {
+  const text = normalizeOptionalTextInput(value);
+  if (!text) return null;
+
+  if (frequencyMode === "daily") {
+    return normalizeOptionalDateInput(text);
+  }
+
+  if (frequencyMode === "weekly") {
+    if (/^\d{4}-Week\d{1,2}$/i.test(text)) return text;
+
+    const normalizedDate = normalizeOptionalDateInput(text);
+    if (!normalizedDate) return null;
+
+    return getCurrentWeekFromPseudoDate(new Date(`${normalizedDate}T00:00:00Z`));
+  }
+
+  const normalizedDate = normalizeOptionalDateInput(text);
+  if (normalizedDate) return normalizedDate.slice(0, 7);
+
+  const parsedWeekDate = parseWeekLabelDate(text);
+  if (parsedWeekDate) {
+    return formatKpiChartMonthKey(parsedWeekDate);
+  }
+
+  const parsedMonthDate = parseKpiChartMonthDate(text);
+  return parsedMonthDate ? formatKpiChartMonthKey(parsedMonthDate) : null;
+}
+
+function getKpiChartPeriodDate(periodKey, frequencyMode) {
+  const text = normalizeOptionalTextInput(periodKey);
+  if (!text) return null;
+
+  if (frequencyMode === "daily") {
+    const normalizedDate = normalizeOptionalDateInput(text);
+    return normalizedDate ? new Date(`${normalizedDate}T00:00:00Z`) : null;
+  }
+
+  if (frequencyMode === "weekly") {
+    return parseWeekLabelDate(text);
+  }
+
+  return parseKpiChartMonthDate(text);
+}
+
+function formatKpiChartPeriodLabel(periodKey, frequencyMode) {
+  const text = normalizeOptionalTextInput(periodKey) || "";
+  if (frequencyMode !== "monthly") return text;
+
+  const monthDate = parseKpiChartMonthDate(text);
+  if (!monthDate) return text;
+
+  return monthDate.toLocaleDateString("en-US", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC"
+  });
+}
+
+function shiftKpiChartPeriodKey(periodKey, frequencyMode, offset) {
+  const baseDate = getKpiChartPeriodDate(periodKey, frequencyMode);
+  if (!baseDate) return null;
+
+  if (frequencyMode === "daily") {
+    return formatIsoDateValue(new Date(baseDate.getTime() + (offset * KPI_CHART_DAY_MS)));
+  }
+
+  if (frequencyMode === "weekly") {
+    return getCurrentWeekFromPseudoDate(
+      new Date(baseDate.getTime() + (offset * 7 * KPI_CHART_DAY_MS))
+    );
+  }
+
+  return formatKpiChartMonthKey(
+    new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth() + offset, 1))
+  );
+}
+
+function getKpiChartHistoryItemPeriodKey(item, frequencyMode) {
+  if (!item || typeof item !== "object") return null;
+
+  if (frequencyMode === "daily") {
+    return parseKpiChartPeriodKey(
+      item.result_date || item.period_label || item.week,
+      frequencyMode
+    );
+  }
+
+  if (frequencyMode === "weekly") {
+    return parseKpiChartPeriodKey(
+      item.week || item.period_label || item.result_date,
+      frequencyMode
+    );
+  }
+
+  return parseKpiChartPeriodKey(
+    item.period_label || item.result_date || item.week,
+    frequencyMode
+  );
+}
+
+function resolveKpiChartCurrentPeriodKey(periodLabel, frequencyMode) {
+  const requestedKey = parseKpiChartPeriodKey(periodLabel, frequencyMode);
+  if (requestedKey) return requestedKey;
+
+  const fallbackPeriodLabel = getKpiSubmissionTargetPeriodLabel({
+    timeContext: buildTimeZoneDateContext(DEFAULT_KPI_SUBMISSION_TIMEZONE),
+    frequencyLabel:
+      frequencyMode === "daily"
+        ? "Daily"
+        : frequencyMode === "monthly"
+          ? "Monthly"
+          : "Weekly"
+  });
+
+  return parseKpiChartPeriodKey(fallbackPeriodLabel, frequencyMode);
+}
+
+function buildKpiChartHistorySeries({
+  historyItems = [],
+  frequencyMode = "weekly",
+  currentPeriodLabel = null,
+  currentValue = null,
+  windowSize = KPI_CHART_HISTORY_WINDOW,
+  futureWindowSize = KPI_CHART_FUTURE_WINDOW
+} = {}) {
+  const normalizedWindowSize =
+    Number.isInteger(windowSize) && windowSize > 0
+      ? windowSize
+      : KPI_CHART_HISTORY_WINDOW;
+  const normalizedFutureWindowSize =
+    Number.isInteger(futureWindowSize) && futureWindowSize >= 0
+      ? futureWindowSize
+      : KPI_CHART_FUTURE_WINDOW;
+  const periodMap = new Map();
+
+  (Array.isArray(historyItems) ? historyItems : []).forEach((item) => {
+    const numericValue = Number(item?.value ?? item?.new_value);
+    if (!Number.isFinite(numericValue)) return;
+
+    const periodKey = getKpiChartHistoryItemPeriodKey(item, frequencyMode);
+    if (!periodKey) return;
+
+    const bucket = periodMap.get(periodKey) || { sum: 0, count: 0 };
+    bucket.sum += numericValue;
+    bucket.count += 1;
+    periodMap.set(periodKey, bucket);
+  });
+
+  const resolvedCurrentPeriodKey = resolveKpiChartCurrentPeriodKey(
+    currentPeriodLabel,
+    frequencyMode
+  );
+
+  if (resolvedCurrentPeriodKey && Number.isFinite(Number(currentValue))) {
+    periodMap.set(resolvedCurrentPeriodKey, {
+      sum: Number(currentValue),
+      count: 1
+    });
+  }
+
+  let orderedPeriodKeys = [];
+
+  if (resolvedCurrentPeriodKey) {
+    for (let offset = normalizedWindowSize - 1; offset >= 0; offset -= 1) {
+      const shiftedPeriodKey = shiftKpiChartPeriodKey(
+        resolvedCurrentPeriodKey,
+        frequencyMode,
+        -offset
+      );
+
+      if (shiftedPeriodKey) {
+        orderedPeriodKeys.push(shiftedPeriodKey);
+      }
+    }
+
+    for (let offset = 1; offset <= normalizedFutureWindowSize; offset += 1) {
+      const shiftedPeriodKey = shiftKpiChartPeriodKey(
+        resolvedCurrentPeriodKey,
+        frequencyMode,
+        offset
+      );
+
+      if (shiftedPeriodKey) {
+        orderedPeriodKeys.push(shiftedPeriodKey);
+      }
+    }
+  }
+
+  if (!orderedPeriodKeys.length) {
+    orderedPeriodKeys = Array.from(periodMap.keys())
+      .sort((left, right) => {
+        const leftTime = getKpiChartPeriodDate(left, frequencyMode)?.getTime() ?? 0;
+        const rightTime = getKpiChartPeriodDate(right, frequencyMode)?.getTime() ?? 0;
+        return leftTime - rightTime;
+      })
+      .slice(-(normalizedWindowSize + normalizedFutureWindowSize));
+  }
+
+  return {
+    labels: orderedPeriodKeys.map((periodKey) =>
+      formatKpiChartPeriodLabel(periodKey, frequencyMode)
+    ),
+    values: orderedPeriodKeys.map((periodKey) => {
+      const bucket = periodMap.get(periodKey);
+      return bucket ? Number((bucket.sum / bucket.count).toFixed(2)) : null;
+    }),
+    currentPeriodLabel: resolvedCurrentPeriodKey
+      ? formatKpiChartPeriodLabel(resolvedCurrentPeriodKey, frequencyMode)
+      : null
+  };
+}
+
 function getPeriodLabelForFrequency(item, frequency) {
   const mode = normalizeKpiFrequency(frequency);
 
   if (mode === "daily") {
-    return item.result_date || item.week;
+    return parseKpiChartPeriodKey(item.result_date || item.week, mode);
   }
 
   if (mode === "weekly") {
-    return item.week;
+    return parseKpiChartPeriodKey(item.week || item.period_label || item.result_date, mode);
   }
 
-  return weekToMonthLabel(item.week);
+  return formatKpiChartPeriodLabel(
+    parseKpiChartPeriodKey(item.period_label || item.result_date || item.week, mode),
+    mode
+  );
 }
 
 
@@ -28156,36 +28336,44 @@ historyByKpi[historyKey].push({
     });
 
     function weekLabelToDate(weekStr) {
-      const m = String(weekStr || "").match(/^(\d{4})-Week(\d{1,2})$/);
-      if (!m) return new Date(0);
-      const year = parseInt(m[1], 10);
-      const weekNum = parseInt(m[2], 10);
-      return new Date(year, 0, 1 + (weekNum - 1) * 7);
+      return parseWeekLabelDate(weekStr);
     }
 
     function weekToMonthLabel(weekStr) {
-      const d = weekLabelToDate(weekStr);
-      if (isNaN(d.getTime())) return weekStr || "";
-      return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+      const monthKey = parseKpiChartPeriodKey(weekStr, "monthly");
+      if (!monthKey) return weekStr || "";
+      return formatKpiChartPeriodLabel(monthKey, "monthly");
     }
 
     function monthLabelToDate(monthLabel) {
-      const d = new Date("1 " + monthLabel);
-      return isNaN(d.getTime()) ? new Date(0) : d;
+      return parseKpiChartMonthDate(monthLabel);
     }
 
     function findPreviousMonthLabel(currentMonthLabel, labels) {
       const currentDate = monthLabelToDate(currentMonthLabel);
+      if (!currentDate) return null;
+
       return Array.from(new Set((labels || []).filter(Boolean)))
-        .sort((a, b) => monthLabelToDate(a) - monthLabelToDate(b))
-        .filter((label) => monthLabelToDate(label) < currentDate)
+        .sort((a, b) => {
+          const leftTime = monthLabelToDate(a)?.getTime() ?? 0;
+          const rightTime = monthLabelToDate(b)?.getTime() ?? 0;
+          return leftTime - rightTime;
+        })
+        .filter((label) => {
+          const labelDate = monthLabelToDate(label);
+          return labelDate ? labelDate.getTime() < currentDate.getTime() : false;
+        })
         .pop() || null;
     }
 
     function sortHistoryEntries(entries, getUpdatedAt) {
       return (Array.isArray(entries) ? entries.slice() : []).sort((a, b) => {
-        const weekDiff = weekLabelToDate(b?.week) - weekLabelToDate(a?.week);
-        if (weekDiff !== 0) return weekDiff;
+        const leftMonthKey = parseKpiChartPeriodKey(a?.week || a?.month_label, "monthly");
+        const rightMonthKey = parseKpiChartPeriodKey(b?.week || b?.month_label, "monthly");
+        const monthDiff =
+          (getKpiChartPeriodDate(rightMonthKey, "monthly")?.getTime() ?? 0) -
+          (getKpiChartPeriodDate(leftMonthKey, "monthly")?.getTime() ?? 0);
+        if (monthDiff !== 0) return monthDiff;
 
         return new Date(getUpdatedAt(b) || 0) - new Date(getUpdatedAt(a) || 0);
       });
@@ -28372,62 +28560,17 @@ console.log("week:", week);
 console.log("rawHistory:", rawHistory);
 console.log("===========================");
 
-function getChartPeriod(item) {
-  if (frequencyMode === "daily") {
-    return item.result_date || item.period_label || item.week;
-  }
-
-  if (frequencyMode === "weekly") {
-    return item.week || item.period_label || item.result_date;
-  }
-
-  return item.period_label || weekToMonthLabel(item.week) || item.result_date;
-}
-
-function getChartSortValue(label) {
-  if (frequencyMode === "daily") return new Date(label).getTime();
-  if (frequencyMode === "monthly") return monthLabelToDate(label).getTime();
-  return weekLabelToDate(label).getTime();
-}
-
-const periodMap = {};
-
-rawHistory.forEach((item) => {
-  if (isNaN(item.value)) return;
-
-  const periodLabel = getChartPeriod(item);
-  if (!periodLabel) return;
-
-  if (!periodMap[periodLabel]) {
-    periodMap[periodLabel] = { sum: 0, count: 0 };
-  }
-
-  periodMap[periodLabel].sum += item.value;
-  periodMap[periodLabel].count += 1;
+const chartSeries = buildKpiChartHistorySeries({
+  historyItems: rawHistory,
+  frequencyMode,
+  currentPeriodLabel: week,
+  currentValue,
+  windowSize: KPI_CHART_HISTORY_WINDOW
 });
 
-const currentPeriodLabel =
-  frequencyMode === "daily"
-    ? week
-    : frequencyMode === "monthly"
-      ? weekToMonthLabel(week)
-      : week;
-
-if (currentValue !== null) {
-  periodMap[currentPeriodLabel] = {
-    sum: currentValue,
-    count: 1
-  };
-}
-
-let historyLabels = Object.keys(periodMap)
-  .sort((a, b) => getChartSortValue(a) - getChartSortValue(b))
-  .slice(-4);
-
-let historyValues = historyLabels.map((label) => {
-  const p = periodMap[label];
-  return Number((p.sum / p.count).toFixed(2));
-});
+const currentPeriodLabel = chartSeries.currentPeriodLabel || week;
+let historyLabels = chartSeries.labels;
+let historyValues = chartSeries.values;
 
  console.log("historyLabels:", historyLabels);
  console.log("historyValues:", historyValues);    
@@ -29413,7 +29556,7 @@ let historyValues = historyLabels.map((label) => {
 
        .ca-entry-editor-table td:first-child .ca-modal-input {
          min-width: 118px;
-}
+        }
 
           .ca-responsible-cell {
             display: inline-flex;
