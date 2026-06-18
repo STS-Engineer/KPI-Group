@@ -14987,81 +14987,99 @@ function populateAllocationLookupOptions(values = {}) {
 
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
-    if (scopeKind === "role") {
-const roleId = getNormalizedParameterRoleId();
+if (scopeKind === "role") {
+  const roleId = getNormalizedParameterRoleId();
+  if (!roleId) return [];
 
-if (!roleId && isRoleApplyAllMode()) {
-  return getParameterAllocationUnits().map(unit => ({
-    row_kind: "role",
-    value: getRoleRowScopeId(unit.value, ""),
-    people_id: "",
-    label: unit.label || "Unit " + unit.value,
-    unit_id: String(unit.value),
-    unit_type_id: unit.unit_type_id || null,
-    local_currency: unit.selling_currency || unit.operating_currency || "",
-    responsible_people_id: "",
-    responsible_label: "",
-    responsibles: []
-  }));
+  const unitsById = new Map(
+    getParameterAllocationUnits().map(unit => [
+      String(unit.value || unit.unit_id || ""),
+      unit
+    ])
+  );
+
+  return (allocationLookups.peopleRoleAssignments || [])
+    .filter(a => String(a.role_id || "").trim() === String(roleId))
+    .filter(a => String(a.unit_id || "").trim())
+    .map(a => {
+      const unit = unitsById.get(String(a.unit_id || ""));
+      if (!unit) return null;
+
+      const peopleId = String(a.people_id || a.value || "").trim();
+      if (!peopleId) return null;
+
+      const responsibleLabel =
+        a.label ||
+        getParameterPeopleLabel(peopleId) ||
+        ("Person " + peopleId);
+
+      return {
+        row_kind: "role",
+        value: getRoleRowScopeId(String(a.unit_id), peopleId),
+        people_id: peopleId,
+
+        label:
+          String(unit.label || "").trim() ||
+          String(unit.unit_name || "").trim() ||
+          ("Unit " + a.unit_id),
+
+        unit_id: String(a.unit_id),
+        unit_type_id: unit.unit_type_id || null,
+        unit_type_name: unit.unit_type_name || "",
+        selling_currency: unit.selling_currency || "",
+        operating_currency: unit.operating_currency || "",
+        local_currency: unit.selling_currency || unit.operating_currency || "",
+
+        responsible_people_id: peopleId,
+        responsible_label: responsibleLabel,
+
+        responsibles: [{
+          people_id: peopleId,
+          label: responsibleLabel,
+          role_id: a.role_id,
+          role_name: a.role_name || "",
+          is_primary: Boolean(a.is_primary)
+        }]
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) =>
+      String(left.label || "").localeCompare(String(right.label || "")) ||
+      String(left.responsible_label || "").localeCompare(String(right.responsible_label || ""))
+    );
 }
 
-if (!roleId) return [];
+if (scopeKind === "zone") {
+  const normalizedRoleId = getNormalizedParameterRoleId();
 
-    const unitsById = new Map(
-      getParameterAllocationUnits().map(unit => [String(unit.value), unit])
-    );
+  return (allocationLookups.peopleRoleAssignments || [])
+    .filter(a => a.zone_id)
+    .filter(a => !normalizedRoleId || String(a.role_id || "") === normalizedRoleId)
+    .map(a => {
+      const zone = (allocationLookups.zones || []).find(
+        z => String(z.value || z.zone_id || "") === String(a.zone_id)
+      );
 
-    return (allocationLookups.peopleRoleAssignments || [])
-      .filter(a => String(a.role_id || "") === String(roleId))
-      .filter(a => a.unit_id)
-      .map(a => {
-        const unit = unitsById.get(String(a.unit_id));
-        if (!unit) return null;
-
-        return {
-          row_kind: "role",
-          value: String(a.people_id),
-          people_id: String(a.people_id),
-          label: unit.label || "Unit " + a.unit_id,
-          unit_id: String(a.unit_id),
-          unit_type_id: unit.unit_type_id || null,
-          local_currency: unit.selling_currency || unit.operating_currency || "",
-          responsible_people_id: String(a.people_id),
-          responsible_label: a.label || getParameterPeopleLabel(a.people_id),
-          responsibles: [{
-            people_id: String(a.people_id),
-            label: a.label || getParameterPeopleLabel(a.people_id),
-            role_id: a.role_id,
-            role_name: a.role_name || "",
-            is_primary: Boolean(a.is_primary)
-          }]
-        };
-      });
-  }
-
-
-  if (scopeKind === "zone") {
-    const normalizedRoleId = getNormalizedParameterRoleId();
-    return (allocationLookups.zones || [])
-      .map(zoneEntry => ({
+      return {
         row_kind: "zone",
-        value: String(zoneEntry.value || zoneEntry.zone_id || ""),
-        label: zoneEntry.label || zoneEntry.zone_name || "",
+        value: "zone:" + a.zone_id + ":people:" + a.people_id,
+        zone_id: String(a.zone_id),
+        label: (zone && (zone.label || zone.zone_name)) || "Zone " + a.zone_id,
         local_currency: "",
-        responsable_zone: zoneEntry.responsable_zone || "",
-        responsible_people_id: zoneEntry.responsible_people_id || "",
-        responsibles: Array.isArray(zoneEntry.responsibles)
-          ? zoneEntry.responsibles.slice()
-          : [],
+        people_id: String(a.people_id),
+        responsible_people_id: String(a.people_id),
+        responsible_label: a.label || getParameterPeopleLabel(a.people_id),
+        responsibles: [{
+          people_id: String(a.people_id),
+          label: a.label || getParameterPeopleLabel(a.people_id),
+          role_id: a.role_id,
+          role_name: a.role_name || "",
+          is_primary: Boolean(a.is_primary)
+        }],
         role: ""
-      }))
-      .filter((zoneEntry) => {
-        if (!normalizedRoleId) return true;
-        return zoneEntry.responsibles.some(
-          (responsibleEntry) => String(responsibleEntry?.role_id || "").trim() === normalizedRoleId
-        );
-      });
-  }
+      };
+    });
+}
 
 if (scopeKind === "product_line") {
   return (allocationLookups.productLines || []).map(productLine => ({
@@ -15206,7 +15224,7 @@ function getParameterUnitAllocationRows() {
 
       return {
         plant_id: scopeKind === "unit" ? scopeId : null,
-        zone_id: scopeKind === "zone" ? scopeId : null,
+       zone_id: scopeKind === "zone" ? String(scopeEntry.zone_id || "").trim() || null : null,
         product_line_id: scopeKind === "product_line" ? scopeId : null,
         product_id: null,
         unit_id: null,
@@ -15295,56 +15313,67 @@ function autoFillSetByFromUnit() {
 function getParameterVisibleUnitRows() {
   const scopeKind = getParameterScopeKind();
 
-  if (scopeKind === "role") {
-    const roleId = getNormalizedParameterRoleId();
-    if (!roleId) return [];
+if (scopeKind === "role") {
+  const roleId = getNormalizedParameterRoleId();
+  if (!roleId) return [];
 
-    return getParameterAllocationUnits()
-      .map((unitEntry) => {
-        const unitId = String(unitEntry?.value || unitEntry?.unit_id || "").trim();
-        if (!unitId) return null;
+  const unitsById = new Map(
+    getParameterAllocationUnits().map(unit => [
+      String(unit.value || unit.unit_id || ""),
+      unit
+    ])
+  );
 
-        const matchedResponsible = getParameterMatchedResponsible(unitEntry, roleId);
-        const peopleId = String(matchedResponsible?.people_id || "").trim();
-        if (!peopleId) return null;
+  return (allocationLookups.peopleRoleAssignments || [])
+    .filter(a => String(a.role_id || "").trim() === String(roleId))
+    .filter(a => String(a.unit_id || "").trim())
+    .map(a => {
+      const unit = unitsById.get(String(a.unit_id || ""));
+      if (!unit) return null;
 
-        const responsibleLabel =
-          matchedResponsible.label ||
-          getParameterPeopleLabel(peopleId) ||
-          ("Person " + peopleId);
+      const peopleId = String(a.people_id || a.value || "").trim();
+      if (!peopleId) return null;
 
-        return {
-          row_kind: "role",
-          value: getRoleRowScopeId(unitId, peopleId),
+      const responsibleLabel =
+        a.label ||
+        getParameterPeopleLabel(peopleId) ||
+        ("Person " + peopleId);
+
+      return {
+        row_kind: "role",
+        value: getRoleRowScopeId(String(a.unit_id), peopleId),
+        people_id: peopleId,
+
+        label:
+          String(unit.label || "").trim() ||
+          String(unit.unit_name || "").trim() ||
+          ("Unit " + a.unit_id),
+
+        unit_id: String(a.unit_id),
+        unit_type_id: unit.unit_type_id || null,
+        unit_type_name: unit.unit_type_name || "",
+        selling_currency: unit.selling_currency || "",
+        operating_currency: unit.operating_currency || "",
+        local_currency: unit.selling_currency || unit.operating_currency || "",
+
+        responsible_people_id: peopleId,
+        responsible_label: responsibleLabel,
+
+        responsibles: [{
           people_id: peopleId,
-          label:
-            String(unitEntry?.label || "").trim() ||
-            String(unitEntry?.unit_name || "").trim() ||
-            ("Unit " + unitId),
-          unit_id: unitId,
-          unit_type_id: unitEntry?.unit_type_id ?? null,
-          unit_type_name: String(unitEntry?.unit_type_name || "").trim(),
-          selling_currency: String(unitEntry?.selling_currency || "").trim(),
-          operating_currency: String(unitEntry?.operating_currency || "").trim(),
-          local_currency:
-            String(unitEntry?.selling_currency || "").trim() ||
-            String(unitEntry?.operating_currency || "").trim(),
-          responsible_people_id: peopleId,
-          responsible_label: responsibleLabel,
-          responsibles: [{
-            people_id: peopleId,
-            label: responsibleLabel,
-            role_id: matchedResponsible.role_id,
-            role_name: matchedResponsible.role_name || "",
-            is_primary: Boolean(matchedResponsible.is_primary)
-          }]
-        };
-      })
-      .filter(Boolean)
-      .sort((left, right) =>
-        String(left.label || "").localeCompare(String(right.label || ""))
-      );
-  }
+          label: responsibleLabel,
+          role_id: a.role_id,
+          role_name: a.role_name || "",
+          is_primary: Boolean(a.is_primary)
+        }]
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) =>
+      String(left.label || "").localeCompare(String(right.label || "")) ||
+      String(left.responsible_label || "").localeCompare(String(right.responsible_label || ""))
+    );
+}
 if (scopeKind === "product_line") {
   return (allocationLookups.productLines || []).map(productLine => ({
     row_kind: "product_line",
@@ -15359,28 +15388,40 @@ if (scopeKind === "product_line") {
   }));
 }
 
-  if (scopeKind === "zone") {
-    const normalizedRoleId = getNormalizedParameterRoleId();
+if (scopeKind === "zone") {
+  const normalizedRoleId = getNormalizedParameterRoleId();
 
-    return (allocationLookups.zones || [])
-      .map(zoneEntry => ({
+  return (allocationLookups.peopleRoleAssignments || [])
+    .filter(a => String(a.zone_id || "").trim())
+    .filter(a => !normalizedRoleId || String(a.role_id || "").trim() === normalizedRoleId)
+    .map(a => {
+      const zone = (allocationLookups.zones || []).find(
+        z => String(z.value || z.zone_id || "").trim() === String(a.zone_id || "").trim()
+      );
+
+      const peopleId = String(a.people_id || a.value || "").trim();
+      const label = a.label || getParameterPeopleLabel(peopleId) || ("Person " + peopleId);
+
+      return {
         row_kind: "zone",
-        value: String(zoneEntry.value || zoneEntry.zone_id || ""),
-        label: zoneEntry.label || zoneEntry.zone_name || "",
+        value: "zone:" + a.zone_id + ":people:" + peopleId,
+        zone_id: String(a.zone_id),
+        label: (zone && (zone.label || zone.zone_name)) || ("Zone " + a.zone_id),
         local_currency: "",
-        responsable_zone: zoneEntry.responsable_zone || "",
-        responsible_people_id: zoneEntry.responsible_people_id || "",
-        responsibles: Array.isArray(zoneEntry.responsibles)
-          ? zoneEntry.responsibles.slice()
-          : []
-      }))
-      .filter(zoneEntry => {
-        if (!normalizedRoleId) return true;
-        return zoneEntry.responsibles.some(
-          r => String(r?.role_id || "").trim() === normalizedRoleId
-        );
-      });
-  }
+        people_id: peopleId,
+        responsible_people_id: peopleId,
+        responsable_zone: label,
+        responsible_label: label,
+        responsibles: [{
+          people_id: peopleId,
+          label: label,
+          role_id: a.role_id,
+          role_name: a.role_name || "",
+          is_primary: Boolean(a.is_primary)
+        }]
+      };
+    });
+}
 
   const selectedUnits = getParameterUnitsForSelectedUnitType({
     includeAllWhenEmpty: Boolean(parameterLockedUnitId)
@@ -15760,19 +15801,25 @@ function syncIndividualResponsibleOptions(preferredValue = "") {
     return;
   }
 
-  const relatedPeople = getParameterRoleResponsibleCandidates(normalizedRoleId)
-    .map(person => ({
-      value: String(person.people_id || ""),
-      label: person.label || getParameterPeopleLabel(person.people_id) || ""
-    }))
-    .filter(person => person.value);
+const relatedPeople = getParameterRoleResponsibleCandidates(normalizedRoleId)
+  .map(person => ({
+    value: String(person.people_id || ""),
+    label: person.label || getParameterPeopleLabel(person.people_id) || ""
+  }))
+  .filter(person => person.value);
 
-  setLookupSelectOptions(
-    "parameter_set_by_people_id",
-    relatedPeople,
-    relatedPeople.length ? "Select related responsible" : "No responsible for this role",
-    preferredValue
-  );
+const validPreferredValue = relatedPeople.some(
+  person => String(person.value) === String(preferredValue)
+)
+  ? preferredValue
+  : "";
+
+setLookupSelectOptions(
+  "parameter_set_by_people_id",
+  relatedPeople,
+  relatedPeople.length ? "Select related responsible" : "No responsible",
+  validPreferredValue
+);
 }
 
 function syncIndividualParameterFields() {
@@ -16036,14 +16083,14 @@ if (isRoleParameterScope()) {
       return {
       kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
       plant_id: scopeKind === "unit" ? scopeId : null,
-      zone_id: scopeKind === "zone" ? scopeId : null,
+     zone_id: scopeKind === "zone" ? String(scopeEntry.zone_id || "").trim() || null : null,
       product_line_id: null,
        unit_id: null,
         product_id: scopeKind === "zone" || scopeKind === "product_line" ? null : getParameterFieldValue("parameter_product_id"),
         unit_type_id: scopeKind === "unit" || scopeKind === "role"
         ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
         : null,
-         role_id: scopeKind === "zone" ? null : (sharedRoleId || null),
+         role_id: sharedRoleId || null,
         target_value: targetValue,
         target_setup_date: targetSetupDate,
         target_unit: kpiUnit,
