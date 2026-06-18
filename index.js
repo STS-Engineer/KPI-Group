@@ -15299,70 +15299,51 @@ function getParameterVisibleUnitRows() {
     const roleId = getNormalizedParameterRoleId();
     if (!roleId) return [];
 
-    const fallbackUnitsById = new Map(
-      getParameterAllocationUnits().map((unit) => [String(unit.value), unit])
-    );
+    return getParameterAllocationUnits()
+      .map((unitEntry) => {
+        const unitId = String(unitEntry?.value || unitEntry?.unit_id || "").trim();
+        if (!unitId) return null;
 
-    return (allocationLookups.roleScopeAssignments || allocationLookups.peopleRoleAssignments || [])
-      .filter((assignment) => String(assignment.role_id || "").trim() === roleId)
-      .filter((assignment) => String(assignment.unit_id || "").trim())
-      .map((assignment) => {
-        const peopleId = String(assignment.people_id || "").trim();
-        const unitId = String(assignment.unit_id || "").trim();
-        const fallbackUnit = fallbackUnitsById.get(unitId) || null;
+        const matchedResponsible = getParameterMatchedResponsible(unitEntry, roleId);
+        const peopleId = String(matchedResponsible?.people_id || "").trim();
+        if (!peopleId) return null;
+
         const responsibleLabel =
-          assignment.label ||
+          matchedResponsible.label ||
           getParameterPeopleLabel(peopleId) ||
           ("Person " + peopleId);
 
         return {
-          assignment_id: assignment.assignment_id ?? null,
           row_kind: "role",
           value: getRoleRowScopeId(unitId, peopleId),
           people_id: peopleId,
           label:
-            String(assignment.unit_name || "").trim() ||
-            String(fallbackUnit?.label || "").trim() ||
+            String(unitEntry?.label || "").trim() ||
+            String(unitEntry?.unit_name || "").trim() ||
             ("Unit " + unitId),
           unit_id: unitId,
-          unit_type_id: assignment.unit_type_id ?? fallbackUnit?.unit_type_id ?? null,
-          unit_type_name:
-            String(assignment.unit_type_name || "").trim() ||
-            String(fallbackUnit?.unit_type_name || "").trim(),
-          selling_currency:
-            String(assignment.selling_currency || "").trim() ||
-            String(fallbackUnit?.selling_currency || "").trim(),
-          operating_currency:
-            String(assignment.operating_currency || "").trim() ||
-            String(fallbackUnit?.operating_currency || "").trim(),
+          unit_type_id: unitEntry?.unit_type_id ?? null,
+          unit_type_name: String(unitEntry?.unit_type_name || "").trim(),
+          selling_currency: String(unitEntry?.selling_currency || "").trim(),
+          operating_currency: String(unitEntry?.operating_currency || "").trim(),
           local_currency:
-            String(assignment.selling_currency || "").trim() ||
-            String(assignment.operating_currency || "").trim() ||
-            String(fallbackUnit?.selling_currency || "").trim() ||
-            String(fallbackUnit?.operating_currency || "").trim(),
+            String(unitEntry?.selling_currency || "").trim() ||
+            String(unitEntry?.operating_currency || "").trim(),
           responsible_people_id: peopleId,
           responsible_label: responsibleLabel,
-          assignment_status: String(assignment.assignment_status || "").trim(),
-          start_date: String(assignment.start_date || "").trim(),
-          end_date: String(assignment.end_date || "").trim(),
           responsibles: [{
             people_id: peopleId,
             label: responsibleLabel,
-            role_id: assignment.role_id,
-            role_name: assignment.role_name || "",
-            is_primary: Boolean(assignment.is_primary)
+            role_id: matchedResponsible.role_id,
+            role_name: matchedResponsible.role_name || "",
+            is_primary: Boolean(matchedResponsible.is_primary)
           }]
         };
       })
-      .sort((left, right) => {
-        const leftAssignmentId = Number(left.assignment_id || 0);
-        const rightAssignmentId = Number(right.assignment_id || 0);
-        if (leftAssignmentId !== rightAssignmentId) {
-          return leftAssignmentId - rightAssignmentId;
-        }
-
-        return String(left.responsible_label || "").localeCompare(String(right.responsible_label || ""));
-      });
+      .filter(Boolean)
+      .sort((left, right) =>
+        String(left.label || "").localeCompare(String(right.label || ""))
+      );
   }
 if (scopeKind === "product_line") {
   return (allocationLookups.productLines || []).map(productLine => ({
@@ -15993,6 +15974,10 @@ if (isRoleParameterScope()) {
     .map((scopeEntry) => {
       const scopeId = String(scopeEntry.value || "").trim();
       const state = getParameterUnitState("role", scopeId);
+      const resolvedResponsible = resolveParameterResponsibleEntry(scopeEntry, state);
+      const responsiblePeopleId = String(
+        resolvedResponsible?.people_id || scopeEntry.people_id || ""
+      ).trim();
 
       // In edit, update existing rows only. Do not insert new role rows.
       if (parameterEditMode && !state.kpi_target_allocation_id) {
@@ -16027,7 +16012,7 @@ if (isRoleParameterScope()) {
           fallbackSetupDate,
         target_unit: kpiUnit,
         local_currency: scopeEntry.local_currency || "",
-        set_by_people_id: scopeEntry.people_id || null,
+        set_by_people_id: responsiblePeopleId || null,
         last_best_target: String(state.last_best_target ?? "").trim() || null,
         approved_by_people_id: String(state.approved_by_id ?? "").trim() || null
       };
@@ -16337,12 +16322,12 @@ if (isZoneScope) {
   if (tableHint) {
     tableHint.textContent = isApplyAllMode
       ? "Apply one shared target and setup date to every unit linked to the selected role."
-      : "Select a role, then enter targets for related people.";
+      : "Select a role, then enter targets for each related unit and its linked responsible.";
   }
   if (tableCopy) tableCopy.textContent =
     isApplyAllMode
       ? "The table below shows one shared row for all units linked to the selected role. The same target value and setup date will be applied to every related allocation."
-      : "The table below lists all units that have the selected role assigned. Apply All uses one shared target. Individual mode lets you enter a different target for each person.";
+      : "The table below lists each unit once for the selected role and keeps the assigned responsible linked automatically. Apply All uses one shared target, while Individual mode lets you enter a different target for each unit.";
   if (tableBadge) tableBadge.textContent = "Role View";
 
   return;
@@ -16596,7 +16581,7 @@ if (
             '<th>KPI Unit</th>' +
             '<th>Target Value</th>' +
             '<th>Setup Date</th>' +
-            '<th>' + escapeHtml(scopeKind === "role" && !isRoleApplyAllMode() ? "Role" : "Responsible") + '</th>' +
+            '<th>' + escapeHtml(scopeKind === "role" && isRoleApplyAllMode() ? "Role" : "Responsible") + '</th>' +
           '</tr>' +
         '</thead>' +
         '<tbody>' +
@@ -16640,7 +16625,7 @@ if (
                 '</td>' +
                '<td>' +
                   (
-               scopeKind === "role" && !isRoleApplyAllMode()
+               scopeKind === "role" && isRoleApplyAllMode()
                ? '<input class="readonly-input parameter-unit-responsible-input" type="text" readonly tabindex="-1" value="' + escapeHtml(getParameterRoleLabel(selectedRoleId) || "Selected role") + '" />'
                : '<input class="' + responsibleInputClass + '" type="text" readonly tabindex="-1" value="' + escapeHtml(responsibleLabel) + '" placeholder="' + escapeHtml(responsiblePlaceholder) + '" />' + responsibleNoteMarkup
                ) +
