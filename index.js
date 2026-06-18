@@ -4228,7 +4228,7 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
     normalizedKpiType ? `type:${String(normalizedKpiType).toLowerCase()}` : "",
     normalizedUnitTypeId ? `unitType:${normalizedUnitTypeId}` : "",
     normalizedRoleId ? `role:${normalizedRoleId}` : "",
-    isRoleScope && normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : "",
+    normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : "",
     normalizedFunction ? `function:${String(normalizedFunction).toLowerCase()}` : "",
     normalizedProductId ? `product:${normalizedProductId}` : "",
     normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "",
@@ -4241,29 +4241,27 @@ const getKpiTargetAllocationScopeKey = (row = {}) => {
 
 const getKpiTargetAllocationScopeIdentifier = (row = {}) => {
   const normalizedZoneId = normalizeOptionalIntegerInput(row.zone_id);
-  if (normalizedZoneId) return `zone:${normalizedZoneId}`;
-
   const normalizedUnitId = normalizeOptionalIntegerInput(row.plant_id ?? row.unit_id);
-  const normalizedKpiType = normalizeOptionalTextInput(row.kpi_type);
+  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
   const normalizedRoleId = normalizeOptionalIntegerInput(row.role_id);
   const normalizedSetByPeopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
-  const isRoleScope =
-    String(normalizedKpiType || "").trim().toLowerCase() === "role";
-  if (normalizedUnitId) {
-    if (isRoleScope) {
-      return [
-        `unit:${normalizedUnitId}`,
-        normalizedRoleId ? `role:${normalizedRoleId}` : "",
-        normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : ""
-      ]
-        .filter(Boolean)
-        .join("|");
-    }
 
-    return `unit:${normalizedUnitId}`;
+  if (normalizedZoneId) {
+    return [
+      `zone:${normalizedZoneId}`,
+      normalizedRoleId ? `role:${normalizedRoleId}` : "",
+      normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : ""
+    ].filter(Boolean).join("|");
   }
 
-  const normalizedProductLineId = normalizeOptionalIntegerInput(row.product_line_id);
+  if (normalizedUnitId) {
+    return [
+      `unit:${normalizedUnitId}`,
+      normalizedRoleId ? `role:${normalizedRoleId}` : "",
+      normalizedSetByPeopleId ? `people:${normalizedSetByPeopleId}` : ""
+    ].filter(Boolean).join("|");
+  }
+
   return normalizedProductLineId ? `productLine:${normalizedProductLineId}` : "";
 };
 
@@ -13758,7 +13756,7 @@ textarea {
       let parameterCreateDraft = null;
       let chartsLoaded = false;
       let chartInstances = [];
-      const PARAMETER_ZONE_ALL_ROLE_VALUE = "__zone_all_roles__";
+      const PARAMETER_ZONE_ALL_ROLE_VALUE = "__all_roles__";
       const PARAMETER_MODAL_FIELD_IDS = [
         "parameter_object_id",
         "parameter_kpi_id",
@@ -13914,47 +13912,39 @@ function populateParameterRoleScopeOptions(selectedValue = "") {
   const scopeKind = getParameterScopeKind();
   const normalizedSelectedValue = String(selectedValue || "").trim();
 
-  if (scopeKind === "zone") {
+if (scopeKind === "zone") {
+  const zoneRoleMap = new Map();
 
-    const zoneRoleMap = new Map();
+  (allocationLookups.peopleRoleAssignments || [])
+    .filter(a => String(a.zone_id || "").trim())
+    .forEach(a => {
+      const roleId = String(a.role_id || "").trim();
+      if (!roleId) return;
 
-    (allocationLookups.zones || []).forEach((zoneEntry) => {
-      if (!Array.isArray(zoneEntry?.responsibles)) return;
-
-      zoneEntry.responsibles.forEach((responsibleEntry) => {
-        const roleId = String(responsibleEntry?.role_id || "").trim();
-        if (!roleId) return;
-
-        if (!zoneRoleMap.has(roleId)) {
-          zoneRoleMap.set(roleId, {
-            value: roleId,
-            label:
-              String(responsibleEntry?.role_name || "").trim() ||
-              ("Role " + roleId)
-          });
-        }
-      });
+      if (!zoneRoleMap.has(roleId)) {
+        zoneRoleMap.set(roleId, {
+          value: roleId,
+          label: a.role_name || getParameterRoleLabel(roleId) || ("Role " + roleId)
+        });
+      }
     });
 
-    const roleOptionsForZone = [
-      {
-        value: "__all_roles__",
-        label: "All roles"
-      },
-      ...Array.from(zoneRoleMap.values()).sort((left, right) =>
-        String(left.label || "").localeCompare(String(right.label || ""))
-      )
-    ];
+const roleOptionsForZone = [
+  { value: PARAMETER_ZONE_ALL_ROLE_VALUE, label: "All roles" },
+  ...Array.from(zoneRoleMap.values()).sort((a, b) =>
+    String(a.label || "").localeCompare(String(b.label || ""))
+  )
+];
 
-    setLookupSelectOptions(
-      "parameter_role_id",
-      roleOptionsForZone,
-      "Select role",
-      normalizedSelectedValue || "__all_roles__"
-    );
+  setLookupSelectOptions(
+    "parameter_role_id",
+    roleOptionsForZone,
+    "Select role",
+    normalizedSelectedValue || PARAMETER_ZONE_ALL_ROLE_VALUE
+  );
 
-    return;
-  }
+  return;
+}
 
   if (scopeKind === "unit" && !isIndividualParameterScope()) {
     const roleOptionsForUnitType = getParameterRoleOptionsForSelectedUnitType();
@@ -14151,6 +14141,49 @@ function getParameterScopeKind() {
     return String(unitId || "").trim() + ":" + String(peopleId || "").trim();
    }
 
+   function getPeopleAssignmentScopeId(scopeKind, scopeId, peopleId) {
+  const normalizedScopeKind = String(scopeKind || "").trim();
+  const normalizedScopeId = String(scopeId || "").trim();
+  const normalizedPeopleId = String(peopleId || "").trim();
+
+  if (!normalizedScopeKind || !normalizedScopeId) return "";
+  if (!normalizedPeopleId) return normalizedScopeId;
+
+  return normalizedScopeKind + ":" + normalizedScopeId + ":people:" + normalizedPeopleId;
+}
+
+function inferParameterRoleIdFromAllocation(row, rows = []) {
+  const sourceRows = [row, ...(Array.isArray(rows) ? rows : [])];
+
+  for (const allocationRow of sourceRows) {
+    const peopleId = String(allocationRow?.set_by_people_id || "").trim();
+    const unitId = String(allocationRow?.plant_id || allocationRow?.unit_id || "").trim();
+    const zoneId = String(allocationRow?.zone_id || "").trim();
+
+    if (!peopleId) continue;
+
+    const matchedAssignment = (allocationLookups.peopleRoleAssignments || []).find(a => {
+      if (String(a.people_id || "").trim() !== peopleId) return false;
+
+      if (zoneId) {
+        return String(a.zone_id || "").trim() === zoneId;
+      }
+
+      if (unitId) {
+        return String(a.unit_id || "").trim() === unitId;
+      }
+
+      return false;
+    });
+
+    if (matchedAssignment?.role_id) {
+      return String(matchedAssignment.role_id);
+    }
+  }
+
+  return "";
+}
+
   function initializeParameterUnitTargetState(rows = []) {
     resetParameterUnitTargetState();
 
@@ -14188,6 +14221,8 @@ function getParameterScopeKind() {
 
 const normalizedKpiType = String(row?.kpi_type || "").trim().toLowerCase();
 
+const peopleId = String(row?.set_by_people_id || "").trim();
+
 const scopeType = normalizedKpiType === "role"
   ? "role"
   : row?.product_line_id
@@ -14197,9 +14232,12 @@ const scopeType = normalizedKpiType === "role"
       : "unit";
 
 const scopeId = normalizedKpiType === "role"
-  ? getRoleRowScopeId(row?.plant_id || row?.unit_id, row?.set_by_people_id)
-  : row?.product_line_id ?? row?.zone_id ?? row?.plant_id ?? row?.unit_id;
-    if (!scopeId) return;
+  ? getRoleRowScopeId(row?.plant_id || row?.unit_id, peopleId)
+  : row?.product_line_id
+    ? row.product_line_id
+    : row?.zone_id
+      ? getPeopleAssignmentScopeId("zone", row.zone_id, peopleId)
+      : getPeopleAssignmentScopeId("unit", row.plant_id || row.unit_id, peopleId);
 
     setParameterUnitState(scopeType, scopeId, {
       kpi_target_allocation_id: row.kpi_target_allocation_id ?? "",
@@ -15223,16 +15261,20 @@ function getParameterUnitAllocationRows() {
      sharedSetByPeopleId;
 
       return {
-        plant_id: scopeKind === "unit" ? scopeId : null,
+        plant_id: scopeKind === "unit"
+        ? String(scopeEntry.unit_id || "").trim() || null
+        : null,
        zone_id: scopeKind === "zone" ? String(scopeEntry.zone_id || "").trim() || null : null,
         product_line_id: scopeKind === "product_line" ? scopeId : null,
         product_id: null,
-        unit_id: null,
+        unit_id: scopeKind === "unit"
+       ? String(scopeEntry.unit_id || "").trim() || null
+      : null,
         unit_type_id:
           scopeKind === "unit"
             ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
             : null,
-        role_id: scopeKind === "unit" ? sharedRoleId : null,
+        role_id: sharedRoleId || null,
         target_value: targetValue,
         target_setup_date: targetSetupDate,
         target_unit: kpiUnit,
@@ -15298,6 +15340,7 @@ if (productLineField) {
 
   renderMultisiteUnitMatrix();
 }
+
 
 
 function autoFillSetByFromUnit() {
@@ -15422,6 +15465,49 @@ if (scopeKind === "zone") {
       };
     });
 }
+
+  const selectedUnitTypeId = String(getParameterFieldValue("parameter_unit_type_id") || "").trim();
+  const normalizedRoleId = getNormalizedParameterRoleId();
+
+  if (normalizedRoleId) {
+    return (allocationLookups.peopleRoleAssignments || [])
+      .filter(a => String(a.role_id || "").trim() === normalizedRoleId)
+      .filter(a => String(a.unit_id || "").trim())
+      .filter(a => !selectedUnitTypeId || String(a.unit_type_id || "").trim() === selectedUnitTypeId)
+      .map(a => {
+        const unitId = String(a.unit_id || "").trim();
+        const peopleId = String(a.people_id || a.value || "").trim();
+        if (!unitId || !peopleId) return null;
+
+        const responsibleLabel =
+          a.label ||
+          getParameterPeopleLabel(peopleId) ||
+          ("Person " + peopleId);
+
+        return {
+          row_kind: "unit",
+          value: "unit:" + unitId + ":people:" + peopleId,
+          unit_id: unitId,
+          people_id: peopleId,
+          label: a.unit_name || ("Unit " + unitId),
+          unit_type_id: a.unit_type_id || null,
+          unit_type_name: a.unit_type_name || "",
+          selling_currency: a.selling_currency || "",
+          operating_currency: a.operating_currency || "",
+          local_currency: a.selling_currency || a.operating_currency || "",
+          responsible_people_id: peopleId,
+          responsible_label: responsibleLabel,
+          responsibles: [{
+            people_id: peopleId,
+            label: responsibleLabel,
+            role_id: a.role_id,
+            role_name: a.role_name || "",
+            is_primary: Boolean(a.is_primary)
+          }]
+        };
+      })
+      .filter(Boolean);
+  }
 
   const selectedUnits = getParameterUnitsForSelectedUnitType({
     includeAllWhenEmpty: Boolean(parameterLockedUnitId)
@@ -16082,10 +16168,14 @@ if (isRoleParameterScope()) {
 
       return {
       kpi_target_allocation_id: String(state.kpi_target_allocation_id ?? "").trim() || null,
-      plant_id: scopeKind === "unit" ? scopeId : null,
+      plant_id: scopeKind === "unit"
+      ? String(scopeEntry.unit_id || "").trim() || null
+      : null,
      zone_id: scopeKind === "zone" ? String(scopeEntry.zone_id || "").trim() || null : null,
       product_line_id: null,
-       unit_id: null,
+      unit_id: scopeKind === "unit"
+      ? String(scopeEntry.unit_id || "").trim() || null
+      : null,
         product_id: scopeKind === "zone" || scopeKind === "product_line" ? null : getParameterFieldValue("parameter_product_id"),
         unit_type_id: scopeKind === "unit" || scopeKind === "role"
         ? (sharedUnitTypeId || String(scopeEntry.unit_type_id || ""))
@@ -17943,11 +18033,13 @@ function buildParameterAllocationGroupKey(row) {
         const productLineId = String(row.product_line_id || "").trim();
         if (productLineId) return "product_line:" + productLineId;
 
-        const zoneId = String(row.zone_id || "").trim();
-        if (zoneId) return "zone:" + zoneId;
+       const peopleId = String(row.set_by_people_id || row.responsible_people_id || "").trim();
 
-        const unitId = String(row.plant_id || row.unit_id || "").trim();
-        if (unitId) return "unit:" + unitId;
+      const zoneId = String(row.zone_id || "").trim();
+       if (zoneId) return "zone:" + zoneId + (peopleId ? ":people:" + peopleId : "");
+
+      const unitId = String(row.plant_id || row.unit_id || "").trim();
+      if (unitId) return "unit:" + unitId + (peopleId ? ":people:" + peopleId : "");
 
         const allocationId = String(row.kpi_target_allocation_id || "").trim();
         return allocationId ? "allocation:" + allocationId : "";
@@ -20439,13 +20531,16 @@ updateParameterKpiSummary();
         normalizedKpiType === "zone" ||
         normalizedKpiType === "product line" ||
         normalizedKpiType === "role";
+        
 
         const mappings = {
           parameter_object_id: primaryRow.kpi_target_allocation_id,
           parameter_kpi_id: primaryRow.kpi_id,
           parameter_kpi_type: primaryRow.kpi_type,
           parameter_unit_type_id: primaryRow.unit_type_id,
-          parameter_role_id: primaryRow.role_id,
+          parameter_role_id:
+          primaryRow.role_id ||
+          inferParameterRoleIdFromAllocation(primaryRow, relatedAllocations),
           parameter_role_target_mode:
           primaryRow.role_target_mode ||
           primaryRow.assignment_mode ||
@@ -20478,6 +20573,25 @@ updateParameterKpiSummary();
         parameterLockedUnitId = isGroupedScope
           ? ""
           : String(primaryRow.plant_id || primaryRow.unit_id || "").trim();
+
+const relatedRoleIds = relatedAllocations
+  .map(row => String(row?.role_id || "").trim())
+  .filter(Boolean);
+
+const uniqueRelatedRoleIds = [...new Set(relatedRoleIds)];
+
+const editRoleId =
+  normalizedKpiType === "zone"
+    ? (
+        uniqueRelatedRoleIds.length === 1
+          ? uniqueRelatedRoleIds[0]
+          : PARAMETER_ZONE_ALL_ROLE_VALUE
+      )
+    : (
+        primaryRow.role_id ||
+        inferParameterRoleIdFromAllocation(primaryRow, relatedAllocations) ||
+        ""
+      );
     if (normalizedKpiType === "zone") {
     parameterLockedZoneIds = relatedAllocations
       .map((row) => String(row.zone_id || "").trim())
@@ -20527,6 +20641,15 @@ Object.keys(mappings).forEach(id => {
           if (el) el.value = mappings[id] ?? "";
         });
 
+        populateParameterRoleScopeOptions(editRoleId);
+
+const roleEl = document.getElementById("parameter_role_id");
+if (roleEl) {
+  roleEl.value = String(editRoleId || "");
+}
+
+syncParameterRoleDropdown();
+
         const unitTypeSelect = document.getElementById("parameter_unit_type_id");
         if (unitTypeSelect) {
           unitTypeSelect.disabled = Boolean(parameterLockedUnitId) || Boolean(parameterLockedZoneId) || isGroupedScope;
@@ -20534,7 +20657,7 @@ Object.keys(mappings).forEach(id => {
 
     handleParameterKpiTypeChange();
 
-if (normalizedKpiType === "zone") {
+if (normalizedKpiType === "zone" || normalizedKpiType === "role") {
   const zoneUnitEl = document.getElementById("parameter_zone_unit_id");
   const zoneProductEl = document.getElementById("parameter_zone_product_id");
 
@@ -20704,10 +20827,10 @@ function buildParameterPayload() {
     { preferFormState: true }
   );
 
-  const roleId =
-    scopeKind === "zone" || scopeKind === "product_line"
-      ? ""
-      : getNormalizedParameterRoleId();
+ const roleId =
+  scopeKind === "product_line"
+    ? ""
+    : getNormalizedParameterRoleId();
 
   return {
     kpi_target_allocation_id: getParameterFieldValue("parameter_object_id") || "",
@@ -37495,24 +37618,24 @@ const runWeeklyKpiSubmissionCron = async ({
 };
 
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
