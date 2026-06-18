@@ -18579,6 +18579,7 @@ function getExpectedMultisiteTargetCount(row = {}) {
         const numericValue = normalizeChartLimitValue(value);
         const low = normalizeChartLimitValue(lowLimit);
         const high = normalizeChartLimitValue(highLimit);
+        const resolvedDirection = normalizeChartDirection(direction);
 
         if (numericValue === null) return "rgba(148, 163, 184, 0.85)";
 
@@ -18586,8 +18587,9 @@ function getExpectedMultisiteTargetCount(row = {}) {
         const upperBound = low !== null && high !== null ? Math.max(low, high) : high;
         const isBelowLower = lowerBound !== null && numericValue < lowerBound;
         const isAboveUpper = upperBound !== null && numericValue > upperBound;
+        const isBad = resolvedDirection === "down" ? isAboveUpper : isBelowLower;
 
-        return isBelowLower || isAboveUpper
+        return isBad
           ? "rgba(239, 68, 68, 0.88)"
           : "rgba(74, 222, 128, 0.88)";
       }
@@ -21609,11 +21611,14 @@ const getKpiStatus = (value, lowLimit, highLimit, direction = 'up') => {
 
   const isBelowLower = lowerBound !== null && val < lowerBound;
   const isAboveUpper = upperBound !== null && val > upperBound;
-  const isOutsideBounds = isBelowLower || isAboveUpper;
+  const isBad =
+    resolvedDirection === 'down'
+      ? isAboveUpper
+      : isBelowLower;
 
   return {
-    color: isOutsideBounds ? '#dc3545' : '#28a745',
-    isGood: !isOutsideBounds,
+    color: isBad ? '#dc3545' : '#28a745',
+    isGood: !isBad,
     direction: resolvedDirection,
     lowerBound,
     upperBound
@@ -21938,6 +21943,44 @@ const buildAbsoluteAppUrl = (req, relativePath = "/") => {
   const protocol = forwardedProto || req?.protocol || "http";
   const host = normalizeOptionalTextInput(req?.get?.("host")) || `kpi-form.azurewebsites.net${port}`;
   return `${protocol}://${host}${normalizedPath}`;
+};
+
+const buildKpiFormUrl = ({
+  responsibleId,
+  week,
+  calculationMode = null,
+  frequency = null
+} = {}) => {
+  const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
+  const normalizedWeek = normalizeOptionalTextInput(week);
+
+  const params = new URLSearchParams();
+  if (normalizedResponsibleId) {
+    params.set("responsible_id", String(normalizedResponsibleId));
+  }
+  if (normalizedWeek) {
+    params.set("week", normalizedWeek);
+  }
+
+  const normalizedCalculationMode = normalizeOptionalTextInput(calculationMode);
+  if (normalizedCalculationMode) {
+    params.set("calculation_mode", normalizedCalculationMode);
+  }
+
+  const normalizedFrequency = normalizeOptionalTextInput(frequency);
+  if (normalizedFrequency) {
+    params.set("frequency", normalizedFrequency);
+  }
+
+  const query = params.toString();
+  return query ? `/form?${query}` : "/form";
+};
+
+const sanitizeKpiFormReturnUrl = (value, fallback = null) => {
+  const text = normalizeOptionalTextInput(value);
+  if (!text || !text.startsWith("/form")) return fallback;
+  if (text.startsWith("//")) return fallback;
+  return text;
 };
 
 const formatKpiTargetAllocationScopeSummary = (row = {}) => {
@@ -27530,8 +27573,27 @@ app.post("/submit-bulk-corrective-actions", async (req, res) => {
 // ---------- Redirect handler ----------
 app.post("/redirect", async (req, res) => {
   try {
-    const { responsible_id, week, ...values } = req.body;
+    const {
+      responsible_id,
+      week,
+      calculation_mode: submittedCalculationMode,
+      frequency: submittedFrequency,
+      return_url: submittedReturnUrl,
+      ...values
+    } = req.body;
     const normalizedWeek = normalizeOptionalTextInput(week) || formatIsoDateValue(new Date());
+    const normalizedCalculationMode = normalizeOptionalTextInput(submittedCalculationMode);
+    const normalizedFrequency = normalizeOptionalTextInput(submittedFrequency);
+    const fallbackFormUrl = buildKpiFormUrl({
+      responsibleId: responsible_id,
+      week: normalizedWeek,
+      calculationMode: normalizedCalculationMode,
+      frequency: normalizedFrequency
+    });
+    const kpiFormReturnUrl = sanitizeKpiFormReturnUrl(submittedReturnUrl, fallbackFormUrl);
+    const dashboardReturnUrlParam = kpiFormReturnUrl
+      ? `&return_url=${encodeURIComponent(kpiFormReturnUrl)}`
+      : "";
     const resultDate = deriveKpiResultDate(normalizedWeek);
     const periodType = deriveKpiResultPeriodType(normalizedWeek);
     const recordedByPeopleId = await resolveRecordedByPeopleId(responsible_id);
@@ -27783,8 +27845,8 @@ app.post("/redirect", async (req, res) => {
       <body><div class="sc">
         <h1 style="color:#28a745;">KPI Submitted Successfully!</h1>
         <p>Your KPI values for ${normalizedWeek} have been saved.</p>
-        <a href="/form?responsible_id=${encodeURIComponent(responsible_id)}&week=${encodeURIComponent(normalizedWeek)}" class="btn btn-secondary">Back to KPI Form</a>
-        <a href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}" class="btn">Go to Dashboard</a>
+        <a href="${escapeHtml(kpiFormReturnUrl)}" class="btn btn-secondary">Back to KPI Form</a>
+        <a href="/dashboard?responsible_id=${encodeURIComponent(responsible_id)}${dashboardReturnUrlParam}" class="btn">Go to Dashboard</a>
       </div></body></html>`);
   } catch (err) {
     res.status(err.statusCode || 500).send(`<h2 style="color:red;">âŒ Failed: ${err.message}</h2>`);
@@ -28269,6 +28331,15 @@ app.get("/form", async (req, res) => {
       normalizedFrequencyFilter ||
       normalizeOptionalTextInput(kpis?.[0]?.frequency) ||
       "Weekly";
+    const formReturnUrl = sanitizeKpiFormReturnUrl(
+      req.originalUrl,
+      buildKpiFormUrl({
+        responsibleId: responsible_id,
+        week,
+        calculationMode: requestedCalculationMode,
+        frequency: formFrequencyLabel
+      })
+    );
 
     if (!kpis.length) {
       return res.send(`
@@ -31046,6 +31117,9 @@ let historyValues = chartSeries.values;
               <form action="/redirect" method="POST" id="kpiForm" novalidate>
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
                 <input type="hidden" name="week" value="${week}" />
+                <input type="hidden" name="calculation_mode" value="${escapeHtml(normalizeOptionalTextInput(requestedCalculationMode) || "")}" />
+                <input type="hidden" name="frequency" value="${escapeHtml(formFrequencyLabel || "")}" />
+                <input type="hidden" name="return_url" value="${escapeHtml(formReturnUrl || "")}" />
                 ${kpiCardsHtml}
                <button type="submit" class="submit-btn" ${hasInitialInvalidKpi ? "disabled" : ""}>
                Submit KPI Values
@@ -31731,6 +31805,10 @@ function syncDomFromStore(kvId) {
             if (!card) return;
             const rawLow = parseFloat(card.dataset.lowLimit);
             const rawHigh = parseFloat(card.dataset.highLimit);
+            const direction =
+              String(card.dataset.goodDirection || "up").toLowerCase() === "down"
+                ? "down"
+                : "up";
             const hasLow = !isNaN(rawLow), hasHigh = !isNaN(rawHigh);
             const lowerBound = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : hasHigh ? rawHigh : null;
             const upperBound = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : hasLow ? rawLow : null;
@@ -31738,8 +31816,9 @@ function syncDomFromStore(kvId) {
             const kvId = input.dataset.kpiValuesId;
             const caPanel = document.getElementById("ca_container_" + kvId);
             const isOutside = !isNaN(val) && (
-              (lowerBound !== null && val < lowerBound) ||
-              (upperBound !== null && val > upperBound)
+              direction === "down"
+                ? upperBound !== null && val > upperBound
+                : lowerBound !== null && val < lowerBound
             );
             if (!caPanel) return;
             caPanel.classList.toggle("visible", isOutside);
@@ -31772,6 +31851,10 @@ function needsCorrectiveAction(value, lowLimit, highLimit, goodDirection) {
   const numericValue = Number(value);
   const numericLowLimit = Number.isFinite(Number(lowLimit)) ? Number(lowLimit) : null;
   const numericHighLimit = Number.isFinite(Number(highLimit)) ? Number(highLimit) : null;
+  const resolvedDirection =
+    String(goodDirection || "up").toLowerCase() === "down"
+      ? "down"
+      : "up";
   const lowerBound =
     numericLowLimit !== null && numericHighLimit !== null
       ? Math.min(numericLowLimit, numericHighLimit)
@@ -31785,10 +31868,11 @@ function needsCorrectiveAction(value, lowLimit, highLimit, goodDirection) {
         ? numericHighLimit
         : numericLowLimit;
 
-  return (
-    (lowerBound !== null && numericValue < lowerBound) ||
-    (upperBound !== null && numericValue > upperBound)
-  );
+  if (resolvedDirection === "down") {
+    return upperBound !== null && numericValue > upperBound;
+  }
+
+  return lowerBound !== null && numericValue < lowerBound;
 }
  
 
@@ -33031,33 +33115,60 @@ if (input && !preserveDraftValue) {
             return lines;
           }
 
-          function normalizePointDirection(direction) {
+         function normalizePointDirection(direction) {
             const normalizedDirection = String(direction || "").trim().toLowerCase();
             return normalizedDirection === "down" ? "down" : "up";
           }
 
-         function getPointColor(value, lowLimit, highLimit, direction, target) {
+         function getPointStatus(value, lowLimit, highLimit, direction) {
             const val = parseFloat(value);
             const rawLow = parseFloat(lowLimit);
             const rawHigh = parseFloat(highLimit);
-            const rawTarget = parseFloat(target);
             const hasLow = !isNaN(rawLow);
             const hasHigh = !isNaN(rawHigh);
-            const hasTarget = !isNaN(rawTarget);
             const lower = hasLow && hasHigh ? Math.min(rawLow, rawHigh) : hasLow ? rawLow : null;
             const upper = hasLow && hasHigh ? Math.max(rawLow, rawHigh) : hasHigh ? rawHigh : null;
+            const resolvedDirection = normalizePointDirection(direction);
+
+            if (isNaN(val)) {
+              return {
+                isBad: false,
+                isGood: false,
+                lower,
+                upper,
+                direction: resolvedDirection
+              };
+            }
+
+            const isBelowLower = lower !== null && val < lower;
+            const isAboveUpper = upper !== null && val > upper;
+            const isBad = resolvedDirection === "down" ? isAboveUpper : isBelowLower;
+
+            return {
+              isBad,
+              isGood: !isBad,
+              lower,
+              upper,
+              direction: resolvedDirection
+            };
+          }
+
+         function getPointColor(value, lowLimit, highLimit, direction, target) {
+            const rawTarget = parseFloat(target);
+            const hasTarget = !isNaN(rawTarget);
+            const val = parseFloat(value);
+            const status = getPointStatus(value, lowLimit, highLimit, direction);
 
             if (isNaN(val)) return "#94a3b8";
+            if (status.isBad) return "#e34b24";
 
-            const isOutside =
-              (lower !== null && val < lower) ||
-              (upper !== null && val > upper);
-
-            if (isOutside) return "#e34b24";
-
-            // Above target AND within (at/below) the upper limit -> dark green
-            if (hasTarget && val > rawTarget && (upper === null || val <= upper)) {
-              return "#15803d";
+            if (hasTarget) {
+              if (status.direction === "down" && val <= rawTarget) {
+                return "#15803d";
+              }
+              if (status.direction === "up" && val >= rawTarget) {
+                return "#15803d";
+              }
             }
 
             return "#b7dc58";
@@ -34276,6 +34387,7 @@ function openCommentsHistoryModal(kvId) {
 app.get("/dashboard", async (req, res) => {
   try {
     const responsibleId = normalizeOptionalIntegerInput(req.query?.responsible_id);
+    const requestedFormReturnUrl = sanitizeKpiFormReturnUrl(req.query?.return_url);
     if (!responsibleId) {
       return res.status(400).send("Missing responsible_id");
     }
@@ -34342,6 +34454,7 @@ app.get("/dashboard", async (req, res) => {
         k.up_tolerance,
         k.low_tolerance,
         k.frequency,
+        k.calculation_mode,
         k.kpi_explanation AS definition,
         k.calculation_on,
         k.target_auto_adjustment,
@@ -34466,7 +34579,12 @@ app.get("/dashboard", async (req, res) => {
     const dashboardFormWeek =
       normalizeOptionalTextInput(latestSubmittedRow?.week || latestSubmittedRow?.period_label) ||
       getCurrentFormWeek();
-    const kpiFormUrl = `/form?responsible_id=${encodeURIComponent(responsible_id)}&week=${encodeURIComponent(dashboardFormWeek)}`;
+    const kpiFormUrl = requestedFormReturnUrl || buildKpiFormUrl({
+      responsibleId: responsible_id,
+      week: dashboardFormWeek,
+      calculationMode: latestSubmittedRow?.calculation_mode,
+      frequency: latestSubmittedRow?.frequency
+    });
     const monthOptionsHtml = monthSummaries
       .map((summary) =>
         `<option value="${escapeHtml(summary.monthKey)}"${summary.monthKey === selectedMonthKey ? " selected" : ""}>${escapeHtml(summary.monthLabel)}${summary.isLatest ? " - Latest" : ""}</option>`
