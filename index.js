@@ -1,5 +1,7 @@
 require("dotenv").config();
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const { Pool } = require("pg");
 const bodyParser = require("body-parser");
 const cors = require("cors");
@@ -46,6 +48,8 @@ const NUMERIC_TEXT_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
 const KPI_KNOWLEDGE_BASE_MAX_DEPTH = 5;
 const KPI_KNOWLEDGE_REFRESH_BATCH_SIZE = 10;
 const KPI_KNOWLEDGE_REFRESH_INTERVAL_MS = 5000;
+const KPI_FILE_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
+const KPI_FILE_STORAGE_DIRECTORY = path.join(__dirname, "data", "kpi-files");
 const KPI_KNOWLEDGE_BASE_STOP_WORDS = new Set([
   "a",
   "an",
@@ -159,6 +163,254 @@ const normalizeOptionalIntegerInput = (value) => {
   const text = normalizeOptionalTextInput(value);
   if (text === null || !/^\d+$/.test(text)) return null;
   return Number(text);
+};
+
+const normalizeKpiFileUploadPayload = (value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const fileName = normalizeOptionalTextInput(
+    value.name ?? value.file_name ?? value.filename
+  );
+  const fileType =
+    normalizeOptionalTextInput(value.type ?? value.mime_type) ||
+    "application/octet-stream";
+  const sizeValue = Number(value.size);
+  const contentBase64 = normalizeOptionalTextInput(
+    value.content_base64 ?? value.base64 ?? value.contentBase64
+  );
+
+  if (!fileName && !contentBase64) {
+    return null;
+  }
+
+  if (!fileName || !contentBase64) {
+    throw createHttpError(400, "Uploaded KPI file is incomplete.");
+  }
+
+  if (!Number.isFinite(sizeValue) || sizeValue < 0) {
+    throw createHttpError(400, "Uploaded KPI file size is invalid.");
+  }
+
+  if (sizeValue > KPI_FILE_UPLOAD_MAX_BYTES) {
+    throw createHttpError(
+      400,
+      `Uploaded KPI file exceeds the ${Math.round(KPI_FILE_UPLOAD_MAX_BYTES / (1024 * 1024))} MB limit.`
+    );
+  }
+
+  const normalizedBase64 = contentBase64.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/=]+$/.test(normalizedBase64)) {
+    throw createHttpError(400, "Uploaded KPI file content is invalid.");
+  }
+
+  return {
+    name: fileName,
+    type: fileType,
+    size: sizeValue,
+    content_base64: normalizedBase64
+  };
+};
+
+const sanitizeKpiFileName = (value) => {
+  const normalized = String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const cleaned = normalized
+    .replace(/[^\w.\-() ]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .trim();
+
+  return cleaned || "kpi-file";
+};
+
+const buildStoredKpiFileName = (kpiId, originalName) => {
+  const sanitizedName = sanitizeKpiFileName(originalName);
+  const extension = path.extname(sanitizedName).slice(0, 32);
+  const baseName = path
+    .basename(sanitizedName, extension)
+    .slice(0, 120)
+    .replace(/[^\w\-()]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  return `kpi-${kpiId}-${Date.now()}-${baseName || "file"}${extension}`;
+};
+
+const getKpiStoredFileName = (storedPath) => {
+  const normalizedPath = normalizeOptionalTextInput(storedPath);
+  if (!normalizedPath) return "";
+
+  const cleanedPath = normalizedPath.split("?")[0].replace(/\\/g, "/");
+  const parts = cleanedPath.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+};
+
+const getKpiDisplayFileName = (storedPath) => {
+  const storedFileName = getKpiStoredFileName(storedPath);
+  if (!storedFileName) return "";
+
+  return storedFileName.replace(/^kpi-\d+-\d+-/, "") || storedFileName;
+};
+
+const buildKpiFilePublicUrl = (kpiId, storedPath) => {
+  const normalizedPath = normalizeOptionalTextInput(storedPath);
+  if (!normalizedPath) return null;
+
+  if (/^(https?:)?\/\//i.test(normalizedPath) || normalizedPath.startsWith("/")) {
+    return normalizedPath;
+  }
+
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) return null;
+
+  const fileNameSegment = encodeURIComponent(
+    getKpiDisplayFileName(normalizedPath) ||
+    getKpiStoredFileName(normalizedPath) ||
+    "kpi-file"
+  );
+
+  return `/api/kpis/${normalizedKpiId}/file/${fileNameSegment}`;
+};
+
+const resolveStoredKpiFileAbsolutePath = (storedPath) => {
+  const normalizedPath = normalizeOptionalTextInput(storedPath);
+  if (
+    !normalizedPath ||
+    /^(https?:)?\/\//i.test(normalizedPath) ||
+    normalizedPath.startsWith("/")
+  ) {
+    return null;
+  }
+
+  const relativeStoragePath = /[\\/]/.test(normalizedPath)
+    ? normalizedPath
+    : path.posix.join("data", "kpi-files", normalizedPath);
+  const resolvedPath = path.resolve(
+    __dirname,
+    relativeStoragePath.replace(/\//g, path.sep)
+  );
+  const storageRoot = path.resolve(KPI_FILE_STORAGE_DIRECTORY);
+
+  if (
+    resolvedPath !== storageRoot &&
+    !resolvedPath.startsWith(storageRoot + path.sep)
+  ) {
+    return null;
+  }
+
+  return resolvedPath;
+};
+
+const writeUploadedKpiFile = async (kpiId, fileUpload) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) {
+    throw createHttpError(400, "A valid KPI ID is required before saving a file.");
+  }
+
+  const normalizedUpload = normalizeKpiFileUploadPayload(fileUpload);
+  if (!normalizedUpload) {
+    return null;
+  }
+
+  const buffer = Buffer.from(normalizedUpload.content_base64, "base64");
+  if (!buffer.length && normalizedUpload.size > 0) {
+    throw createHttpError(400, "Uploaded KPI file content is empty.");
+  }
+
+  if (buffer.length > KPI_FILE_UPLOAD_MAX_BYTES) {
+    throw createHttpError(
+      400,
+      `Uploaded KPI file exceeds the ${Math.round(KPI_FILE_UPLOAD_MAX_BYTES / (1024 * 1024))} MB limit.`
+    );
+  }
+
+  await fs.promises.mkdir(KPI_FILE_STORAGE_DIRECTORY, { recursive: true });
+
+  const storedFileName = buildStoredKpiFileName(normalizedKpiId, normalizedUpload.name);
+  const relativePath = path.posix.join("data", "kpi-files", storedFileName);
+  const absolutePath = path.join(KPI_FILE_STORAGE_DIRECTORY, storedFileName);
+
+  await fs.promises.writeFile(absolutePath, buffer);
+
+  return {
+    stored_path: relativePath,
+    absolute_path: absolutePath,
+    file_name: normalizedUpload.name,
+    file_size: buffer.length
+  };
+};
+
+const copyExistingKpiFile = async (
+  kpiId,
+  sourcePath,
+  { preferredFileName = "" } = {}
+) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  if (!normalizedKpiId) {
+    throw createHttpError(400, "A valid KPI ID is required before copying a file.");
+  }
+
+  const normalizedSourcePath = normalizeOptionalTextInput(sourcePath);
+  if (!normalizedSourcePath) {
+    return null;
+  }
+
+  const normalizedPreferredFileName = normalizeOptionalTextInput(preferredFileName);
+  const displayFileName =
+    normalizedPreferredFileName ||
+    getKpiDisplayFileName(normalizedSourcePath) ||
+    getKpiStoredFileName(normalizedSourcePath) ||
+    "kpi-file";
+
+  if (
+    /^(https?:)?\/\//i.test(normalizedSourcePath) ||
+    normalizedSourcePath.startsWith("/")
+  ) {
+    return {
+      stored_path: normalizedSourcePath,
+      absolute_path: null,
+      file_name: displayFileName,
+      file_size: null
+    };
+  }
+
+  const sourceAbsolutePath = resolveStoredKpiFileAbsolutePath(normalizedSourcePath);
+  if (!sourceAbsolutePath) {
+    throw createHttpError(400, "Existing KPI file path is invalid.");
+  }
+
+  await fs.promises.access(sourceAbsolutePath, fs.constants.F_OK);
+  await fs.promises.mkdir(KPI_FILE_STORAGE_DIRECTORY, { recursive: true });
+
+  const storedFileName = buildStoredKpiFileName(normalizedKpiId, displayFileName);
+  const relativePath = path.posix.join("data", "kpi-files", storedFileName);
+  const absolutePath = path.join(KPI_FILE_STORAGE_DIRECTORY, storedFileName);
+
+  await fs.promises.copyFile(sourceAbsolutePath, absolutePath);
+  const copiedStat = await fs.promises.stat(absolutePath);
+
+  return {
+    stored_path: relativePath,
+    absolute_path: absolutePath,
+    file_name: displayFileName,
+    file_size: copiedStat.size
+  };
+};
+
+const deleteStoredKpiFile = async (storedPath) => {
+  const absolutePath = resolveStoredKpiFileAbsolutePath(storedPath);
+  if (!absolutePath) return;
+
+  try {
+    await fs.promises.unlink(absolutePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.error("Unable to delete KPI file:", error.message);
+    }
+  }
 };
 
 const loadKpiKnowledgeBaseForAssistant = async (kpiId) => {
@@ -558,6 +810,15 @@ const prepareKpiWritePayload = (payload = {}) => {
   const rawReferenceKpiId = normalizeOptionalTextInput(payload.reference_kpi_id);
   const rawOwnerRoleId = normalizeOptionalTextInput(payload.owner_role_id);
   const rawKfs = normalizeOptionalTextInput(payload.kfs);
+  const fileUpload = normalizeKpiFileUploadPayload(
+    payload.file_upload ?? payload.fileUpload
+  );
+  const fileSourcePath = normalizeOptionalTextInput(
+    payload.file_source_path ?? payload.fileSourcePath
+  );
+  const fileSourceName = normalizeOptionalTextInput(
+    payload.file_source_name ?? payload.fileSourceName ?? payload.file_name
+  );
   const kfs = ["KPI", "KFS"].includes(rawKfs) ? rawKfs : null;
   const subjectNodeId = rawSubjectNodeId === null ? null : Number(rawSubjectNodeId);
   const targetValue = normalizeOptionalNumericInput(rawTarget);
@@ -781,7 +1042,10 @@ const prepareKpiWritePayload = (payload = {}) => {
     status,
     comments: normalizeOptionalTextInput(payload.comments),
     high_limit: highLimit === null ? null : Number(highLimit),
-    low_limit: lowLimit === null ? null : Number(lowLimit)
+    low_limit: lowLimit === null ? null : Number(lowLimit),
+    file_upload: fileUpload,
+    file_source_path: fileSourcePath,
+    file_source_name: fileSourceName
   };
 };
 
@@ -931,6 +1195,11 @@ const ensureKpiRatioSchema = async () => {
       await pool.query(`
         ALTER TABLE public.kpi
         ADD COLUMN IF NOT EXISTS reactivity_need VARCHAR(255)
+      `);
+
+      await pool.query(`
+        ALTER TABLE public.kpi
+        ADD COLUMN IF NOT EXISTS file VARCHAR
       `);
 
       await pool.query(`
@@ -3654,6 +3923,9 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     name: row.set_by_people_name,
     first_name: row.set_by_people_first_name
   }) || "";
+  const storedFilePath = normalizeOptionalTextInput(row.file);
+  const fileUrl = buildKpiFilePublicUrl(row.kpi_id, storedFilePath);
+  const fileName = getKpiDisplayFileName(storedFilePath);
 
   return {
     kpi_id: row.kpi_id,
@@ -3692,6 +3964,9 @@ const mapKpiRowToClient = (row, subjectPathById = new Map()) => {
     owner_role_id: row.owner_role_id,
     status: row.status || "Active",
     comments: row.comments || "",
+    file: storedFilePath,
+    file_name: fileName || null,
+    file_url: fileUrl,
     created_at: row.created_at,
     updated_at: row.updated_at,
     kpi_knowledge_updated_date: row.kpi_knowledge_updated_date ?? null,
@@ -3769,6 +4044,7 @@ const loadKpiRowsForUi = async ({ search = "", kpiId = null, responsibleId = nul
       k.status,
       k.kfs,
       k.comments,
+      k.file,
       k.created_at,
       k.updated_at,
       k.kpi_knowledge_updated_date,
@@ -4429,8 +4705,8 @@ const loadKpiTargetAllocationRowsByIdsForUi = async (allocationIds = []) => {
 };
 
 app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json({ limit: "40mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "40mb" }));
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 // ========== KPI ADMIN API ==========
@@ -4506,6 +4782,58 @@ app.get("/api/kpis/:id", async (req, res) => {
   } catch (err) {
     console.error("GET /api/kpis/:id error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/kpis/:id/file/:fileName?", async (req, res) => {
+  try {
+    await ensureKpiRatioSchema();
+
+    const kpiId = normalizeOptionalIntegerInput(req.params.id);
+    if (!kpiId) {
+      return res.status(400).json({ error: "KPI ID is invalid." });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT file
+      FROM public.kpi
+      WHERE kpi_id = $1
+      LIMIT 1
+      `,
+      [kpiId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    const storedFilePath = normalizeOptionalTextInput(result.rows[0].file);
+    if (!storedFilePath) {
+      return res.status(404).json({ error: "No file is attached to this KPI." });
+    }
+
+    if (/^(https?:)?\/\//i.test(storedFilePath)) {
+      return res.redirect(storedFilePath);
+    }
+
+    const absolutePath = resolveStoredKpiFileAbsolutePath(storedFilePath);
+    if (!absolutePath) {
+      return res.status(404).json({ error: "Stored KPI file path is invalid." });
+    }
+
+    await fs.promises.access(absolutePath, fs.constants.F_OK);
+    return res.download(
+      absolutePath,
+      getKpiDisplayFileName(storedFilePath) || getKpiStoredFileName(storedFilePath) || "kpi-file"
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return res.status(404).json({ error: "KPI file not found on server." });
+    }
+
+    console.error("GET /api/kpis/:id/file error:", error.message);
+    return res.status(500).json({ error: "Failed to download KPI file" });
   }
 });
 
@@ -4758,6 +5086,7 @@ app.delete("/api/kpis/:id/ai-support/conversation", async (req, res) => {
 // CREATE KPI
 app.post("/api/kpis", async (req, res) => {
   let client;
+  let uploadedFileStoredPath = null;
 
   try {
     await ensureKpiRatioSchema();
@@ -4795,7 +5124,10 @@ app.post("/api/kpis", async (req, res) => {
       comments,
       high_limit,
       low_limit,
-      kfs
+      kfs,
+      file_upload,
+      file_source_path,
+      file_source_name
     } = prepareKpiWritePayload(req.body);
     const createdByPeopleId = normalizeOptionalIntegerInput(req.body.created_by_people_id);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
@@ -4892,6 +5224,24 @@ app.post("/api/kpis", async (req, res) => {
     );
 
     const newKpi = result.rows[0];
+    const fileAttachment =
+      file_upload
+        ? await writeUploadedKpiFile(newKpi.kpi_id, file_upload)
+        : await copyExistingKpiFile(newKpi.kpi_id, file_source_path, {
+          preferredFileName: file_source_name
+        });
+
+    if (fileAttachment) {
+      uploadedFileStoredPath = fileAttachment.stored_path;
+      await client.query(
+        `
+        UPDATE public.kpi
+        SET file = $1
+        WHERE kpi_id = $2
+        `,
+        [fileAttachment.stored_path, newKpi.kpi_id]
+      );
+    }
     await upsertPrimarySubjectKpiLink(client, newKpi.kpi_id, resolvedSubjectId);
     await refreshKpiKnowledgeBaseForKpiId(client, newKpi.kpi_id, {
       reason: "kpi_created"
@@ -4903,6 +5253,9 @@ app.post("/api/kpis", async (req, res) => {
   } catch (err) {
     if (client) {
       await client.query("ROLLBACK").catch(() => { });
+    }
+    if (uploadedFileStoredPath) {
+      await deleteStoredKpiFile(uploadedFileStoredPath);
     }
     console.error("POST /api/kpis error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to create KPI" });
@@ -4916,6 +5269,8 @@ app.post("/api/kpis", async (req, res) => {
 // UPDATE KPI
 app.put("/api/kpis/:id", async (req, res) => {
   let client;
+  let uploadedFileStoredPath = null;
+  let replacedFilePath = null;
 
   try {
     await ensureKpiRatioSchema();
@@ -4953,7 +5308,10 @@ app.put("/api/kpis/:id", async (req, res) => {
       comments,
       high_limit,
       low_limit,
-      kfs
+      kfs,
+      file_upload,
+      file_source_path,
+      file_source_name
     } = prepareKpiWritePayload(req.body);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
       subject_id,
@@ -4966,6 +5324,33 @@ app.put("/api/kpis/:id", async (req, res) => {
 
     client = await pool.connect();
     await client.query("BEGIN");
+
+    const existingKpiResult = await client.query(
+      `
+      SELECT file
+      FROM public.kpi
+      WHERE kpi_id = $1
+      FOR UPDATE
+      `,
+      [req.params.id]
+    );
+
+    if (!existingKpiResult.rows.length) {
+      await client.query("ROLLBACK").catch(() => { });
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    const existingFilePath = normalizeOptionalTextInput(existingKpiResult.rows[0].file);
+    let nextFilePath = existingFilePath;
+
+    if (file_upload) {
+      const savedFile = await writeUploadedKpiFile(req.params.id, file_upload);
+      if (savedFile) {
+        uploadedFileStoredPath = savedFile.stored_path;
+        nextFilePath = savedFile.stored_path;
+        replacedFilePath = existingFilePath;
+      }
+    }
 
     const result = await client.query(
       `
@@ -5004,8 +5389,9 @@ app.put("/api/kpis/:id", async (req, res) => {
         pricing_type = $31,
         reactivity_need = $32,
         kfs = $33,
+        file = $34,
         updated_at = NOW()
-      WHERE kpi_id = $34
+      WHERE kpi_id = $35
       RETURNING *;
       `,
       [
@@ -5042,14 +5428,10 @@ app.put("/api/kpis/:id", async (req, res) => {
         pricing_type,
         reactivity_need,
         kfs,
+        nextFilePath,
         req.params.id
       ]
     );
-
-    if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => { });
-      return res.status(404).json({ error: "KPI not found" });
-    }
 
     await upsertPrimarySubjectKpiLink(client, Number(req.params.id), resolvedSubjectId);
     await refreshKpiKnowledgeBaseForKpiId(client, Number(req.params.id), {
@@ -5057,11 +5439,18 @@ app.put("/api/kpis/:id", async (req, res) => {
     });
     await client.query("COMMIT");
 
+    if (replacedFilePath && replacedFilePath !== nextFilePath) {
+      await deleteStoredKpiFile(replacedFilePath);
+    }
+
     const rows = await loadKpiRowsForUi({ kpiId: Number(req.params.id) });
     res.json(rows[0] || result.rows[0]);
   } catch (err) {
     if (client) {
       await client.query("ROLLBACK").catch(() => { });
+    }
+    if (uploadedFileStoredPath) {
+      await deleteStoredKpiFile(uploadedFileStoredPath);
     }
     console.error("PUT /api/kpis/:id error:", err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Failed to update KPI" });
@@ -5132,6 +5521,7 @@ const deleteKpiTargetAllocationDependentRecords = async (client, allocationIds =
 // DELETE KPI
 app.delete("/api/kpis/:id", async (req, res) => {
   let client;
+  let deletedFilePath = null;
 
   try {
     await ensureKpiAssistantConversationSchema();
@@ -5141,7 +5531,7 @@ app.delete("/api/kpis/:id", async (req, res) => {
     await deleteKpiDependentRecords(client, req.params.id);
 
     const result = await client.query(
-      `DELETE FROM public.kpi WHERE kpi_id = $1 RETURNING kpi_id`,
+      `DELETE FROM public.kpi WHERE kpi_id = $1 RETURNING kpi_id, file`,
       [req.params.id]
     );
 
@@ -5150,7 +5540,11 @@ app.delete("/api/kpis/:id", async (req, res) => {
       return res.status(404).json({ error: "KPI not found" });
     }
 
+    deletedFilePath = normalizeOptionalTextInput(result.rows[0].file);
     await client.query("COMMIT");
+    if (deletedFilePath) {
+      await deleteStoredKpiFile(deletedFilePath);
+    }
     res.json({ success: true });
   } catch (err) {
     if (client) {
@@ -6478,6 +6872,7 @@ app.get("/api/responsibles/:responsibleId/kpi-graphs", async (req, res) => {
 app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
   const { responsibleId } = req.params;
   let client;
+  let uploadedFileStoredPath = null;
 
   try {
     await ensureKpiRatioSchema();
@@ -6520,7 +6915,10 @@ app.post("/api/responsibles/:responsibleId/kpis", async (req, res) => {
       comments,
       high_limit,
       low_limit,
-      kfs
+      kfs,
+      file_upload,
+      file_source_path,
+      file_source_name
     } = prepareKpiWritePayload(req.body);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
       subject_id,
@@ -6617,6 +7015,24 @@ VALUES (
     );
 
     const newKpi = insertKpi.rows[0];
+    const fileAttachment =
+      file_upload
+        ? await writeUploadedKpiFile(newKpi.kpi_id, file_upload)
+        : await copyExistingKpiFile(newKpi.kpi_id, file_source_path, {
+          preferredFileName: file_source_name
+        });
+
+    if (fileAttachment) {
+      uploadedFileStoredPath = fileAttachment.stored_path;
+      await client.query(
+        `
+        UPDATE public.kpi
+        SET file = $1
+        WHERE kpi_id = $2
+        `,
+        [fileAttachment.stored_path, newKpi.kpi_id]
+      );
+    }
     await upsertPrimarySubjectKpiLink(client, newKpi.kpi_id, resolvedSubjectId);
     await refreshKpiKnowledgeBaseForKpiId(client, newKpi.kpi_id, {
       reason: "responsible_kpi_created"
@@ -6632,6 +7048,9 @@ VALUES (
   } catch (error) {
     if (client) {
       await client.query("ROLLBACK").catch(() => { });
+    }
+    if (uploadedFileStoredPath) {
+      await deleteStoredKpiFile(uploadedFileStoredPath);
     }
     console.error(error);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to create KPI" });
@@ -6695,6 +7114,8 @@ app.get("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
 app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   const { responsibleId, kpiId } = req.params;
   let client;
+  let uploadedFileStoredPath = null;
+  let replacedFilePath = null;
 
   try {
     await ensureKpiRatioSchema();
@@ -6738,7 +7159,8 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
       status,
       comments,
       high_limit,
-      low_limit
+      low_limit,
+      file_upload
     } = prepareKpiWritePayload(req.body);
     const resolvedSubjectId = await resolveSubjectIdForKpiPayload({
       subject_id,
@@ -6751,6 +7173,34 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
 
     client = await pool.connect();
     await client.query("BEGIN");
+
+    const existingKpiResult = await client.query(
+      `
+      SELECT file
+      FROM public.kpi
+      WHERE kpi_id = $1
+        AND created_by_people_id = $2
+      FOR UPDATE
+      `,
+      [kpiId, responsiblePeopleId]
+    );
+
+    if (!existingKpiResult.rows.length) {
+      await client.query("ROLLBACK").catch(() => { });
+      return res.status(404).json({ error: "KPI not found" });
+    }
+
+    const existingFilePath = normalizeOptionalTextInput(existingKpiResult.rows[0].file);
+    let nextFilePath = existingFilePath;
+
+    if (file_upload) {
+      const savedFile = await writeUploadedKpiFile(kpiId, file_upload);
+      if (savedFile) {
+        uploadedFileStoredPath = savedFile.stored_path;
+        nextFilePath = savedFile.stored_path;
+        replacedFilePath = existingFilePath;
+      }
+    }
 
     const result = await client.query(
       `
@@ -6789,9 +7239,10 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
           pricing_type = $31,
           reactivity_need = $32,
           kfs = $33,
+          file = $34,
           updated_at = NOW()
-      WHERE kpi_id = $34
-        AND created_by_people_id = $35
+      WHERE kpi_id = $35
+        AND created_by_people_id = $36
       RETURNING *
       `,
       [
@@ -6828,21 +7279,21 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
         pricing_type,
         reactivity_need,
         kfs,
+        nextFilePath,
         kpiId,
         responsiblePeopleId
       ]
     );
-
-    if (!result.rows.length) {
-      await client.query("ROLLBACK").catch(() => { });
-      return res.status(404).json({ error: "KPI not found" });
-    }
 
     await upsertPrimarySubjectKpiLink(client, Number(kpiId), resolvedSubjectId);
     await refreshKpiKnowledgeBaseForKpiId(client, Number(kpiId), {
       reason: "responsible_kpi_updated"
     });
     await client.query("COMMIT");
+
+    if (replacedFilePath && replacedFilePath !== nextFilePath) {
+      await deleteStoredKpiFile(replacedFilePath);
+    }
 
     const rows = await loadKpiRowsForUi({
       kpiId: Number(kpiId),
@@ -6852,6 +7303,9 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   } catch (error) {
     if (client) {
       await client.query("ROLLBACK").catch(() => { });
+    }
+    if (uploadedFileStoredPath) {
+      await deleteStoredKpiFile(uploadedFileStoredPath);
     }
     console.error(error);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Failed to update KPI" });
@@ -6865,6 +7319,7 @@ app.put("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
 app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
   const { responsibleId, kpiId } = req.params;
   let client;
+  let deletedFilePath = null;
 
   try {
     await ensureKpiRatioSchema();
@@ -6911,7 +7366,11 @@ app.delete("/api/responsibles/:responsibleId/kpis/:kpiId", async (req, res) => {
       return res.status(404).json({ error: "KPI not found" });
     }
 
+    deletedFilePath = normalizeOptionalTextInput(result.rows[0].file);
     await client.query("COMMIT");
+    if (deletedFilePath) {
+      await deleteStoredKpiFile(deletedFilePath);
+    }
     res.json({ success: true });
   } catch (error) {
     if (client) {
@@ -10123,7 +10582,17 @@ textarea {
       .field input::placeholder,
       .field textarea::placeholder,
       .field select::placeholder {
+        color: #64748b;
+        opacity: 1;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        transition: color 0.15s ease, transform 0.15s ease;
+      }
+
+      .field input:focus::placeholder,
+      .field textarea:focus::placeholder {
         color: #94a3b8;
+        transform: translateX(2px);
       }
 
       .field input:focus,
@@ -10137,6 +10606,43 @@ textarea {
         min-height: 56px;
         resize: none;
         line-height: 1.45;
+      }
+
+      .field.f-file label span,
+      .field.f-file label .hint,
+      #kpiFileCurrentWrap,
+      #kpiFileSelectedWrap,
+      #kpiFileSelectedLabel {
+        color: #0f172a !important;
+      }
+
+      .field input[type="file"] {
+        border-radius: 12px;
+        padding: 6px 8px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(248,250,252,0.98) 100%);
+        color: #0f172a;
+        cursor: pointer;
+      }
+
+      .field input[type="file"]::file-selector-button {
+        margin-right: 12px;
+        padding: 8px 14px;
+        border: 1px solid rgba(148,163,184,0.32);
+        border-radius: 10px;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+        color: #0f172a;
+        font-size: 12px;
+        font-weight: 700;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+      }
+
+      .field input[type="file"]::file-selector-button:hover {
+        background: linear-gradient(180deg, #f8fbff 0%, #eff6ff 100%);
+        border-color: rgba(37,99,235,0.34);
+        box-shadow: 0 6px 16px rgba(37,99,235,0.10);
+        transform: translateY(-1px);
       }
 
       .field.is-hidden {
@@ -13232,6 +13738,7 @@ textarea {
               <div class="field f-unit">
                 <label><span>Unit</span></label>
                 <select id="unit" required>
+                <option value="" selected>Select Unit</option>
                   <option value="kCur">kCur</option>
                   <option value="%">%</option>
                   <option value="EA">EA</option>
@@ -13242,18 +13749,20 @@ textarea {
               <div class="field f-freq">
                 <label><span>Frequency</span></label>
                 <select id="frequency" required>
+                 <option value="" selected>Select Frequency</option>
                   <option value="Daily">Daily</option>
                   <option value="Weekly">Weekly</option>
-                  <option value="By Weekly">By Weekly</option>
+                  <option value="By Weekly">BI Weekly</option>
                   <option value="Monthly">Monthly</option>
-                  <option value="By Monthly">By Monthly</option>
+                  <option value="By Monthly">BI Monthly</option>
                   <option value="Yearly">Yearly</option>
-                  <option value="By Yearly">By Yearly</option>
+                  <option value="By Yearly">BI Yearly</option>
                 </select>
               </div>
               <div class="field f-dir">
                 <label><span>Direction</span></label>
                 <select id="direction" required>
+                  <option value="" selected>Select Direction</option>
                   <option value="Up">Up</option>
                   <option value="Down">Down</option>
                 </select>
@@ -13396,6 +13905,26 @@ textarea {
                <div class="field f-def">
                 <label><span>Definition</span><span class="hint">Explain clearly</span></label>
                 <textarea id="definition" placeholder="Write a clear KPI definition..." required></textarea>
+              </div>
+
+              <div class="field f-file">
+                <label><span>KPI File</span><span class="hint">Upload any file type</span></label>
+                <input id="kpi_file" type="file" accept="*/*" onchange="handleKpiFileInputChange(event)" />
+                <div id="kpiFileCurrentWrap" style="display:none;margin-top:8px;font-size:12px;color:#475569;">
+                  <div style="font-weight:600;">Current file</div>
+                  <a
+                    id="kpiFileCurrentLink"
+                    href="#"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    download
+                    style="word-break:break-all;color:#2563eb;"
+                  ></a>
+                </div>
+                <div id="kpiFileSelectedWrap" style="display:none;margin-top:8px;font-size:12px;color:#475569;">
+                  <div style="font-weight:600;">Selected file</div>
+                  <span id="kpiFileSelectedLabel"></span>
+                </div>
               </div>
             </div>
           </div>
@@ -13765,6 +14294,10 @@ textarea {
       let parameterResolvedZoneId = "";
       let parameterZoneLookupPending = false;
       let kpiSavePending = false;
+      const KPI_FILE_UPLOAD_MAX_SIZE = ${KPI_FILE_UPLOAD_MAX_BYTES};
+      let pendingKpiUploadFile = null;
+      let currentKpiFileUrl = "";
+      let currentKpiFileName = "";
       let parameterSavePending = false;
       let parameterEditMode = false;
       let kpiCreateDraft = null;
@@ -14395,6 +14928,128 @@ function getKpiFieldElement(id) {
 
   const modalRoot = document.getElementById("modalBackdrop");
   return modalRoot?.querySelector("#" + id) || document.getElementById(id);
+}
+
+function formatKpiFileSize(size) {
+  const numericSize = Number(size);
+  if (!Number.isFinite(numericSize) || numericSize < 0) {
+    return "";
+  }
+
+  if (numericSize < 1024) return numericSize + " B";
+  if (numericSize < 1024 * 1024) return (numericSize / 1024).toFixed(1) + " KB";
+  return (numericSize / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function updateKpiFileFieldState() {
+  const currentWrap = document.getElementById("kpiFileCurrentWrap");
+  const currentLink = document.getElementById("kpiFileCurrentLink");
+  const selectedWrap = document.getElementById("kpiFileSelectedWrap");
+  const selectedLabel = document.getElementById("kpiFileSelectedLabel");
+
+  if (currentWrap) {
+    currentWrap.style.display = currentKpiFileUrl ? "" : "none";
+  }
+
+  if (currentLink) {
+    currentLink.href = currentKpiFileUrl || "#";
+    currentLink.textContent = currentKpiFileName || currentKpiFileUrl || "";
+    currentLink.title = currentKpiFileName || currentKpiFileUrl || "";
+    if (currentKpiFileName) {
+      currentLink.setAttribute("download", currentKpiFileName);
+    } else {
+      currentLink.setAttribute("download", "");
+    }
+  }
+
+  if (selectedWrap) {
+    selectedWrap.style.display = pendingKpiUploadFile ? "" : "none";
+  }
+
+  if (selectedLabel) {
+    selectedLabel.textContent = pendingKpiUploadFile
+      ? pendingKpiUploadFile.name + " (" + formatKpiFileSize(pendingKpiUploadFile.size) + ")"
+      : "";
+  }
+}
+
+function setCurrentKpiFileState(fileUrl = "", fileName = "") {
+  currentKpiFileUrl = String(fileUrl || "").trim();
+  currentKpiFileName = String(fileName || "").trim();
+  updateKpiFileFieldState();
+}
+
+function resetKpiFileState({ preservePendingUpload = false } = {}) {
+  if (!preservePendingUpload) {
+    pendingKpiUploadFile = null;
+  }
+
+  currentKpiFileUrl = "";
+  currentKpiFileName = "";
+
+  const fileInput = document.getElementById("kpi_file");
+  if (fileInput && !preservePendingUpload) {
+    fileInput.value = "";
+  }
+
+  updateKpiFileFieldState();
+}
+
+function handleKpiFileInputChange(event) {
+  const selectedFile = event?.target?.files?.[0] || null;
+
+  if (selectedFile && selectedFile.size > KPI_FILE_UPLOAD_MAX_SIZE) {
+    showToast("The selected file is too large. Maximum size is 20 MB.");
+    event.target.value = "";
+    pendingKpiUploadFile = null;
+    updateKpiFileFieldState();
+    return;
+  }
+
+  pendingKpiUploadFile = selectedFile;
+  updateKpiFileFieldState();
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) {
+      resolve(null);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const marker = "base64,";
+      const markerIndex = result.indexOf(marker);
+
+      if (markerIndex === -1) {
+        reject(new Error("Failed to encode the selected file."));
+        return;
+      }
+
+      resolve(result.slice(markerIndex + marker.length));
+    };
+    reader.onerror = () => {
+      reject(reader.error || new Error("Failed to read the selected file."));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+async function buildKpiFileUploadPayload() {
+  if (!pendingKpiUploadFile) {
+    return null;
+  }
+
+  const contentBase64 = await readFileAsBase64(pendingKpiUploadFile);
+  return {
+    name: pendingKpiUploadFile.name || "kpi-file",
+    type: pendingKpiUploadFile.type || "application/octet-stream",
+    size: pendingKpiUploadFile.size || 0,
+    content_base64: contentBase64
+  };
 }
 
 function cloneDraftSnapshot(value) {
@@ -17568,6 +18223,14 @@ function renderKpiDetailsModalContent(kpi = {}) {
     '</div>';
   }
 
+  function fieldHtml(label, html) {
+    if (!hasValue(html)) return "";
+    return '<div class="kdr-field">' +
+      '<span class="kdr-label">' + escapeHtml(label) + '</span>' +
+      '<span class="kdr-value">' + html + '</span>' +
+    '</div>';
+  }
+
   function row(sectionLabel, colClass, ...fields) {
     const rendered = fields.filter(Boolean).join("");
     if (!rendered) return "";
@@ -17713,6 +18376,18 @@ function fmtTolerance(value) {
     field("Target",        fmtNum(kpi.target, unit))
   );
 
+  const fileUrl = String(kpi.file_url || "").trim();
+  const fileName = String(kpi.file_name || "").trim();
+  const fileHtml = !fileUrl ? "" : row("Attachment", colClass([fileName, fileUrl]),
+    fileName ? field("File Name", fileName) : "",
+fieldHtml(
+  "File",
+  '<a href="' + escapeHtml(fileUrl) + '" target="_blank" rel="noopener noreferrer" download>' +
+    escapeHtml(fileName || fileUrl) +
+  '</a>'
+)
+  );
+
   /* ── Definition ── */
   const defText = String(kpi.definition || "").trim();
   const defHtml = !defText ? "" :
@@ -17724,7 +18399,7 @@ function fmtTolerance(value) {
       '</div>' +
     '</div>';
 
-  const html = identityHtml + measHtml + classificationHtml + calcHtml + rangeHtml + tolHtml + timeHtml + defHtml;
+  const html = identityHtml + measHtml + classificationHtml + calcHtml + rangeHtml + tolHtml + timeHtml + fileHtml + defHtml;
 
   const contentEl = document.getElementById("kpiDetailsModalContent");
   if (contentEl) contentEl.innerHTML = html || '<div style="padding:20px;color:#64748b;text-align:center;">No KPI data available.</div>';
@@ -19394,7 +20069,7 @@ async function loadKpis(search = "") {
       }
 
       function restoreKpiCreateDraft(draft = null) {
-        resetForm();
+        resetForm({ preservePendingUpload: true });
         if (!draft || typeof draft !== "object") return;
 
         initializeKpiHierarchySelectors({
@@ -19430,6 +20105,7 @@ async function loadKpis(search = "") {
         syncKpiRequiredState();
         syncToleranceInputs();
         recalculateLimits();
+        updateKpiFileFieldState();
         updateModalOverview();
       }
 
@@ -20104,7 +20780,9 @@ function validateKpiForm() {
 }
 
 
-function resetForm() {
+function resetForm(options = {}) {
+  const preservePendingUpload = Boolean(options && options.preservePendingUpload);
+
   [
     "kpi_id",
     "kpi_code",
@@ -20141,6 +20819,8 @@ function resetForm() {
     const el = getKpiFieldElement(id);
     if (el) el.value = "";
   });
+
+  resetKpiFileState({ preservePendingUpload });
 
   const toleranceTypeEl = getKpiFieldElement("tolerance_type");
   if (toleranceTypeEl) toleranceTypeEl.value = "";
@@ -20205,6 +20885,7 @@ function setFieldValue(id, value) {
 
 
 function fillForm(data) {
+  resetKpiFileState();
   setFieldValue("kpi_id", data.kpi_id);
 
   initializeKpiHierarchySelectors({
@@ -20223,6 +20904,7 @@ function fillForm(data) {
   setFieldValue("direction", data.target_direction);
   setFieldValue("status", data.status || "Active");
   setFieldValue("comments", data.comments || "");
+  setCurrentKpiFileState(data.file_url || "", data.file_name || "");
 
   setFieldValue("calculation_on", data.calculation_on);
   setFieldValue("nombre_periode", data.nombre_periode);
@@ -20362,7 +21044,9 @@ function fillForm(data) {
           comments: data.comments || "",
           owner_role_id: data.owner_role_id ?? "",
           high_limit: data.high_limit ?? "",
-          low_limit: data.low_limit ?? ""
+          low_limit: data.low_limit ?? "",
+          file_source_path: data.file || "",
+          file_source_name: data.file_name || ""
         };
       }
 
@@ -20422,13 +21106,14 @@ function fillForm(data) {
      return el.value || "";
     }
 
-   function buildPayload() {
+   async function buildPayload() {
   const kfs = getSafeValue("kfs") || "KPI";
   const toleranceType = getSafeValue("tolerance_type");
   const minType = getSafeValue("min_type") || "Null";
   const maxType = getSafeValue("max_type") || "Null";
   const minValue = normalizeNullableFieldValue(getSafeValue("min", { optional: true }));
   const maxValue = normalizeNullableFieldValue(getSafeValue("max", { optional: true }));
+  const fileUpload = await buildKpiFileUploadPayload();
 
   return {
     kfs: kfs, // ADD THIS LINE
@@ -20468,7 +21153,8 @@ function fillForm(data) {
     status: getSafeValue("status", { optional: true }),
     comments: getSafeValue("comments", { optional: true }),
     high_limit: getSafeValue("high_limit", { optional: true }) || null,
-    low_limit: getSafeValue("low_limit", { optional: true }) || null
+    low_limit: getSafeValue("low_limit", { optional: true }) || null,
+    file_upload: fileUpload
   };
 }
 
@@ -20495,7 +21181,7 @@ function fillForm(data) {
           const res = await fetch(url, {
             method,
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(buildPayload())
+            body: JSON.stringify(await buildPayload())
           });
 
           const savedKpi = await res.json().catch(() => null);
@@ -20508,6 +21194,8 @@ function fillForm(data) {
        if (isCreateMode) {
          kpiCreateDraft = null;
        }
+       pendingKpiUploadFile = null;
+       setCurrentKpiFileState(savedKpi?.file_url || "", savedKpi?.file_name || "");
        closeModal(true);
        if (isCreateMode) {
          resetForm();
@@ -37729,24 +38417,24 @@ const runWeeklyKpiSubmissionCron = async ({
 };
 
 
-cron.schedule("*/5 * * * *", async () => {
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Ratio",
-    lockId: "send_kpi_weekly_email_ratio_job",
-    stateKey: "ratio",
-    logLabel: "Ratio"
-  });
+// cron.schedule("*/5 * * * *", async () => {
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Ratio",
+//     lockId: "send_kpi_weekly_email_ratio_job",
+//     stateKey: "ratio",
+//     logLabel: "Ratio"
+//   });
 
-  await runWeeklyKpiSubmissionCron({
-    calculationMode: "Direct",
-    lockId: "send_kpi_weekly_email_direct_job",
-    stateKey: "direct",
-    logLabel: "Direct"
-  });
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+//   await runWeeklyKpiSubmissionCron({
+//     calculationMode: "Direct",
+//     lockId: "send_kpi_weekly_email_direct_job",
+//     stateKey: "direct",
+//     logLabel: "Direct"
+//   });
+// }, {
+//   scheduled: true,
+//   timezone: "UTC"
+// });
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
@@ -40931,7 +41619,6 @@ const loadKpiTrainingPortalRows = async ({
 // ─────────────────────────────────────────────────────────────────────
 
 // Serve the dashboard HTML file
-const path = require("path");
 app.get("/kpi-training-center", (req, res) => {
   res.sendFile(path.join(__dirname, "kpi-training-center.html"));
 });
