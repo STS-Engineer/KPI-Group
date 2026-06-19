@@ -9292,7 +9292,7 @@ textarea {
       }
 
       .kpi-matrix-table .parameter-table-actions {
-        width: 176px;
+        width: 280px;
       }
 
       .kpi-matrix-action-btn {
@@ -9361,6 +9361,21 @@ textarea {
         background: #ffffff;
         color: #2563eb;
         border: 1px solid rgba(37,99,235,0.18);
+      }
+
+      .duplicate-btn {
+        background: linear-gradient(135deg, rgba(245,158,11,0.12), rgba(249,115,22,0.10));
+        color: #d97706;
+        border: 1px solid rgba(217,119,6,0.18);
+      }
+
+      .duplicate-text-btn {
+        width: auto;
+        min-width: 104px;
+        padding: 0 14px;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.03em;
       }
 
       .delete-btn {
@@ -17947,6 +17962,15 @@ function getCurrentKpiRowById(kpiId) {
                     <div class="kpi-matrix-actions">
                       <button
                         type="button"
+                        class="action-btn duplicate-btn duplicate-text-btn kpi-matrix-action-btn"
+                        onclick="duplicateKpi(\${row.kpi_id}, this)"
+                        aria-label="Duplicate KPI"
+                        title="Duplicate KPI"
+                      >
+                        Duplicate
+                      </button>
+                      <button
+                        type="button"
                         class="action-btn kpi-view-btn kpi-matrix-action-btn"
                         onclick="openKpiDetailsModal(\${row.kpi_id})"
                         aria-label="View KPI details"
@@ -20296,6 +20320,93 @@ function fillForm(data) {
         console.error("OPEN EDIT MODAL ERROR:", error);
         showToast("Unable to load KPI: " + error.message);
          } 
+      }
+
+      function buildDuplicateKpiPayload(data = {}) {
+        const duplicatedName = String(data.indicator_sub_title || "").trim()
+          ? String(data.indicator_sub_title).trim() + " (Copy)"
+          : "Untitled KPI (Copy)";
+
+        return {
+          kfs: data.kfs || "KPI",
+          indicator_title: data.indicator_title || "",
+          indicator_sub_title: duplicatedName,
+          subject: data.subject || "",
+          subject_node_id: data.subject_node_id || "",
+          kpi_code: "",
+          kpi_formula: data.kpi_formula || "",
+          unit: data.unit || "",
+          definition: data.definition || "",
+          frequency: data.frequency || "",
+          target: data.target ?? "",
+          tolerance_type: data.tolerance_type || "",
+          up_tolerance: data.up_tolerance ?? "",
+          low_tolerance: data.low_tolerance ?? "",
+          max: data.max ?? "",
+          min: data.min ?? "",
+          calculation_on: data.calculation_on || "",
+          target_auto_adjustment: data.target_auto_adjustment || "",
+          reactivity_status: data.reactivity_status || "",
+          importance: data.importance || "",
+          pricing_type: data.pricing_type || "",
+          reactivity_need: data.reactivity_need || "",
+          direction: data.target_direction || "",
+          nombre_periode: data.nombre_periode || "",
+          calculation_mode: data.calculation_mode || "",
+          reference_kpi_id: data.reference_kpi_id ?? "",
+          display_trend: data.display_trend || "",
+          regression: data.regression || "",
+          min_type: data.min_type || "",
+          max_type: data.max_type || "",
+          status: data.status || "Active",
+          comments: data.comments || "",
+          owner_role_id: data.owner_role_id ?? "",
+          high_limit: data.high_limit ?? "",
+          low_limit: data.low_limit ?? ""
+        };
+      }
+
+      async function duplicateKpi(kpiId, triggerBtn = null) {
+        if (!kpiId) return;
+        if (triggerBtn && triggerBtn.disabled) return;
+
+        const createUrl = responsibleId
+          ? '/api/responsibles/' + responsibleId + '/kpis'
+          : '/api/kpis';
+
+        try {
+          if (triggerBtn) {
+            triggerBtn.disabled = true;
+            triggerBtn.setAttribute("aria-busy", "true");
+          }
+
+          const res = await fetch('/api/kpis/' + kpiId);
+          if (!res.ok) throw new Error("Failed to load KPI");
+
+          const data = await res.json();
+          const createRes = await fetch(createUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildDuplicateKpiPayload(data))
+          });
+
+          const createdKpi = await createRes.json().catch(() => null);
+          if (!createRes.ok) {
+            showToast(createdKpi?.error || "Duplicate failed");
+            return;
+          }
+
+          await loadKpis(document.getElementById("search").value || "");
+          showToast("KPI duplicated successfully");
+        } catch (error) {
+          console.error("DUPLICATE KPI ERROR:", error);
+          showToast("Unable to duplicate KPI: " + error.message);
+        } finally {
+          if (triggerBtn) {
+            triggerBtn.disabled = false;
+            triggerBtn.removeAttribute("aria-busy");
+          }
+        }
       }
 
 
