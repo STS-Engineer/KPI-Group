@@ -10413,11 +10413,12 @@ textarea {
         margin: auto;
       }
 
-   #modalBackdrop {
-     align-items: center;
-     padding: 12px;
-     overflow: auto;
-    }
+ #modalBackdrop {
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
 
 
 .kpi-attributes-modal {
@@ -11849,9 +11850,12 @@ textarea {
 }
 
 .kpi-attributes-modal {
-  width: min(1620px, calc(100vw - 44px)) !important;
-  max-height: calc(100vh - 30px) !important;
-  height: auto !important;
+  width: 75vw !important;
+  height: 75vh !important;
+
+  max-width: 75vw !important;
+  max-height: 75vh !important;
+
   border-radius: 24px !important;
   overflow: hidden !important;
   background:
@@ -12094,11 +12098,16 @@ textarea {
   }
 }
 
-/* Keep the KPI modal polished, compact, and content-driven */
+/* Keep the KPI modal always visually like 75% */
 .kpi-attributes-modal {
-  width: min(1580px, calc(100vw - 32px)) !important;
-  height: auto !important;
-  max-height: calc(100vh - 24px) !important;
+  width: calc((100vw - 32px) / 0.75) !important;
+  height: calc((100vh - 32px) / 0.75) !important;
+  max-width: none !important;
+  max-height: none !important;
+
+  transform: scale(0.75) !important;
+  transform-origin: center center !important;
+
   overflow: hidden !important;
   display: flex !important;
   flex-direction: column !important;
@@ -12106,13 +12115,13 @@ textarea {
 }
 
 .kpi-attributes-modal .modal-body {
-  flex: 0 1 auto !important;
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
   display: grid !important;
   align-content: start !important;
   gap: 6px !important;
-  max-height: calc(100vh - 96px) !important;
+  max-height: none !important;
   height: auto !important;
-  min-height: 0 !important;
   overflow-y: auto !important;
   overflow-x: hidden !important;
   padding: 6px 10px 4px !important;
@@ -13529,6 +13538,42 @@ textarea {
 .parameter-modal .field {
   min-width: 0 !important;
 }
+
+/* FIX Average fields: keep in same row, prevent modal overflow */
+.kpi-attributes-modal .calc-logic-row:first-child {
+  display: grid !important;
+  grid-template-columns: minmax(260px, 1fr) 24px minmax(180px, 0.55fr) minmax(180px, 0.55fr) !important;
+  gap: 6px 10px !important;
+  align-items: end !important;
+}
+
+.kpi-attributes-modal .calc-logic-row:first-child .clr-label {
+  grid-column: 1 / -1 !important;
+}
+
+.kpi-attributes-modal .calc-logic-row:first-child > .field:not(.cond-field) {
+  grid-column: 1 / 2 !important;
+}
+
+.kpi-attributes-modal #calc_on_arrow {
+  grid-column: 2 / 3 !important;
+  align-self: center !important;
+  justify-self: center !important;
+}
+
+.kpi-attributes-modal #wrap_period_type {
+  grid-column: 3 / 4 !important;
+}
+
+.kpi-attributes-modal #wrap_nombre_periode {
+  grid-column: 4 / 5 !important;
+}
+
+.kpi-attributes-modal #wrap_period_type,
+.kpi-attributes-modal #wrap_nombre_periode {
+  margin: 0 !important;
+}
+
  </style>
   </head>
 
@@ -13845,15 +13890,19 @@ textarea {
                   </select>
                 </div>
                 <span class="calc-logic-arrow" id="calc_on_arrow" style="display:none;">→</span>
-                <div class="field cond-field" id="wrap_nombre_periode" style="display:none;">
-                  <label><span>Number of Periods</span><span class="hint">Period count</span></label>
-                  <select id="nombre_periode" required>
-                    <option value="1 week">1 week</option>
-                    <option value="2 weeks">2 weeks</option>
-                    <option value="3 weeks">3 weeks</option>
-                    <option value="4 weeks">4 weeks</option>
-                  </select>
-                </div>
+ <div class="field cond-field" id="wrap_period_type" style="display:none;">
+  <label><span>Period Type</span></label>
+  <select id="period_type" onchange="handlePeriodTypeChange()">
+    <option value="">Select period type</option>
+    <option value="Weekly">Weekly</option>
+    <option value="Monthly">Monthly</option>
+  </select>
+</div>
+
+<div class="field cond-field" id="wrap_nombre_periode" style="display:none;">
+  <label><span>Number of Periods</span><span class="hint">Period count</span></label>
+  <select id="nombre_periode"></select>
+</div>
               </div>
               <div class="calc-logic-row">
                 <span class="clr-label">Calculation Mode</span>
@@ -20491,6 +20540,60 @@ function handleCalculationOnChange() {
   syncKpiRequiredState();
 }
 
+
+function handleCalculationOnChange() {
+  const value = getKpiFieldElement("calculation_on")?.value;
+  const showAverageFields = value === "Average";
+
+  const periodWrap = document.getElementById("wrap_period_type");
+  const numberWrap = document.getElementById("wrap_nombre_periode");
+  const periodType = getKpiFieldElement("period_type");
+  const nombrePeriode = getKpiFieldElement("nombre_periode");
+  const arrowOn = document.getElementById("calc_on_arrow");
+
+  if (periodWrap) periodWrap.style.display = showAverageFields ? "" : "none";
+  if (numberWrap) numberWrap.style.display = showAverageFields ? "" : "none";
+  if (arrowOn) arrowOn.style.display = showAverageFields ? "" : "none";
+
+  if (periodType) {
+    periodType.disabled = !showAverageFields;
+    if (showAverageFields && !periodType.value) periodType.value = "Weekly";
+  }
+
+  if (nombrePeriode) {
+    nombrePeriode.disabled = !showAverageFields;
+  }
+
+  if (showAverageFields) {
+    handlePeriodTypeChange();
+  } else if (nombrePeriode) {
+    nombrePeriode.innerHTML = "";
+    nombrePeriode.value = "";
+  }
+
+  syncKpiRequiredState();
+}
+
+function handlePeriodTypeChange() {
+  const periodType =
+    (getKpiFieldElement("period_type") &&
+      getKpiFieldElement("period_type").value) || "Weekly";
+
+  const select = getKpiFieldElement("nombre_periode");
+  if (!select) return;
+
+  const unit = periodType === "Monthly" ? "month" : "week";
+
+  select.innerHTML = [1, 2, 3, 4]
+    .map(function (n) {
+      const label = n + " " + unit + (n > 1 ? "s" : "");
+      return '<option value="' + label + '">' + label + "</option>";
+    })
+    .join("");
+
+  select.value = "1 " + unit;
+}
+
 function handleDisplayTrendChange() {
   const value = getKpiFieldElement("display_trend")?.value;
   const wrap = document.getElementById("wrap_regression");
@@ -21140,7 +21243,9 @@ function fillForm(data) {
     pricing_type: getSafeValue("pricing_type", { optional: true }) || null,
     reactivity_need: getSafeValue("reactivity_need", { optional: true }) || null,
     target_direction: getSafeValue("direction"),
-    nombre_periode: getSafeValue("nombre_periode"),
+    nombre_periode: getSafeValue("calculation_on") === "Average"
+    ? getSafeValue("nombre_periode")
+    : "",
     calculation_mode: getSafeValue("calculation_mode"),
     reference_kpi_id: getSafeValue("calculation_mode") === "Ratio"
       ? (getSafeValue("reference_kpi_id", { optional: true }) || null)
@@ -38417,24 +38522,24 @@ const runWeeklyKpiSubmissionCron = async ({
 };
 
 
-// cron.schedule("*/5 * * * *", async () => {
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Ratio",
-//     lockId: "send_kpi_weekly_email_ratio_job",
-//     stateKey: "ratio",
-//     logLabel: "Ratio"
-//   });
+cron.schedule("*/5 * * * *", async () => {
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Ratio",
+    lockId: "send_kpi_weekly_email_ratio_job",
+    stateKey: "ratio",
+    logLabel: "Ratio"
+  });
 
-//   await runWeeklyKpiSubmissionCron({
-//     calculationMode: "Direct",
-//     lockId: "send_kpi_weekly_email_direct_job",
-//     stateKey: "direct",
-//     logLabel: "Direct"
-//   });
-// }, {
-//   scheduled: true,
-//   timezone: "UTC"
-// });
+  await runWeeklyKpiSubmissionCron({
+    calculationMode: "Direct",
+    lockId: "send_kpi_weekly_email_direct_job",
+    stateKey: "direct",
+    logLabel: "Direct"
+  });
+}, {
+  scheduled: true,
+  timezone: "UTC"
+});
 
 // ---------- Cron: weekly reports ----------
 // let reportCronRunning = false;
