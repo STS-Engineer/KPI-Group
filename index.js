@@ -32264,7 +32264,7 @@ function getCaModalActions(kvId) {
         card.querySelector('input[name="ca_status_' + kvId + '[]"]')
       );
 
-      if (rootCause || implSolution || dueDate || actionId) {
+     if (rootCause || implSolution || actionId) {
         caModalStore[kvId].push({
           id: actionId,
           root_cause: rootCause,
@@ -34934,7 +34934,6 @@ function getFallbackCurrentMonthLabel(card, labels) {
             return Boolean(
               String(action.root_cause || "").trim() ||
               String(action.implemented_solution || "").trim() ||
-              String(action.due_date || "").trim() ||
               String(action.id || action.corrective_action_id || "").trim()
             );
           }
