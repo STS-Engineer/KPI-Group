@@ -43178,15 +43178,15 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
 
 //Training cron 
 
-// cron.schedule("15 12 * * *", async () => {
-//   try {
-//     console.log("[KPI Training Cron] Sending responsible training links...");
-//     const result = await sendKpiTrainingLinksToResponsibles();
-//     console.log("[KPI Training Cron] Done:", result);
-//   } catch (error) {
-//     console.error("[KPI Training Cron] Failed:", error.message);
-//   }
-// });
+cron.schedule("10 09 * * 2", async () => {
+  try {
+    console.log("[KPI Training Cron] Sending responsible training links...");
+    const result = await sendKpiTrainingLinksToResponsibles();
+    console.log("[KPI Training Cron] Done:", result);
+  } catch (error) {
+    console.error("[KPI Training Cron] Failed:", error.message);
+  }
+});
 
 // cron.schedule("30 12 * * *", async () => {
 //   try {
