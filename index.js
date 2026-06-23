@@ -43178,7 +43178,7 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("10 09 * * 2", async () => {
+cron.schedule("00 10 * * *", async () => {
   try {
     console.log("[KPI Training Cron] Sending responsible training links...");
     const result = await sendKpiTrainingLinksToResponsibles();
