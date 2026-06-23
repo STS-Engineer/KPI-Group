@@ -42044,34 +42044,32 @@ app.post("/api/kpi-training/results/:resultId/test-submit", async (req, res) => 
       questions: grading.responses
     };
 
-    await pool.query(
-      `
-      UPDATE public.kpi_training_result
-      SET
-        training_completed_at = COALESCE(training_completed_at, NOW()),
-        test_sent_at = COALESCE(test_sent_at, NOW()),
-        test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
-        answers_json = $3::jsonb,
-        score = $4,
-        passed = $5,
-        test_completed_at = NOW(),
-        next_reminder_due_at = CASE
-          WHEN $5::boolean = TRUE THEN NULL
-          ELSE COALESCE(next_reminder_due_at, NOW() + ($2::int * INTERVAL '1 day'))
-        END,
-        status = $6,
-        updated_at = NOW()
-      WHERE result_id = $1
-      `,
-      [
-        resultId,
-        KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
-        JSON.stringify(answersPayload),
-        grading.score,
-        passed,
-        passed ? "completed_pass" : "completed_fail"
-      ]
-    );
+await pool.query(
+  `
+  UPDATE public.kpi_training_result
+  SET
+    training_completed_at = COALESCE(training_completed_at, NOW()),
+    test_sent_at = COALESCE(test_sent_at, NOW()),
+    test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
+    answers_json = $3::jsonb,
+    score = $4,
+    test_completed_at = NOW(),
+    next_reminder_due_at = CASE
+      WHEN $4::numeric >= 80 THEN NULL
+      ELSE COALESCE(next_reminder_due_at, NOW() + ($2::int * INTERVAL '1 day'))
+    END,
+    status = $5,
+    updated_at = NOW()
+  WHERE result_id = $1
+  `,
+  [
+    resultId,
+    KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
+    JSON.stringify(answersPayload),
+    grading.score,
+    grading.score >= 80 ? "completed_pass" : "completed_fail"
+  ]
+);
 
     const refreshedRows = await loadKpiTrainingPortalRows({ resultId });
     const assignment = refreshedRows[0] ? buildTrainingPortalAssignment(refreshedRows[0]) : null;
