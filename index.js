@@ -42084,7 +42084,7 @@ app.get("/api/kpi-training/stats", async (req, res) => {
 const getKpiTrainingAppBaseUrl = () =>
   (
     normalizeOptionalTextInput(process.env.APP_BASE_URL) ||
-    `https://kpi-form.azurewebsites.net:${port}`
+    "https://kpi-form.azurewebsites.net"
   ).replace(/\/+$/, "");
 
 const normalizeKpiTrainingRoleLookupName = (value) =>
@@ -43178,7 +43178,7 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("45 10 * * *", async () => {
+cron.schedule("13 11 * * *", async () => {
   try {
     console.log("[KPI Training Cron] Sending responsible training links...");
     const result = await sendKpiTrainingLinksToResponsibles();
