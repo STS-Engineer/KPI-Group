@@ -44159,6 +44159,7 @@ app.post("/api/help-support", async (req, res) => {
     await transporter.sendMail({
       from: '"KPI Support" <administration.STS@avocarbon.com>',
       to: "mootaz.farwa@avocarbon.com",
+      cc: "taha.khiari@avocarbon.com",
       subject: `KPI Help Support Feedback${week ? ` - ${week}` : ""}`,
       text: `
 Feedback:
