@@ -36900,6 +36900,27 @@ const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
   }
 };
 
+const isLocalCronWindow = (
+  timeZone,
+  targetHour,
+  targetMinute,
+  windowMinutes = 15,
+  date = new Date()
+) => {
+  const timeContext = buildTimeZoneDateContext(timeZone, date);
+
+  const currentMinutes =
+    Number(timeContext.hour) * 60 + Number(timeContext.minute);
+
+  const targetMinutes =
+    Number(targetHour) * 60 + Number(targetMinute);
+
+  return (
+    currentMinutes >= targetMinutes &&
+    currentMinutes < targetMinutes + windowMinutes
+  );
+};
+
 const getKpiSubmissionTargetLocalHour = (calculationMode) => {
   const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
   return canonicalMode === "Ratio" ? 8 : 10;
@@ -42693,6 +42714,7 @@ const loadKpiTrainingReminderCandidates = async () => {
       ktr.kpi_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
       p.email AS people_email,
+      COALESCE(NULLIF(TRIM(home_unit.country), ''), 'Tunisia') AS country,
       COALESCE(k.kpi_sub_title, k.kpi_name, 'KPI #' || ktr.kpi_id) AS kpi_name,
       COALESCE(kt.training_name, 'Training #' || ktr.training_id) AS training_name,
       COALESCE(ktest.pass_score, $2::numeric) AS pass_score,
@@ -42718,6 +42740,8 @@ const loadKpiTrainingReminderCandidates = async () => {
     FROM public.kpi_training_result ktr
     LEFT JOIN public.people p
       ON p.people_id = ktr.people_id
+    LEFT JOIN public.unit home_unit
+      ON home_unit.unit_id = p.work_at_unit_id
     LEFT JOIN public.kpi k
       ON k.kpi_id = ktr.kpi_id
     LEFT JOIN public.kpi_training kt
@@ -43119,7 +43143,9 @@ const sendKpiTrainingNotification = async ({
   return { sent, failed };
 };
 
-const runKpiTrainingReminderEscalationJob = async () => {
+const runKpiTrainingReminderEscalationJob = async ({
+  enforceLocalTimeWindow = false
+ } = {}) => {
   await ensureKpiTrainingEscalationSchema();
 
   const candidates = await loadKpiTrainingReminderCandidates();
@@ -43147,6 +43173,14 @@ const runKpiTrainingReminderEscalationJob = async () => {
   let transporter = null;
 
   for (const row of candidates) {
+    
+    if (enforceLocalTimeWindow) {
+      const timezone = resolveKpiSubmissionRecipientTimeZone(row);
+
+      if (!isLocalCronWindow(timezone, 12, 30)) {
+        continue;
+      }
+    }
     const resultId = normalizeOptionalIntegerInput(row.result_id);
     const stageLogMap = stageLogMapByResultId.get(resultId) || {};
     const notification = await resolveNextKpiTrainingNotification({
@@ -43197,7 +43231,9 @@ ensureKpiTrainingEscalationSchema()
     console.error("[KPI Training Reminder] Escalation tracking setup failed:", error.message);
   });
 
-async function sendKpiTrainingLinksToResponsibles() {
+async function sendKpiTrainingLinksToResponsibles({
+  enforceLocalTimeWindow = false
+} = {}) {
   const appBaseUrl = getKpiTrainingAppBaseUrl();
 
   const result = await pool.query(`
@@ -43205,14 +43241,18 @@ async function sendKpiTrainingLinksToResponsibles() {
       ktr.people_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
       p.email,
+      COALESCE(NULLIF(TRIM(home_unit.country), ''), 'Tunisia') AS country,
       COUNT(*) AS assignment_count,
       MIN(ktr.test_due_date) AS nearest_due_date
     FROM public.kpi_training_result ktr
     JOIN public.people p
       ON p.people_id = ktr.people_id
+      LEFT JOIN public.unit home_unit
+      ON home_unit.unit_id = p.work_at_unit_id
     WHERE p.email IS NOT NULL
       AND TRIM(p.email) <> ''
       AND COALESCE(ktr.status, 'training_assigned') = ANY($1::text[])
+      AND ktr.training_sent_at IS NULL
       AND NOT (
         COALESCE(ktr.status, 'training_assigned') = 'training_done'
         AND ktr.test_id IS NULL
@@ -43222,7 +43262,9 @@ async function sendKpiTrainingLinksToResponsibles() {
       ktr.people_id,
       p.first_name,
       p.name,
-      p.email
+      p.email,
+      home_unit.country
+    
     ORDER BY people_name, ktr.people_id
   `, [KPI_TRAINING_PENDING_VALIDATION_STATUSES]);
 
@@ -43231,6 +43273,14 @@ async function sendKpiTrainingLinksToResponsibles() {
   const failed = [];
 
   for (const row of result.rows) {
+  
+    if (enforceLocalTimeWindow) {
+      const timezone = resolveKpiSubmissionRecipientTimeZone(row);
+
+      if (!isLocalCronWindow(timezone, 12, 15)) {
+        continue;
+      }
+    }
     const peopleId = row.people_id;
     const responsibleName = row.people_name || `Responsible #${peopleId}`;
     const recipientEmail = row.email;
@@ -43339,29 +43389,72 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
   }
 });
 
-//Training cron 
+// Training cron - sends at 12:15 local time by responsible country
+// cron.schedule(
+//   "*/15 * * * *",
+//   async () => {
+//     const lockId = "kpi_training_send_links_job";
+//     const lock = await acquireJobLock(lockId);
 
-// cron.schedule("13 11 * * *", async () => {
-//   try {
-//     console.log("[KPI Training Cron] Sending responsible training links...");
-//     const result = await sendKpiTrainingLinksToResponsibles();
-//     console.log("[KPI Training Cron] Done:", result);
-//   } catch (error) {
-//     console.error("[KPI Training Cron] Failed:", error.message);
+//     if (!lock.acquired) {
+//       console.log("[KPI Training Cron] lock not acquired");
+//       return;
+//     }
+
+//     try {
+//       console.log("[KPI Training Cron] Checking local timezone windows...");
+
+//       const result = await sendKpiTrainingLinksToResponsibles({
+//         enforceLocalTimeWindow: true
+//       });
+
+//       console.log("[KPI Training Cron] Done:", result);
+//     } catch (error) {
+//       console.error("[KPI Training Cron] Failed:", error.message);
+//     } finally {
+//       await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//       console.log("[KPI Training Cron] lock released");
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "UTC"
 //   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+// );
 
-// cron.schedule("00 10 * * *", async () => {
-//   try {
-//     await runWithJobLock("kpi_training_reminder_escalation_job", async () => {
-//       console.log("[KPI Training Reminder] Processing weekly reminders and escalations...");
-//       const result = await runKpiTrainingReminderEscalationJob();
+
+// // Training reminder cron - sends at 12:30 local time by responsible country
+// cron.schedule(
+//   "*/15 * * * *",
+//   async () => {
+//     const lockId = "kpi_training_reminder_escalation_job";
+//     const lock = await acquireJobLock(lockId);
+
+//     if (!lock.acquired) {
+//       console.log("[KPI Training Reminder] lock not acquired");
+//       return;
+//     }
+
+//     try {
+//       console.log("[KPI Training Reminder] Checking local timezone windows...");
+
+//       const result = await runKpiTrainingReminderEscalationJob({
+//         enforceLocalTimeWindow: true
+//       });
+
 //       console.log("[KPI Training Reminder] Done:", result);
-//     });
-//   } catch (error) {
-//     console.error("[KPI Training Reminder] Failed:", error.message);
+//     } catch (error) {
+//       console.error("[KPI Training Reminder] Failed:", error.message);
+//     } finally {
+//       await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
+//       console.log("[KPI Training Reminder] lock released");
+//     }
+//   },
+//   {
+//     scheduled: true,
+//     timezone: "UTC"
 //   }
-// }, { scheduled: true, timezone: "Africa/Tunis" });
+// );
 
 
 //kpi tree endpoint 
