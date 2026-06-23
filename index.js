@@ -31861,6 +31861,67 @@ let historyValues = chartSeries.values;
             .assistant-shell{right:16px;bottom:16px;}
             .assistant-panel{height:min(76vh,620px);}
           }
+      .card-action-btn--help{
+         background:linear-gradient(135deg,#0ea5e9,#2563eb);
+        color:white;
+        box-shadow:0 6px 16px rgba(37,99,235,0.22);
+       }
+     .card-action-btn--help:hover{
+       box-shadow:0 10px 22px rgba(37,99,235,0.32);
+      }
+
+        .support-row{
+    display:flex;
+    justify-content:flex-end;
+    margin-top:10px;
+    margin-bottom:20px;
+}
+
+.help-support-btn{
+    border:none;
+    border-radius:12px;
+    padding:12px 20px;
+    cursor:pointer;
+    font-size:14px;
+    font-weight:700;
+    color:#fff;
+
+    background:linear-gradient(135deg,#0ea5e9,#2563eb);
+
+    box-shadow:0 8px 18px rgba(37,99,235,.20);
+    transition:.2s;
+}
+
+.help-support-btn:hover{
+    transform:translateY(-2px);
+    box-shadow:0 12px 24px rgba(37,99,235,.30);
+}
+
+.spinner{
+  display:none;
+  width:14px;
+  height:14px;
+  margin-right:8px;
+  border:2px solid rgba(255,255,255,.4);
+  border-top-color:#fff;
+  border-radius:50%;
+  animation:spin .8s linear infinite;
+}
+
+#helpSupportSubmitBtn.loading .spinner{
+  display:inline-block;
+}
+
+#helpSupportSubmitBtn.loading{
+  pointer-events:none;
+  opacity:.8;
+}
+
+@keyframes spin{
+  to{
+    transform:rotate(360deg);
+  }
+}
         </style>
       </head>
       <body>
@@ -32172,6 +32233,14 @@ let historyValues = chartSeries.values;
             </div>
 
             <div class="kpi-section">
+             <div class="support-row">
+            <button
+               type="button"
+               class="help-support-btn"
+               onclick="openHelpSupportModal()">
+            ❓ Help Support
+              </button>
+             </div>
               <h3 style="color:#0078D7;margin-bottom:20px;border-bottom:2px solid #0078D7;padding-bottom:8px;">KPI Values</h3>
               <form action="/redirect" method="POST" id="kpiForm" novalidate>
                 <input type="hidden" name="responsible_id" value="${responsible_id}" />
@@ -35417,6 +35486,74 @@ function openCommentsHistoryModal(kvId) {
       historyModal.setAttribute("aria-hidden", "false");
       document.body.classList.add("chart-modal-open");
      }
+
+  function openHelpSupportModal() {
+  const modal = document.getElementById("helpSupportModal");
+  const status = document.getElementById("helpSupportStatus");
+  const feedback = document.getElementById("helpSupportFeedback");
+
+  if (status) status.textContent = "";
+  if (feedback) feedback.value = "";
+
+  modal.classList.add("active");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function closeHelpSupportModal() {
+  const modal = document.getElementById("helpSupportModal");
+  modal.classList.remove("active");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+async function submitHelpSupportFeedback() {
+  const feedbackEl = document.getElementById("helpSupportFeedback");
+  const statusEl = document.getElementById("helpSupportStatus");
+  const btn = document.getElementById("helpSupportSubmitBtn");
+  const feedback = feedbackEl.value.trim();
+
+  if (!feedback) {
+    statusEl.style.color = "#dc2626";
+    statusEl.textContent = "Please enter your feedback.";
+    return;
+  }
+
+  btn.classList.add("loading");
+  btn.disabled = true;
+
+  statusEl.style.color = "#64748b";
+  statusEl.textContent = "Sending...";
+
+  try {
+    const response = await fetch("/api/help-support", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        feedback,
+        page: window.location.href,
+        name: document.querySelector(".info-value")?.textContent || "",
+        group: document.querySelectorAll(".info-value")[1]?.textContent || "",
+        role: document.querySelectorAll(".info-value")[2]?.textContent || "",
+        week: document.querySelectorAll(".info-value")[3]?.textContent || ""
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || "Failed to send feedback.");
+    }
+
+    statusEl.style.color = "#16a34a";
+    statusEl.textContent = "Feedback sent successfully.";
+    setTimeout(closeHelpSupportModal, 900);
+  } catch (error) {
+    statusEl.style.color = "#dc2626";
+    statusEl.textContent = error.message || "Unable to send feedback.";
+  } finally {
+    btn.classList.remove("loading");
+    btn.disabled = false;
+  }
+}
         </script>
 
 <div id="caRequiredSimpleModal" class="modal-overlay">
@@ -35429,6 +35566,34 @@ function openCommentsHistoryModal(kvId) {
         OK
       </button>
     </div>
+  </div>
+</div>
+
+<div id="helpSupportModal" class="modal-overlay" aria-hidden="true">
+  <div class="modal-box">
+    <button type="button" class="ca-modal-close" onclick="closeHelpSupportModal()">×</button>
+    <h3>Help Support</h3>
+    <p>Write your feedback or issue below.</p>
+
+    <textarea
+      id="helpSupportFeedback"
+      class="comment-input"
+      style="min-height:140px;"
+      placeholder="Describe your issue or feedback..."></textarea>
+
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;">
+      <button type="button" class="card-action-btn card-action-btn--ghost" onclick="closeHelpSupportModal()">Cancel</button>
+      <button
+  type="button"
+  id="helpSupportSubmitBtn"
+  class="card-action-btn card-action-btn--primary"
+  onclick="submitHelpSupportFeedback()">
+  <span class="spinner"></span>
+  <span class="btn-text">Submit</span>
+</button>
+    </div>
+
+    <div id="helpSupportStatus" style="margin-top:10px;font-size:13px;"></div>
   </div>
 </div>
       </body>
@@ -43972,6 +44137,57 @@ app.get("/api/ceo-kpi/dashboard", async (req, res) => {
   } catch (error) {
     console.error("GET /api/ceo-kpi/dashboard error:", error);
     res.status(500).json({ error: "Failed to load CEO KPI dashboard" });
+  }
+});
+
+//help support
+app.post("/api/help-support", async (req, res) => {
+  try {
+    const feedback = normalizeOptionalTextInput(req.body.feedback);
+    const page = normalizeOptionalTextInput(req.body.page);
+    const name = normalizeOptionalTextInput(req.body.name);
+    const role = normalizeOptionalTextInput(req.body.role);
+    const group = normalizeOptionalTextInput(req.body.group);
+    const week = normalizeOptionalTextInput(req.body.week);
+
+    if (!feedback) {
+      return res.status(400).json({ success: false, message: "Feedback is required." });
+    }
+
+    const transporter = createTransporter();
+
+    await transporter.sendMail({
+      from: '"KPI Support" <administration.STS@avocarbon.com>',
+      to: "mootaz.farwa@avocarbon.com",
+      subject: `KPI Help Support Feedback${week ? ` - ${week}` : ""}`,
+      text: `
+Feedback:
+${feedback}
+
+Context:
+Name: ${name || ""}
+Role: ${role || ""}
+Group: ${group || ""}
+Week: ${week || ""}
+Page: ${page || ""}
+      `,
+      html: `
+        <h3>KPI Help Support Feedback</h3>
+        <p><b>Feedback:</b></p>
+        <p>${escapeHtml(feedback).replace(/\n/g, "<br>")}</p>
+        <hr>
+        <p><b>Name:</b> ${escapeHtml(name || "")}</p>
+        <p><b>Role:</b> ${escapeHtml(role || "")}</p>
+        <p><b>Group:</b> ${escapeHtml(group || "")}</p>
+        <p><b>Week:</b> ${escapeHtml(week || "")}</p>
+        <p><b>Page:</b> ${escapeHtml(page || "")}</p>
+      `
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Help support email failed:", error);
+    res.status(500).json({ success: false, message: "Unable to send feedback." });
   }
 });
 // ---------- Start server ----------
