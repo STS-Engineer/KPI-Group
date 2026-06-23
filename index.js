@@ -43343,17 +43343,17 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
 
 //Training cron 
 
-cron.schedule("13 11 * * *", async () => {
-  try {
-    console.log("[KPI Training Cron] Sending responsible training links...");
-    const result = await sendKpiTrainingLinksToResponsibles();
-    console.log("[KPI Training Cron] Done:", result);
-  } catch (error) {
-    console.error("[KPI Training Cron] Failed:", error.message);
-  }
-}, { scheduled: true, timezone: "Africa/Tunis" });
+// cron.schedule("13 11 * * *", async () => {
+//   try {
+//     console.log("[KPI Training Cron] Sending responsible training links...");
+//     const result = await sendKpiTrainingLinksToResponsibles();
+//     console.log("[KPI Training Cron] Done:", result);
+//   } catch (error) {
+//     console.error("[KPI Training Cron] Failed:", error.message);
+//   }
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
-// cron.schedule("30 12 * * *", async () => {
+// cron.schedule("00 10 * * *", async () => {
 //   try {
 //     await runWithJobLock("kpi_training_reminder_escalation_job", async () => {
 //       console.log("[KPI Training Reminder] Processing weekly reminders and escalations...");
