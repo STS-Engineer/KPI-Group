@@ -37034,7 +37034,13 @@ const recordKpiSubmissionEmailDispatch = async ({
       unit_timezone
     )
     VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9)
-    ON CONFLICT (people_id, calculation_mode, frequency_label, local_dispatch_date) DO NOTHING
+   ON CONFLICT (
+      people_id,
+      calculation_mode,
+      frequency_label,
+      COALESCE(unit_id, 0),
+      local_dispatch_date
+    ) DO NOTHING
     `,
     [
       normalizedPeopleId,
