@@ -36932,11 +36932,12 @@ const hasReachedKpiSubmissionLocalSendWindow = (
 ) => {
   const targetHour = getKpiSubmissionTargetLocalHour(calculationMode);
 
-  return (
-    Number(timeContext.hour) === targetHour &&
-    Number(timeContext.minute) >= 0 &&
-    Number(timeContext.minute) < KPI_SUBMISSION_DISPATCH_WINDOW_MINUTES
-  );
+  const currentMinutes =
+    Number(timeContext.hour) * 60 + Number(timeContext.minute);
+
+  const targetMinutes = targetHour * 60;
+
+  return currentMinutes >= targetMinutes;
 };
 
 const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
