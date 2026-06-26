@@ -2022,13 +2022,15 @@ const ensureKpiSubmissionEmailDispatchLogSchema = async () => {
       `);
 
       await pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_kpi_submission_email_dispatch_log_people_mode_frequency_date
-        ON public.kpi_submission_email_dispatch_log (
-          people_id,
-          calculation_mode,
-          frequency_label,
-          local_dispatch_date
-        )
+       DROP INDEX IF EXISTS public.uq_kpi_submission_email_dispatch_log_people_mode_frequency_date;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_kpi_submission_email_dispatch_log_people_mode_frequency_unit_date
+      ON public.kpi_submission_email_dispatch_log (
+      people_id,
+      calculation_mode,
+      frequency_label,
+     COALESCE(unit_id, 0),
+     local_dispatch_date
+      )
       `);
 
       await pool.query(`
@@ -36967,12 +36969,14 @@ const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
   peopleId,
   calculationMode,
   frequencyLabel,
-  localDispatchDate
+  localDispatchDate,
+  unitId = null
 }) => {
   const normalizedPeopleId = normalizeOptionalIntegerInput(peopleId);
   const canonicalMode = getCanonicalKpiCalculationMode(calculationMode);
   const canonicalFrequency = getCanonicalKpiSubmissionFrequency(frequencyLabel);
   const normalizedLocalDate = normalizeOptionalTextInput(localDispatchDate);
+  const normalizedUnitId = normalizeOptionalIntegerInput(unitId);
 
   if (!normalizedPeopleId || !normalizedLocalDate) {
     return false;
@@ -36980,15 +36984,16 @@ const hasKpiSubmissionEmailBeenSentForLocalDate = async ({
 
   const result = await pool.query(
     `
-    SELECT 1
-    FROM public.kpi_submission_email_dispatch_log
-    WHERE people_id = $1
-      AND calculation_mode = $2
-      AND frequency_label = $3
-      AND local_dispatch_date = $4::date
-    LIMIT 1
+  SELECT 1
+   FROM public.kpi_submission_email_dispatch_log
+  WHERE people_id = $1
+   AND calculation_mode = $2
+   AND frequency_label = $3
+   AND local_dispatch_date = $4::date
+   AND COALESCE(unit_id, 0) = COALESCE($5::integer, 0)
+   LIMIT 1
     `,
-    [normalizedPeopleId, canonicalMode, canonicalFrequency, normalizedLocalDate]
+    [normalizedPeopleId, canonicalMode, canonicalFrequency, normalizedLocalDate, normalizedUnitId]
   );
 
   return Boolean(result.rows.length);
@@ -38677,7 +38682,8 @@ const runWeeklyKpiSubmissionCron = async ({
         peopleId: recipient.people_id,
         calculationMode: canonicalMode,
         frequencyLabel,
-        localDispatchDate: timeContext.localDate
+        localDispatchDate: timeContext.localDate,
+        unitId: recipient.unit_id
       });
 
       if (alreadySent) {
