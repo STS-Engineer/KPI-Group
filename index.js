@@ -3787,9 +3787,11 @@ const loadKpiTargetAllocationLookups = async () => {
     }))
   };
 };
-const loadFormResponsibleContext = async (responsibleId) => {
+const loadFormResponsibleContext = async (responsibleId, unitId = null) => {
   const normalizedResponsibleId =
     normalizeOptionalIntegerInput(responsibleId);
+
+  const normalizedUnitId = normalizeOptionalIntegerInput(unitId);
 
   if (!normalizedResponsibleId) return null;
 
@@ -3800,11 +3802,13 @@ const loadFormResponsibleContext = async (responsibleId) => {
       p.name,
       p.first_name,
       p.email,
-      COALESCE(home_unit.unit_name, allocation_scope.group_name) AS plant_name,
+      COALESCE(requested_unit.unit_name, allocation_scope.group_name, home_unit.unit_name) AS plant_name,
       COALESCE(primary_role.role_name, allocation_scope.role_name) AS role_name
     FROM public.people p
     LEFT JOIN public.unit home_unit
       ON home_unit.unit_id = p.work_at_unit_id
+    LEFT JOIN public.unit requested_unit
+      ON requested_unit.unit_id = $2  
     LEFT JOIN LATERAL (
       SELECT r.role_name
       FROM public.people_role_assignment pra
@@ -3835,7 +3839,7 @@ const loadFormResponsibleContext = async (responsibleId) => {
     WHERE p.people_id = $1
     LIMIT 1
     `,
-    [normalizedResponsibleId]
+    [normalizedResponsibleId, normalizedUnitId]
   );
 
   if (!result.rows.length) {
@@ -23008,7 +23012,8 @@ const buildKpiFormUrl = ({
   responsibleId,
   week,
   calculationMode = null,
-  frequency = null
+  frequency = null,
+  unitId = null
 } = {}) => {
   const normalizedResponsibleId = normalizeOptionalIntegerInput(responsibleId);
   const normalizedWeek = normalizeOptionalTextInput(week);
@@ -23029,6 +23034,11 @@ const buildKpiFormUrl = ({
   const normalizedFrequency = normalizeOptionalTextInput(frequency);
   if (normalizedFrequency) {
     params.set("frequency", normalizedFrequency);
+  }
+
+  const normalizedUnitId = normalizeOptionalIntegerInput(unitId);
+  if (normalizedUnitId) {
+    params.set("unit_id", String(normalizedUnitId));
   }
 
   const query = params.toString();
@@ -26252,10 +26262,10 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       responsibleContext
     });
     const demandeur =
-    normalizeOptionalTextInput(responsibleContext?.name) ||
-    normalizeOptionalTextInput(responsibleContext?.email);
+      normalizeOptionalTextInput(responsibleContext?.name) ||
+      normalizeOptionalTextInput(responsibleContext?.email);
     const emailDemandeur =
-     normalizeOptionalTextInput(responsibleContext?.email);
+      normalizeOptionalTextInput(responsibleContext?.email);
 
     const implementedSolution =
       normalizeOptionalTextInput(action.implementedSolution ?? action.implemented_solution);
@@ -26420,7 +26430,7 @@ const updateActionPlanCorrectiveActionStatus = async (correctiveActionId, nextSt
 };
 
 const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
-  const responsible = await loadFormResponsibleContext(responsibleId);
+  const responsible = await loadFormResponsibleContext(responsibleId, filters.unitId);
   const normalizedWeek = normalizeOptionalTextInput(week);
   const normalizedFrequencyFilter = normalizeOptionalTextInput(filters.frequency)
     ? getCanonicalKpiSubmissionFrequency(filters.frequency)
@@ -26431,6 +26441,7 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
   const responsibleNumericId = normalizeOptionalIntegerInput(
     responsible?.people_id ?? responsibleId
   );
+  const normalizedUnitId = normalizeOptionalIntegerInput(filters.unitId);
   const correctiveActionsEnabled = await canUseActionPlanCorrectiveActions();
 
   const kpiRes = await pool.query(
@@ -26529,6 +26540,10 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
 ) latest_limits ON TRUE
     WHERE $2::integer IS NOT NULL
       AND kta.set_by_people_id = $2
+  AND (
+  $5::integer IS NULL
+  OR COALESCE(kta.unit_id, kta.plant_id) = $5
+)
       AND (
         $3::text IS NULL
         OR LOWER(COALESCE(NULLIF(TRIM(k.frequency), ''), 'weekly')) = LOWER($3)
@@ -26546,7 +26561,8 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
       normalizedWeek,
       responsibleNumericId,
       normalizedFrequencyFilter,
-      normalizedCalculationModeFilter
+      normalizedCalculationModeFilter,
+      normalizedUnitId
     ]
   );
 
@@ -26572,10 +26588,10 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
     const allocationKey = String(
       kpi.kpi_target_allocation_id ?? kpi.kpi_values_id ?? ""
     ).trim();
-     const allPeriodActions = historyByAllocationId[allocationKey] || [];
-     const currentWeekActions = currentByAllocationId[allocationKey] || [];
+    const allPeriodActions = historyByAllocationId[allocationKey] || [];
+    const currentWeekActions = currentByAllocationId[allocationKey] || [];
 
-     const openActions = allPeriodActions.filter((action) => {
+    const openActions = allPeriodActions.filter((action) => {
       return (
         normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !==
         CLOSED_CORRECTIVE_ACTION_STATUS
@@ -26634,6 +26650,14 @@ const generateEmailHtml = ({
 
   if (normalizedFrequencyLabel) {
     queryParams.set("frequency", normalizedFrequencyLabel);
+  }
+
+  const responsibleUnitId =
+    normalizeOptionalIntegerInput(responsible?.unit_id) ||
+    normalizeOptionalIntegerInput(responsible?.plant_id);
+
+  if (responsibleUnitId) {
+    queryParams.set("unit_id", String(responsibleUnitId));
   }
 
   const formUrl = `${appBaseUrl}/form?${queryParams.toString()}`;
@@ -28641,9 +28665,12 @@ app.post("/redirect", async (req, res) => {
       week,
       calculation_mode: submittedCalculationMode,
       frequency: submittedFrequency,
+      unit_id: submittedUnitId,
       return_url: submittedReturnUrl,
       ...values
     } = req.body;
+
+    const requestedUnitId = normalizeOptionalIntegerInput(submittedUnitId);
     const normalizedWeek = normalizeOptionalTextInput(week) || formatIsoDateValue(new Date());
     const normalizedCalculationMode = normalizeOptionalTextInput(submittedCalculationMode);
     const normalizedFrequency = normalizeOptionalTextInput(submittedFrequency);
@@ -28651,7 +28678,8 @@ app.post("/redirect", async (req, res) => {
       responsibleId: responsible_id,
       week: normalizedWeek,
       calculationMode: normalizedCalculationMode,
-      frequency: normalizedFrequency
+      frequency: normalizedFrequency,
+      unitId: requestedUnitId
     });
     const kpiFormReturnUrl = sanitizeKpiFormReturnUrl(submittedReturnUrl, fallbackFormUrl);
     const dashboardReturnUrlParam = kpiFormReturnUrl
@@ -28660,7 +28688,7 @@ app.post("/redirect", async (req, res) => {
     const resultDate = deriveKpiResultDate(normalizedWeek);
     const periodType = deriveKpiResultPeriodType(normalizedWeek);
     const recordedByPeopleId = await resolveRecordedByPeopleId(responsible_id);
-    const responsibleContext = await loadFormResponsibleContext(responsible_id);
+    const responsibleContext = await loadFormResponsibleContext(responsible_id, requestedUnitId);
     const correctiveActionsEnabled = await canUseActionPlanCorrectiveActions();
 
     // Extract KPI values
@@ -28920,7 +28948,7 @@ app.post("/redirect", async (req, res) => {
 
 app.get("/api/kpi-chart-data", async (req, res) => {
   try {
-   const { kpi_id, week, kpi_values_id, frequency } = req.query;
+    const { kpi_id, week, kpi_values_id, frequency } = req.query;
     const allocationId = normalizeOptionalIntegerInput(kpi_values_id);
     const kpiId = normalizeOptionalIntegerInput(kpi_id);
     const normalizedWeek = normalizeOptionalTextInput(week);
@@ -28934,8 +28962,8 @@ app.get("/api/kpi-chart-data", async (req, res) => {
       : "kr.kpi_id = $1";
     const baseWhereValue = allocationId || kpiId;
 
-  const kpiFrequencyRes = await pool.query(
-  `
+    const kpiFrequencyRes = await pool.query(
+      `
    SELECT k.frequency
    FROM public.kpi k
   LEFT JOIN public.kpi_target_allocation kta
@@ -28945,20 +28973,20 @@ app.get("/api/kpi-chart-data", async (req, res) => {
     OR ($2::integer IS NOT NULL AND kta.kpi_target_allocation_id = $2)
   LIMIT 1
   `,
-  [kpiId, allocationId]
-);
+      [kpiId, allocationId]
+    );
 
-   const frequencyMode = normalizeKpiFrequency(
-   frequency || (/^\d{4}-\d{2}-\d{2}$/.test(normalizedWeek) ? "Daily" : kpiFrequencyRes.rows[0]?.frequency)
-     );
-    
+    const frequencyMode = normalizeKpiFrequency(
+      frequency || (/^\d{4}-\d{2}-\d{2}$/.test(normalizedWeek) ? "Daily" : kpiFrequencyRes.rows[0]?.frequency)
+    );
+
     console.log("KPI CHART DATA DEBUG", {
-    query: req.query,
-    frequency,
-    dbFrequency: kpiFrequencyRes.rows[0]?.frequency,
-    normalizedWeek,
-    frequencyMode
-   });
+      query: req.query,
+      frequency,
+      dbFrequency: kpiFrequencyRes.rows[0]?.frequency,
+      normalizedWeek,
+      frequencyMode
+    });
 
     const histRes = await pool.query(
       `
@@ -29007,7 +29035,7 @@ app.get("/api/kpi-chart-data", async (req, res) => {
     });
 
     const limitsRes = await pool.query(
-  `
+      `
   SELECT
     COALESCE(latest_limits.target_value, kta.target_value, k.target_value) AS target,
     COALESCE(latest_limits.upper_limit, k.high_limit) AS high_limit,
@@ -29041,18 +29069,18 @@ app.get("/api/kpi-chart-data", async (req, res) => {
   WHERE k.kpi_id = $2
   LIMIT 1
   `,
-  [allocationId, kpiId, normalizedWeek]
-);
+      [allocationId, kpiId, normalizedWeek]
+    );
 
-res.json({
-  labels: chartSeries.labels,
-  values: chartSeries.values,
-  currentMonthLabel: chartSeries.currentPeriodLabel,
-  currentValue: isNaN(currentValue) ? null : currentValue,
-  target: limitsRes.rows[0]?.target ?? null,
-  highLimit: limitsRes.rows[0]?.high_limit ?? null,
-  lowLimit: limitsRes.rows[0]?.low_limit ?? null
-});
+    res.json({
+      labels: chartSeries.labels,
+      values: chartSeries.values,
+      currentMonthLabel: chartSeries.currentPeriodLabel,
+      currentValue: isNaN(currentValue) ? null : currentValue,
+      target: limitsRes.rows[0]?.target ?? null,
+      highLimit: limitsRes.rows[0]?.high_limit ?? null,
+      lowLimit: limitsRes.rows[0]?.low_limit ?? null
+    });
   } catch (err) {
     console.error("kpi-chart-data error:", err.message);
     res.status(500).json({ error: err.message });
@@ -29343,7 +29371,8 @@ app.get("/form", async (req, res) => {
       responsible_id,
       week: requestedWeek,
       frequency: requestedFrequency,
-      calculation_mode: requestedCalculationMode
+      calculation_mode: requestedCalculationMode,
+      unit_id: requestedUnitId
     } = req.query;
     const normalizedFrequencyFilter = normalizeOptionalTextInput(requestedFrequency)
       ? getCanonicalKpiSubmissionFrequency(requestedFrequency)
@@ -29352,9 +29381,9 @@ app.get("/form", async (req, res) => {
       normalizeOptionalTextInput(requestedWeek) ||
       (normalizedFrequencyFilter
         ? getKpiSubmissionTargetPeriodLabel({
-            timeContext: buildTimeZoneDateContext(DEFAULT_KPI_SUBMISSION_TIMEZONE),
-            frequencyLabel: normalizedFrequencyFilter
-          })
+          timeContext: buildTimeZoneDateContext(DEFAULT_KPI_SUBMISSION_TIMEZONE),
+          frequencyLabel: normalizedFrequencyFilter
+        })
         : getCurrentFormWeek());
     const peopleRes = await pool.query(
       `SELECT people_id,
@@ -29372,7 +29401,8 @@ app.get("/form", async (req, res) => {
       correctiveActionHistoryByAllocation
     } = await getResponsibleWithKPIs(responsible_id, week, {
       frequency: normalizedFrequencyFilter,
-      calculationMode: normalizeOptionalTextInput(requestedCalculationMode)
+      calculationMode: normalizeOptionalTextInput(requestedCalculationMode),
+      unitId: requestedUnitId
     });
 
     const responsibleContext = await loadFormResponsibleContext(responsible_id);
@@ -29384,12 +29414,12 @@ app.get("/form", async (req, res) => {
       "Allocated scope";
 
     const responsibleRoleLabel =
-    normalizeOptionalTextInput(kpis?.[0]?.allocation_role_name) ||
-    normalizeOptionalTextInput(responsible?.role_name) ||
-    normalizeOptionalTextInput(responsible?.role) ||
-    normalizeOptionalTextInput(responsibleContext?.role_name) ||
-    normalizeOptionalTextInput(responsibleContext?.role) ||
-    "Not assigned";
+      normalizeOptionalTextInput(kpis?.[0]?.allocation_role_name) ||
+      normalizeOptionalTextInput(responsible?.role_name) ||
+      normalizeOptionalTextInput(responsible?.role) ||
+      normalizeOptionalTextInput(responsibleContext?.role_name) ||
+      normalizeOptionalTextInput(responsibleContext?.role) ||
+      "Not assigned";
 
     const formFrequencyLabel =
       normalizedFrequencyFilter ||
@@ -29401,7 +29431,8 @@ app.get("/form", async (req, res) => {
         responsibleId: responsible_id,
         week,
         calculationMode: requestedCalculationMode,
-        frequency: formFrequencyLabel
+        frequency: formFrequencyLabel,
+        unitId: requestedUnitId
       })
     );
 
@@ -29435,8 +29466,8 @@ app.get("/form", async (req, res) => {
       .map((kpi) => normalizeOptionalIntegerInput(kpi.kpi_values_id))
       .filter((value) => Number.isInteger(value));
 
-const histRes = await pool.query(
-  `
+    const histRes = await pool.query(
+      `
   SELECT
     kr.kpi_target_allocation_id AS kpi_values_id,
     kr.kpi_id,
@@ -29455,19 +29486,19 @@ const histRes = await pool.query(
     kr.period_label ASC,
     kr.recorded_at ASC
   `,
-  [allocationIds]
-);
+      [allocationIds]
+    );
 
     const historyByKpi = {};
     histRes.rows.forEach((row) => {
       const historyKey = String(row.kpi_values_id || row.kpi_id);
       if (!historyByKpi[historyKey]) historyByKpi[historyKey] = [];
-historyByKpi[historyKey].push({
-  week: row.week,
-  period_label: row.period_label,
-  result_date: row.result_date,
-  value: parseFloat(row.new_value)
-});
+      historyByKpi[historyKey].push({
+        week: row.week,
+        period_label: row.period_label,
+        result_date: row.result_date,
+        value: parseFloat(row.new_value)
+      });
     });
 
     function weekLabelToDate(weekStr) {
@@ -29608,23 +29639,23 @@ historyByKpi[historyKey].push({
     let kpiCardsHtml = "";
     let hasInitialInvalidKpi = false;
     function getDisplayUnit(kpi) {
-  const unit = String(kpi.unit || "").trim();
+      const unit = String(kpi.unit || "").trim();
 
-  if (unit.toLowerCase() !== "kcur") return unit;
+      if (unit.toLowerCase() !== "kcur") return unit;
 
-  const currency = String(
-    kpi.selling_currency ||
-    kpi.local_currency ||
-    ""
-  ).trim().toUpperCase();
+      const currency = String(
+        kpi.selling_currency ||
+        kpi.local_currency ||
+        ""
+      ).trim().toUpperCase();
 
-  return currency ? `k${currency}` : "kCur";
+      return currency ? `k${currency}` : "kCur";
     }
     kpis.forEach((kpi) => {
       let lowLimit = null;
       const displayUnit = getDisplayUnit({
-       ...kpi,
-       unit: kpi.display_unit
+        ...kpi,
+        unit: kpi.display_unit
       });
       if (kpi.low_limit && kpi.low_limit !== "None" && kpi.low_limit !== "null" && kpi.low_limit !== "" && !isNaN(parseFloat(kpi.low_limit))) {
         lowLimit = parseFloat(kpi.low_limit);
@@ -29644,21 +29675,21 @@ historyByKpi[historyKey].push({
       const goodDirection = inferKpiDirection(kpi);
       const showCA = correctiveActionsEnabled && currentValue !== null &&
         needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
-const initialNeedsCA =
-  currentValue !== null &&
-  needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
-const hasValidCA = Array.isArray(kpi.current_week_corrective_actions) &&
-  kpi.current_week_corrective_actions.some(a =>
-    String(a.root_cause || "").trim() &&
-    String(a.implemented_solution || "").trim() &&
-    String(a.due_date || "").trim() &&
-    String(a.responsible || "").trim()
-  );
+      const initialNeedsCA =
+        currentValue !== null &&
+        needsCorrectiveAction(currentValue, lowLimit, highLimit, goodDirection);
+      const hasValidCA = Array.isArray(kpi.current_week_corrective_actions) &&
+        kpi.current_week_corrective_actions.some(a =>
+          String(a.root_cause || "").trim() &&
+          String(a.implemented_solution || "").trim() &&
+          String(a.due_date || "").trim() &&
+          String(a.responsible || "").trim()
+        );
 
-if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
-  hasInitialInvalidKpi = true;
-}
-       const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
+      if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
+        hasInitialInvalidKpi = true;
+      }
+      const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
         Array.isArray(kpi.corrective_actions) ? kpi.corrective_actions : []
       ) : [];
       const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
@@ -29682,34 +29713,34 @@ if (correctiveActionsEnabled && initialNeedsCA && !hasValidCA) {
       // â”€â”€ Corrective actions section (no footer add-btn inside) â”€â”€
 
 
-const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
-const frequencyMode = normalizeKpiFrequency(formFrequencyLabel || requestedFrequency || kpi.frequency);
+      const rawHistory = historyByKpi[String(kpi.kpi_values_id || kpi.kpi_id)] || [];
+      const frequencyMode = normalizeKpiFrequency(formFrequencyLabel || requestedFrequency || kpi.frequency);
 
-console.log("===== KPI CHART DEBUG =====");
-console.log("kpi:", kpi.kpi_name || kpi.indicator_sub_title);
-console.log("requestedFrequency:", requestedFrequency);
-console.log("formFrequencyLabel:", formFrequencyLabel);
-console.log("kpi.frequency:", kpi.frequency);
-console.log("frequencyMode:", frequencyMode);
-console.log("week:", week);
-console.log("rawHistory:", rawHistory);
-console.log("===========================");
+      console.log("===== KPI CHART DEBUG =====");
+      console.log("kpi:", kpi.kpi_name || kpi.indicator_sub_title);
+      console.log("requestedFrequency:", requestedFrequency);
+      console.log("formFrequencyLabel:", formFrequencyLabel);
+      console.log("kpi.frequency:", kpi.frequency);
+      console.log("frequencyMode:", frequencyMode);
+      console.log("week:", week);
+      console.log("rawHistory:", rawHistory);
+      console.log("===========================");
 
-const chartSeries = buildKpiChartHistorySeries({
-  historyItems: rawHistory,
-  frequencyMode,
-  currentPeriodLabel: week,
-  currentValue,
-  windowSize: KPI_CHART_HISTORY_WINDOW
-});
+      const chartSeries = buildKpiChartHistorySeries({
+        historyItems: rawHistory,
+        frequencyMode,
+        currentPeriodLabel: week,
+        currentValue,
+        windowSize: KPI_CHART_HISTORY_WINDOW
+      });
 
-const currentPeriodLabel = chartSeries.currentPeriodLabel || week;
-let historyLabels = chartSeries.labels;
-let historyValues = chartSeries.values;
+      const currentPeriodLabel = chartSeries.currentPeriodLabel || week;
+      let historyLabels = chartSeries.labels;
+      let historyValues = chartSeries.values;
 
- console.log("historyLabels:", historyLabels);
- console.log("historyValues:", historyValues);    
-    
+      console.log("historyLabels:", historyLabels);
+      console.log("historyValues:", historyValues);
+
 
       const allHistoryActions = sortHistoryEntries(
         Object.values(
@@ -36563,9 +36594,12 @@ const sendKPIEmail = async (responsibleId, week, options = {}) => {
     const frequencyLabel = normalizeOptionalTextInput(options.frequency)
       ? getCanonicalKpiSubmissionFrequency(options.frequency)
       : null;
+    const unitId = normalizeOptionalIntegerInput(options.unitId);
+
     const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week, {
       calculationMode,
-      frequency: frequencyLabel
+      frequency: frequencyLabel,
+      unitId
     });
     if (!responsible) {
       throw new Error(`Responsible ${responsibleId} not found`);
@@ -36579,7 +36613,10 @@ const sendKPIEmail = async (responsibleId, week, options = {}) => {
       return false;
     }
     const html = generateEmailHtml({
-      responsible,
+      responsible: {
+        ...responsible,
+        unit_id: unitId
+      },
       week,
       calculationMode,
       frequencyLabel
@@ -36681,12 +36718,14 @@ const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
     if (!peopleId) return;
 
     const frequencyLabel = getCanonicalKpiSubmissionFrequency(row.frequency);
-    const key = `${peopleId}:${frequencyLabel}`;
+    const unitId = normalizeOptionalIntegerInput(row.unit_id);
+    const key = `${peopleId}:${frequencyLabel}:${unitId || "no-unit"}`;
 
     if (!recipientByKey.has(key)) {
       recipientByKey.set(key, {
         ...row,
         people_id: peopleId,
+        unit_id: unitId,
         frequency_label: frequencyLabel
       });
     }
@@ -36903,27 +36942,6 @@ const buildTimeZoneDateContext = (timeZone, date = new Date()) => {
 
     throw error;
   }
-};
-
-const isLocalCronWindow = (
-  timeZone,
-  targetHour,
-  targetMinute,
-  windowMinutes = 15,
-  date = new Date()
-) => {
-  const timeContext = buildTimeZoneDateContext(timeZone, date);
-
-  const currentMinutes =
-    Number(timeContext.hour) * 60 + Number(timeContext.minute);
-
-  const targetMinutes =
-    Number(targetHour) * 60 + Number(targetMinute);
-
-  return (
-    currentMinutes >= targetMinutes &&
-    currentMinutes < targetMinutes + windowMinutes
-  );
 };
 
 const getKpiSubmissionTargetLocalHour = (calculationMode) => {
@@ -38670,7 +38688,8 @@ const runWeeklyKpiSubmissionCron = async ({
       try {
         const emailSent = await sendKPIEmail(recipient.people_id, targetPeriodLabel, {
           calculationMode,
-          frequency: frequencyLabel
+          frequency: frequencyLabel,
+          unitId: recipient.unit_id
         });
 
         if (!emailSent) {
@@ -41741,7 +41760,7 @@ const buildTrainingPortalAssignment = (row = {}) => {
   const testCompleted =
     Boolean(row.test_completed_at) ||
     KPI_TRAINING_TEST_COMPLETED_STATUSES.has(status);
-    const progressPercent = testCompleted ? 100 : 72;
+  const progressPercent = testCompleted ? 100 : 72;
 
   return {
     result_id: normalizeOptionalIntegerInput(row.result_id),
@@ -42071,32 +42090,34 @@ app.post("/api/kpi-training/results/:resultId/test-submit", async (req, res) => 
       questions: grading.responses
     };
 
-await pool.query(
-  `
-  UPDATE public.kpi_training_result
-  SET
-    training_completed_at = COALESCE(training_completed_at, NOW()),
-    test_sent_at = COALESCE(test_sent_at, NOW()),
-    test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
-    answers_json = $3::jsonb,
-    score = $4,
-    test_completed_at = NOW(),
-    next_reminder_due_at = CASE
-      WHEN $4::numeric >= 80 THEN NULL
-      ELSE COALESCE(next_reminder_due_at, NOW() + ($2::int * INTERVAL '1 day'))
-    END,
-    status = $5,
-    updated_at = NOW()
-  WHERE result_id = $1
-  `,
-  [
-    resultId,
-    KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
-    JSON.stringify(answersPayload),
-    grading.score,
-    grading.score >= 80 ? "completed_pass" : "completed_fail"
-  ]
-);
+    await pool.query(
+      `
+      UPDATE public.kpi_training_result
+      SET
+        training_completed_at = COALESCE(training_completed_at, NOW()),
+        test_sent_at = COALESCE(test_sent_at, NOW()),
+        test_due_date = COALESCE(test_due_date, CURRENT_DATE + $2::int),
+        answers_json = $3::jsonb,
+        score = $4,
+
+        test_completed_at = NOW(),
+        next_reminder_due_at = CASE
+          WHEN $5::boolean = TRUE THEN NULL
+          ELSE COALESCE(next_reminder_due_at, NOW() + ($2::int * INTERVAL '1 day'))
+        END,
+        status = $6,
+        updated_at = NOW()
+      WHERE result_id = $1
+      `,
+      [
+        resultId,
+        KPI_TRAINING_DEFAULT_TEST_DUE_DAYS,
+        JSON.stringify(answersPayload),
+        grading.score,
+        passed,
+        passed ? "completed_pass" : "completed_fail"
+      ]
+    );
 
     const refreshedRows = await loadKpiTrainingPortalRows({ resultId });
     const assignment = refreshedRows[0] ? buildTrainingPortalAssignment(refreshedRows[0]) : null;
@@ -42720,7 +42741,6 @@ const loadKpiTrainingReminderCandidates = async () => {
       ktr.kpi_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
       p.email AS people_email,
-      COALESCE(NULLIF(TRIM(home_unit.country), ''), 'Tunisia') AS country,
       COALESCE(k.kpi_sub_title, k.kpi_name, 'KPI #' || ktr.kpi_id) AS kpi_name,
       COALESCE(kt.training_name, 'Training #' || ktr.training_id) AS training_name,
       COALESCE(ktest.pass_score, $2::numeric) AS pass_score,
@@ -42746,8 +42766,6 @@ const loadKpiTrainingReminderCandidates = async () => {
     FROM public.kpi_training_result ktr
     LEFT JOIN public.people p
       ON p.people_id = ktr.people_id
-    LEFT JOIN public.unit home_unit
-      ON home_unit.unit_id = p.work_at_unit_id
     LEFT JOIN public.kpi k
       ON k.kpi_id = ktr.kpi_id
     LEFT JOIN public.kpi_training kt
@@ -43149,9 +43167,7 @@ const sendKpiTrainingNotification = async ({
   return { sent, failed };
 };
 
-const runKpiTrainingReminderEscalationJob = async ({
-  enforceLocalTimeWindow = false
- } = {}) => {
+const runKpiTrainingReminderEscalationJob = async () => {
   await ensureKpiTrainingEscalationSchema();
 
   const candidates = await loadKpiTrainingReminderCandidates();
@@ -43179,14 +43195,6 @@ const runKpiTrainingReminderEscalationJob = async ({
   let transporter = null;
 
   for (const row of candidates) {
-    
-    if (enforceLocalTimeWindow) {
-      const timezone = resolveKpiSubmissionRecipientTimeZone(row);
-
-      if (!isLocalCronWindow(timezone, 12, 30)) {
-        continue;
-      }
-    }
     const resultId = normalizeOptionalIntegerInput(row.result_id);
     const stageLogMap = stageLogMapByResultId.get(resultId) || {};
     const notification = await resolveNextKpiTrainingNotification({
@@ -43237,9 +43245,7 @@ ensureKpiTrainingEscalationSchema()
     console.error("[KPI Training Reminder] Escalation tracking setup failed:", error.message);
   });
 
-async function sendKpiTrainingLinksToResponsibles({
-  enforceLocalTimeWindow = false
-} = {}) {
+async function sendKpiTrainingLinksToResponsibles() {
   const appBaseUrl = getKpiTrainingAppBaseUrl();
 
   const result = await pool.query(`
@@ -43247,18 +43253,14 @@ async function sendKpiTrainingLinksToResponsibles({
       ktr.people_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(p.first_name, ''), COALESCE(p.name, ''))), '') AS people_name,
       p.email,
-      COALESCE(NULLIF(TRIM(home_unit.country), ''), 'Tunisia') AS country,
       COUNT(*) AS assignment_count,
       MIN(ktr.test_due_date) AS nearest_due_date
     FROM public.kpi_training_result ktr
     JOIN public.people p
       ON p.people_id = ktr.people_id
-      LEFT JOIN public.unit home_unit
-      ON home_unit.unit_id = p.work_at_unit_id
     WHERE p.email IS NOT NULL
       AND TRIM(p.email) <> ''
       AND COALESCE(ktr.status, 'training_assigned') = ANY($1::text[])
-      AND ktr.training_sent_at IS NULL
       AND NOT (
         COALESCE(ktr.status, 'training_assigned') = 'training_done'
         AND ktr.test_id IS NULL
@@ -43268,9 +43270,7 @@ async function sendKpiTrainingLinksToResponsibles({
       ktr.people_id,
       p.first_name,
       p.name,
-      p.email,
-      home_unit.country
-    
+      p.email
     ORDER BY people_name, ktr.people_id
   `, [KPI_TRAINING_PENDING_VALIDATION_STATUSES]);
 
@@ -43279,14 +43279,6 @@ async function sendKpiTrainingLinksToResponsibles({
   const failed = [];
 
   for (const row of result.rows) {
-  
-    if (enforceLocalTimeWindow) {
-      const timezone = resolveKpiSubmissionRecipientTimeZone(row);
-
-      if (!isLocalCronWindow(timezone, 12, 15)) {
-        continue;
-      }
-    }
     const peopleId = row.people_id;
     const responsibleName = row.people_name || `Responsible #${peopleId}`;
     const recipientEmail = row.email;
@@ -43395,72 +43387,29 @@ app.post("/api/kpi-training/process-reminders", async (req, res) => {
   }
 });
 
-// Training cron - sends at 12:15 local time by responsible country
-// cron.schedule(
-//   "*/15 * * * *",
-//   async () => {
-//     const lockId = "kpi_training_send_links_job";
-//     const lock = await acquireJobLock(lockId);
+//Training cron 
 
-//     if (!lock.acquired) {
-//       console.log("[KPI Training Cron] lock not acquired");
-//       return;
-//     }
-
-//     try {
-//       console.log("[KPI Training Cron] Checking local timezone windows...");
-
-//       const result = await sendKpiTrainingLinksToResponsibles({
-//         enforceLocalTimeWindow: true
-//       });
-
-//       console.log("[KPI Training Cron] Done:", result);
-//     } catch (error) {
-//       console.error("[KPI Training Cron] Failed:", error.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//       console.log("[KPI Training Cron] lock released");
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "UTC"
+// cron.schedule("13 11 * * *", async () => {
+//   try {
+//     console.log("[KPI Training Cron] Sending responsible training links...");
+//     const result = await sendKpiTrainingLinksToResponsibles();
+//     console.log("[KPI Training Cron] Done:", result);
+//   } catch (error) {
+//     console.error("[KPI Training Cron] Failed:", error.message);
 //   }
-// );
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
-
-// // Training reminder cron - sends at 12:30 local time by responsible country
-// cron.schedule(
-//   "*/15 * * * *",
-//   async () => {
-//     const lockId = "kpi_training_reminder_escalation_job";
-//     const lock = await acquireJobLock(lockId);
-
-//     if (!lock.acquired) {
-//       console.log("[KPI Training Reminder] lock not acquired");
-//       return;
-//     }
-
-//     try {
-//       console.log("[KPI Training Reminder] Checking local timezone windows...");
-
-//       const result = await runKpiTrainingReminderEscalationJob({
-//         enforceLocalTimeWindow: true
-//       });
-
+// cron.schedule("00 10 * * *", async () => {
+//   try {
+//     await runWithJobLock("kpi_training_reminder_escalation_job", async () => {
+//       console.log("[KPI Training Reminder] Processing weekly reminders and escalations...");
+//       const result = await runKpiTrainingReminderEscalationJob();
 //       console.log("[KPI Training Reminder] Done:", result);
-//     } catch (error) {
-//       console.error("[KPI Training Reminder] Failed:", error.message);
-//     } finally {
-//       await releaseJobLock(lockId, lock.instanceId, lock.lockHash);
-//       console.log("[KPI Training Reminder] lock released");
-//     }
-//   },
-//   {
-//     scheduled: true,
-//     timezone: "UTC"
+//     });
+//   } catch (error) {
+//     console.error("[KPI Training Reminder] Failed:", error.message);
 //   }
-// );
+// }, { scheduled: true, timezone: "Africa/Tunis" });
 
 
 //kpi tree endpoint 
