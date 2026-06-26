@@ -26439,6 +26439,8 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
       kta.kpi_target_allocation_id AS kpi_values_id,
       kta.kpi_target_allocation_id,
       kta.kpi_id,
+      role.role_name AS allocation_role_name,
+      kta.role_id AS allocation_role_id,
       COALESCE(subject_link.subject_name, k.kpi_sub_title, k.kpi_name, 'KPI') AS subject,
       COALESCE(k.kpi_name, k.kpi_sub_title, 'Untitled KPI') AS indicator_sub_title,
      COALESCE(kta.target_unit, k.unit) AS unit,
@@ -26473,6 +26475,8 @@ const getResponsibleWithKPIs = async (responsibleId, week, filters = {}) => {
 
     LEFT JOIN public.unit plant_scope
     ON plant_scope.unit_id = kta.plant_id
+    LEFT JOIN public.role role
+    ON role.role_id = kta.role_id
     LEFT JOIN LATERAL (
       SELECT s.subject_name
       FROM public.subject_kpi sk
@@ -29380,11 +29384,12 @@ app.get("/form", async (req, res) => {
       "Allocated scope";
 
     const responsibleRoleLabel =
-      normalizeOptionalTextInput(responsible?.role_name) ||
-      normalizeOptionalTextInput(responsible?.role) ||
-      normalizeOptionalTextInput(responsibleContext?.role_name) ||
-      normalizeOptionalTextInput(responsibleContext?.role) ||
-      "Not assigned";
+    normalizeOptionalTextInput(kpis?.[0]?.allocation_role_name) ||
+    normalizeOptionalTextInput(responsible?.role_name) ||
+    normalizeOptionalTextInput(responsible?.role) ||
+    normalizeOptionalTextInput(responsibleContext?.role_name) ||
+    normalizeOptionalTextInput(responsibleContext?.role) ||
+    "Not assigned";
 
     const formFrequencyLabel =
       normalizedFrequencyFilter ||
