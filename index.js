@@ -165,6 +165,48 @@ const normalizeOptionalIntegerInput = (value) => {
   return Number(text);
 };
 
+const enrichIndividualAllocationScope = async (db, row = {}) => {
+  if (String(row.kpi_type || "").trim().toLowerCase() !== "individual") {
+    return row;
+  }
+
+  const peopleId = normalizeOptionalIntegerInput(row.set_by_people_id);
+  const roleId = normalizeOptionalIntegerInput(row.role_id);
+
+  if (!peopleId || !roleId) return row;
+  if (row.plant_id && row.unit_id) return row;
+
+  const result = await db.query(
+    `
+    SELECT
+      pra.unit_id,
+      pra.zone_id,
+      pra.market_id,
+      pra.product_line_id
+    FROM public.people_role_assignment pra
+    WHERE pra.people_id = $1
+      AND pra.role_id = $2
+      AND COALESCE(pra.assignment_status, 'ACTIVE') = 'ACTIVE'
+      AND (pra.end_date IS NULL OR pra.end_date >= CURRENT_DATE)
+    ORDER BY COALESCE(pra.is_primary, false) DESC, pra.assignment_id DESC
+    LIMIT 1
+    `,
+    [peopleId, roleId]
+  );
+
+  const assignment = result.rows[0];
+  if (!assignment) return row;
+
+  return {
+    ...row,
+    plant_id: row.plant_id || assignment.unit_id || null,
+    unit_id: row.unit_id || assignment.unit_id || null,
+    zone_id: row.zone_id || assignment.zone_id || null,
+    market_id: row.market_id || assignment.market_id || null,
+    product_line_id: row.product_line_id || assignment.product_line_id || null
+  };
+};
+
 const normalizeKpiFileUploadPayload = (value) => {
   if (!value || typeof value !== "object") {
     return null;
@@ -7566,7 +7608,8 @@ app.post("/api/responsibles/:responsibleId/kpi-objects", async (req, res) => {
     const insertedIds = [];
     const touchedKpiIds = new Set();
 
-    for (const preparedRow of preparedRows) {
+   for (const rawPreparedRow of preparedRows) {
+      const preparedRow = await enrichIndividualAllocationScope(client, rawPreparedRow);
       const preparedKpiId = normalizeOptionalIntegerInput(preparedRow.kpi_id);
       if (preparedKpiId) {
         touchedKpiIds.add(preparedKpiId);
