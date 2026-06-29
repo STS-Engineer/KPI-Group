@@ -43778,28 +43778,58 @@ app.get("/api/statistics/kpi-count-by-responsible", async (req, res) => {
 // 5) Chart 4: KPI Target vs Value
 app.get("/api/statistics/kpi-target-vs-value", async (req, res) => {
   try {
-    const { week } = req.query;
+    const { week, unit_id, department_id, kpi_id } = req.query;
 
-    const result = await pool.query(`
+    const toNullableInt = (value) => {
+      const text = String(value ?? "").trim();
+      if (!text || text.toLowerCase() === "nan") return null;
+
+      const number = Number(text);
+      return Number.isInteger(number) && number > 0 ? number : null;
+    };
+
+    const unitId = toNullableInt(unit_id);
+    const departmentId = toNullableInt(department_id);
+    const kpiId = toNullableInt(kpi_id);
+
+    const result = await pool.query(
+      `
       SELECT
+        factory.unit_id,
+        factory.unit_name,
+        v.department_id,
+        v.department_name,
         k.kpi_id,
         k.kpi_name,
-        v.department_name,
+        v.people_id,
         v.employee_name AS people_name,
+        kr.week,
+        kr.week AS period_value,
         NULLIF(kta.target_value::text, '')::numeric AS target,
         NULLIF(kr.raw_value::text, '')::numeric AS value
       FROM public.v_people_department v
+      JOIN public.unit factory
+        ON factory.unit_id = v.factory_id
       JOIN public.kpi_target_allocation kta
         ON kta.set_by_people_id = v.people_id
       JOIN public.kpi k
         ON k.kpi_id = kta.kpi_id
       JOIN public.kpi_result kr
         ON kr.kpi_target_allocation_id = kta.kpi_target_allocation_id
-       AND ($1::text IS NULL OR kr.week = $1)
       WHERE kr.raw_value IS NOT NULL
-      ORDER BY v.department_name, k.kpi_name
-      LIMIT 40
-    `, [week || null]);
+        AND ($1::text IS NULL OR kr.week = $1)
+        AND ($2::int IS NULL OR v.factory_id = $2)
+        AND ($3::int IS NULL OR v.department_id = $3)
+        AND ($4::int IS NULL OR k.kpi_id = $4)
+      ORDER BY v.employee_name, k.kpi_name
+      `,
+      [
+        week || null,
+        unitId,
+        departmentId,
+        kpiId
+      ]
+    );
 
     res.json(result.rows);
   } catch (err) {
