@@ -44407,5 +44407,183 @@ Page: ${page || ""}
     res.status(500).json({ success: false, message: "Unable to send feedback." });
   }
 });
+
+
+const ROWS_SQL = `
+  SELECT
+    v.kpi_target_allocation_id               AS a,
+    v.kpi_name                               AS k,
+    COALESCE(v.plant_name, '—')              AS p,
+    COALESCE(v.role_name,  '—')              AS r,
+    v.current_status                         AS s,
+    v.priority_score                         AS pr,
+    s.analysis_details->>'priority_level'    AS pl,
+    v.escalation_level                       AS e,
+    v.latest_value                           AS v,
+    v.latest_target                          AS t,
+    v.performance_gap                        AS g,
+    s.analysis_details->>'performance_trend' AS tr,
+    s.analysis_details->>'action_status'     AS ac,
+    s.analysis_details->>'comment'           AS c,
+    s.analysis_details->>'importance'        AS im,
+    s.analysis_details->>'urgency'           AS u,
+    v.calculation_date                       AS calc
+  FROM v_kpi_monitoring v
+  JOIN kpi_monitoring_status s
+    ON s.monitoring_status_id = v.monitoring_status_id
+  {WHERE}
+  ORDER BY v.priority_score DESC NULLS LAST, v.kpi_name
+`;
+
+const num = (x) => {
+  if (x === null || x === undefined) return null;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+};
+
+const shape = (row) => ({
+  a: row.a,
+  k: row.k,
+  p: row.p,
+  r: row.r,
+  s: row.s,
+  pr: num(row.pr),
+  pl: row.pl,
+  e: row.e === null || row.e === undefined ? 0 : Number(row.e),
+  v: num(row.v),
+  t: num(row.t),
+  g: num(row.g),
+  tr: row.tr,
+  ac: row.ac,
+  c: row.c,
+  im: row.im,
+  u: row.u,
+});
+app.get("/api/kpi/monitoring", async (req, res) => {
+  try {
+    const { plant } = req.query;
+
+    let sql = ROWS_SQL;
+    const params = [];
+
+    if (plant && plant !== "All") {
+      sql = sql.replace("{WHERE}", "WHERE v.plant_name = $1");
+      params.push(plant);
+    } else {
+      sql = sql.replace("{WHERE}", "");
+    }
+
+    const { rows } = await pool.query(sql, params);
+
+    res.json({
+      ok: true,
+      updatedAt: rows.length ? rows[0].calc : null,
+      count: rows.length,
+      data: rows.map(shape),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load KPI monitoring.",
+    });
+  }
+});
+
+app.get("/api/kpi/monitoring/meta", async (req, res) => {
+  try {
+    const plantsQ = pool.query(`
+      SELECT DISTINCT plant_name
+      FROM v_kpi_monitoring
+      WHERE plant_name IS NOT NULL
+      ORDER BY plant_name
+    `);
+
+    const countsQ = pool.query(`
+      SELECT current_status AS s,
+             COUNT(*)::int AS n
+      FROM v_kpi_monitoring
+      GROUP BY current_status
+    `);
+
+    const updatedQ = pool.query(`
+      SELECT MAX(calculation_date) AS updatedAt
+      FROM kpi_monitoring_status
+    `);
+
+    const [plants, counts, updated] = await Promise.all([
+      plantsQ,
+      countsQ,
+      updatedQ,
+    ]);
+
+    res.json({
+      ok: true,
+      plants: ["All", ...plants.rows.map((r) => r.plant_name)],
+      counts: counts.rows.reduce((obj, row) => {
+        obj[row.s] = row.n;
+        return obj;
+      }, {}),
+      updatedAt: updated.rows[0].updatedat || updated.rows[0].updatedAt,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load metadata.",
+    });
+  }
+});
+
+app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
+  try {
+    const { allocationId } = req.params;
+
+    const sql = `
+      SELECT
+        v.kpi_target_allocation_id AS a,
+        v.kpi_name AS k,
+        COALESCE(v.plant_name,'—') AS p,
+        COALESCE(v.role_name,'—') AS r,
+        v.current_status AS s,
+        v.priority_score AS pr,
+        s.analysis_details->>'priority_level' AS pl,
+        v.escalation_level AS e,
+        v.latest_value AS v,
+        v.latest_target AS t,
+        v.performance_gap AS g,
+        s.analysis_details->>'performance_trend' AS tr,
+        s.analysis_details->>'action_status' AS ac,
+        s.analysis_details->>'comment' AS c,
+        s.analysis_details->>'importance' AS im,
+        s.analysis_details->>'urgency' AS u,
+        v.calculation_date AS calc
+      FROM v_kpi_monitoring v
+      JOIN kpi_monitoring_status s
+        ON s.monitoring_status_id = v.monitoring_status_id
+      WHERE v.kpi_target_allocation_id = $1
+    `;
+
+    const { rows } = await pool.query(sql, [allocationId]);
+
+    if (!rows.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "KPI allocation not found.",
+      });
+    }
+
+    res.json({
+      ok: true,
+      data: shape(rows[0]),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load KPI allocation.",
+    });
+  }
+});
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
