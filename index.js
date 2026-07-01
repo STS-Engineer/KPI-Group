@@ -29878,6 +29878,10 @@ app.get("/form", async (req, res) => {
                       data-kpi-values-id="${kpi.kpi_values_id}"
                       required
                     />
+
+                  <div class="kpi-value-error" style="display:none;">
+                  Current Value is required.
+                  </div>
                     ${displayUnit ? `<span class="kpi-input-unit">${displayUnit}</span>` : ""}
                   </div>
                 </div>
@@ -29985,6 +29989,15 @@ app.get("/form", async (req, res) => {
     const correctiveActionResponsibleOptionsHtml = correctiveActionResponsibleOptions
       .map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
       .join("");
+
+      const isMonthlyForm =
+  String(formFrequencyLabel || "").trim().toLowerCase() === "monthly";
+
+const formPeriodLabel = isMonthlyForm
+  ? weekToMonthLabel(week)
+  : week;
+
+const formPeriodTitle = isMonthlyForm ? "Month" : "Week";
 
     res.send(`
       <!DOCTYPE html>
@@ -31737,6 +31750,18 @@ app.get("/form", async (req, res) => {
           .kpi-card.requires-ca .kpi-input{
             border-color:#ef4444 !important;
            }
+
+          .kpi-value-error {
+           margin-top: 6px;
+           color: #dc2626;
+          font-size: 12px;
+          font-weight: 700;
+           } 
+
+          .kpi-input.is-empty {
+           border-color: #dc2626 !important;
+           background: #fff5f5;
+          }
           .submit-btn{background:#0078D7;color:white;border:none;padding:12px 30px;border-radius:4px;font-size:16px;font-weight:600;cursor:pointer;display:block;width:100%;margin-top:20px;}
           .close-action-confirm-overlay{
             position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
@@ -32301,7 +32326,7 @@ app.get("/form", async (req, res) => {
         <!-- Main container -->
         <div class="container">
           <div class="header">
-            <h2 style="color:white;font-size:22px;margin:0;">KPI Submission - ${week}</h2>
+           <h2 style="color:white;font-size:22px;margin:0;">KPI Submission - ${formPeriodLabel}</h2>
           </div>
 
           <div class="form-section">
@@ -32309,7 +32334,7 @@ app.get("/form", async (req, res) => {
               <div class="info-row"><div class="info-label">Name</div><div class="info-value">${responsible.name}</div></div>
               <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsibleGroupLabel}</div></div>
               <div class="info-row"><div class="info-label">Role</div><div class="info-value">${responsibleRoleLabel}</div></div>
-              <div class="info-row"><div class="info-label">Week</div><div class="info-value">${week}</div></div>
+              <div class="info-row"><div class="info-label">${formPeriodTitle}</div><div class="info-value">${formPeriodLabel}</div></div>
              <div class="info-row"><div class="info-label">Frequency</div><div class="info-value">${formFrequencyLabel}</div></div>
             </div>
 
@@ -33045,9 +33070,26 @@ document.querySelectorAll(".value-input").forEach(input => {
   input.addEventListener("input", function () {
     const kvId = this.dataset.kpiValuesId;
 
+    this.dataset.touched = "true";
+    syncValueInputDirtyState(this);
     updateCurrentMonthBarFromInput(kvId, this.value);
 
-    updateSubmitButtonState(true);
+    // no popup while typing
+    updateSubmitButtonState(false);
+  });
+
+  input.addEventListener("blur", function () {
+    const card = this.closest(".kpi-card");
+    if (!card) return;
+
+    const invalidCards = updateSubmitButtonState(false);
+
+    if (
+      this.dataset.touched === "true" &&
+      invalidCards.includes(card)
+    ) {
+      showCorrectiveActionRequiredPopup(card);
+    }
   });
 });
 
@@ -33087,7 +33129,12 @@ function needsCorrectiveAction(value, lowLimit, highLimit, goodDirection) {
 
 function isKpiOutsideLimits(card) {
   const input = card.querySelector(".value-input");
-  const value = toNumber(input ? input.value : "");
+
+  if (!input || String(input.value || "").trim() === "") {
+    return false;
+  }
+
+  const value = toNumber(input.value);
 
   const lowLimit = toNumber(card.dataset.lowLimit);
   const highLimit = toNumber(card.dataset.highLimit);
@@ -33164,16 +33211,37 @@ function showCorrectiveActionRequiredPopup(card) {
 }
 
 function updateSubmitButtonState(showPopup = false) {
-  const submitBtn = document.querySelector(".submit-btn");
-  const invalidCards = [];
+const submitBtn = document.querySelector(".submit-btn");
+const invalidCards = [];
+let hasEmptyValue = false;
  
   document.querySelectorAll(".kpi-card").forEach(card => {
     const kvId = card.dataset.kpiValuesId;
- 
+    const valueInput = card.querySelector(".value-input");
+const valueError = card.querySelector(".kpi-value-error");
+
+const isEmptyValue =
+  !valueInput || String(valueInput.value || "").trim() === "";
+
+if (valueInput) {
+  valueInput.classList.toggle("is-empty", isEmptyValue);
+}
+
+const shouldShowEmptyError =
+  isEmptyValue && valueInput && valueInput.dataset.touched === "true";
+
+if (valueError) {
+  valueError.style.display = shouldShowEmptyError ? "block" : "none";
+}
+
+if (isEmptyValue) {
+  hasEmptyValue = true;
+}
     // Check if the value is outside the accepted limit band and no valid corrective action exists
     const needsCA =
-      isKpiOutsideLimits(card) &&
-      !hasValidCorrectiveAction(kvId);
+  !isEmptyValue &&
+  isKpiOutsideLimits(card) &&
+  !hasValidCorrectiveAction(kvId);
  
     // Track previous state to detect transitions
     const hadRequiresCA = card.classList.contains("requires-ca");
@@ -33195,7 +33263,7 @@ function updateSubmitButtonState(showPopup = false) {
  
   // DISABLE SUBMIT BUTTON if any KPI needs corrective action
   if (submitBtn) {
-    submitBtn.disabled = invalidCards.length > 0;
+    submitBtn.disabled = invalidCards.length > 0 || hasEmptyValue;
   }
  
   return invalidCards;
@@ -34113,10 +34181,22 @@ if (input && !preserveDraftValue) {
   }
 
   updateKpiChart(kvId);
-  setTimeout(runCorrectiveActionPopupCheck, 300);
+  setTimeout(function () {
+  updateSubmitButtonState(false);
+}, 300);
 }
 
+function getPreviousMonthLabelFromWeek(weekStr) {
+  const d = weekLabelToDateClient(weekStr);
+  if (!d || isNaN(d.getTime())) return "";
 
+  d.setMonth(d.getMonth() - 1);
+
+  return d.toLocaleString("en-US", {
+    month: "short",
+    year: "numeric"
+  });
+}
   function startRealtimeCharts() {
   document.querySelectorAll(".kpi-card").forEach(card => {
     const kvId = card.dataset.kpiValuesId;
@@ -34541,7 +34621,9 @@ function getFallbackCurrentMonthLabel(card, labels) {
     values = [];
   }
 
-  const currentMonthLabel = getFallbackCurrentMonthLabel(card, labels);
+  const currentMonthLabel =
+  getPreviousMonthLabelFromWeek(card.dataset.currentWeek) ||
+  getFallbackCurrentMonthLabel(card, labels);
   if (!currentMonthLabel) return;
 
   const existingIndex = labels.indexOf(currentMonthLabel);
@@ -35316,6 +35398,8 @@ document.querySelectorAll(".value-input").forEach(input => {
   });
 });
 
+updateSubmitButtonState(false);
+
 startRealtimeCharts();
             // Chart expand
             document.querySelectorAll(".kpi-chart-trigger").forEach(panel => {
@@ -35685,6 +35769,7 @@ async function submitHelpSupportFeedback() {
     res.send(`<p style="color:red;">Error: ${err.message}</p>`);
   }
 });
+
 
 
 // ---------- Dashboard ----------
