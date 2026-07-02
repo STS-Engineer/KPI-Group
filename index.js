@@ -26718,6 +26718,11 @@ const ensureActionPlanCorrectiveActionSchema = async () => {
         ADD COLUMN IF NOT EXISTS kpi_id VARCHAR
       `);
 
+      await actionPlanPool.query(`
+       ALTER TABLE public.action
+       ADD COLUMN IF NOT EXISTS unit_id VARCHAR
+       `);
+
        await actionPlanPool.query(`
         ALTER TABLE public.action
         ADD COLUMN IF NOT EXISTS unit_id VARCHAR
@@ -27326,9 +27331,14 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
   let savedCount = 0;
   const keptActionIds = new Set();
   const actionPlanKpiId = normalizeOptionalIntegerInput(kpiId);
-  const actionPlanKpiIdValue = Number.isInteger(actionPlanKpiId)
-    ? String(actionPlanKpiId)
-    : null;
+ const actionPlanKpiIdValue = Number.isInteger(actionPlanKpiId)
+  ? String(actionPlanKpiId)
+  : null;
+
+ const actionPlanUnitId = normalizeOptionalIntegerInput(unitId);
+ const actionPlanUnitIdValue = Number.isInteger(actionPlanUnitId)
+  ? String(actionPlanUnitId)
+  : null;
 
   for (let index = 0; index < meaningfulActions.length; index += 1) {
     const action = meaningfulActions[index];
@@ -27375,7 +27385,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       responsibleEmail,
       demandeur,
       emailDemandeur,
-      actionPlanKpiIdValue
+      actionPlanKpiIdValue,
+      actionPlanUnitIdValue
     ];
 
     if (actionId && existingActionIds.has(actionId)) {
@@ -27396,6 +27407,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
           demandeur = $12,
           email_demandeur = $13,
           kpi_id = $14,
+          unit_id = $15,
           type = 'action',
           updated_at = NOW(),
           closed_date = CASE
@@ -27403,7 +27415,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
             ELSE NULL
           END
         WHERE id = $1
-         AND sujet_id = $15
+         AND sujet_id = $16
         RETURNING id
         `,
         [actionId, ...values, sujetId]
@@ -27435,6 +27447,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       demandeur,
       email_demandeur,
       kpi_id,
+      unit_id,
       closed_date
     )
       VALUES (
@@ -27453,6 +27466,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
         $12,
         $13,
         $14,
+        $15,
         CASE
           WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
           ELSE NULL
@@ -29994,15 +30008,16 @@ app.post("/redirect", async (req, res) => {
       // Save the corrective actions for this KPI period in the Action Plan DB.
       // -------------------------------------------------------
       if (correctiveActionsEnabled) {
-        const syncResult = await syncActionPlanCorrectiveActionsForPeriod({
-          kpiTargetAllocationId: allocationId,
-          kpiId,
-          periodLabel: normalizedWeek,
-          subject: allocation.subject_name,
-          kpiName: allocation.kpi_name,
-          actions: submittedActions,
-          responsibleContext
-        });
+    const syncResult = await syncActionPlanCorrectiveActionsForPeriod({
+       kpiTargetAllocationId: allocationId,
+       kpiId,
+       unitId: allocation.unit_id ?? allocation.plant_id,
+       periodLabel: normalizedWeek,
+       subject: allocation.subject_name,
+       kpiName: allocation.kpi_name,
+       actions: submittedActions,
+       responsibleContext
+       });
 
         correctiveActionsCount += syncResult.savedCount || 0;
       }
