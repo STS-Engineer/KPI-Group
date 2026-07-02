@@ -13654,6 +13654,594 @@ textarea {
   min-width: 0 !important;
 }
 
+/* Airtable-inspired target allocation modal */
+.parameter-modal {
+  --airtable-bg: #f5f6f8;
+  --airtable-surface: #ffffff;
+  --airtable-border: #d8dee6;
+  --airtable-border-strong: #c6ced8;
+  --airtable-text: #1f2937;
+  --airtable-muted: #667085;
+  --airtable-blue: #2d7ff9;
+  --airtable-blue-strong: #1f6feb;
+  --airtable-teal: #18b7b0;
+  --airtable-teal-soft: #e2f7f6;
+  --airtable-row-hover: #f4f8ff;
+  --airtable-tag-blue-bg: #e8f0fe;
+  --airtable-tag-blue-text: #2856c3;
+  --airtable-tag-green-bg: #e2f7f3;
+  --airtable-tag-green-text: #0f766e;
+  --airtable-warning-bg: #fff7e6;
+  --airtable-warning-border: #efd8a0;
+  --airtable-warning-text: #8a6a00;
+  width: min(1520px, calc(100vw - 40px)) !important;
+  height: calc(100vh - 36px) !important;
+  max-height: calc(100vh - 36px) !important;
+  border-radius: 22px !important;
+  background: var(--airtable-bg) !important;
+  border: 1px solid rgba(198, 206, 216, 0.95) !important;
+  box-shadow: 0 26px 72px rgba(15, 23, 42, 0.18) !important;
+  position: relative;
+}
+
+.parameter-modal::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 8px;
+  background: linear-gradient(90deg, #17b8b3 0%, #12b0aa 45%, #0f9f99 100%);
+}
+
+.parameter-modal .modal-header {
+  padding: 22px 24px 16px !important;
+  background: var(--airtable-surface) !important;
+  border-bottom: 1px solid var(--airtable-border) !important;
+}
+
+.parameter-modal .modal-header h2 {
+  font-size: 27px !important;
+  font-weight: 900 !important;
+  letter-spacing: -0.04em !important;
+  color: #172033 !important;
+}
+
+.parameter-modal .modal-subtitle {
+  margin-top: 8px !important;
+  color: var(--airtable-muted) !important;
+  font-size: 13px !important;
+  line-height: 1.6 !important;
+  max-width: 920px !important;
+}
+
+.parameter-modal .modal-body {
+  padding: 14px !important;
+  background: var(--airtable-bg) !important;
+}
+
+.parameter-modal .form-section {
+  margin-bottom: 12px !important;
+  padding: 14px !important;
+  border-radius: 16px !important;
+  background: var(--airtable-surface) !important;
+  border: 1px solid var(--airtable-border) !important;
+  box-shadow: none !important;
+}
+
+.parameter-modal .form-grid {
+  gap: 14px !important;
+  align-items: start !important;
+}
+
+.parameter-modal #parameterAllocationFieldsSection .form-grid,
+.parameter-modal #parameterAllocationFieldsSection.is-individual-layout .form-grid {
+  column-gap: 16px !important;
+  row-gap: 14px !important;
+}
+
+.parameter-modal .field label {
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  color: #273142 !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.parameter-modal .field .hint {
+  font-size: 10px !important;
+  color: #8a97ab !important;
+}
+
+.parameter-modal .field input,
+.parameter-modal .field select,
+.parameter-modal .field textarea,
+.parameter-role-trigger,
+.parameter-role-search input {
+  min-height: 40px !important;
+  border-radius: 10px !important;
+  border: 1px solid var(--airtable-border-strong) !important;
+  background: #ffffff !important;
+  padding: 9px 12px !important;
+  font-size: 13px !important;
+  color: var(--airtable-text) !important;
+  box-shadow: none !important;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease !important;
+}
+
+.parameter-modal .field textarea,
+.parameter-kpi-definition {
+  min-height: 88px !important;
+  line-height: 1.55 !important;
+}
+
+.parameter-modal .field input:focus,
+.parameter-modal .field select:focus,
+.parameter-modal .field textarea:focus,
+.parameter-role-search input:focus,
+.parameter-role-select.is-open .parameter-role-trigger,
+.parameter-role-trigger:hover {
+  border-color: rgba(45, 127, 249, 0.7) !important;
+  box-shadow: 0 0 0 3px rgba(45, 127, 249, 0.14) !important;
+  transform: none !important;
+}
+
+.readonly-input {
+  background: #f6f8fb !important;
+  color: #516074 !important;
+  border-color: #d7dde6 !important;
+}
+
+.parameter-role-trigger {
+  justify-content: space-between !important;
+}
+
+.parameter-role-menu {
+  top: calc(100% + 6px) !important;
+  border: 1px solid var(--airtable-border) !important;
+  border-radius: 14px !important;
+  background: #ffffff !important;
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.16) !important;
+}
+
+.parameter-role-search {
+  padding: 8px !important;
+  border-bottom: 1px solid var(--airtable-border) !important;
+  background: #fbfcfd !important;
+}
+
+.parameter-role-options {
+  max-height: min(340px, calc(100vh - 300px)) !important;
+  padding: 6px !important;
+}
+
+.parameter-role-option {
+  border-radius: 10px !important;
+  padding: 9px 10px !important;
+}
+
+.parameter-role-option:hover {
+  background: #f3f7ff !important;
+}
+
+.parameter-role-option.is-selected {
+  background: #e8f1ff !important;
+  color: #2454bf !important;
+  font-weight: 800 !important;
+}
+
+.parameter-modal .multisite-matrix-shell {
+  border: 1px solid #dbe2ea !important;
+  border-radius: 14px !important;
+  padding: 0 !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
+  overflow: hidden !important;
+}
+
+.parameter-modal .multisite-matrix-intro {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 10px !important;
+  margin: 0 !important;
+  padding: 8px 12px !important;
+  border-bottom: 1px solid #e4e9f0 !important;
+  background: #f9fafc !important;
+}
+
+.multisite-matrix-toolbar {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 12px !important;
+  width: 100% !important;
+  flex-wrap: wrap !important;
+}
+
+.multisite-toolbar-group {
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  min-width: 0 !important;
+  flex-wrap: wrap !important;
+}
+
+.parameter-modal .multisite-matrix-badge {
+  padding: 6px 11px !important;
+  border-radius: 999px !important;
+  background: #eef5ff !important;
+  border: 1px solid #d8e6ff !important;
+  color: #2659bd !important;
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.01em !important;
+  text-transform: none !important;
+  box-shadow: none !important;
+}
+
+.multisite-toolbar-action {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  padding: 6px 10px !important;
+  border-radius: 8px !important;
+  border: 1px solid #dde5ee !important;
+  background: #ffffff !important;
+  color: #5c6c81 !important;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  line-height: 1 !important;
+  white-space: nowrap !important;
+  cursor: default !important;
+}
+
+.multisite-toolbar-action::before {
+  content: "" !important;
+  width: 10px !important;
+  height: 10px !important;
+  border-radius: 3px !important;
+  background: linear-gradient(180deg, #94a3b8 0%, #cbd5e1 100%) !important;
+  opacity: 0.42 !important;
+}
+
+.multisite-toolbar-hint {
+  color: #7a8699 !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  line-height: 1.4 !important;
+}
+
+.multisite-table-wrap {
+  overflow: auto !important;
+  max-height: min(54vh, calc(100vh - 390px)) !important;
+  padding: 0 !important;
+  border: none !important;
+  border-radius: 0 !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
+}
+
+.multisite-table {
+  width: 100% !important;
+  min-width: 1080px !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  table-layout: fixed !important;
+}
+
+.multisite-table thead th {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 3 !important;
+  padding: 8px 12px !important;
+  background: #f8f9fb !important;
+  color: #64748b !important;
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.01em !important;
+  text-transform: none !important;
+  border-bottom: 1px solid var(--airtable-border) !important;
+  border-right: 1px solid #edf1f5 !important;
+  box-shadow: none !important;
+  white-space: nowrap !important;
+}
+
+.multisite-table thead th:last-child {
+  border-right: none !important;
+}
+
+.multisite-table tbody tr {
+  transition: background 0.15s ease !important;
+}
+
+.multisite-table tbody tr:nth-child(even) td {
+  background: #fcfdff !important;
+}
+
+.multisite-table tbody tr:hover td {
+  background: #f7fbff !important;
+}
+
+.multisite-table td {
+  padding: 8px 12px !important;
+  background: #ffffff !important;
+  border-bottom: 1px solid var(--airtable-border) !important;
+  border-right: 1px solid #eef2f6 !important;
+  color: #172033 !important;
+  font-size: 12px !important;
+  vertical-align: top !important;
+}
+
+.multisite-table td:last-child {
+  border-right: none !important;
+}
+
+.multisite-table tbody tr td:first-child,
+.multisite-table tbody tr td:last-child {
+  border-radius: 0 !important;
+  border-left: none !important;
+}
+
+.multisite-table td:first-child {
+  min-width: 260px !important;
+  font-weight: 700 !important;
+}
+
+.multisite-table input,
+.multisite-table select,
+.multisite-table textarea {
+  width: 100% !important;
+  min-height: 32px !important;
+  border-radius: 6px !important;
+  border: 1px solid transparent !important;
+  background: transparent !important;
+  padding: 5px 8px !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  line-height: 1.4 !important;
+  color: var(--airtable-text) !important;
+  box-shadow: none !important;
+}
+
+.multisite-table input:hover,
+.multisite-table select:hover,
+.multisite-table textarea:hover {
+  background: #f8fbff !important;
+  border-color: #dbe7f8 !important;
+}
+
+.multisite-table .readonly-input {
+  display: inline-flex !important;
+  align-items: center !important;
+  max-width: 100% !important;
+  min-height: 28px !important;
+  padding: 4px 10px !important;
+  border-radius: 999px !important;
+  background: #f3f5f9 !important;
+  color: #506074 !important;
+  border: 1px solid #dbe2ea !important;
+  font-weight: 700 !important;
+  font-size: 11px !important;
+  line-height: 1.25 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+.multisite-table .parameter-unit-responsible-input {
+  min-width: 0 !important;
+  background: #f5f0ff !important;
+  border-color: #e5d9ff !important;
+  color: #6d3fba !important;
+}
+
+.multisite-table .parameter-unit-responsible-input.is-empty {
+  border-style: dashed !important;
+  color: #8b99ad !important;
+  background: #fbfcfd !important;
+}
+
+.multisite-table input:focus,
+.multisite-table select:focus,
+.multisite-table textarea:focus {
+  background: #ffffff !important;
+  border-color: rgba(45, 127, 249, 0.7) !important;
+  box-shadow: 0 0 0 2px rgba(45, 127, 249, 0.16) !important;
+  transform: none !important;
+}
+
+.parameter-unit-name {
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  line-height: 1.35 !important;
+  color: #172033 !important;
+}
+
+.parameter-unit-meta {
+  margin-top: 3px !important;
+  font-size: 11px !important;
+  line-height: 1.4 !important;
+  color: #8391a5 !important;
+}
+
+.parameter-unit-cell-note {
+  display: inline-flex !important;
+  align-items: center !important;
+  max-width: 100% !important;
+  margin-top: 6px !important;
+  padding: 4px 8px !important;
+  border-radius: 999px !important;
+  border: 1px solid #d9e4f4 !important;
+  background: #f3f8ff !important;
+  box-shadow: none !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  line-height: 1.35 !important;
+  color: #537093 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+.parameter-unit-cell-note.is-linked {
+  border-color: #cfe7e5 !important;
+  background: #eefbf9 !important;
+  color: #0f766e !important;
+}
+
+.parameter-unit-cell-note.is-warning {
+  border-color: var(--airtable-warning-border) !important;
+  background: var(--airtable-warning-bg) !important;
+  color: var(--airtable-warning-text) !important;
+}
+
+.parameter-kpi-unit-pill {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  max-width: 100% !important;
+  min-width: 48px !important;
+  padding: 4px 9px !important;
+  border-radius: 999px !important;
+  background: #f3f5f8 !important;
+  border: 1px solid #dbe2ea !important;
+  color: #4f6177 !important;
+  font-size: 11px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0 !important;
+  box-shadow: none !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+.parameter-kpi-unit-pill.is-currency {
+  background: #eef4ff !important;
+  border-color: #d8e6ff !important;
+  color: #2d5fb9 !important;
+}
+
+.parameter-kpi-unit-pill.is-kpi-unit {
+  background: #e9faf1 !important;
+  border-color: #caebd9 !important;
+  color: #0f7a43 !important;
+}
+
+.parameter-table-empty {
+  margin: 12px !important;
+  padding: 20px 18px !important;
+  border-radius: 12px !important;
+  border: 1px dashed var(--airtable-border-strong) !important;
+  background: #fbfcfd !important;
+  color: #667085 !important;
+  box-shadow: none !important;
+}
+
+.parameter-modal .modal-footer {
+  padding: 14px 20px !important;
+  background: #ffffff !important;
+  border-top: 1px solid var(--airtable-border) !important;
+}
+
+.parameter-modal .footer-actions {
+  gap: 12px !important;
+}
+
+.parameter-modal .btn {
+  border-radius: 10px !important;
+  padding: 12px 18px !important;
+  font-weight: 800 !important;
+  box-shadow: none !important;
+}
+
+.parameter-modal .btn:hover {
+  transform: none !important;
+}
+
+.parameter-modal .btn-primary {
+  background: var(--airtable-blue) !important;
+  border: 1px solid var(--airtable-blue) !important;
+  color: #ffffff !important;
+}
+
+.parameter-modal .btn-primary:hover {
+  background: var(--airtable-blue-strong) !important;
+  border-color: var(--airtable-blue-strong) !important;
+}
+
+.parameter-modal .btn-soft,
+.parameter-modal #parameterCloseBtn {
+  background: #ffffff !important;
+  border: 1px solid var(--airtable-border-strong) !important;
+  color: #253041 !important;
+}
+
+.multisite-table td.parameter-fill-cell {
+  position: relative;
+}
+
+.parameter-fill-field {
+  position: relative;
+  display: block;
+  overflow: visible;
+}
+
+.parameter-fill-field .parameter-fill-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  height: 8px;
+  border: 1px solid #ffffff;
+  border-radius: 1px;
+  background: var(--airtable-blue);
+  box-shadow: none;
+  transform: translate(50%, 50%);
+  opacity: 0;
+  pointer-events: none;
+  cursor: ns-resize;
+  padding: 0;
+  z-index: 4;
+}
+
+.parameter-fill-field:hover .parameter-fill-handle,
+.parameter-fill-field:focus-within .parameter-fill-handle,
+.parameter-fill-field.is-fill-source .parameter-fill-handle,
+.parameter-fill-field.is-fill-target .parameter-fill-handle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.parameter-fill-field.is-fill-source > input,
+.parameter-fill-field.is-fill-source > select,
+.parameter-fill-field.is-fill-source > textarea {
+  border-color: rgba(45, 127, 249, 0.72) !important;
+  box-shadow: 0 0 0 2px rgba(45, 127, 249, 0.12) !important;
+  background: #ffffff !important;
+}
+
+.parameter-fill-field.is-fill-target > input,
+.parameter-fill-field.is-fill-target > select,
+.parameter-fill-field.is-fill-target > textarea {
+  border-color: rgba(45, 127, 249, 0.4) !important;
+  background: #f3f8ff !important;
+}
+
+.multisite-table td.parameter-fill-source-cell {
+  box-shadow: inset 0 0 0 1px rgba(45, 127, 249, 0.72);
+}
+
+.multisite-table td.parameter-fill-target-cell {
+  background: #f4f8ff !important;
+}
+
+body.parameter-fill-dragging,
+body.parameter-fill-dragging * {
+  user-select: none !important;
+  cursor: ns-resize !important;
+}
+
 /* FIX Average fields: keep in same row, prevent modal overflow */
 .kpi-attributes-modal .calc-logic-row:first-child {
   display: grid !important;
@@ -13897,14 +14485,14 @@ textarea {
             <div class="kpi-main-row">
               <div class="field f-unit">
                 <label><span>Unit</span></label>
-                <select id="unit" required>
-                <option value="" selected>Select Unit</option>
-                  <option value="kCur">kCur</option>
-                  <option value="%">%</option>
-                  <option value="EA">EA</option>
-                  <option value="PPM">PPM</option>
-                  <option value="Number">Number</option>
-                </select>
+         <select id="unit" required>
+    <option value="" disabled>Select Unit</option>
+    <option value="kCur" selected>kCur</option>
+    <option value="%">%</option>
+    <option value="EA">EA</option>
+    <option value="PPM">PPM</option>
+    <option value="Number">Number</option>
+</select>
               </div>
               <div class="field f-freq">
                 <label><span>Frequency</span></label>
@@ -14347,7 +14935,16 @@ textarea {
                 
                 <div class="multisite-matrix-shell">
                   <div class="multisite-matrix-intro">
-                    <div class="multisite-matrix-badge" id="parameter_scope_table_badge">Unit Type View</div>
+                    <div class="multisite-matrix-toolbar">
+                      <div class="multisite-toolbar-group">
+                        <div class="multisite-matrix-badge" id="parameter_scope_table_badge">Unit Type View</div>
+                        <span class="multisite-toolbar-action">Hidden fields</span>
+                        <span class="multisite-toolbar-action">Filter</span>
+                        <span class="multisite-toolbar-action">Group</span>
+                        <span class="multisite-toolbar-action">Sort</span>
+                      </div>
+                      <div class="multisite-toolbar-hint">Drag the blue corner to fill values down a column.</div>
+                    </div>
                   </div>
                   <div id="parameterMultisiteMatrix"></div>
                 </div>
@@ -14457,6 +15054,7 @@ textarea {
       let parameterLockedZoneIds = [];
       let parameterResolvedZoneId = "";
       let parameterZoneLookupPending = false;
+      let parameterFillDragState = null;
       let kpiSavePending = false;
       const KPI_FILE_UPLOAD_MAX_SIZE = ${KPI_FILE_UPLOAD_MAX_BYTES};
       let pendingKpiUploadFile = null;
@@ -16153,6 +16751,7 @@ function renderParameterTableEmptyState(message) {
   const matrixEl = document.getElementById("parameterMultisiteMatrix");
   if (!matrixEl) return;
 
+  cleanupParameterFillDragState();
   matrixEl.innerHTML = '<div class="parameter-table-empty">' + escapeHtml(message) + '</div>';
 }
 
@@ -17092,6 +17691,7 @@ function renderParameterTableEmptyState(message) {
   const matrixEl = document.getElementById("parameterMultisiteMatrix");
   if (!matrixEl) return;
 
+  cleanupParameterFillDragState();
   matrixEl.innerHTML = '<div class="parameter-table-empty">' + escapeHtml(message) + '</div>';
 }
 
@@ -17414,9 +18014,301 @@ function syncRoleApplyAllRowState(visibleRows = [], patch = {}) {
   }
 }
 
+function resolveParameterFillControl(element, preferredFillKey = "") {
+  if (!element || typeof element.closest !== "function") return null;
+
+  const directControl =
+    typeof element.matches === "function" &&
+    element.matches(
+      preferredFillKey
+        ? '[data-fill-key="' + preferredFillKey + '"]'
+        : "[data-fill-key]"
+    )
+      ? element
+      : null;
+  if (directControl) return directControl;
+
+  const fillField = element.closest(".parameter-fill-field");
+  if (fillField) {
+    const fieldControl = fillField.querySelector(
+      preferredFillKey
+        ? '[data-fill-key="' + preferredFillKey + '"]'
+        : "[data-fill-key]"
+    );
+    if (fieldControl) return fieldControl;
+  }
+
+  const fillCell = element.closest("td.parameter-fill-cell");
+  return fillCell
+    ? fillCell.querySelector(
+        preferredFillKey
+          ? '[data-fill-key="' + preferredFillKey + '"]'
+          : "[data-fill-key]"
+      )
+    : null;
+}
+
+function getParameterFillControls(fillKey) {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl || !fillKey) return [];
+
+  return Array.from(
+    matrixEl.querySelectorAll('[data-fill-key="' + fillKey + '"]')
+  ).filter((control) => !control.disabled);
+}
+
+function clearParameterFillPreview(fillKey = "") {
+  const matrixEl = document.getElementById("parameterMultisiteMatrix");
+  if (!matrixEl) return;
+
+  const selector = fillKey
+    ? '[data-fill-key="' + fillKey + '"]'
+    : "[data-fill-key]";
+
+  Array.from(matrixEl.querySelectorAll(selector)).forEach((control) => {
+    const fillField = control.closest(".parameter-fill-field");
+    const cell = control.closest("td");
+    if (fillField) {
+      fillField.classList.remove("is-fill-source", "is-fill-target");
+    }
+    if (cell) {
+      cell.classList.remove("parameter-fill-source-cell", "parameter-fill-target-cell");
+    }
+  });
+}
+
+function syncParameterFillPreview(controls, sourceIndex, targetIndex) {
+  controls.forEach((control, index) => {
+    const fillField = control.closest(".parameter-fill-field");
+    const cell = control.closest("td");
+    const isSource = index === sourceIndex;
+    const isTarget = index > sourceIndex && index <= targetIndex;
+
+    if (fillField) {
+      fillField.classList.toggle("is-fill-source", isSource);
+      fillField.classList.toggle("is-fill-target", isTarget);
+    }
+
+    if (cell) {
+      cell.classList.toggle("parameter-fill-source-cell", isSource);
+      cell.classList.toggle("parameter-fill-target-cell", isTarget);
+    }
+  });
+
+  if (parameterFillDragState) {
+    parameterFillDragState.targetIndex = targetIndex;
+  }
+}
+
+function updateParameterFillPreviewFromPoint(clientX, clientY) {
+  const dragState = parameterFillDragState;
+  if (!dragState) return;
+
+  dragState.pointerX = clientX;
+  dragState.pointerY = clientY;
+
+  const controls = getParameterFillControls(dragState.fillKey);
+  const sourceIndex = controls.indexOf(dragState.sourceControl);
+  if (sourceIndex === -1) return;
+
+  let targetIndex = sourceIndex;
+  const hoveredElement = document.elementFromPoint(clientX, clientY);
+  const hoveredControl = resolveParameterFillControl(hoveredElement, dragState.fillKey);
+
+  if (hoveredControl && hoveredControl.dataset.fillKey === dragState.fillKey) {
+    const hoveredIndex = controls.indexOf(hoveredControl);
+    if (hoveredIndex !== -1) {
+      targetIndex = Math.max(sourceIndex, hoveredIndex);
+    }
+  } else if (
+    dragState.tableWrap &&
+    typeof dragState.tableWrap.getBoundingClientRect === "function"
+  ) {
+    const wrapRect = dragState.tableWrap.getBoundingClientRect();
+    if (clientY > wrapRect.bottom) {
+      targetIndex = controls.length - 1;
+    }
+  }
+
+  syncParameterFillPreview(controls, sourceIndex, targetIndex);
+}
+
+function stopParameterFillAutoScroll() {
+  if (parameterFillDragState?.autoScrollFrame) {
+    cancelAnimationFrame(parameterFillDragState.autoScrollFrame);
+    parameterFillDragState.autoScrollFrame = null;
+  }
+}
+
+function tickParameterFillAutoScroll() {
+  const dragState = parameterFillDragState;
+  if (!dragState || !dragState.tableWrap) return;
+
+  const wrapRect = dragState.tableWrap.getBoundingClientRect();
+  const edgeSize = 34;
+  let scrollDelta = 0;
+
+  if (dragState.pointerY > wrapRect.bottom - edgeSize) {
+    scrollDelta = Math.max(6, Math.ceil((dragState.pointerY - (wrapRect.bottom - edgeSize)) / 3));
+  } else if (dragState.pointerY < wrapRect.top + edgeSize) {
+    scrollDelta = -Math.max(6, Math.ceil(((wrapRect.top + edgeSize) - dragState.pointerY) / 3));
+  }
+
+  if (scrollDelta !== 0) {
+    dragState.tableWrap.scrollTop += scrollDelta;
+    updateParameterFillPreviewFromPoint(dragState.pointerX, dragState.pointerY);
+  }
+
+  dragState.autoScrollFrame = requestAnimationFrame(tickParameterFillAutoScroll);
+}
+
+function applyParameterFillValue(control, value) {
+  if (!control || control.disabled) return;
+
+  control.value = value;
+  control.dispatchEvent(new Event("input", { bubbles: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function cleanupParameterFillDragState() {
+  stopParameterFillAutoScroll();
+  clearParameterFillPreview(parameterFillDragState?.fillKey || "");
+  window.removeEventListener("pointermove", handleParameterFillPointerMove);
+  window.removeEventListener("pointerup", finishParameterFillDrag);
+  window.removeEventListener("pointercancel", finishParameterFillDrag);
+  document.body.classList.remove("parameter-fill-dragging");
+  parameterFillDragState = null;
+}
+
+function finishParameterFillDrag() {
+  const dragState = parameterFillDragState;
+  if (!dragState) return;
+
+  const controls = getParameterFillControls(dragState.fillKey);
+  const sourceIndex = controls.indexOf(dragState.sourceControl);
+  const targetIndex = Math.max(sourceIndex, dragState.targetIndex ?? sourceIndex);
+
+  if (sourceIndex !== -1 && targetIndex > sourceIndex) {
+    const sourceValue = dragState.sourceControl.value;
+    for (let index = sourceIndex + 1; index <= targetIndex; index += 1) {
+      applyParameterFillValue(controls[index], sourceValue);
+    }
+  }
+
+  cleanupParameterFillDragState();
+}
+
+function handleParameterFillPointerMove(event) {
+  if (!parameterFillDragState) return;
+  updateParameterFillPreviewFromPoint(event.clientX, event.clientY);
+}
+
+function startParameterFillDrag(event) {
+  const fillHandle = event.currentTarget;
+  const sourceControl = resolveParameterFillControl(fillHandle);
+  if (!sourceControl) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  cleanupParameterFillDragState();
+
+  const fillKey = String(sourceControl.dataset.fillKey || "").trim();
+  const controls = getParameterFillControls(fillKey);
+  const sourceIndex = controls.indexOf(sourceControl);
+  if (!fillKey || sourceIndex === -1) return;
+
+  parameterFillDragState = {
+    fillKey,
+    sourceControl,
+    sourceIndex,
+    targetIndex: sourceIndex,
+    tableWrap: sourceControl.closest(".multisite-table-wrap"),
+    pointerX: event.clientX,
+    pointerY: event.clientY,
+    autoScrollFrame: null
+  };
+
+  syncParameterFillPreview(controls, sourceIndex, sourceIndex);
+  document.body.classList.add("parameter-fill-dragging");
+
+  window.addEventListener("pointermove", handleParameterFillPointerMove);
+  window.addEventListener("pointerup", finishParameterFillDrag);
+  window.addEventListener("pointercancel", finishParameterFillDrag);
+
+  tickParameterFillAutoScroll();
+}
+
+function fillParameterColumnToEnd(event) {
+  const fillHandle = event.currentTarget;
+  const sourceControl = resolveParameterFillControl(fillHandle);
+  if (!sourceControl) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const fillKey = String(sourceControl.dataset.fillKey || "").trim();
+  const controls = getParameterFillControls(fillKey);
+  const sourceIndex = controls.indexOf(sourceControl);
+  if (!fillKey || sourceIndex === -1) return;
+
+  const sourceValue = sourceControl.value;
+  for (let index = sourceIndex + 1; index < controls.length; index += 1) {
+    applyParameterFillValue(controls[index], sourceValue);
+  }
+}
+
+function enhanceParameterFillHandles(rootEl = document.getElementById("parameterMultisiteMatrix")) {
+  if (!rootEl) return;
+
+  const editableControls = Array.from(
+    rootEl.querySelectorAll(
+      ".parameter-unit-target-input, .parameter-unit-setup-date-input, .parameter-unit-approved-by-select"
+    )
+  ).filter((control) => !control.disabled && !control.classList.contains("readonly-input"));
+
+  editableControls.forEach((control) => {
+    const existingWrapper = control.closest(".parameter-fill-field");
+    const fillKey = control.classList.contains("parameter-unit-target-input")
+      ? "target_value"
+      : control.classList.contains("parameter-unit-setup-date-input")
+        ? "target_setup_date"
+        : control.classList.contains("parameter-unit-approved-by-select")
+          ? "approved_by_id"
+          : "";
+
+    if (!fillKey) return;
+
+    control.dataset.fillKey = fillKey;
+
+    if (existingWrapper) return;
+
+    const cell = control.closest("td");
+    if (cell) {
+      cell.classList.add("parameter-fill-cell");
+    }
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "parameter-fill-field";
+    control.parentNode.insertBefore(wrapper, control);
+    wrapper.appendChild(control);
+
+    const fillHandle = document.createElement("button");
+    fillHandle.type = "button";
+    fillHandle.className = "parameter-fill-handle";
+    fillHandle.tabIndex = -1;
+    fillHandle.setAttribute("aria-label", "Drag to fill down");
+    fillHandle.title = "Drag to fill down. Double-click to fill to the end.";
+    fillHandle.addEventListener("pointerdown", startParameterFillDrag);
+    fillHandle.addEventListener("dblclick", fillParameterColumnToEnd);
+    wrapper.appendChild(fillHandle);
+  });
+}
+
 function renderMultisiteUnitMatrix() {
   const matrixEl = document.getElementById("parameterMultisiteMatrix");
   if (!matrixEl) return;
+
+  cleanupParameterFillDragState();
 
   const scopeKind = getParameterScopeKind();
   const selectedKpiId = getParameterFieldValue("parameter_kpi_id");
@@ -17503,7 +18395,7 @@ if (
                 '<div class="parameter-unit-name">' + escapeHtml(unitSummary.title) + '</div>' +
                 '<div class="parameter-unit-meta">' + escapeHtml(unitSummary.detail) + '</div>' +
               '</td>' +
-              '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
+              '<td><span class="parameter-kpi-unit-pill is-kpi-unit">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
               '<td>' +
                 '<input class="parameter-unit-target-input" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(sharedTargetValue) + '" />' +
               '</td>' +
@@ -17511,7 +18403,7 @@ if (
                 '<input class="parameter-unit-setup-date-input" type="date" value="' + escapeHtml(sharedSetupDate) + '" />' +
               '</td>' +
               '<td>' +
-                '<input class="readonly-input parameter-unit-responsible-input" type="text" readonly tabindex="-1" value="' + escapeHtml(roleLabel) + '" />' +
+                '<div class="readonly-input parameter-unit-responsible-input" title="' + escapeHtml(roleLabel) + '">' + escapeHtml(roleLabel) + '</div>' +
               '</td>' +
             '</tr>' +
           '</tbody>' +
@@ -17536,6 +18428,7 @@ if (
       });
     });
 
+    enhanceParameterFillHandles(matrixEl);
     syncPrimaryParameterFieldsFromTable();
     return;
   }
@@ -17585,9 +18478,9 @@ if (
                     : '') +
                 '</td>' +
                 (showSellCurrencyColumn
-                  ? '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>'
+                  ? '<td><span class="parameter-kpi-unit-pill is-currency">' + escapeHtml(scopeEntry.local_currency || "-") + '</span></td>'
                   : '') +
-                '<td><span class="parameter-kpi-unit-pill">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
+                '<td><span class="parameter-kpi-unit-pill is-kpi-unit">' + escapeHtml(selectedKpiUnit || "-") + '</span></td>' +
                 '<td>' +
                   '<input class="parameter-unit-target-input" data-scope-kind="' + escapeHtml(scopeEntryKind) + '" data-scope-id="' + escapeHtml(scopeId) + '" type="number" step="any" placeholder="Enter target value" value="' + escapeHtml(targetInputValue) + '" />' +
                 '</td>' +
@@ -17597,8 +18490,8 @@ if (
                '<td>' +
                   (
                scopeKind === "role" && isRoleApplyAllMode()
-               ? '<input class="readonly-input parameter-unit-responsible-input" type="text" readonly tabindex="-1" value="' + escapeHtml(getParameterRoleLabel(selectedRoleId) || "Selected role") + '" />'
-               : '<input class="' + responsibleInputClass + '" type="text" readonly tabindex="-1" value="' + escapeHtml(responsibleLabel) + '" placeholder="' + escapeHtml(responsiblePlaceholder) + '" />' + responsibleNoteMarkup
+               ? '<div class="readonly-input parameter-unit-responsible-input" title="' + escapeHtml(getParameterRoleLabel(selectedRoleId) || "Selected role") + '">' + escapeHtml(getParameterRoleLabel(selectedRoleId) || "Selected role") + '</div>'
+               : '<div class="' + responsibleInputClass + '" title="' + escapeHtml(responsibleLabel || responsiblePlaceholder) + '">' + escapeHtml(responsibleLabel || responsiblePlaceholder) + '</div>' + responsibleNoteMarkup
                ) +
               '</td>' +
               '</tr>';
@@ -17639,6 +18532,7 @@ Array.from(matrixEl.querySelectorAll(".parameter-unit-target-input")).forEach((i
     });
   });
 
+  enhanceParameterFillHandles(matrixEl);
   syncPrimaryParameterFieldsFromTable();
 }
 
@@ -20199,6 +21093,7 @@ async function loadKpis(search = "") {
 
       function closeParameterModal(force = false) {
         if (parameterSavePending && !force) return;
+        cleanupParameterFillDragState();
         closeParameterRoleDropdown();
         document.getElementById("parameterModalBackdrop").classList.remove("open");
       }
@@ -21192,6 +22087,17 @@ function fillForm(data) {
           restoreKpiCreateDraft(kpiCreateDraft);
         } else {
           resetForm();
+          document.getElementById("unit").value = "kCur";
+          document.getElementById("frequency").value = "Weekly";
+          document.getElementById("direction").value = "Up";
+          document.getElementById("reactivity_status").value = "Anticipated";
+          document.getElementById("calculation_on").value = "Value";
+          document.getElementById("pricing_type").value = "Operational";
+          document.getElementById("importance").value = "Medium";
+          document.getElementById("reactivity_need").value = "Urgent";
+          document.getElementById("calculation_mode").value = "Direct";
+          document.getElementById("display_trend").value = "Yes";
+
         }
         document.getElementById("modalTitle").textContent = "Add New KPI";
         document.getElementById("modalSubtitle").textContent =
@@ -22441,7 +23347,6 @@ function syncToleranceRadioButtons() {
   </html>
   `);
 });
-
 
 
 
