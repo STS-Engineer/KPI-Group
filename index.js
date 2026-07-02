@@ -12346,9 +12346,33 @@ textarea {
 }
 
 .kpi-attributes-modal.subject-selection-mode .subject-selection-section .tree-list {
-  height: 100% !important;
+  display: flex !important;
+  flex: 1 1 auto !important;
+  height: auto !important;
   min-height: 0 !important;
   max-height: none !important;
+  overflow: visible !important;
+  align-items: stretch !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .sf-flow {
+  flex: 1 1 auto !important;
+  width: max-content !important;
+  min-height: 100% !important;
+  height: auto !important;
+  align-items: stretch !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .sf-column {
+  display: flex !important;
+  flex-direction: column !important;
+  min-height: 100% !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .sf-col-body {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+  overflow: visible !important;
 }
 
 @media (max-width: 1280px) {
@@ -22417,6 +22441,7 @@ function syncToleranceRadioButtons() {
   </html>
   `);
 });
+
 
 
 
