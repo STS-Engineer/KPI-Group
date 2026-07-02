@@ -22097,6 +22097,7 @@ function fillForm(data) {
           document.getElementById("reactivity_need").value = "Urgent";
           document.getElementById("calculation_mode").value = "Direct";
           document.getElementById("display_trend").value = "Yes";
+          document.getElementById("min_type").value = "0";
 
         }
         document.getElementById("modalTitle").textContent = "Add New KPI";
