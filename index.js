@@ -26718,6 +26718,11 @@ const ensureActionPlanCorrectiveActionSchema = async () => {
         ADD COLUMN IF NOT EXISTS kpi_id VARCHAR
       `);
 
+       await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS unit_id VARCHAR
+      `);
+
       await actionPlanPool.query(`
         UPDATE public.action AS a
         SET kpi_id = parsed.kpi_id
@@ -27027,6 +27032,7 @@ const mapActionPlanActionRow = (row = {}) => {
   });
   if (!subjectInfo) return null;
   const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+  const persistedUnitId = normalizeOptionalIntegerInput(row.unit_id);
 
   const status =
     normalizeCorrectiveActionStatus(row.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
@@ -27038,6 +27044,8 @@ const mapActionPlanActionRow = (row = {}) => {
     kpi_values_id: subjectInfo.kpiTargetAllocationId,
     kpi_target_allocation_id: subjectInfo.kpiTargetAllocationId,
     kpi_id: persistedKpiId || subjectInfo.kpiId,
+    unit_id: persistedUnitId,
+    unitId: persistedUnitId,
     week: subjectInfo.periodLabel,
     period_label: subjectInfo.periodLabel,
     // In Action Plan DB, the action title stores the implemented solution
@@ -27059,6 +27067,7 @@ const mapActionPlanActionRow = (row = {}) => {
     sujet_title: normalizeOptionalTextInput(row.sujet_title)
   };
 };
+
 
 const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLabel = null) => {
   if (!(await canUseActionPlanCorrectiveActions())) {
