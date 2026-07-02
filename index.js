@@ -45458,6 +45458,7 @@ const ROWS_SQL = `
   SELECT
     v.kpi_target_allocation_id               AS a,
     kta.kpi_id                              AS kid,
+    COALESCE(kta.unit_id, kta.plant_id)     AS uid,
     v.kpi_name                               AS k,
     COALESCE(v.plant_name, '—')              AS p,
     COALESCE(v.role_name,  '—')              AS r,
@@ -45489,9 +45490,18 @@ const num = (x) => {
   return Number.isFinite(n) ? n : null;
 };
 
+const buildMonitoringActionScopeKey = (kpiId, unitId = null) => {
+  const normalizedKpiId = normalizeOptionalIntegerInput(kpiId);
+  const normalizedUnitId = normalizeOptionalIntegerInput(unitId);
+  if (!normalizedKpiId) return "";
+
+  return `${normalizedKpiId}::${normalizedUnitId || ""}`;
+};
+
 const mapMonitoringActionRow = (row = {}) => {
   const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
   if (!persistedKpiId) return null;
+  const persistedUnitId = normalizeOptionalIntegerInput(row.unit_id);
 
   const subjectInfo = parseActionPlanSubjectReference({
     subjectCode: row.sujet_code,
@@ -45508,6 +45518,8 @@ const mapMonitoringActionRow = (row = {}) => {
     id: normalizeOptionalIntegerInput(row.id),
     corrective_action_id: normalizeOptionalIntegerInput(row.id),
     kpi_id: persistedKpiId,
+    unit_id: persistedUnitId,
+    unitId: persistedUnitId,
     kpi_target_allocation_id:
       normalizeOptionalIntegerInput(subjectInfo?.kpiTargetAllocationId) || null,
     week: normalizeOptionalTextInput(subjectInfo?.periodLabel) || null,
@@ -45532,15 +45544,25 @@ const mapMonitoringActionRow = (row = {}) => {
   };
 };
 
-const loadMonitoringActionsByKpiIds = async (kpiIds = []) => {
+const loadMonitoringActionsByScope = async (rows = []) => {
+  const normalizedScopes = Array.from(new Set(
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        kpiId: normalizeOptionalIntegerInput(row?.kid ?? row?.kpiId ?? row?.kpi_id),
+        unitId: normalizeOptionalIntegerInput(row?.uid ?? row?.unitId ?? row?.unit_id)
+      }))
+      .filter((row) => Number.isInteger(row.kpiId))
+      .map((row) => JSON.stringify(row))
+  )).map((value) => JSON.parse(value));
+
   const normalizedKpiIds = Array.from(new Set(
-    (Array.isArray(kpiIds) ? kpiIds : [])
-      .map((value) => normalizeOptionalIntegerInput(value))
+    normalizedScopes
+      .map((row) => row.kpiId)
       .filter((value) => Number.isInteger(value))
       .map((value) => String(value))
   ));
 
-  if (!normalizedKpiIds.length || !(await canUseActionPlanCorrectiveActions())) {
+  if (!normalizedScopes.length || !normalizedKpiIds.length || !(await canUseActionPlanCorrectiveActions())) {
     return {};
   }
 
@@ -45552,6 +45574,7 @@ const loadMonitoringActionsByKpiIds = async (kpiIds = []) => {
       SELECT
         a.id,
         a.kpi_id,
+        a.unit_id,
         a.sujet_id,
         a.type,
         a.titre,
@@ -45580,25 +45603,27 @@ const loadMonitoringActionsByKpiIds = async (kpiIds = []) => {
       [normalizedKpiIds]
     );
 
-    const actionsByKpiId = {};
+    const actionsByScopeKey = {};
 
     actionsRes.rows.forEach((row) => {
       const mappedAction = mapMonitoringActionRow(row);
       if (!mappedAction) return;
 
-      const key = String(mappedAction.kpi_id);
-      if (!actionsByKpiId[key]) {
-        actionsByKpiId[key] = [];
+      const key = buildMonitoringActionScopeKey(mappedAction.kpi_id, mappedAction.unit_id);
+      if (!key) return;
+
+      if (!actionsByScopeKey[key]) {
+        actionsByScopeKey[key] = [];
       }
 
-      actionsByKpiId[key].push(mappedAction);
+      actionsByScopeKey[key].push(mappedAction);
     });
 
-    Object.keys(actionsByKpiId).forEach((key) => {
-      actionsByKpiId[key] = sortCorrectiveActions(actionsByKpiId[key]);
+    Object.keys(actionsByScopeKey).forEach((key) => {
+      actionsByScopeKey[key] = sortCorrectiveActions(actionsByScopeKey[key]);
     });
 
-    return actionsByKpiId;
+    return actionsByScopeKey;
   } catch (error) {
     console.error("Failed to load monitoring actions:", error.message);
     return {};
@@ -45629,13 +45654,20 @@ const summarizeMonitoringActions = (actions = []) => {
   };
 };
 
-const shape = (row, actionsByKpiId = {}) => {
+const shape = (row, actionsByScope = {}) => {
   const kpiId = normalizeOptionalIntegerInput(row.kid);
-  const actions = kpiId ? (actionsByKpiId[String(kpiId)] || []) : [];
+  const unitId = normalizeOptionalIntegerInput(row.uid);
+  const scopeKey = buildMonitoringActionScopeKey(kpiId, unitId);
+  const fallbackScopeKey = buildMonitoringActionScopeKey(kpiId, null);
+  const actions = scopeKey
+    ? (actionsByScope[scopeKey] || actionsByScope[fallbackScopeKey] || [])
+    : [];
 
   return ({
   a: row.a,
   kpiId,
+  uid: unitId,
+  unitId,
   k: row.k,
   p: row.p,
   r: row.r,
@@ -45670,15 +45702,13 @@ app.get("/api/kpi/monitoring", async (req, res) => {
     }
 
     const { rows } = await pool.query(sql, params);
-    const actionsByKpiId = await loadMonitoringActionsByKpiIds(
-      rows.map((row) => row.kid)
-    );
+    const actionsByScope = await loadMonitoringActionsByScope(rows);
 
     res.json({
       ok: true,
       updatedAt: rows.length ? rows[0].calc : null,
       count: rows.length,
-      data: rows.map((row) => shape(row, actionsByKpiId)),
+      data: rows.map((row) => shape(row, actionsByScope)),
     });
   } catch (err) {
     console.error(err);
@@ -45742,6 +45772,7 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
       SELECT
         v.kpi_target_allocation_id AS a,
         kta.kpi_id AS kid,
+        COALESCE(kta.unit_id, kta.plant_id) AS uid,
         v.kpi_name AS k,
         COALESCE(v.plant_name,'—') AS p,
         COALESCE(v.role_name,'—') AS r,
@@ -45775,11 +45806,11 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
       });
     }
 
-    const actionsByKpiId = await loadMonitoringActionsByKpiIds([rows[0].kid]);
+    const actionsByScope = await loadMonitoringActionsByScope(rows);
 
     res.json({
       ok: true,
-      data: shape(rows[0], actionsByKpiId),
+      data: shape(rows[0], actionsByScope),
     });
   } catch (err) {
     console.error(err);
@@ -45789,6 +45820,5 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
     });
   }
 });
-
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
