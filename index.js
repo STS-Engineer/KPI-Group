@@ -29826,6 +29826,8 @@ app.post("/redirect", async (req, res) => {
           kta.kpi_target_allocation_id,
           kta.kpi_id,
           kta.kpi_type,
+          kta.plant_id,
+          kta.unit_id,
           kta.last_best_target,
           COALESCE(kta.target_value, k.target_value) AS effective_target_value,
           COALESCE(kta.target_unit, k.unit) AS effective_unit,
@@ -30008,16 +30010,16 @@ app.post("/redirect", async (req, res) => {
       // Save the corrective actions for this KPI period in the Action Plan DB.
       // -------------------------------------------------------
       if (correctiveActionsEnabled) {
-    const syncResult = await syncActionPlanCorrectiveActionsForPeriod({
-       kpiTargetAllocationId: allocationId,
-       kpiId,
-       unitId: allocation.unit_id ?? allocation.plant_id,
-       periodLabel: normalizedWeek,
-       subject: allocation.subject_name,
-       kpiName: allocation.kpi_name,
-       actions: submittedActions,
-       responsibleContext
-       });
+        const syncResult = await syncActionPlanCorrectiveActionsForPeriod({
+          kpiTargetAllocationId: allocationId,
+          kpiId,
+          unitId: allocation.unit_id ?? allocation.plant_id,
+          periodLabel: normalizedWeek,
+          subject: allocation.subject_name,
+          kpiName: allocation.kpi_name,
+          actions: submittedActions,
+          responsibleContext
+        });
 
         correctiveActionsCount += syncResult.savedCount || 0;
       }
