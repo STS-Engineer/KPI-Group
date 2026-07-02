@@ -26713,6 +26713,35 @@ const ensureActionPlanCorrectiveActionSchema = async () => {
         ADD COLUMN IF NOT EXISTS urgency VARCHAR(50)
       `);
 
+      await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS kpi_id VARCHAR
+      `);
+
+      await actionPlanPool.query(`
+        UPDATE public.action AS a
+        SET kpi_id = parsed.kpi_id
+        FROM (
+          SELECT
+            s.id AS sujet_id,
+            NULLIF(
+              split_part(
+                COALESCE(
+                  NULLIF(BTRIM(COALESCE(s.code, '')), ''),
+                  substring(COALESCE(s.description, '') from 'Link key:\\s*([^\\s]+)')
+                ),
+                '|',
+                3
+              ),
+              ''
+            ) AS kpi_id
+          FROM public.sujet s
+        ) AS parsed
+        WHERE a.sujet_id = parsed.sujet_id
+          AND COALESCE(BTRIM(COALESCE(a.kpi_id, '')), '') = ''
+          AND parsed.kpi_id IS NOT NULL
+      `);
+
       return true;
     })().catch((error) => {
       actionPlanCorrectiveActionSchemaPromise = null;
@@ -26997,6 +27026,7 @@ const mapActionPlanActionRow = (row = {}) => {
     description: row.sujet_description
   });
   if (!subjectInfo) return null;
+  const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
 
   const status =
     normalizeCorrectiveActionStatus(row.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
@@ -27007,7 +27037,7 @@ const mapActionPlanActionRow = (row = {}) => {
     corrective_action_id: row.id,
     kpi_values_id: subjectInfo.kpiTargetAllocationId,
     kpi_target_allocation_id: subjectInfo.kpiTargetAllocationId,
-    kpi_id: subjectInfo.kpiId,
+    kpi_id: persistedKpiId || subjectInfo.kpiId,
     week: subjectInfo.periodLabel,
     period_label: subjectInfo.periodLabel,
     // In Action Plan DB, the action title stores the implemented solution
@@ -27286,6 +27316,10 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
 
   let savedCount = 0;
   const keptActionIds = new Set();
+  const actionPlanKpiId = normalizeOptionalIntegerInput(kpiId);
+  const actionPlanKpiIdValue = Number.isInteger(actionPlanKpiId)
+    ? String(actionPlanKpiId)
+    : null;
 
   for (let index = 0; index < meaningfulActions.length; index += 1) {
     const action = meaningfulActions[index];
@@ -27331,7 +27365,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       index + 1,
       responsibleEmail,
       demandeur,
-      emailDemandeur
+      emailDemandeur,
+      actionPlanKpiIdValue
     ];
 
     if (actionId && existingActionIds.has(actionId)) {
@@ -27351,6 +27386,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
           email_responsable = $11,
           demandeur = $12,
           email_demandeur = $13,
+          kpi_id = $14,
           type = 'action',
           updated_at = NOW(),
           closed_date = CASE
@@ -27358,7 +27394,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
             ELSE NULL
           END
         WHERE id = $1
-         AND sujet_id = $14
+         AND sujet_id = $15
         RETURNING id
         `,
         [actionId, ...values, sujetId]
@@ -27389,6 +27425,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       email_responsable,
       demandeur,
       email_demandeur,
+      kpi_id,
       closed_date
     )
       VALUES (
@@ -27406,6 +27443,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
         $11,
         $12,
         $13,
+        $14,
         CASE
           WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
           ELSE NULL
@@ -45410,6 +45448,7 @@ Page: ${page || ""}
 const ROWS_SQL = `
   SELECT
     v.kpi_target_allocation_id               AS a,
+    kta.kpi_id                              AS kid,
     v.kpi_name                               AS k,
     COALESCE(v.plant_name, '—')              AS p,
     COALESCE(v.role_name,  '—')              AS r,
@@ -45427,6 +45466,8 @@ const ROWS_SQL = `
     s.analysis_details->>'urgency'           AS u,
     v.calculation_date                       AS calc
   FROM v_kpi_monitoring v
+  JOIN public.kpi_target_allocation kta
+    ON kta.kpi_target_allocation_id = v.kpi_target_allocation_id
   JOIN kpi_monitoring_status s
     ON s.monitoring_status_id = v.monitoring_status_id
   {WHERE}
@@ -45439,8 +45480,153 @@ const num = (x) => {
   return Number.isFinite(n) ? n : null;
 };
 
-const shape = (row) => ({
+const mapMonitoringActionRow = (row = {}) => {
+  const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+  if (!persistedKpiId) return null;
+
+  const subjectInfo = parseActionPlanSubjectReference({
+    subjectCode: row.sujet_code,
+    description: row.sujet_description
+  });
+  const status =
+    normalizeCorrectiveActionStatus(row.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
+    OPEN_CORRECTIVE_ACTION_STATUS;
+  const dueDate = formatDateOnlyValue(row.due_date);
+  const isClosed = String(status || "").trim().toLowerCase() === "closed";
+  const overdueDays = isClosed ? 0 : getCorrectiveActionOverdueDays(dueDate);
+
+  return {
+    id: normalizeOptionalIntegerInput(row.id),
+    corrective_action_id: normalizeOptionalIntegerInput(row.id),
+    kpi_id: persistedKpiId,
+    kpi_target_allocation_id:
+      normalizeOptionalIntegerInput(subjectInfo?.kpiTargetAllocationId) || null,
+    week: normalizeOptionalTextInput(subjectInfo?.periodLabel) || null,
+    period_label: normalizeOptionalTextInput(subjectInfo?.periodLabel) || null,
+    root_cause: normalizeOptionalTextInput(row.description) || "",
+    implemented_solution: normalizeOptionalTextInput(row.titre) || "",
+    status,
+    due_date: dueDate,
+    estimated_duration_days: normalizeCorrectiveActionEstimatedDurationDays(row.estimated_duration_days),
+    importance: normalizeCorrectiveActionImportance(row.importance),
+    urgency: normalizeCorrectiveActionUrgency(row.urgency),
+    responsible: normalizeOptionalTextInput(row.responsable) || "",
+    email_responsable: normalizeOptionalTextInput(row.email_responsable),
+    created_date: row.created_at,
+    updated_date: row.updated_at,
+    closed_date: row.closed_date,
+    sujet_id: normalizeOptionalIntegerInput(row.sujet_id),
+    sujet_code: normalizeOptionalTextInput(row.sujet_code),
+    sujet_title: normalizeOptionalTextInput(row.sujet_title),
+    overdue_days: overdueDays,
+    is_overdue: overdueDays > 0
+  };
+};
+
+const loadMonitoringActionsByKpiIds = async (kpiIds = []) => {
+  const normalizedKpiIds = Array.from(new Set(
+    (Array.isArray(kpiIds) ? kpiIds : [])
+      .map((value) => normalizeOptionalIntegerInput(value))
+      .filter((value) => Number.isInteger(value))
+      .map((value) => String(value))
+  ));
+
+  if (!normalizedKpiIds.length || !(await canUseActionPlanCorrectiveActions())) {
+    return {};
+  }
+
+  try {
+    await ensureActionPlanCorrectiveActionSchema();
+
+    const actionsRes = await actionPlanPool.query(
+      `
+      SELECT
+        a.id,
+        a.kpi_id,
+        a.sujet_id,
+        a.type,
+        a.titre,
+        a.description,
+        a.status,
+        a.responsable,
+        a.email_responsable,
+        a.due_date,
+        a.estimated_duration_days,
+        a.importance,
+        a.urgency,
+        a.created_at,
+        a.updated_at,
+        a.closed_date,
+        s.code AS sujet_code,
+        s.titre AS sujet_title,
+        s.description AS sujet_description
+      FROM public.action a
+      LEFT JOIN public.sujet s
+        ON s.id = a.sujet_id
+      WHERE COALESCE(BTRIM(COALESCE(a.kpi_id, '')), '') <> ''
+        AND a.kpi_id = ANY($1::text[])
+        AND LOWER(COALESCE(a.type, 'action')) = 'action'
+      ORDER BY COALESCE(a.updated_at, a.created_at) DESC, a.id DESC
+      `,
+      [normalizedKpiIds]
+    );
+
+    const actionsByKpiId = {};
+
+    actionsRes.rows.forEach((row) => {
+      const mappedAction = mapMonitoringActionRow(row);
+      if (!mappedAction) return;
+
+      const key = String(mappedAction.kpi_id);
+      if (!actionsByKpiId[key]) {
+        actionsByKpiId[key] = [];
+      }
+
+      actionsByKpiId[key].push(mappedAction);
+    });
+
+    Object.keys(actionsByKpiId).forEach((key) => {
+      actionsByKpiId[key] = sortCorrectiveActions(actionsByKpiId[key]);
+    });
+
+    return actionsByKpiId;
+  } catch (error) {
+    console.error("Failed to load monitoring actions:", error.message);
+    return {};
+  }
+};
+
+const summarizeMonitoringActions = (actions = []) => {
+  const normalizedActions = sortCorrectiveActions(Array.isArray(actions) ? actions : []);
+  const openActions = normalizedActions.filter(
+    (action) =>
+      normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) !== "Closed"
+  );
+  const closedActions = normalizedActions.filter(
+    (action) =>
+      normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) === "Closed"
+  );
+  const overdueActions = openActions.filter((action) => action.is_overdue);
+  const latestAction = normalizedActions[0] || null;
+
+  return {
+    total: normalizedActions.length,
+    open: openActions.length,
+    closed: closedActions.length,
+    overdue: overdueActions.length,
+    latestStatus: latestAction?.status || null,
+    latestDueDate: latestAction?.due_date || null,
+    latestUpdatedAt: latestAction?.updated_date ?? latestAction?.created_date ?? null
+  };
+};
+
+const shape = (row, actionsByKpiId = {}) => {
+  const kpiId = normalizeOptionalIntegerInput(row.kid);
+  const actions = kpiId ? (actionsByKpiId[String(kpiId)] || []) : [];
+
+  return ({
   a: row.a,
+  kpiId,
   k: row.k,
   p: row.p,
   r: row.r,
@@ -45456,7 +45642,10 @@ const shape = (row) => ({
   c: row.c,
   im: row.im,
   u: row.u,
+  actions,
+  actionSummary: summarizeMonitoringActions(actions)
 });
+};
 app.get("/api/kpi/monitoring", async (req, res) => {
   try {
     const { plant } = req.query;
@@ -45472,12 +45661,15 @@ app.get("/api/kpi/monitoring", async (req, res) => {
     }
 
     const { rows } = await pool.query(sql, params);
+    const actionsByKpiId = await loadMonitoringActionsByKpiIds(
+      rows.map((row) => row.kid)
+    );
 
     res.json({
       ok: true,
       updatedAt: rows.length ? rows[0].calc : null,
       count: rows.length,
-      data: rows.map(shape),
+      data: rows.map((row) => shape(row, actionsByKpiId)),
     });
   } catch (err) {
     console.error(err);
@@ -45540,6 +45732,7 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
     const sql = `
       SELECT
         v.kpi_target_allocation_id AS a,
+        kta.kpi_id AS kid,
         v.kpi_name AS k,
         COALESCE(v.plant_name,'—') AS p,
         COALESCE(v.role_name,'—') AS r,
@@ -45557,6 +45750,8 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
         s.analysis_details->>'urgency' AS u,
         v.calculation_date AS calc
       FROM v_kpi_monitoring v
+      JOIN public.kpi_target_allocation kta
+        ON kta.kpi_target_allocation_id = v.kpi_target_allocation_id
       JOIN kpi_monitoring_status s
         ON s.monitoring_status_id = v.monitoring_status_id
       WHERE v.kpi_target_allocation_id = $1
@@ -45571,9 +45766,11 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
       });
     }
 
+    const actionsByKpiId = await loadMonitoringActionsByKpiIds([rows[0].kid]);
+
     res.json({
       ok: true,
-      data: shape(rows[0]),
+      data: shape(rows[0], actionsByKpiId),
     });
   } catch (err) {
     console.error(err);
@@ -45583,5 +45780,6 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
     });
   }
 });
+
 // ---------- Start server ----------
 app.listen(port, () => console.log("Server running on port " + port));
