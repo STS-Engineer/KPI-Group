@@ -12309,6 +12309,48 @@ textarea {
   margin-top: 0 !important;
 }
 
+.kpi-attributes-modal.subject-selection-mode .modal-body {
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-dependent-section {
+  display: none !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section {
+  display: flex !important;
+  flex-direction: column !important;
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .form-grid {
+  display: flex !important;
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+  align-items: stretch !important;
+  justify-content: flex-start !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .hierarchy-tree-field,
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .tree-select,
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .tree-select-panel {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .tree-select-panel {
+  max-height: none !important;
+}
+
+.kpi-attributes-modal.subject-selection-mode .subject-selection-section .tree-list {
+  height: 100% !important;
+  min-height: 0 !important;
+  max-height: none !important;
+}
+
 @media (max-width: 1280px) {
   .kpi-attributes-modal .kpi-inline-row {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
@@ -13790,7 +13832,7 @@ textarea {
   </div>
 </div>
 
-          <div class="form-section">
+          <div class="form-section subject-selection-section">
             <div class="form-grid">
             <div class="field col-12 hierarchy-field hierarchy-tree-field">
               <label><span>Subject</span><span class="hint">Excel hierarchy tree</span></label>
@@ -13799,7 +13841,7 @@ textarea {
               <div class="tree-select" id="subjectTreeSelect">
                 <button type="button" class="tree-select-trigger" id="subjectTreeTrigger" onclick="toggleSubjectTree()">
                   <span class="tree-select-value">
-                    <span class="tree-select-label" id="subjectTreeLabel">Selectdv subject from tree</span>
+                    <span class="tree-select-label" id="subjectTreeLabel">Select subject from tree</span>
                     <span class="tree-select-meta" id="subjectTreeMeta">Open the visual hierarchy to choose a subject and follow its branch.</span>
                   </span>
                   <span class="tree-select-chevron" id="subjectTreeChevron">▾</span>
@@ -13827,7 +13869,7 @@ textarea {
             </div>
           </div>
 
-          <div class="form-section">
+          <div class="form-section subject-dependent-section">
             <div class="kpi-main-row">
               <div class="field f-unit">
                 <label><span>Unit</span></label>
@@ -13888,7 +13930,7 @@ textarea {
             </div>
           </div>
 
-          <div class="form-section">
+          <div class="form-section subject-dependent-section">
             <div class="kpi-three-row">
               <div class="field">
                 <label><span>Reactivity Status</span></label>
@@ -13927,7 +13969,7 @@ textarea {
           </div>
 
           <!-- SECTION 3: Calculation logic stacked rows -->
-          <div class="form-section">
+          <div class="form-section subject-dependent-section">
             <div class="calc-section-rows">
               <div class="calc-logic-row">
                 <span class="clr-label">Calculation On</span>
@@ -14027,7 +14069,7 @@ textarea {
             </div>
           </div>
 
-<div class="form-section">
+<div class="form-section subject-dependent-section">
 
   <div class="tolerance-wrap">
 
@@ -17676,6 +17718,28 @@ function updateSubjectTreeTrigger(node = null, fallbackLabel = "") {
   }
 }
 
+function syncSubjectSelectionMode() {
+  const modalEl = document.querySelector("#modalBackdrop .kpi-attributes-modal");
+  const treeSelect = document.getElementById("subjectTreeSelect");
+  const searchEl = document.getElementById("subjectTreeSearch");
+  const isSelectionMode = Boolean(
+    modalEl &&
+    treeSelect &&
+    treeSelect.classList.contains("open")
+  );
+
+  if (!modalEl) return;
+
+  modalEl.classList.toggle("subject-selection-mode", isSelectionMode);
+
+  if (isSelectionMode && searchEl) {
+    requestAnimationFrame(() => {
+      searchEl.focus();
+      searchEl.select();
+    });
+  }
+}
+
 function toggleSubjectTree(forceOpen) {
   const treeSelect = document.getElementById("subjectTreeSelect");
   if (!treeSelect) return;
@@ -17686,6 +17750,7 @@ function toggleSubjectTree(forceOpen) {
 
   treeSelect.classList.toggle("open", shouldOpen);
   updateSubjectTreeTrigger(getSubjectNode(getFieldValue("subject_node_id")));
+  syncSubjectSelectionMode();
 }
 
 function closeSubjectTree() {
@@ -20053,6 +20118,7 @@ async function loadKpis(search = "") {
       function openModal() {
         setKpiSaveLoading(kpiSavePending);
         document.getElementById("modalBackdrop").classList.add("open");
+        syncSubjectSelectionMode();
         requestAnimationFrame(() => {
           syncDefinitionTextareaHeight();
         });
@@ -20060,6 +20126,7 @@ async function loadKpis(search = "") {
 
       function closeModal(force = false) {
         if (kpiSavePending && !force) return;
+        closeSubjectTree();
         document.getElementById("modalBackdrop").classList.remove("open");
       }
 
