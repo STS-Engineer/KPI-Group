@@ -27250,6 +27250,7 @@ const ensureActionPlanSubject = async ({
 const syncActionPlanCorrectiveActionsForPeriod = async ({
   kpiTargetAllocationId,
   kpiId,
+  unitId,
   periodLabel,
   subject,
   kpiName,
