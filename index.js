@@ -45472,11 +45472,13 @@ Page: ${page || ""}
 });
 
 
+
 const ROWS_SQL = `
   SELECT
     v.kpi_target_allocation_id               AS a,
     kta.kpi_id                              AS kid,
     COALESCE(kta.unit_id, kta.plant_id)     AS uid,
+    s.owner_role_id                         AS owner_role_id,
     v.kpi_name                               AS k,
     COALESCE(v.plant_name, '—')              AS p,
     COALESCE(v.role_name,  '—')              AS r,
@@ -45675,6 +45677,7 @@ const summarizeMonitoringActions = (actions = []) => {
 const shape = (row, actionsByScope = {}) => {
   const kpiId = normalizeOptionalIntegerInput(row.kid);
   const unitId = normalizeOptionalIntegerInput(row.uid);
+  const ownerRoleId = normalizeOptionalIntegerInput(row.owner_role_id);
   const scopeKey = buildMonitoringActionScopeKey(kpiId, unitId);
   const fallbackScopeKey = buildMonitoringActionScopeKey(kpiId, null);
   const actions = scopeKey
@@ -45686,6 +45689,8 @@ const shape = (row, actionsByScope = {}) => {
   kpiId,
   uid: unitId,
   unitId,
+  owner_role_id: ownerRoleId,
+  ownerRoleId,
   k: row.k,
   p: row.p,
   r: row.r,
@@ -45736,7 +45741,6 @@ app.get("/api/kpi/monitoring", async (req, res) => {
     });
   }
 });
-
 app.get("/api/kpi/monitoring/meta", async (req, res) => {
   try {
     const plantsQ = pool.query(`
@@ -45791,6 +45795,7 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
         v.kpi_target_allocation_id AS a,
         kta.kpi_id AS kid,
         COALESCE(kta.unit_id, kta.plant_id) AS uid,
+        s.owner_role_id AS owner_role_id,
         v.kpi_name AS k,
         COALESCE(v.plant_name,'—') AS p,
         COALESCE(v.role_name,'—') AS r,
@@ -45836,6 +45841,32 @@ app.get("/api/kpi/monitoring/:allocationId", async (req, res) => {
       ok: false,
       error: "Failed to load KPI allocation.",
     });
+  }
+});
+
+app.post("/api/kpi/monitoring/comment", async (req, res) => {
+  try {
+    const { actionId, comment } = req.body;
+
+    if (!actionId) {
+      return res.status(400).json({ ok: false, error: "actionId is required" });
+    }
+
+    await actionPlanPool.query(
+      `
+      UPDATE public.action
+      SET
+        comment = $1,
+        updated_at = NOW()
+      WHERE id = $2
+      `,
+      [comment, actionId]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 // ---------- Start server ----------
