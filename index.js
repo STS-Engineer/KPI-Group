@@ -11649,6 +11649,7 @@ textarea {
 .sf-badge-l1 { background: rgba(37,99,235,0.10); color: #1d4ed8; }
 .sf-badge-l2 { background: rgba(6,182,212,0.10);  color: #0891b2; }
 .sf-badge-l3 { background: rgba(16,185,129,0.10); color: #047857; }
+.sf-badge-l4 { background: rgba(245,158,11,0.12); color: #b45309; }
 .sf-badge-lx { background: rgba(148,163,184,0.12); color: #64748b; }
 
 .sf-selected .sf-badge {
@@ -18553,7 +18554,7 @@ function getFieldValue(id) {
 const subjectTreeNodeLookup = new Map();
 let subjectTreeExpandedIds = new Set();
 let subjectTreeSelectedFlow = [];
-const SUBJECT_TREE_MAX_LEVELS = 4;
+const SUBJECT_TREE_MAX_LEVELS = 5;
 
 function getAllSubjectTreeIds(nodes = getSubjectTreeRoots(), target = new Set()) {
   (Array.isArray(nodes) ? nodes : []).forEach((node) => {
@@ -18738,8 +18739,8 @@ function renderSubjectTree() {
   var columns = getSubjectFlowColumns();
   var search = (currentTreeSearch || '').toLowerCase().trim();
 
-  var levelTitles = ['Parent subjects', 'Related subjects', 'Sub-category', 'KPI subjects'];
-  var badgeClasses = ['sf-badge-l0', 'sf-badge-l1', 'sf-badge-l2', 'sf-badge-l3'];
+  var levelTitles = ['Parent subjects', 'Related subjects', 'Sub-category', 'KPI subjects', 'Level 5'];
+  var badgeClasses = ['sf-badge-l0', 'sf-badge-l1', 'sf-badge-l2', 'sf-badge-l3', 'sf-badge-l4'];
 
   var html = '<div class="sf-flow">';
 
@@ -22096,7 +22097,7 @@ function fillForm(data) {
           document.getElementById("importance").value = "Medium";
           document.getElementById("reactivity_need").value = "Urgent";
           document.getElementById("calculation_mode").value = "Direct";
-          document.getElementById("display_trend").value = "Yes";
+          document.getElementById("display_trend").value = "No";
           document.getElementById("min_type").value = "0";
 
         }
