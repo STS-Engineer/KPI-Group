@@ -8412,7 +8412,16 @@ app.get("/responsible/:responsibleId/dashboard", async (req, res) => {
 
   const responsibleName = responsibleContext?.name || "KPI Workspace";
   const dashboardResponsibleId = responsibleContext?.people_id || responsibleId;
-  const kpiSubjectHierarchy = subjectHierarchyData.tree;
+  function filterActiveSubjectTree(nodes = []) {
+  return nodes
+    .filter(node => String(node.status || "").toLowerCase() === "active")
+    .map(node => ({
+      ...node,
+      children: filterActiveSubjectTree(node.children || [])
+    }));
+}
+
+const kpiSubjectHierarchy = filterActiveSubjectTree(subjectHierarchyData.tree || []);
 
   res.send(`
   <!DOCTYPE html>
