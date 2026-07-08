@@ -38372,7 +38372,7 @@ const loadKpiSubmissionEmailRecipients = async (calculationMode = null) => {
       owner.people_id,
       NULLIF(TRIM(CONCAT_WS(' ', COALESCE(owner.first_name, ''), COALESCE(owner.name, ''))), '') AS name,
       owner.email,
-      COALESCE(unit_scope.unit_id, plant_scope.unit_id, primary_unit.unit_id, home_unit.unit_id) AS unit_id,
+      COALESCE(unit_scope.unit_id, plant_scope.unit_id) AS unit_id,
       COALESCE(
         NULLIF(TRIM(unit_scope.unit_name), ''),
         NULLIF(TRIM(plant_scope.unit_name), ''),
