@@ -14287,6 +14287,449 @@ body.parameter-fill-dragging * {
   margin: 0 !important;
 }
 
+/* Modern KPI modal refinement */
+#modalBackdrop {
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 8px !important;
+  overflow: hidden !important;
+}
+
+#modalBackdrop.open {
+  background:
+    radial-gradient(circle at 12% 12%, rgba(34, 197, 94, 0.08), transparent 24%),
+    radial-gradient(circle at 88% 16%, rgba(59, 130, 246, 0.14), transparent 26%),
+    rgba(15, 23, 42, 0.62) !important;
+  backdrop-filter: blur(18px) saturate(135%) !important;
+}
+
+.kpi-attributes-modal {
+  --kpi-modal-scale: 1;
+  width: min(1760px, calc(100vw - 16px)) !important;
+  max-width: min(1760px, calc(100vw - 16px)) !important;
+  height: auto !important;
+  max-height: none !important;
+  transform: scale(var(--kpi-modal-scale)) !important;
+  transform-origin: center center !important;
+  border-radius: 30px !important;
+  overflow: hidden !important;
+  background:
+    radial-gradient(circle at top right, rgba(59, 130, 246, 0.12), transparent 30%),
+    linear-gradient(180deg, #ffffff 0%, #f5f9ff 100%) !important;
+  border: 1px solid rgba(226, 232, 240, 0.95) !important;
+  box-shadow:
+    0 34px 96px rgba(15, 23, 42, 0.28),
+    0 10px 30px rgba(37, 99, 235, 0.08) !important;
+}
+
+.kpi-attributes-modal::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.56), rgba(255, 255, 255, 0)),
+    radial-gradient(circle at 18% 0%, rgba(14, 165, 233, 0.08), transparent 26%);
+  pointer-events: none;
+}
+
+.kpi-attributes-modal .modal-header {
+  position: relative !important;
+  z-index: 1 !important;
+  padding: 16px 22px 12px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(248, 251, 255, 0.96) 100%) !important;
+  border-bottom: 1px solid rgba(203, 213, 225, 0.72) !important;
+}
+
+.kpi-attributes-modal .modal-title-wrap {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 6px !important;
+}
+
+.kpi-attributes-modal .modal-title-wrap::before {
+  content: "";
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  background: rgba(14, 165, 233, 0.08);
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+}
+
+.kpi-attributes-modal .modal-header h2 {
+  margin: 0 !important;
+  font-size: clamp(34px, 2.45vw, 48px) !important;
+  line-height: 1.02 !important;
+  font-weight: 950 !important;
+  letter-spacing: -0.06em !important;
+  color: #172036 !important;
+}
+
+.kpi-attributes-modal .modal-subtitle {
+  display: block !important;
+  margin: 0 !important;
+  max-width: 860px !important;
+  font-size: 14px !important;
+  line-height: 1.45 !important;
+  color: #61748f !important;
+}
+
+.kpi-attributes-modal #kpiCloseBtn {
+  width: 46px !important;
+  height: 46px !important;
+  min-width: 46px !important;
+  border-radius: 15px !important;
+  border: 1px solid rgba(203, 213, 225, 0.9) !important;
+  background: rgba(255, 255, 255, 0.96) !important;
+  color: #475569 !important;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08) !important;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease !important;
+}
+
+.kpi-attributes-modal #kpiCloseBtn:hover {
+  transform: translateY(-1px) !important;
+  border-color: rgba(59, 130, 246, 0.32) !important;
+  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.14) !important;
+}
+
+.kpi-attributes-modal .modal-body {
+  position: relative !important;
+  z-index: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 8px !important;
+  padding: 10px 14px 12px !important;
+  overflow: visible !important;
+  background:
+    linear-gradient(180deg, rgba(247, 250, 255, 0.94) 0%, rgba(240, 246, 255, 0.98) 100%) !important;
+}
+
+.kpi-attributes-modal .form-section {
+  position: relative !important;
+  margin: 0 !important;
+  padding: 11px 13px !important;
+  border-radius: 22px !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  border: 1px solid rgba(203, 213, 225, 0.76) !important;
+  box-shadow:
+    0 14px 36px rgba(15, 23, 42, 0.055),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+}
+
+.kpi-attributes-modal .form-section::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.44), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+
+.kpi-attributes-modal .field label,
+.kpi-attributes-modal .hierarchy-tree-field > label,
+.kpi-attributes-modal .calc-logic-row .clr-label,
+.kpi-attributes-modal .tol-type-label {
+  position: relative;
+  z-index: 1;
+  font-size: 10px !important;
+  font-weight: 900 !important;
+  letter-spacing: 0.08em !important;
+  text-transform: uppercase !important;
+  color: #51637c !important;
+}
+
+.kpi-attributes-modal .field .hint,
+.kpi-attributes-modal .hierarchy-tree-field > label > .hint {
+  font-size: 9px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.05em !important;
+  text-transform: uppercase !important;
+  color: #94a3b8 !important;
+}
+
+.kpi-attributes-modal .field input,
+.kpi-attributes-modal .field select,
+.kpi-attributes-modal .field textarea,
+.kpi-attributes-modal .tree-select-trigger {
+  position: relative;
+  z-index: 1;
+  width: 100% !important;
+  min-height: 42px !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(191, 204, 218, 0.9) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(247, 250, 255, 0.98) 100%) !important;
+  color: #182338 !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78) !important;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease !important;
+}
+
+.kpi-attributes-modal .field input,
+.kpi-attributes-modal .field select,
+.kpi-attributes-modal .field textarea {
+  padding: 10px 12px !important;
+  font-size: 13px !important;
+}
+
+.kpi-attributes-modal .field textarea {
+  min-height: 58px !important;
+  resize: none !important;
+  line-height: 1.45 !important;
+}
+
+.kpi-attributes-modal .field input::placeholder,
+.kpi-attributes-modal .field textarea::placeholder {
+  color: #8fa1b9 !important;
+}
+
+.kpi-attributes-modal .field input:focus,
+.kpi-attributes-modal .field select:focus,
+.kpi-attributes-modal .field textarea:focus,
+.kpi-attributes-modal .tree-select-trigger:focus,
+.kpi-attributes-modal .tree-select.open .tree-select-trigger {
+  border-color: rgba(59, 130, 246, 0.58) !important;
+  box-shadow:
+    0 0 0 4px rgba(59, 130, 246, 0.11),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82) !important;
+  background: #ffffff !important;
+  outline: none !important;
+}
+
+.kpi-attributes-modal .kpi-main-row,
+.kpi-attributes-modal .kpi-three-row {
+  position: relative;
+  z-index: 1;
+}
+
+.kpi-attributes-modal .tree-select-trigger {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 14px !important;
+  padding: 10px 12px !important;
+  text-align: left !important;
+}
+
+.kpi-attributes-modal .tree-select-label {
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  color: #182338 !important;
+}
+
+.kpi-attributes-modal .tree-select-meta {
+  margin-top: 3px !important;
+  font-size: 11px !important;
+  line-height: 1.35 !important;
+  color: #6e8098 !important;
+}
+
+.kpi-attributes-modal .tree-select-chevron {
+  font-size: 14px !important;
+  color: #0f766e !important;
+}
+
+.kpi-attributes-modal .tree-select-panel {
+  margin-top: 8px !important;
+  border-radius: 20px !important;
+  border: 1px solid rgba(203, 213, 225, 0.78) !important;
+  background: rgba(255, 255, 255, 0.98) !important;
+  box-shadow: 0 18px 44px rgba(15, 23, 42, 0.12) !important;
+}
+
+.kpi-attributes-modal .tree-select-toolbar {
+  padding: 10px !important;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.88) !important;
+  background: linear-gradient(180deg, rgba(248, 251, 255, 0.98), rgba(242, 247, 255, 0.98)) !important;
+}
+
+.kpi-attributes-modal .tree-list {
+  height: min(280px, 26vh) !important;
+  min-height: 220px !important;
+  max-height: min(280px, 26vh) !important;
+  padding: 10px !important;
+}
+
+.kpi-attributes-modal .sf-column {
+  width: 228px !important;
+  flex: 0 0 228px !important;
+}
+
+.kpi-attributes-modal .sf-col-head {
+  padding: 12px 14px !important;
+}
+
+.kpi-attributes-modal .sf-item {
+  margin-bottom: 5px !important;
+  padding: 10px 11px !important;
+  border-radius: 13px !important;
+}
+
+.kpi-attributes-modal .sf-item-name {
+  font-size: 12px !important;
+  font-weight: 900 !important;
+}
+
+.kpi-attributes-modal .calc-section-rows {
+  gap: 8px !important;
+}
+
+.kpi-attributes-modal .calc-logic-row {
+  padding: 9px 10px !important;
+  border-radius: 18px !important;
+  border: 1px solid rgba(226, 232, 240, 0.94) !important;
+  background: linear-gradient(180deg, rgba(249, 251, 255, 0.96), rgba(243, 247, 255, 0.96)) !important;
+}
+
+.kpi-attributes-modal .calc-logic-arrow {
+  color: #0f766e !important;
+  font-weight: 900 !important;
+}
+
+.kpi-attributes-modal .f-file input[type="file"] {
+  padding: 7px 10px !important;
+}
+
+.kpi-attributes-modal .tolerance-wrap {
+  position: relative;
+  z-index: 1;
+  display: grid !important;
+  grid-template-columns: 120px 1fr !important;
+  gap: 10px !important;
+  align-items: start !important;
+}
+
+.kpi-attributes-modal .tolerance-options {
+  display: grid !important;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  gap: 10px !important;
+}
+
+.kpi-attributes-modal .tolerance-option-row {
+  padding: 10px !important;
+  border-radius: 18px !important;
+  border: 1px solid rgba(203, 213, 225, 0.82) !important;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 251, 255, 0.96)) !important;
+}
+
+.kpi-attributes-modal .tol-radio-label {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  margin-bottom: 8px !important;
+  font-size: 12px !important;
+  font-weight: 800 !important;
+  color: #182338 !important;
+}
+
+.kpi-attributes-modal .tol-radio-label input[type="radio"] {
+  accent-color: #2563eb;
+}
+
+.kpi-attributes-modal .tolerance-fields-row {
+  display: grid !important;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  gap: 8px !important;
+}
+
+.kpi-attributes-modal .modal-footer {
+  padding: 4px 0 0 !important;
+  border-top: none !important;
+  background: transparent !important;
+}
+
+.kpi-attributes-modal .footer-actions {
+  display: flex !important;
+  justify-content: flex-end !important;
+  gap: 10px !important;
+}
+
+.kpi-attributes-modal .btn {
+  min-height: 40px !important;
+  padding: 0 18px !important;
+  border-radius: 14px !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  letter-spacing: -0.01em !important;
+}
+
+.kpi-attributes-modal .btn-primary {
+  background: linear-gradient(135deg, #3153f4 0%, #1696e8 100%) !important;
+  border: none !important;
+  box-shadow: 0 16px 32px rgba(37, 99, 235, 0.26) !important;
+}
+
+.kpi-attributes-modal .btn-soft {
+  background: rgba(255, 255, 255, 0.92) !important;
+  border: 1px solid rgba(203, 213, 225, 0.88) !important;
+  color: #182338 !important;
+}
+
+.kpi-attributes-modal .btn-danger {
+  background: rgba(255, 255, 255, 0.92) !important;
+  border: 1px solid rgba(248, 113, 113, 0.42) !important;
+  color: #b91c1c !important;
+}
+
+@media (max-width: 1180px), (max-height: 920px) {
+  .kpi-attributes-modal .modal-header {
+    padding: 14px 18px 10px !important;
+  }
+
+  .kpi-attributes-modal .modal-header h2 {
+    font-size: clamp(30px, 2.1vw, 40px) !important;
+  }
+
+  .kpi-attributes-modal .modal-body {
+    gap: 6px !important;
+    padding: 8px 10px 10px !important;
+  }
+
+  .kpi-attributes-modal .form-section {
+    padding: 10px 11px !important;
+    border-radius: 18px !important;
+  }
+
+  .kpi-attributes-modal .field input,
+  .kpi-attributes-modal .field select,
+  .kpi-attributes-modal .field textarea,
+  .kpi-attributes-modal .tree-select-trigger {
+    min-height: 39px !important;
+  }
+}
+
+@media (max-width: 900px) {
+  #modalBackdrop {
+    padding: 12px !important;
+    overflow: auto !important;
+  }
+
+  .kpi-attributes-modal {
+    width: calc(100vw - 24px) !important;
+    max-width: calc(100vw - 24px) !important;
+    transform: none !important;
+  }
+
+  .kpi-attributes-modal .modal-header {
+    padding: 16px !important;
+  }
+
+  .kpi-attributes-modal .modal-body {
+    overflow: auto !important;
+  }
+
+  .kpi-attributes-modal .tolerance-wrap,
+  .kpi-attributes-modal .tolerance-options,
+  .kpi-attributes-modal .tolerance-fields-row {
+    grid-template-columns: 1fr !important;
+  }
+}
+
  </style>
   </head>
 
@@ -14418,7 +14861,7 @@ body.parameter-fill-dragging * {
           <div class="modal-title-wrap">
             <h2 id="modalTitle">Edit KPI Attributes</h2>
             <div class="modal-subtitle" id="modalSubtitle">
-              Update KPI information, targets, calculation rules and thresholds in a cleaner professional form.
+              Refine the KPI identity, subject alignment, calculation logic, and tolerance settings in one focused view.
             </div>
           </div>
 
@@ -21043,12 +21486,78 @@ async function loadKpis(search = "") {
         showToast("Dashboard refreshed");
       }
 
+      let kpiModalFitFrame = null;
+      let kpiModalResizeObserver = null;
+
+      function ensureKpiModalViewportObserver() {
+        if (kpiModalResizeObserver || typeof ResizeObserver === "undefined") {
+          return;
+        }
+
+        const modalEl = document.querySelector("#modalBackdrop .kpi-attributes-modal");
+        const modalBodyEl = modalEl ? modalEl.querySelector(".modal-body") : null;
+        if (!modalEl) {
+          return;
+        }
+
+        kpiModalResizeObserver = new ResizeObserver(() => {
+          scheduleKpiModalViewportFit();
+        });
+        kpiModalResizeObserver.observe(modalEl);
+        if (modalBodyEl) {
+          kpiModalResizeObserver.observe(modalBodyEl);
+        }
+      }
+
+      function syncKpiModalViewportFit() {
+        const backdrop = document.getElementById("modalBackdrop");
+        const modalEl = backdrop ? backdrop.querySelector(".kpi-attributes-modal") : null;
+
+        if (!backdrop || !modalEl || !backdrop.classList.contains("open")) {
+          return;
+        }
+
+        modalEl.style.setProperty("--kpi-modal-scale", "1");
+
+        if (window.innerWidth <= 900) {
+          return;
+        }
+
+        const viewportWidth = Math.max(window.innerWidth - 16, 320);
+        const viewportHeight = Math.max(window.innerHeight - 16, 320);
+        const modalWidth = Math.ceil(modalEl.scrollWidth || modalEl.offsetWidth || 1);
+        const modalHeight = Math.ceil(modalEl.scrollHeight || modalEl.offsetHeight || 1);
+        const widthScale = viewportWidth / Math.max(modalWidth, 1);
+        const heightScale = viewportHeight / Math.max(modalHeight, 1);
+        const scale = Math.min(widthScale, heightScale, 1);
+
+        modalEl.style.setProperty(
+          "--kpi-modal-scale",
+          scale < 0.995 ? String(Number(scale.toFixed(4))) : "1"
+        );
+      }
+
+      function scheduleKpiModalViewportFit() {
+        if (kpiModalFitFrame) {
+          cancelAnimationFrame(kpiModalFitFrame);
+        }
+
+        kpiModalFitFrame = requestAnimationFrame(() => {
+          kpiModalFitFrame = null;
+          syncKpiModalViewportFit();
+        });
+      }
+
+      window.addEventListener("resize", scheduleKpiModalViewportFit);
+
       function openModal() {
         setKpiSaveLoading(kpiSavePending);
         document.getElementById("modalBackdrop").classList.add("open");
+        ensureKpiModalViewportObserver();
         syncSubjectSelectionMode();
         requestAnimationFrame(() => {
           syncDefinitionTextareaHeight();
+          scheduleKpiModalViewportFit();
         });
       }
 
@@ -22106,13 +22615,17 @@ function fillForm(data) {
           document.getElementById("importance").value = "Medium";
           document.getElementById("reactivity_need").value = "Urgent";
           document.getElementById("calculation_mode").value = "Direct";
-          document.getElementById("display_trend").value = "No";
-          document.getElementById("min_type").value = "0";
+           document.getElementById("display_trend").value = "No";
+            document.getElementById("min_type").value = "0";
 
         }
         document.getElementById("modalTitle").textContent = "Add New KPI";
-        document.getElementById("modalSubtitle").textContent =
-          "Create a new KPI with clear identity, target logic and threshold visibility. It will be linked to " + (responsibleName || "this responsible") + " when you save its target allocation.";
+        const createSubtitleEl = document.getElementById("modalSubtitle");
+        if (createSubtitleEl) {
+          createSubtitleEl.textContent =
+            "Create a KPI with a clear name, subject branch, measurement logic, and threshold setup for " + (responsibleName || "this responsible") + ".";
+        }
+        
         const deleteBtn = document.getElementById("deleteBtn");
         if (deleteBtn) {
          deleteBtn.style.display = "none";
@@ -22148,9 +22661,15 @@ function fillForm(data) {
           handleMinTypeChange();
           handleMaxTypeChange();
 
-          document.getElementById("modalTitle").textContent = "Edit KPI Attributes";
-          document.getElementById("modalSubtitle").textContent =
-            "";
+          const modalTitleEl = document.getElementById("modalTitle");
+          if (modalTitleEl) {
+            modalTitleEl.textContent = "Edit KPI Attributes";
+          }
+          const editSubtitleEl = document.getElementById("modalSubtitle");
+          if (editSubtitleEl) {
+            editSubtitleEl.textContent =
+              "Refine the KPI identity, subject alignment, calculation logic, and tolerance settings in one focused view.";
+          }
           const deleteBtn = document.getElementById("deleteBtn");
           if (deleteBtn) {
            deleteBtn.style.display = "inline-flex";
