@@ -38313,50 +38313,117 @@ const sendKPIEmail = async (responsibleId, week, options = {}) => {
     const calculationMode = normalizeOptionalTextInput(options.calculationMode)
       ? getCanonicalKpiCalculationMode(options.calculationMode)
       : null;
+
     const frequencyLabel = normalizeOptionalTextInput(options.frequency)
       ? getCanonicalKpiSubmissionFrequency(options.frequency)
       : null;
+
     const unitId = normalizeOptionalIntegerInput(options.unitId);
+
+    console.log("[KPI Email] Start sendKPIEmail:", {
+      responsibleId,
+      week,
+      calculationMode,
+      frequencyLabel,
+      unitId,
+    });
 
     const { responsible, kpis } = await getResponsibleWithKPIs(responsibleId, week, {
       calculationMode,
       frequency: frequencyLabel,
-      unitId
+      unitId,
     });
+
+    console.log("[KPI Email] Loaded responsible:", {
+      responsibleId,
+      responsibleName: responsible?.name,
+      responsibleEmail: responsible?.email,
+      kpiCount: Array.isArray(kpis) ? kpis.length : 0,
+    });
+
     if (!responsible) {
       throw new Error(`Responsible ${responsibleId} not found`);
     }
+
     if (!normalizeOptionalTextInput(responsible.email)) {
-      console.warn(`[KPI Reminder] Skipping ${responsible.name || responsibleId} because no email is defined.`);
+      console.warn(`[KPI Email] Skipped: no email for ${responsible.name || responsibleId}`);
       return false;
     }
+
     if (!Array.isArray(kpis) || !kpis.length) {
-      console.warn(`[KPI Reminder] Skipping ${responsible.name || responsibleId} because no KPI allocations were found.`);
+      console.warn(`[KPI Email] Skipped: no KPI allocations for ${responsible.name || responsibleId}`);
       return false;
     }
+
     const html = generateEmailHtml({
       responsible: {
         ...responsible,
-        unit_id: unitId
+        unit_id: unitId,
       },
       week,
       calculationMode,
-      frequencyLabel
+      frequencyLabel,
     });
+
     const transporter = createTransporter();
+
+    console.log("[KPI Email] Verifying SMTP transporter...");
+
+    await transporter.verify();
+
+    console.log("[KPI Email] SMTP transporter verified OK");
+
     const subjectContext = [calculationMode, frequencyLabel].filter(Boolean).join(" | ");
     const subjectSuffix = subjectContext ? ` (${subjectContext})` : "";
     const formattedPeriodLabel = formatKpiSubmissionPeriodLabel(week, frequencyLabel);
-    await transporter.sendMail({
-      from: '"Administration STS" <administration.STS@avocarbon.com>',
+
+    const subject = `KPI Submission${subjectSuffix} for ${responsible.name} - ${formattedPeriodLabel}`;
+
+    console.log("[KPI Email] Sending email:", {
+      from: "KPI Manager <kpi-manager@avocarbon.com>",
       to: responsible.email,
-      subject: `KPI Submission${subjectSuffix} for ${responsible.name} - ${formattedPeriodLabel}`,
+      subject,
+    });
+
+    const info = await transporter.sendMail({
+      from: '"KPI Manager" <kpi-manager@avocarbon.com>',
+      replyTo: "kpi-manager@avocarbon.com",
+      to: responsible.email,
+      subject,
       html,
     });
-    console.log(`Email sent to ${responsible.email}`);
+
+    console.log("[KPI Email] SMTP RESULT:", {
+      accepted: info.accepted,
+      rejected: info.rejected,
+      pending: info.pending,
+      response: info.response,
+      messageId: info.messageId,
+      envelope: info.envelope,
+    });
+
+    if (Array.isArray(info.rejected) && info.rejected.length > 0) {
+      console.error("[KPI Email] SMTP rejected recipients:", info.rejected);
+      return false;
+    }
+
+    if (!Array.isArray(info.accepted) || !info.accepted.length) {
+      console.error("[KPI Email] SMTP did not accept any recipient");
+      return false;
+    }
+
+    console.log(`[KPI Email] Email accepted by SMTP for ${responsible.email}`);
     return true;
   } catch (err) {
-    console.error(`âŒ Failed to send email to responsible ID ${responsibleId}:`, err.message);
+    console.error(`[KPI Email] Failed to send email to responsible ID ${responsibleId}:`, {
+      message: err.message,
+      code: err.code,
+      command: err.command,
+      response: err.response,
+      responseCode: err.responseCode,
+      stack: err.stack,
+    });
+
     return false;
   }
 };
