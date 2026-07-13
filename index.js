@@ -27248,6 +27248,16 @@ const ensureActionPlanCorrectiveActionSchema = async () => {
       `);
 
       await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS kpi_target_allocation_id VARCHAR
+      `);
+
+      await actionPlanPool.query(`
+        ALTER TABLE public.action
+        ADD COLUMN IF NOT EXISTS period_label VARCHAR
+      `);
+
+      await actionPlanPool.query(`
        ALTER TABLE public.action
        ADD COLUMN IF NOT EXISTS unit_id VARCHAR
        `);
@@ -27279,6 +27289,32 @@ const ensureActionPlanCorrectiveActionSchema = async () => {
         WHERE a.sujet_id = parsed.sujet_id
           AND COALESCE(BTRIM(COALESCE(a.kpi_id, '')), '') = ''
           AND parsed.kpi_id IS NOT NULL
+      `);
+
+      await actionPlanPool.query(`
+        UPDATE public.action AS a
+        SET kpi_target_allocation_id = parsed.kpi_target_allocation_id
+        FROM (
+          SELECT
+            action_row.id AS action_id,
+            NULLIF(
+              split_part(
+                COALESCE(
+                  NULLIF(BTRIM(COALESCE(s.code, '')), ''),
+                  substring(COALESCE(s.description, '') from 'Link key:\\s*([^\\s]+)')
+                ),
+                '|',
+                2
+              ),
+              ''
+            ) AS kpi_target_allocation_id
+          FROM public.action action_row
+          JOIN public.sujet s
+            ON s.id = action_row.sujet_id
+        ) AS parsed
+        WHERE a.id = parsed.action_id
+          AND COALESCE(BTRIM(COALESCE(a.kpi_target_allocation_id, '')), '') = ''
+          AND parsed.kpi_target_allocation_id IS NOT NULL
       `);
 
       return true;
@@ -27444,10 +27480,8 @@ const buildActionPlanSubjectMetadata = ({
   return {
     title: subjectLabel,
     description:
-      `${ACTION_PLAN_SUBJECT_LINK_KEY_PREFIX} ${normalizedSubjectCode}\n` +
       `Corrective actions captured from the KPI form for subject "${subjectLabel}" ` +
-      `and KPI "${kpiLabel}" during ${periodText}. ` +
-      `Allocation ${kpiTargetAllocationId}, KPI ${kpiId}.`
+      `and KPI "${kpiLabel}". Shared subject row reused for the same responsible across periods.`
   };
 };
 
@@ -27532,12 +27566,79 @@ const resolveActionPlanResponsibleEmail = async ({
   return findResponsibleEmailByDisplayName(normalizedResponsibleName);
 };
 
+const getActionPlanSubjectOwnerIdentifier = (responsibleContext = null) => (
+  normalizeOptionalTextInput(responsibleContext?.email) ||
+  normalizeOptionalTextInput(responsibleContext?.name) ||
+  null
+);
+
+const resolveActionPlanActionScope = (row = {}) => {
+  const subjectInfo = parseActionPlanSubjectReference({
+    subjectCode: row.sujet_code,
+    description: row.sujet_description
+  });
+
+  return {
+    subjectInfo,
+    kpiTargetAllocationId:
+      normalizeOptionalIntegerInput(row.kpi_target_allocation_id) ||
+      normalizeOptionalIntegerInput(subjectInfo?.kpiTargetAllocationId) ||
+      null,
+    periodLabel:
+      normalizeOptionalTextInput(row.period_label) ||
+      normalizeOptionalTextInput(subjectInfo?.periodLabel) ||
+      null
+  };
+};
+
 const findActionPlanSubjectId = async ({
+  subjectTitle = null,
+  insertedBy = null,
   subjectCode = null,
   descriptionSearchValue = null
 } = {}) => {
+  const normalizedSubjectTitle = normalizeOptionalTextInput(subjectTitle);
+  const normalizedInsertedBy = normalizeOptionalTextInput(insertedBy);
   const normalizedSubjectCode = normalizeOptionalTextInput(subjectCode);
   const normalizedDescriptionSearchValue = normalizeOptionalTextInput(descriptionSearchValue);
+
+  if (normalizedSubjectTitle && normalizedInsertedBy) {
+    const ownedSubjectResult = await actionPlanPool.query(
+      `
+      SELECT id
+      FROM public.sujet
+      WHERE parent_sujet_id IS NULL
+        AND LOWER(BTRIM(COALESCE(titre, ''))) = LOWER($1)
+        AND LOWER(BTRIM(COALESCE(inserted_by, ''))) = LOWER($2)
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [normalizedSubjectTitle, normalizedInsertedBy]
+    );
+
+    const ownedSubjectId = normalizeOptionalIntegerInput(ownedSubjectResult.rows[0]?.id);
+    if (ownedSubjectId) {
+      return ownedSubjectId;
+    }
+
+    const blankOwnerSubjectResult = await actionPlanPool.query(
+      `
+      SELECT id
+      FROM public.sujet
+      WHERE parent_sujet_id IS NULL
+        AND LOWER(BTRIM(COALESCE(titre, ''))) = LOWER($1)
+        AND COALESCE(BTRIM(COALESCE(inserted_by, '')), '') = ''
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [normalizedSubjectTitle]
+    );
+
+    const blankOwnerSubjectId = normalizeOptionalIntegerInput(blankOwnerSubjectResult.rows[0]?.id);
+    if (blankOwnerSubjectId) {
+      return blankOwnerSubjectId;
+    }
+  }
 
   if (!normalizedSubjectCode && !normalizedDescriptionSearchValue) {
     return null;
@@ -27559,13 +27660,136 @@ const findActionPlanSubjectId = async ({
   return normalizeOptionalIntegerInput(result.rows[0]?.id);
 };
 
+const backfillActionPlanActionScopeForSubject = async (sujetId) => {
+  const normalizedSujetId = normalizeOptionalIntegerInput(sujetId);
+  if (!normalizedSujetId) return;
+
+  const actionsRes = await actionPlanPool.query(
+    `
+    SELECT
+      a.id,
+      a.kpi_id,
+      a.kpi_target_allocation_id,
+      a.period_label,
+      s.code AS sujet_code,
+      s.description AS sujet_description
+    FROM public.action a
+    JOIN public.sujet s
+      ON s.id = a.sujet_id
+    WHERE a.sujet_id = $1
+      AND LOWER(COALESCE(a.type, 'action')) = 'action'
+      AND (
+        COALESCE(BTRIM(COALESCE(a.kpi_id, '')), '') = ''
+        OR COALESCE(BTRIM(COALESCE(a.kpi_target_allocation_id, '')), '') = ''
+        OR COALESCE(BTRIM(COALESCE(a.period_label, '')), '') = ''
+      )
+    ORDER BY a.id ASC
+    `,
+    [normalizedSujetId]
+  );
+
+  for (const row of actionsRes.rows) {
+    const { subjectInfo, kpiTargetAllocationId, periodLabel } = resolveActionPlanActionScope(row);
+    const resolvedKpiId =
+      normalizeOptionalIntegerInput(row.kpi_id) ||
+      normalizeOptionalIntegerInput(subjectInfo?.kpiId);
+
+    if (!resolvedKpiId && !kpiTargetAllocationId && !periodLabel) {
+      continue;
+    }
+
+    await actionPlanPool.query(
+      `
+      UPDATE public.action
+      SET
+        kpi_id = CASE
+          WHEN COALESCE(BTRIM(COALESCE(kpi_id, '')), '') = '' AND $2::text IS NOT NULL THEN $2::text
+          ELSE kpi_id
+        END,
+        kpi_target_allocation_id = CASE
+          WHEN COALESCE(BTRIM(COALESCE(kpi_target_allocation_id, '')), '') = '' AND $3::text IS NOT NULL THEN $3::text
+          ELSE kpi_target_allocation_id
+        END,
+        period_label = CASE
+          WHEN COALESCE(BTRIM(COALESCE(period_label, '')), '') = '' AND $4::text IS NOT NULL THEN $4::text
+          ELSE period_label
+        END
+      WHERE id = $1
+      `,
+      [
+        normalizeOptionalIntegerInput(row.id),
+        Number.isInteger(resolvedKpiId) ? String(resolvedKpiId) : null,
+        Number.isInteger(kpiTargetAllocationId) ? String(kpiTargetAllocationId) : null,
+        normalizeOptionalTextInput(periodLabel)
+      ]
+    );
+  }
+};
+
+const loadActionPlanActionIdsForScope = async ({
+  sujetId,
+  kpiTargetAllocationId,
+  periodLabel
+}) => {
+  const normalizedSujetId = normalizeOptionalIntegerInput(sujetId);
+  if (!normalizedSujetId) {
+    return [];
+  }
+
+  const normalizedAllocationId = normalizeOptionalIntegerInput(kpiTargetAllocationId);
+  const normalizedPeriodLabel = normalizeOptionalTextInput(periodLabel) || "";
+  if (!normalizedAllocationId || !normalizedPeriodLabel) {
+    return [];
+  }
+
+  const existingActionsRes = await actionPlanPool.query(
+    `
+    SELECT id
+    FROM public.action
+    WHERE sujet_id = $1
+      AND LOWER(COALESCE(type, 'action')) = 'action'
+      AND COALESCE(BTRIM(COALESCE(kpi_target_allocation_id, '')), '') = $2
+      AND COALESCE(BTRIM(COALESCE(period_label, '')), '') = $3
+    ORDER BY id ASC
+    `,
+    [normalizedSujetId, String(normalizedAllocationId), normalizedPeriodLabel]
+  );
+
+  return existingActionsRes.rows
+    .map((row) => normalizeOptionalIntegerInput(row.id))
+    .filter((value) => Number.isInteger(value));
+};
+
+const deleteActionPlanSubjectIfUnused = async (sujetId) => {
+  const normalizedSujetId = normalizeOptionalIntegerInput(sujetId);
+  if (!normalizedSujetId) return;
+
+  const remainingActionsRes = await actionPlanPool.query(
+    `
+    SELECT COUNT(*)::integer AS action_count
+    FROM public.action
+    WHERE sujet_id = $1
+      AND LOWER(COALESCE(type, 'action')) = 'action'
+    `,
+    [normalizedSujetId]
+  );
+
+  if (Number(remainingActionsRes.rows[0]?.action_count || 0) > 0) {
+    return;
+  }
+
+  await actionPlanPool.query(
+    `DELETE FROM public.sujet WHERE id = $1`,
+    [normalizedSujetId]
+  );
+};
+
 const mapActionPlanActionRow = (row = {}) => {
-  const subjectInfo = parseActionPlanSubjectReference({
-    subjectCode: row.sujet_code,
-    description: row.sujet_description
-  });
-  if (!subjectInfo) return null;
-  const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+  const { subjectInfo, kpiTargetAllocationId, periodLabel } = resolveActionPlanActionScope(row);
+  const persistedKpiId =
+    normalizeOptionalIntegerInput(row.kpi_id) ||
+    normalizeOptionalIntegerInput(subjectInfo?.kpiId);
+  if (!persistedKpiId) return null;
   const persistedUnitId = normalizeOptionalIntegerInput(row.unit_id);
 
   const status =
@@ -27575,13 +27799,13 @@ const mapActionPlanActionRow = (row = {}) => {
   return {
     id: row.id,
     corrective_action_id: row.id,
-    kpi_values_id: subjectInfo.kpiTargetAllocationId,
-    kpi_target_allocation_id: subjectInfo.kpiTargetAllocationId,
-    kpi_id: persistedKpiId || subjectInfo.kpiId,
+    kpi_values_id: kpiTargetAllocationId,
+    kpi_target_allocation_id: kpiTargetAllocationId,
+    kpi_id: persistedKpiId,
     unit_id: persistedUnitId,
     unitId: persistedUnitId,
-    week: subjectInfo.periodLabel,
-    period_label: subjectInfo.periodLabel,
+    week: periodLabel,
+    period_label: periodLabel,
     // In Action Plan DB, the action title stores the implemented solution
     // and the description stores the root cause narrative.
     root_cause: normalizeOptionalTextInput(row.description) || "",
@@ -27611,6 +27835,14 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
     };
   }
 
+  const allocationIds = Array.from(new Set(
+    (Array.isArray(kpiRows) ? kpiRows : [])
+      .map((row) => normalizeOptionalIntegerInput(
+        row.kpi_target_allocation_id ?? row.kpi_values_id
+      ))
+      .filter((value) => Number.isInteger(value))
+      .map((value) => String(value))
+  ));
   const patterns = Array.from(new Set(
     (Array.isArray(kpiRows) ? kpiRows : [])
       .map((row) => buildActionPlanSubjectPattern({
@@ -27628,7 +27860,7 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
       .filter(Boolean)
   ));
 
-  if (!patterns.length && !descriptionPatterns.length) {
+  if (!allocationIds.length && !patterns.length && !descriptionPatterns.length) {
     return {
       currentByAllocationId: {},
       historyByAllocationId: {}
@@ -27642,6 +27874,10 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
       `
       SELECT
         a.id,
+        a.kpi_id,
+        a.unit_id,
+        a.kpi_target_allocation_id,
+        a.period_label,
         a.sujet_id,
         a.type,
         a.titre,
@@ -27663,13 +27899,18 @@ const loadActionPlanCorrectiveActionMaps = async (kpiRows = [], currentPeriodLab
       JOIN public.sujet s
         ON s.id = a.sujet_id
       WHERE (
-        ($1::text[] IS NOT NULL AND COALESCE(s.code, '') LIKE ANY($1::text[]))
-        OR ($2::text[] IS NOT NULL AND COALESCE(s.description, '') LIKE ANY($2::text[]))
+        ($1::text[] IS NOT NULL AND COALESCE(a.kpi_target_allocation_id, '') = ANY($1::text[]))
+        OR ($2::text[] IS NOT NULL AND COALESCE(s.code, '') LIKE ANY($2::text[]))
+        OR ($3::text[] IS NOT NULL AND COALESCE(s.description, '') LIKE ANY($3::text[]))
       )
         AND LOWER(COALESCE(a.type, 'action')) = 'action'
       ORDER BY COALESCE(a.updated_at, a.created_at) DESC, a.id DESC
       `,
-      [patterns.length ? patterns : null, descriptionPatterns.length ? descriptionPatterns : null]
+      [
+        allocationIds.length ? allocationIds : null,
+        patterns.length ? patterns : null,
+        descriptionPatterns.length ? descriptionPatterns : null
+      ]
     );
 
     const normalizedCurrentPeriod = normalizeOptionalTextInput(currentPeriodLabel);
@@ -27719,13 +27960,12 @@ const ensureActionPlanSubject = async ({
   kpiName,
   insertedBy
 }) => {
+  const normalizedInsertedBy = normalizeOptionalTextInput(insertedBy);
   const subjectCode = buildActionPlanSubjectCode({
     kpiTargetAllocationId,
     kpiId,
     periodLabel
   });
-  if (!subjectCode) return null;
-  const descriptionSearchValue = buildActionPlanSubjectDescriptionSearchValue(subjectCode);
 
   const metadata = buildActionPlanSubjectMetadata({
     kpiTargetAllocationId,
@@ -27737,10 +27977,14 @@ const ensureActionPlanSubject = async ({
   });
 
   const existingSubjectId = await findActionPlanSubjectId({
+    subjectTitle: metadata.title,
+    insertedBy: normalizedInsertedBy,
     subjectCode,
-    descriptionSearchValue
+    descriptionSearchValue: buildActionPlanSubjectDescriptionSearchValue(subjectCode)
   });
   if (existingSubjectId) {
+    await backfillActionPlanActionScopeForSubject(existingSubjectId);
+
     await actionPlanPool.query(
       `
       UPDATE public.sujet
@@ -27749,10 +27993,13 @@ const ensureActionPlanSubject = async ({
         titre = $2,
         description = $3,
         updated_at = NOW(),
-        inserted_by = COALESCE($4, inserted_by)
+        inserted_by = CASE
+          WHEN COALESCE(BTRIM(COALESCE(inserted_by, '')), '') = '' AND $4::text IS NOT NULL THEN $4::text
+          ELSE inserted_by
+        END
       WHERE id = $1
       `,
-      [existingSubjectId, metadata.title, metadata.description, normalizeOptionalTextInput(insertedBy)]
+      [existingSubjectId, metadata.title, metadata.description, normalizedInsertedBy]
     );
 
     return {
@@ -27767,7 +28014,7 @@ const ensureActionPlanSubject = async ({
     VALUES ($1, $2, $3, $4)
     RETURNING id
     `,
-    [null, metadata.title, metadata.description, normalizeOptionalTextInput(insertedBy)]
+    [null, metadata.title, metadata.description, normalizedInsertedBy]
   );
 
   return {
@@ -27801,28 +28048,33 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
 
   const submittedActions = Array.isArray(actions) ? actions : [];
   const meaningfulActions = submittedActions.filter(hasMeaningfulCorrectiveActionInput);
+  const subjectOwnerIdentifier = getActionPlanSubjectOwnerIdentifier(responsibleContext);
+  const metadata = buildActionPlanSubjectMetadata({
+    kpiTargetAllocationId,
+    kpiId,
+    periodLabel,
+    subject,
+    kpiName,
+    subjectCode
+  });
 
   let sujetId = await findActionPlanSubjectId({
+    subjectTitle: metadata.title,
+    insertedBy: subjectOwnerIdentifier,
     subjectCode,
     descriptionSearchValue: subjectDescriptionSearchValue
   });
-  const existingActionsRes = sujetId
-    ? await actionPlanPool.query(
-      `
-      SELECT id
-      FROM public.action
-      WHERE sujet_id = $1
-        AND LOWER(COALESCE(type, 'action')) = 'action'
-      ORDER BY id ASC
-      `,
-      [sujetId]
-    )
-    : { rows: [] };
+
+  if (sujetId) {
+    await backfillActionPlanActionScopeForSubject(sujetId);
+  }
 
   const existingActionIds = new Set(
-    existingActionsRes.rows
-      .map((row) => normalizeOptionalIntegerInput(row.id))
-      .filter((value) => Number.isInteger(value))
+    await loadActionPlanActionIdsForScope({
+      sujetId,
+      kpiTargetAllocationId,
+      periodLabel
+    })
   );
 
   if (!meaningfulActions.length) {
@@ -27831,13 +28083,20 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
     }
 
     await actionPlanPool.query(
-      `DELETE FROM public.action WHERE sujet_id = $1`,
-      [sujetId]
+      `
+      DELETE FROM public.action
+      WHERE sujet_id = $1
+        AND LOWER(COALESCE(type, 'action')) = 'action'
+        AND COALESCE(BTRIM(COALESCE(kpi_target_allocation_id, '')), '') = $2
+        AND COALESCE(BTRIM(COALESCE(period_label, '')), '') = $3
+      `,
+      [
+        sujetId,
+        String(normalizeOptionalIntegerInput(kpiTargetAllocationId)),
+        normalizeOptionalTextInput(periodLabel) || ""
+      ]
     );
-    await actionPlanPool.query(
-      `DELETE FROM public.sujet WHERE id = $1`,
-      [sujetId]
-    );
+    await deleteActionPlanSubjectIfUnused(sujetId);
 
     return {
       savedCount: 0,
@@ -27851,7 +28110,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
     periodLabel,
     subject,
     kpiName,
-    insertedBy: normalizeOptionalTextInput(responsibleContext?.email)
+    insertedBy: subjectOwnerIdentifier
   });
   sujetId = normalizeOptionalIntegerInput(ensuredSubject?.sujetId);
   if (!sujetId) {
@@ -27861,14 +28120,19 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
   let savedCount = 0;
   const keptActionIds = new Set();
   const actionPlanKpiId = normalizeOptionalIntegerInput(kpiId);
- const actionPlanKpiIdValue = Number.isInteger(actionPlanKpiId)
-  ? String(actionPlanKpiId)
-  : null;
+  const actionPlanKpiIdValue = Number.isInteger(actionPlanKpiId)
+    ? String(actionPlanKpiId)
+    : null;
 
- const actionPlanUnitId = normalizeOptionalIntegerInput(unitId);
- const actionPlanUnitIdValue = Number.isInteger(actionPlanUnitId)
-  ? String(actionPlanUnitId)
-  : null;
+  const actionPlanUnitId = normalizeOptionalIntegerInput(unitId);
+  const actionPlanUnitIdValue = Number.isInteger(actionPlanUnitId)
+    ? String(actionPlanUnitId)
+    : null;
+  const actionPlanAllocationId = normalizeOptionalIntegerInput(kpiTargetAllocationId);
+  const actionPlanAllocationIdValue = Number.isInteger(actionPlanAllocationId)
+    ? String(actionPlanAllocationId)
+    : null;
+  const normalizedActionPlanPeriodLabel = normalizeOptionalTextInput(periodLabel) || null;
 
   for (let index = 0; index < meaningfulActions.length; index += 1) {
     const action = meaningfulActions[index];
@@ -27877,6 +28141,11 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       action.corrective_action_id ??
       action.id
     );
+
+    if (actionId && !existingActionIds.has(actionId)) {
+      continue;
+    }
+
     const status =
       normalizeCorrectiveActionStatus(action.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
       OPEN_CORRECTIVE_ACTION_STATUS;
@@ -27916,7 +28185,9 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       demandeur,
       emailDemandeur,
       actionPlanKpiIdValue,
-      actionPlanUnitIdValue
+      actionPlanUnitIdValue,
+      actionPlanAllocationIdValue,
+      normalizedActionPlanPeriodLabel
     ];
 
     if (actionId && existingActionIds.has(actionId)) {
@@ -27938,6 +28209,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
           email_demandeur = $13,
           kpi_id = $14,
           unit_id = $15,
+          kpi_target_allocation_id = $16,
+          period_label = $17,
           type = 'action',
           updated_at = NOW(),
           closed_date = CASE
@@ -27945,7 +28218,7 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
             ELSE NULL
           END
         WHERE id = $1
-         AND sujet_id = $16
+         AND sujet_id = $18
         RETURNING id
         `,
         [actionId, ...values, sujetId]
@@ -27978,6 +28251,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
       email_demandeur,
       kpi_id,
       unit_id,
+      kpi_target_allocation_id,
+      period_label,
       closed_date
     )
       VALUES (
@@ -27997,6 +28272,8 @@ const syncActionPlanCorrectiveActionsForPeriod = async ({
         $13,
         $14,
         $15,
+        $16,
+        $17,
         CASE
           WHEN LOWER($4::text) = 'closed' THEN CURRENT_DATE
           ELSE NULL
@@ -31169,14 +31446,20 @@ app.get("/form", async (req, res) => {
         .pop() || null;
     }
 
-    function sortHistoryEntries(entries, getUpdatedAt) {
+    function sortHistoryEntries(entries, getUpdatedAt, frequencyMode = "monthly") {
       return (Array.isArray(entries) ? entries.slice() : []).sort((a, b) => {
-        const leftMonthKey = parseKpiChartPeriodKey(a?.week || a?.month_label, "monthly");
-        const rightMonthKey = parseKpiChartPeriodKey(b?.week || b?.month_label, "monthly");
-        const monthDiff =
-          (getKpiChartPeriodDate(rightMonthKey, "monthly")?.getTime() ?? 0) -
-          (getKpiChartPeriodDate(leftMonthKey, "monthly")?.getTime() ?? 0);
-        if (monthDiff !== 0) return monthDiff;
+        const leftPeriodKey = parseKpiChartPeriodKey(
+          a?.week || a?.period_label || a?.month_label || a?.result_date,
+          frequencyMode
+        );
+        const rightPeriodKey = parseKpiChartPeriodKey(
+          b?.week || b?.period_label || b?.month_label || b?.result_date,
+          frequencyMode
+        );
+        const periodDiff =
+          (getKpiChartPeriodDate(rightPeriodKey, frequencyMode)?.getTime() ?? 0) -
+          (getKpiChartPeriodDate(leftPeriodKey, frequencyMode)?.getTime() ?? 0);
+        if (periodDiff !== 0) return periodDiff;
 
         return new Date(getUpdatedAt(b) || 0) - new Date(getUpdatedAt(a) || 0);
       });
@@ -31327,7 +31610,7 @@ app.get("/form", async (req, res) => {
         hasInitialInvalidKpi = true;
       }
       const correctiveActions = correctiveActionsEnabled ? sortCorrectiveActions(
-        Array.isArray(kpi.corrective_actions) ? kpi.corrective_actions : []
+        Array.isArray(kpi.current_week_corrective_actions) ? kpi.current_week_corrective_actions : []
       ) : [];
       const latestCorrectiveAction = getLatestCorrectiveAction(correctiveActions);
       const caStatus = latestCorrectiveAction?.status || "";
@@ -31385,7 +31668,8 @@ app.get("/form", async (req, res) => {
           correctiveActionsByKpiMonth[String(kpi.kpi_values_id)] ||
           {}
         ).flat(),
-        (entry) => entry?.updated_at
+        (entry) => entry?.updated_at,
+        frequencyMode
       );
       const allHistoryComments = sortHistoryEntries(
         Object.values(
@@ -31393,7 +31677,8 @@ app.get("/form", async (req, res) => {
           commentsByKpiMonth[kpi.kpi_id] ||
           {}
         ).flat(),
-        (entry) => entry?.updated_at
+        (entry) => entry?.updated_at,
+        frequencyMode
       );
       const hasHistoryDetails = Boolean(
         (correctiveActionsEnabled && allHistoryActions && allHistoryActions.length) ||
@@ -33780,10 +34065,12 @@ const formPeriodTitle = isMonthlyForm ? "Month" : "Week";
                     <span class="ca-modal-form-title" id="caModalFormTitle">New Corrective Action</span>
                     <div class="ca-modal-form-caption" id="caModalFormCaption">Use the owner search to assign the action clearly and save faster.</div>
                 
-                  </div>
+                </div>
                   <button type="button" class="ca-tbl-btn ca-tbl-delete" id="caModalFormCollapse">&times; Cancel</button>
                 </div>
                 <input type="hidden" id="caModalEditIndex" value="">
+                <input type="hidden" id="caModalEditActionId" value="">
+                <input type="hidden" id="caModalEditActionStatus" value="">
                 <div class="ca-entry-editor-wrap">
                   <table class="ca-entry-editor-table">
 <colgroup>
@@ -34050,6 +34337,203 @@ function getCaModalActions(kvId) {
   return caModalStore[kvId];
 }
 
+function getCaModalCard(kvId) {
+  return document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
+}
+
+function normalizeKpiFrequency(frequency) {
+  const text = String(frequency || "").trim().toLowerCase();
+
+  if (text.includes("day")) return "daily";
+  if (text.includes("week")) return "weekly";
+  if (text.includes("month")) return "monthly";
+
+  return "weekly";
+}
+
+function getCaModalFrequencyMode(kvId) {
+  const card = getCaModalCard(kvId);
+  return normalizeKpiFrequency(card?.dataset?.frequency || "");
+}
+
+function formatCaPeriodLabel(rawLabel, frequencyMode) {
+  const text = String(rawLabel || "").trim();
+  if (!text) return "";
+
+  const mode = normalizeKpiFrequency(frequencyMode);
+
+  if (mode === "daily") {
+    const isoDayMatch = text.match(/^(\d{4}-\d{2}-\d{2})/);
+    return (isoDayMatch && isoDayMatch[1]) || text;
+  }
+
+  if (mode === "weekly") {
+    if (/^\d{4}-Week\d{1,2}$/i.test(text)) return text;
+
+    const isoDayMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (isoDayMatch) {
+      const parsedDate = new Date(text + "T00:00:00Z");
+      if (!Number.isNaN(parsedDate.getTime())) {
+        const year = parsedDate.getUTCFullYear();
+        const startDate = new Date(Date.UTC(year, 0, 1));
+        const dayOffset = Math.floor((parsedDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000));
+        const weekNumber = Math.ceil((dayOffset + startDate.getUTCDay() + 1) / 7);
+        return year + "-Week" + weekNumber;
+      }
+    }
+
+    return text;
+  }
+
+  if (/^\d{4}-Week\d{1,2}$/i.test(text)) {
+    return weekToMonthLabelClient(text) || text;
+  }
+
+  if (/^\d{4}-\d{2}$/.test(text)) {
+    const parsedMonth = new Date(text + "-01T00:00:00Z");
+    if (!Number.isNaN(parsedMonth.getTime())) {
+      return parsedMonth.toLocaleDateString("en-US", {
+        month: "short",
+        year: "numeric",
+        timeZone: "UTC"
+      });
+    }
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const parsedDate = new Date(text + "T00:00:00Z");
+    if (!Number.isNaN(parsedDate.getTime())) {
+      return parsedDate.toLocaleDateString("en-US", {
+        month: "short",
+        year: "numeric",
+        timeZone: "UTC"
+      });
+    }
+  }
+
+  return text;
+}
+
+function getCaModalCurrentPeriodLabel(kvId) {
+  const card = getCaModalCard(kvId);
+  const frequencyMode = getCaModalFrequencyMode(kvId);
+  const currentWeek = String(card?.dataset?.currentWeek || "").trim();
+  const currentMonthLabel = String(card?.dataset?.currentMonthLabel || "").trim();
+
+  if (frequencyMode === "daily") {
+    return (
+      formatCaPeriodLabel(currentWeek || currentMonthLabel, "daily") ||
+      currentWeek ||
+      currentMonthLabel ||
+      "Current day"
+    );
+  }
+
+  if (frequencyMode === "weekly") {
+    return (
+      formatCaPeriodLabel(currentWeek || currentMonthLabel, "weekly") ||
+      currentWeek ||
+      currentMonthLabel ||
+      "Current week"
+    );
+  }
+
+  return (
+    formatCaPeriodLabel(currentMonthLabel || currentWeek, "monthly") ||
+    currentMonthLabel ||
+    currentWeek ||
+    "Current month"
+  );
+}
+
+function getCaActionPeriodLabel(action, frequencyMode, fallbackLabel) {
+  const mode = normalizeKpiFrequency(frequencyMode);
+  const safeFallback =
+    String(fallbackLabel || "").trim() ||
+    (mode === "daily" ? "Current day" : mode === "weekly" ? "Current week" : "Current month");
+
+  if (!action) return safeFallback;
+
+  if (mode === "daily") {
+    return (
+      formatCaPeriodLabel(action.result_date || action.period_label || action.week, "daily") ||
+      safeFallback
+    );
+  }
+
+  if (mode === "weekly") {
+    return (
+      formatCaPeriodLabel(action.week || action.period_label || action.result_date, "weekly") ||
+      safeFallback
+    );
+  }
+
+  return (
+    formatCaPeriodLabel(action.month_label || action.period_label || action.week || action.result_date, "monthly") ||
+    safeFallback
+  );
+}
+
+function getCaModalDisplayActions(kvId) {
+  const card = getCaModalCard(kvId);
+  const frequencyMode = getCaModalFrequencyMode(kvId);
+  const currentPeriodLabel = getCaModalCurrentPeriodLabel(kvId);
+  const liveActions = getCaModalActions(kvId)
+    .filter(hasCorrectiveActionContent)
+    .map(function(action, actionIndex) {
+      return Object.assign(
+        {
+          status: getCanonicalCorrectiveActionStatus(action?.status),
+          _editableStatus: true,
+          _isCurrentPeriod: true,
+          _periodLabel: currentPeriodLabel,
+          _storeIndex: actionIndex
+        },
+        action
+      );
+    });
+  const liveActionIds = new Set(
+    liveActions
+      .map(function(action) {
+        return String((action && (action.id || action.corrective_action_id)) || "").trim();
+      })
+      .filter(Boolean)
+  );
+  const historyActions = decodeModalPayload(card?.dataset?.historyActions, []);
+  const mergedHistoryActions = (Array.isArray(historyActions) ? historyActions : [])
+    .filter(hasCorrectiveActionContent)
+    .filter(function(action) {
+      const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
+      return !actionId || !liveActionIds.has(actionId);
+    })
+    .map(function(action) {
+      const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
+      return Object.assign(
+        {
+          status: getCanonicalCorrectiveActionStatus(action?.status),
+          _editableStatus: Boolean(actionId),
+          _isCurrentPeriod: false,
+          _periodLabel: getCaActionPeriodLabel(action, frequencyMode, currentPeriodLabel)
+        },
+        action
+      );
+    });
+
+  return liveActions.concat(mergedHistoryActions);
+}
+
+function getCaModalDisplayActionById(kvId, actionId) {
+  const normalizedActionId = String(actionId || "").trim();
+  if (!normalizedActionId) return null;
+
+  return getCaModalDisplayActions(kvId).find(function(action) {
+    const currentActionId = String(
+      (action && (action.id || action.corrective_action_id)) || ""
+    ).trim();
+    return currentActionId === normalizedActionId;
+  }) || null;
+}
+
           function escapeHtml(v) {
             return String(v || "")
               .replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -34190,7 +34674,7 @@ function getCaModalActions(kvId) {
         function renderCaModalTable(kvId) {
        const tbody = document.getElementById("caModalTableBody");
        if (!tbody) return;
-       const actions = getCaModalActions(kvId);
+       const actions = getCaModalDisplayActions(kvId);
        if (!actions.length) {
        tbody.innerHTML = '<tr><td colspan="9" class="ca-table-empty">No corrective actions yet. Click "Add" below to get started.</td></tr>';
        applyCaModalTableFilters();
@@ -34198,7 +34682,8 @@ function getCaModalActions(kvId) {
        }
 
        tbody.innerHTML = actions.map((a, i) => {
-      const sc = statusClass(a.status);
+      const canonicalStatus = getCanonicalCorrectiveActionStatus(a.status);
+      const sc = statusClass(canonicalStatus);
       const responsibleName = String(a.responsible || "").trim();
       const responsibleInitial = getCaResponsibleInitials(responsibleName);
       const filterDueDate = getHistoryDueDateFilterValue(a.due_date);
@@ -34206,10 +34691,24 @@ function getCaModalActions(kvId) {
       const estimatedDurationDays = a.estimated_duration_days ?? "";
       const importance = String(a.importance || "").trim();
       const urgency = String(a.urgency || "").trim();
+      const isCurrentPeriod = a._isCurrentPeriod !== false;
+      const periodLabel = String(a._periodLabel || "").trim();
+      const periodMeta = periodLabel
+        ? '<div class="ca-table-copy-meta">' +
+            escapeHtml((isCurrentPeriod ? "Current period" : "Saved period") + ": " + periodLabel) +
+          '</div>'
+        : "";
+      const storeIndex = Number.isInteger(a._storeIndex) ? a._storeIndex : -1;
+      const actionControls =
+        '<button type="button" class="ca-table-edit-btn" onclick="caModalOpenEdit(' + i + ')">Edit</button>' +
+        (isCurrentPeriod && storeIndex >= 0
+          ? '<button type="button" class="ca-table-delete-btn" onclick="caModalDeleteAction(' + storeIndex + ')">&times;</button>'
+          : "");
       return \`<tr data-ca-row="true" data-ca-responsible="\${escapeHtml(responsibleName)}" data-ca-due-date="\${escapeHtml(filterDueDate)}">
       <td title="\${escapeHtml(a.root_cause)}">
         <div class="ca-table-copy">
           <div class="ca-table-copy-title">\${escapeHtml(truncate(a.root_cause, 110))}</div>
+          \${periodMeta}
         </div>
       </td>
       <td title="\${escapeHtml(a.implemented_solution)}">
@@ -34229,11 +34728,10 @@ function getCaModalActions(kvId) {
       <td>\${estimatedDurationDays !== "" ? \`<span class="ca-date-chip">\${escapeHtml(String(estimatedDurationDays))}</span>\` : "&mdash;"}</td>
       <td>\${importance ? \`<span class="ca-date-chip">\${escapeHtml(importance)}</span>\` : "&mdash;"}</td>
       <td>\${urgency ? \`<span class="ca-date-chip">\${escapeHtml(urgency)}</span>\` : "&mdash;"}</td>
-      <td>\${a.status ? \`<span class="ca-table-status \${sc}">\${escapeHtml(a.status)}</span>\` : "&mdash;"}</td>
+      <td>\${canonicalStatus ? \`<span class="ca-table-status \${sc}">\${escapeHtml(canonicalStatus)}</span>\` : "&mdash;"}</td>
       <td class="ca-col-actions">
         <div class="ca-table-actions">
-          <button type="button" class="ca-table-edit-btn" onclick="caModalOpenForm(\${i})">Edit</button>
-          <button type="button" class="ca-table-delete-btn" onclick="caModalDeleteAction(\${i})">&times;</button>
+          \${actionControls}
         </div>
       </td>
        </tr>\`;
@@ -34250,7 +34748,10 @@ function getCaModalActions(kvId) {
       const rowMode = document.getElementById("caModalRowMode");
       const normalizedStatus = getCanonicalCorrectiveActionStatus(action && action.status) || "Open";
       const statusClass = statusClassName(normalizedStatus);
-      const isEditing = editIndex !== null && editIndex !== undefined && editIndex >= 0;
+      const actionId = String(
+        (action && (action.id || action.corrective_action_id)) || ""
+      ).trim();
+      const isEditing = Boolean(action);
 
       if (statusBadge) {
         statusBadge.textContent = normalizedStatus;
@@ -34280,7 +34781,13 @@ function getCaModalActions(kvId) {
       }
 
       if (rowMode) {
-        rowMode.textContent = isEditing ? ("Editing #" + (Number(editIndex) + 1)) : "New action";
+        rowMode.textContent = isEditing
+          ? (actionId
+              ? "Editing action #" + actionId
+              : (editIndex !== null && editIndex !== undefined && editIndex >= 0
+                  ? "Editing #" + (Number(editIndex) + 1)
+                  : "Editing saved action"))
+          : "New action";
       }
     }
 
@@ -34289,19 +34796,36 @@ function getCaModalActions(kvId) {
       return value || "open";
     }
 
-    function caModalOpenForm(editIndex) {
+    function caModalOpenForm(editIndex, actionOverride = null) {
      const section = document.getElementById("caModalFormSection");
      const formTitle = document.getElementById("caModalFormTitle");
      const editIdx = document.getElementById("caModalEditIndex");
+     const editActionIdEl = document.getElementById("caModalEditActionId");
+     const editActionStatusEl = document.getElementById("caModalEditActionStatus");
      if (!section) return;
 
      section.style.display = "";
-     if (editIndex !== null && editIndex !== undefined && editIndex >= 0) {
+     if (actionOverride || (editIndex !== null && editIndex !== undefined && editIndex >= 0)) {
      const actions = getCaModalActions(caModalKvId);
-     const a = actions[editIndex];
+     const a = actionOverride || actions[editIndex];
      if (!a) return;
-    if (formTitle) formTitle.textContent = "Edit Action #" + (editIndex + 1);
-    if (editIdx) editIdx.value = String(editIndex);
+    const actionId = String((a.id || a.corrective_action_id) || "").trim();
+    const actionStatus = getCanonicalCorrectiveActionStatus(a.status);
+    if (formTitle) {
+      formTitle.textContent = actionId
+        ? "Edit Corrective Action #" + actionId
+        : (editIndex !== null && editIndex !== undefined && editIndex >= 0
+            ? "Edit Action #" + (editIndex + 1)
+            : "Edit Corrective Action");
+    }
+    if (editIdx) {
+      editIdx.value =
+        editIndex !== null && editIndex !== undefined && editIndex >= 0
+          ? String(editIndex)
+          : "";
+    }
+    if (editActionIdEl) editActionIdEl.value = actionId;
+    if (editActionStatusEl) editActionStatusEl.value = actionStatus;
     document.getElementById("caModalDueDate").value = a.due_date || "";
     setCaModalResponsibleValue(a.responsible || "");
     document.getElementById("caModalEstimatedDurationDays").value = a.estimated_duration_days ?? "";
@@ -34309,10 +34833,16 @@ function getCaModalActions(kvId) {
     document.getElementById("caModalSolution").value = a.implemented_solution || "";
     document.getElementById("caModalImportance").value = a.importance || "";
     document.getElementById("caModalUrgency").value = a.urgency || "";
-    updateCaModalEditorMeta(a, editIndex);
+    updateCaModalEditorMeta({
+      ...a,
+      id: actionId,
+      status: actionStatus
+    }, editIndex);
   } else {
     if (formTitle) formTitle.textContent = "New Corrective Action";
     if (editIdx) editIdx.value = "";
+    if (editActionIdEl) editActionIdEl.value = "";
+    if (editActionStatusEl) editActionStatusEl.value = "";
     ["caModalDueDate","caModalEstimatedDurationDays","caModalRootCause","caModalSolution","caModalImportance","caModalUrgency"].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.value = "";
@@ -34325,12 +34855,21 @@ function getCaModalActions(kvId) {
 }
 
           function caModalOpenEdit(index) {
-            caModalOpenForm(index);
+            if (!caModalKvId) return;
+            const displayActions = getCaModalDisplayActions(caModalKvId);
+            const action = displayActions[index];
+            if (!action) return;
+            const storeIndex = Number.isInteger(action._storeIndex) ? action._storeIndex : null;
+            caModalOpenForm(storeIndex, action);
           }
 
           function caModalCollapseForm() {
             const section = document.getElementById("caModalFormSection");
             if (section) section.style.display = "none";
+            ["caModalEditIndex", "caModalEditActionId", "caModalEditActionStatus"].forEach(function(id) {
+              const el = document.getElementById(id);
+              if (el) el.value = "";
+            });
             closeCaResponsibleDropdown();
             updateCaModalEditorMeta(null, null);
           }
@@ -34372,6 +34911,8 @@ function caModalSaveForm() {
   const importanceEl = document.getElementById("caModalImportance");
   const urgencyEl = document.getElementById("caModalUrgency");
   const editIndexEl = document.getElementById("caModalEditIndex");
+  const editActionIdEl = document.getElementById("caModalEditActionId");
+  const editActionStatusEl = document.getElementById("caModalEditActionStatus");
 
   const rootCause = rootCauseEl ? rootCauseEl.value.trim() : "";
   const solution = solutionEl ? solutionEl.value.trim() : "";
@@ -34382,6 +34923,10 @@ function caModalSaveForm() {
   const importance = importanceEl ? importanceEl.value.trim() : "";
   const urgency = urgencyEl ? urgencyEl.value.trim() : "";
   const editIndex = editIndexEl ? editIndexEl.value : "";
+  const editActionId = editActionIdEl ? editActionIdEl.value.trim() : "";
+  const editActionStatus = getCanonicalCorrectiveActionStatus(
+    editActionStatusEl ? editActionStatusEl.value : ""
+  );
 
   if (!rootCause || !solution || !dueDate || estimatedDurationDays === null || !responsible || !importance || !urgency) {
     alert("Please fill in Root Cause, Corrective Action, Due Date, Estimated Duration Days, Responsible, Importance, and Urgency.");
@@ -34389,13 +34934,19 @@ function caModalSaveForm() {
   }
 
   const actions = getCaModalActions(caModalKvId);
-  const existingAction =
+  const editIndexNumber =
     editIndex !== "" && !isNaN(parseInt(editIndex, 10))
-      ? actions[parseInt(editIndex, 10)] || null
+      ? parseInt(editIndex, 10)
       : null;
+  const existingAction =
+    editIndexNumber !== null
+      ? actions[editIndexNumber] || null
+      : actions.find(function(action) {
+          return String(action && action.id || "").trim() === editActionId;
+        }) || null;
 
   const entry = {
-    id: "",
+    id: editActionId || (existingAction && existingAction.id) || "",
     root_cause: rootCause,
     implemented_solution: solution,
     due_date: dueDate,
@@ -34403,15 +34954,25 @@ function caModalSaveForm() {
     responsible: responsible,
     importance: normalizeCorrectiveActionImportance(importance),
     urgency: normalizeCorrectiveActionUrgency(urgency),
-    status: getCanonicalCorrectiveActionStatus(existingAction && existingAction.status)
+    status: getCanonicalCorrectiveActionStatus(
+      (existingAction && existingAction.status) || editActionStatus
+    )
   };
 
-  if (editIndex !== "" && !isNaN(parseInt(editIndex, 10))) {
-    const idx = parseInt(editIndex, 10);
+  if (editIndexNumber !== null) {
+    const idx = editIndexNumber;
     if (actions[idx] && actions[idx].id) {
       entry.id = actions[idx].id;
     }
     actions.splice(idx, 1);
+    actions.unshift(entry);
+  } else if (editActionId) {
+    const existingIndexById = actions.findIndex(function(action) {
+      return String(action && action.id || "").trim() === editActionId;
+    });
+    if (existingIndexById >= 0) {
+      actions.splice(existingIndexById, 1);
+    }
     actions.unshift(entry);
   } else {
     actions.unshift(entry);
@@ -34494,36 +35055,11 @@ function syncDomFromStore(kvId) {
   }
 }
 
-    function openCaTableModal(kvId) {
+function openCaTableModal(kvId) {
   caModalKvId = kvId;
 
   const overlay = document.getElementById("caTableModal");
   if (!overlay) return;
-
-  const card = document.querySelector('.kpi-card[data-kpi-values-id="' + kvId + '"]');
-
-  if (!Object.prototype.hasOwnProperty.call(caModalStore, kvId)) {
-    const liveActions = getCaModalActions(kvId);
-
-    if ((!Array.isArray(liveActions) || !liveActions.length) && card) {
-      const historyActions = decodeModalPayload(card.dataset.historyActions, []);
-      if (Array.isArray(historyActions) && historyActions.length) {
-        caModalStore[kvId] = historyActions
-          .filter(a => getCanonicalCorrectiveActionStatus(a.status) !== "Closed")
-          .map(a => ({
-            id: a.corrective_action_id || a.id || "",
-            root_cause: a.root_cause || "",
-            implemented_solution: a.implemented_solution || "",
-            due_date: a.due_date || "",
-            estimated_duration_days: a.estimated_duration_days ?? null,
-            responsible: a.responsible || "",
-            importance: normalizeCorrectiveActionImportance(a.importance) || "",
-            urgency: normalizeCorrectiveActionUrgency(a.urgency) || "",
-            status: getCanonicalCorrectiveActionStatus(a.status)
-          }));
-      }
-    }
-  }
 
   caModalCollapseForm();
   clearCaModalFilters();
@@ -36741,16 +37277,19 @@ function getFallbackCurrentMonthLabel(card, labels) {
             }
           }
 
-          function getHistoryPeriodLabel(action) {
-            if (!action) return "Current month";
+          function getHistoryPeriodHeading(frequencyMode) {
+            const mode = normalizeKpiFrequency(frequencyMode);
+            if (mode === "daily") return "Day";
+            if (mode === "weekly") return "Week";
+            return "Month";
+          }
 
-            const monthLabel = String(action.month_label || "").trim();
-            if (monthLabel) return monthLabel;
-
-            const weekLabel = String(action.week || "").trim();
-            if (!weekLabel) return "Current month";
-
-            return weekToMonthLabelClient(weekLabel) || weekLabel;
+          function getHistoryPeriodLabel(action, options) {
+            return getCaActionPeriodLabel(
+              action,
+              options?.frequencyMode || "monthly",
+              options?.currentPeriodLabel || "Current period"
+            );
           }
 
           function hasCorrectiveActionContent(action) {
@@ -36789,6 +37328,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
 
             const dueDateFrom = escapeHistoryHtml(options?.dueDateFrom || "");
             const dueDateTo = escapeHistoryHtml(options?.dueDateTo || "");
+            const periodHeading = escapeHistoryHtml(options?.periodHeading || "Period");
 
             return '' +
               '<div data-history-filter-panel>' +
@@ -36808,7 +37348,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
                   '<table class="history-table">' +
                   '<thead>' +
                     '<tr>' +
-                      '<th>Day</th>' +
+                      '<th>' + periodHeading + '</th>' +
                       '<th>Root Cause</th>' +
                       '<th>Implemented Solution</th>' +
                       '<th>Due Date</th>' +
@@ -36829,7 +37369,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
                             : String(action.estimated_duration_days).trim();
                         return '' +
                           '<tr data-history-due-date="' + escapeHistoryHtml(filterDueDate) + '">' +
-                            '<td>' + escapeHistoryHtml(getHistoryPeriodLabel(action)) + '</td>' +
+                            '<td>' + escapeHistoryHtml(getHistoryPeriodLabel(action, options)) + '</td>' +
                             '<td><pre>' + escapeHistoryHtml(action.root_cause || "") + '</pre></td>' +
                             '<td><pre>' + escapeHistoryHtml(action.implemented_solution || "") + '</pre></td>' +
                             '<td>' + escapeHistoryHtml(dueDateDisplay) + '</td>' +
@@ -36864,52 +37404,21 @@ function getFallbackCurrentMonthLabel(card, labels) {
     : null;
   const dueDateFrom = String(dueDateFromInput?.value || "").trim();
   const dueDateTo = String(dueDateToInput?.value || "").trim();
+  const frequencyMode = getCaModalFrequencyMode(kvId);
+  const currentPeriodLabel = getCaModalCurrentPeriodLabel(kvId);
+  const periodHeading = getHistoryPeriodHeading(frequencyMode);
 
   const titleText = getTrimmedText(card.querySelector(".kpi-title")) || "Corrective Actions";
   const subtitleText = getTrimmedText(card.querySelector(".kpi-subtitle"));
-  const currentMonthLabel = card.dataset.currentMonthLabel || "Current month";
-  const liveActions = getCaModalActions(kvId)
-    .map(function(action, actionIndex) {
-      return Object.assign({
-        week: currentMonthLabel,
-        month_label: currentMonthLabel,
-        status: action.status || "Open",
-        _editableStatus: true,
-        _storeIndex: actionIndex
-      }, action);
-    })
-    .filter(shouldShowCurrentCorrectiveAction);
-  const historyActions = decodeModalPayload(card.dataset.historyActions, []);
+  const combinedActions = getCaModalDisplayActions(kvId);
   const historyComments = decodeModalPayload(card.dataset.historyComments, []);
-  const liveActionIds = new Set(
-    liveActions
-      .map(function(action) {
-        return String((action && (action.id || action.corrective_action_id)) || "").trim();
-      })
-      .filter(Boolean)
-  );
-  const combinedActions = liveActions.concat(
-    (Array.isArray(historyActions) ? historyActions : [])
-      .filter(hasCorrectiveActionContent)
-      .filter(function(action) {
-        return !isClosedCorrectiveActionStatus(action.status);
-      })
-      .filter(function(action) {
-        const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
-        return !actionId || !liveActionIds.has(actionId);
-      })
-      .map(function(action) {
-        const actionId = String((action && (action.id || action.corrective_action_id)) || "").trim();
-        return Object.assign({ _editableStatus: Boolean(actionId) }, action);
-      })
-  );
   const sections = [];
 
   if (historyModalTitle) historyModalTitle.textContent = titleText;
   if (historyModalSubtitle) {
     historyModalSubtitle.textContent = subtitleText
-      ? currentMonthLabel + ' • ' + subtitleText
-      : currentMonthLabel;
+      ? currentPeriodLabel + ' • ' + subtitleText
+      : currentPeriodLabel;
   }
 
   sections.push(
@@ -36918,7 +37427,15 @@ function getFallbackCurrentMonthLabel(card, labels) {
       renderHistoryActionsTable(
         combinedActions,
         'No corrective actions were found for this KPI.',
-        { editableStatus: true, kvId: kvId, dueDateFrom: dueDateFrom, dueDateTo: dueDateTo }
+        {
+          editableStatus: true,
+          kvId: kvId,
+          dueDateFrom: dueDateFrom,
+          dueDateTo: dueDateTo,
+          frequencyMode: frequencyMode,
+          periodHeading: periodHeading,
+          currentPeriodLabel: currentPeriodLabel
+        }
       ) +
     '</div>'
   );
@@ -46115,14 +46632,12 @@ const buildMonitoringActionScopeKey = (kpiId, unitId = null) => {
 };
 
 const mapMonitoringActionRow = (row = {}) => {
-  const persistedKpiId = normalizeOptionalIntegerInput(row.kpi_id);
+  const { periodLabel, kpiTargetAllocationId, subjectInfo } = resolveActionPlanActionScope(row);
+  const persistedKpiId =
+    normalizeOptionalIntegerInput(row.kpi_id) ||
+    normalizeOptionalIntegerInput(subjectInfo?.kpiId);
   if (!persistedKpiId) return null;
   const persistedUnitId = normalizeOptionalIntegerInput(row.unit_id);
-
-  const subjectInfo = parseActionPlanSubjectReference({
-    subjectCode: row.sujet_code,
-    description: row.sujet_description
-  });
   const status =
     normalizeCorrectiveActionStatus(row.status, OPEN_CORRECTIVE_ACTION_STATUS) ||
     OPEN_CORRECTIVE_ACTION_STATUS;
@@ -46136,10 +46651,9 @@ const mapMonitoringActionRow = (row = {}) => {
     kpi_id: persistedKpiId,
     unit_id: persistedUnitId,
     unitId: persistedUnitId,
-    kpi_target_allocation_id:
-      normalizeOptionalIntegerInput(subjectInfo?.kpiTargetAllocationId) || null,
-    week: normalizeOptionalTextInput(subjectInfo?.periodLabel) || null,
-    period_label: normalizeOptionalTextInput(subjectInfo?.periodLabel) || null,
+    kpi_target_allocation_id: kpiTargetAllocationId,
+    week: periodLabel,
+    period_label: periodLabel,
     root_cause: normalizeOptionalTextInput(row.description) || "",
     implemented_solution: normalizeOptionalTextInput(row.titre) || "",
     status,
@@ -46191,6 +46705,8 @@ const loadMonitoringActionsByScope = async (rows = []) => {
         a.id,
         a.kpi_id,
         a.unit_id,
+        a.kpi_target_allocation_id,
+        a.period_label,
         a.sujet_id,
         a.type,
         a.titre,
