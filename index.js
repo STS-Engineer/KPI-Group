@@ -9,6 +9,7 @@ const nodemailer = require("nodemailer");
 const cron = require("node-cron");
 const { registerRecommendationRoutes } = require('./kpi-recommendations');
 const { generateKPIRecommendationsPDFBuffer, generatePlantKPIRecommendationsPDFBuffer } = require('./kpi-recommendations');
+const { registerAIGeneratedKpiRoutes } = require("./kpi-derived-generator");
 const {
   buildDelayKnowledgeBaseContext
 } = require("./delay-knowledge-base");
@@ -43110,6 +43111,17 @@ app.post("/api/hierarchy-report/send", triggerHierarchyReportNow);
 
 
 registerRecommendationRoutes(app, pool, createTransporter);
+registerAIGeneratedKpiRoutes(app, {
+  pool,
+  ensureKpiRatioSchema,
+  refreshKpiKnowledgeBaseForKpiId,
+  upsertPrimarySubjectKpiLink,
+  getOpenAIClient,
+  cronScheduler: cron,
+  normalizeOptionalIntegerInput,
+  normalizeOptionalTextInput,
+  createHttpError
+});
 ensureKpiRatioSchema()
   .then(() => {
     console.log("[KPI Knowledge Base] Sync infrastructure is ready.");
