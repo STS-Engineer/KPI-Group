@@ -31430,6 +31430,24 @@ app.get("/form", async (req, res) => {
       return parseKpiChartMonthDate(monthLabel);
     }
 
+
+    const getIsoWeekLabel = (inputDate) => {
+  const date = new Date(Date.UTC(
+    inputDate.getFullYear(),
+    inputDate.getMonth(),
+    inputDate.getDate()
+  ));
+
+  const dayNumber = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNumber);
+
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const weekNumber = Math.ceil(
+    (((date - yearStart) / 86400000) + 1) / 7
+  );
+
+  return `${date.getUTCFullYear()}-Week${String(weekNumber).padStart(2, "0")}`;
+};
     function findPreviousMonthLabel(currentMonthLabel, labels) {
       const currentDate = monthLabelToDate(currentMonthLabel);
       if (!currentDate) return null;
@@ -31877,6 +31895,78 @@ const formPeriodLabel = isMonthlyForm
 
 const formPeriodTitle = isMonthlyForm ? "Month" : "Week";
 
+const buildAvailableFormPeriods = ({
+  selectedPeriod,
+  frequency
+}) => {
+  const normalizedFrequency = String(frequency || "")
+    .trim()
+    .toLowerCase();
+
+  const periods = [];
+
+  if (normalizedFrequency === "monthly") {
+    const currentDate = new Date();
+
+    // Current month + previous 6 months
+    for (let offset = 0; offset >= -6; offset -= 1) {
+      const date = new Date(
+        currentDate.getFullYear(),
+        currentDate.getMonth() + offset,
+        1
+      );
+
+      const monthKey =
+        `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+
+      periods.push({
+        value: formatKpiChartPeriodLabel(monthKey, "monthly"),
+        date
+      });
+    }
+  } else {
+    /*
+     * Use the application's current form week as the fixed reference.
+     * Do not use selectedPeriod here.
+     */
+    const currentWeekLabel = getCurrentFormWeek();
+    const currentWeekDate = weekLabelToDate(currentWeekLabel);
+
+    const referenceDate =
+      currentWeekDate && !Number.isNaN(currentWeekDate.getTime())
+        ? currentWeekDate
+        : new Date();
+
+    // Current week + previous 6 weeks
+    for (let offset = 0; offset >= -4; offset -= 1) {
+      const date = new Date(referenceDate);
+
+      date.setDate(referenceDate.getDate() + offset * 7);
+
+      periods.push({
+        value: getIsoWeekLabel(date),
+        date
+      });
+    }
+  }
+
+  return periods;
+};
+const availableFormPeriods = buildAvailableFormPeriods({
+  selectedPeriod: formPeriodLabel,
+  frequency: formFrequencyLabel
+});
+
+const formPeriodOptionsHtml = availableFormPeriods
+  .map(({ value }) => `
+    <option
+      value="${escapeHtml(value)}"
+      ${value === formPeriodLabel ? "selected" : ""}
+    >
+      ${escapeHtml(value)}
+    </option>
+  `)
+  .join("");
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -31948,6 +32038,42 @@ const formPeriodTitle = isMonthlyForm ? "Month" : "Week";
             font-weight:700;
             color:#0f172a;
           }
+
+          .info-period-select {
+  width: 100%;
+  min-height: 44px;
+  appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  padding-right: 42px;
+
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #2563eb 50%),
+    linear-gradient(135deg, #2563eb 50%, transparent 50%);
+  background-position:
+    calc(100% - 19px) 50%,
+    calc(100% - 13px) 50%;
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+}
+
+.info-period-select:hover {
+  border-color: #93c5fd;
+}
+
+.info-period-select:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow:
+    0 0 0 4px rgba(59, 130, 246, 0.12),
+    0 4px 12px rgba(15, 23, 42, 0.04);
+}
+
+.info-period-select:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
 
           /* â”€â”€ KPI Card â”€â”€ */
           .kpi-card{
@@ -34214,7 +34340,19 @@ const formPeriodTitle = isMonthlyForm ? "Month" : "Week";
               <div class="info-row"><div class="info-label">Name</div><div class="info-value">${responsible.name}</div></div>
               <div class="info-row"><div class="info-label">Group</div><div class="info-value">${responsibleGroupLabel}</div></div>
               <div class="info-row"><div class="info-label">Role</div><div class="info-value">${responsibleRoleLabel}</div></div>
-              <div class="info-row"><div class="info-label">${formPeriodTitle}</div><div class="info-value">${formPeriodLabel}</div></div>
+              <div class="info-row">
+  <label class="info-label" for="formPeriodFilter">
+    ${formPeriodTitle}
+  </label>
+
+  <select
+    id="formPeriodFilter"
+    class="info-value info-period-select"
+    aria-label="Filter KPI form by ${formPeriodTitle.toLowerCase()}"
+  >
+    ${formPeriodOptionsHtml}
+  </select>
+</div>
              <div class="info-row"><div class="info-label">Frequency</div><div class="info-value">${formFrequencyLabel}</div></div>
             </div>
 
@@ -36160,6 +36298,29 @@ async function sendAssistantPrompt(message) {
             options.style.maxHeight = optionsMaxHeight + "px";
           }
 
+          document.addEventListener("DOMContentLoaded", () => {
+  const periodFilter = document.getElementById("formPeriodFilter");
+
+  if (!periodFilter) return;
+
+  periodFilter.addEventListener("change", () => {
+    const selectedPeriod = String(periodFilter.value || "").trim();
+
+    if (!selectedPeriod) return;
+
+    periodFilter.disabled = true;
+
+    const url = new URL(window.location.href);
+
+    // The backend already reads req.query.week.
+    url.searchParams.set("week", selectedPeriod);
+
+    // Keep all existing query parameters:
+    // responsible_id, frequency, calculation_mode and unit_id.
+    window.location.assign(url.toString());
+  });
+});
+
           function syncCaResponsibleDropdown() {
             const { trigger, triggerLabel, search, options, select } = getCaResponsibleDropdownElements();
             if (!trigger || !triggerLabel || !options || !select) return;
@@ -36280,11 +36441,12 @@ if (data.lowLimit !== null && data.lowLimit !== undefined) {
     : false;
 
 if (input && !preserveDraftValue) {
-  const latestValue = [...data.values].reverse().find(v =>
-    v !== null && v !== undefined && v !== "" && !isNaN(Number(v))
-  );
-
-  const nextValue = latestValue !== undefined ? String(latestValue) : "";
+  const nextValue =
+    data.currentValue !== null &&
+    data.currentValue !== undefined &&
+    !isNaN(Number(data.currentValue))
+      ? String(data.currentValue)
+      : "";
   input.value = nextValue;
   setValueInputServerState(input, nextValue);
   checkLowLimit(input);
@@ -36649,13 +36811,11 @@ function getPreviousMonthLabelFromWeek(weekStr) {
            } catch(e) {}
 
            const input = document.getElementById("value_" + kvId);
-           const latestValue = [...values].reverse().find(v =>
-           v !== null && v !== undefined && v !== "" && !isNaN(Number(v))
-           );
+           const currentPeriodValue = getCurrentChartPeriodValue(card, labels, values);
 
-          if (input && latestValue !== undefined && !input.value) {
-          input.value = latestValue;
-          setValueInputServerState(input, latestValue);
+          if (input && currentPeriodValue !== undefined && !input.value) {
+          input.value = String(currentPeriodValue);
+          setValueInputServerState(input, currentPeriodValue);
            }
             const colors = values.map(v => getPointColor(v, lowLimit, highLimit, goodDirection, target));
             const borderColors = values.map(v => getPointBorderColor(v, lowLimit, highLimit, goodDirection, target));
@@ -36709,17 +36869,21 @@ function weekToMonthLabelClient(weekStr) {
   return d.toLocaleString("en-US", { month: "short", year: "numeric" });
 }
 
-function getFallbackCurrentMonthLabel(card, labels) {
-  const storedMonthLabel = String(card?.dataset?.currentMonthLabel || "").trim();
-  if (storedMonthLabel) return storedMonthLabel;
+function getCurrentChartPeriodLabel(card, labels) {
+  const storedPeriodLabel = String(card?.dataset?.currentMonthLabel || "").trim();
+  if (storedPeriodLabel) return storedPeriodLabel;
 
+  const frequencyMode = normalizeKpiFrequency(card?.dataset?.frequency || "");
   const weekFromCard = String(card?.dataset?.currentWeek || "").trim();
-  const monthFromCardWeek = weekToMonthLabelClient(weekFromCard);
-  if (monthFromCardWeek) return monthFromCardWeek;
+  const pageWeek = String(new URLSearchParams(window.location.search).get("week") || "").trim();
+  const periodSource = weekFromCard || pageWeek;
 
-  const pageWeek = new URLSearchParams(window.location.search).get("week") || "";
-  const monthFromPageWeek = weekToMonthLabelClient(pageWeek);
-  if (monthFromPageWeek) return monthFromPageWeek;
+  if (frequencyMode === "monthly") {
+    const monthLabel = weekToMonthLabelClient(periodSource);
+    if (monthLabel) return monthLabel;
+  }
+
+  if (periodSource) return periodSource;
 
   const browserMonthLabel = new Date().toLocaleString("en-US", { month: "short", year: "numeric" });
   if (Array.isArray(labels) && labels.includes(browserMonthLabel)) return browserMonthLabel;
@@ -36729,6 +36893,27 @@ function getFallbackCurrentMonthLabel(card, labels) {
   }
 
   return browserMonthLabel;
+}
+
+function getCurrentChartPeriodValue(card, labels, values) {
+  if (!Array.isArray(labels) || !Array.isArray(values)) {
+    return undefined;
+  }
+
+  const currentPeriodLabel = getCurrentChartPeriodLabel(card, labels);
+  if (!currentPeriodLabel) {
+    return undefined;
+  }
+
+  const existingIndex = labels.lastIndexOf(currentPeriodLabel);
+  if (existingIndex < 0) {
+    return undefined;
+  }
+
+  const value = values[existingIndex];
+  return value !== null && value !== undefined && value !== "" && !isNaN(Number(value))
+    ? value
+    : undefined;
 }
 
 
@@ -36750,12 +36935,10 @@ function getFallbackCurrentMonthLabel(card, labels) {
     values = [];
   }
 
-  const currentMonthLabel =
-  getPreviousMonthLabelFromWeek(card.dataset.currentWeek) ||
-  getFallbackCurrentMonthLabel(card, labels);
-  if (!currentMonthLabel) return;
+  const currentPeriodLabel = getCurrentChartPeriodLabel(card, labels);
+  if (!currentPeriodLabel) return;
 
-  const existingIndex = labels.indexOf(currentMonthLabel);
+  const existingIndex = labels.indexOf(currentPeriodLabel);
 
   if (isNaN(value)) {
     if (existingIndex >= 0) {
@@ -36765,7 +36948,7 @@ function getFallbackCurrentMonthLabel(card, labels) {
     if (existingIndex >= 0) {
       values[existingIndex] = value;
     } else {
-      labels.push(currentMonthLabel);
+      labels.push(currentPeriodLabel);
       values.push(value);
     }
   }
