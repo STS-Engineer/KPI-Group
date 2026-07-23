@@ -5,6 +5,17 @@ const DEFAULT_MODEL = process.env.OPENAI_DERIVED_KPI_MODEL || "gpt-4o-mini";
 const DEFAULT_LIMIT = 8;
 const MAX_LIMIT = 20;
 const MAX_CATALOG_CHARS = 320000;
+const AI_GENERATED_KPI_CALCULATION_MODE = "AI Derived KPI";
+const AI_GENERATED_KPI_TYPE = "calculated";
+const AI_GENERATED_KPI_COMMENT =
+  "Generated automatically by Industrial KPI Generator. Derivation logic is stored in kpi_explanation.";
+const HARD_CODED_CRON_ENABLED = true;
+const HARD_CODED_CRON_EXPRESSION = "0 30 5 * * 1";
+const HARD_CODED_CRON_TIMEZONE = "Africa/Tunis";
+const HARD_CODED_CRON_RUN_ON_STARTUP = false;
+const HARD_CODED_CRON_SEARCH = "";
+const HARD_CODED_CRON_SUBJECT_ID = null;
+const HARD_CODED_CRON_LIMIT = DEFAULT_LIMIT;
 const EXPLANATION_STOP_WORDS = new Set([
   "a",
   "an",
@@ -206,7 +217,7 @@ const validateRecommendation = (recommendation, existingNameIndex, existingMeani
 };
 
 const serializeGeneratedRow = (row) => ({
-  id: row.id,
+  id: row.id ?? row.kpi_id,
   kpi_name: row.kpi_name || "",
   kpi_explanation: row.kpi_explanation || "",
   kpi_sub_title: row.kpi_sub_title || "",
@@ -484,7 +495,7 @@ const buildPageHtml = () => `<!DOCTYPE html>
     <section class="hero">
       <div>
         <h1>Industrial KPI Generator</h1>
-        <p>This simplified version stores only the generated KPI name, subtitle, explanation, frequency, and unit. The explanation should contain the derivation logic for now because formula fields are not yet stored in the database.</p>
+        <p>This version saves generated KPIs directly into the main KPI table. The explanation should contain the derivation logic for now because formula fields are not yet stored separately.</p>
       </div>
       <div class="hero-stats">
         <div class="stat">
@@ -657,81 +668,22 @@ const registerAIGeneratedKpiRoutes = (
     cronScheduler
   }
 ) => {
-  let aiGeneratedKpiSchemaPromise = null;
-  let aiGeneratedKpiPrimaryKeyColumn = "id";
-  let aiGeneratedKpiUnitColumn = "unit";
+  let generatorSetupPromise = null;
   let cronRunInProgress = false;
 
-  const parseBooleanEnv = (value, fallback = false) => {
-    const normalized = String(value ?? "").trim().toLowerCase();
-    if (!normalized) return fallback;
-    if (["1", "true", "yes", "on"].includes(normalized)) return true;
-    if (["0", "false", "no", "off"].includes(normalized)) return false;
-    return fallback;
-  };
-
   const ensureAIGeneratedKpiSchema = async () => {
-    if (!aiGeneratedKpiSchemaPromise) {
-      aiGeneratedKpiSchemaPromise = (async () => {
+    if (!generatorSetupPromise) {
+      generatorSetupPromise = (async () => {
         if (typeof ensureKpiRatioSchema === "function") {
           await ensureKpiRatioSchema();
         }
-
-        await pool.query(`
-          CREATE TABLE IF NOT EXISTS public.ai_generated_kpi (
-            id SERIAL PRIMARY KEY,
-            kpi_name TEXT NOT NULL,
-            kpi_explanation TEXT,
-            kpi_sub_title TEXT,
-            frequency VARCHAR(80),
-            unit VARCHAR(80)
-          )
-        `);
-
-        const columnCheck = await pool.query(
-          `
-          SELECT column_name
-          FROM information_schema.columns
-          WHERE table_schema = 'public'
-            AND table_name = 'ai_generated_kpi'
-            AND column_name IN ('id', 'ai_generated_kpi_id', 'unit', 'derived_unit')
-          ORDER BY CASE column_name
-            WHEN 'id' THEN 0
-            WHEN 'ai_generated_kpi_id' THEN 1
-            WHEN 'unit' THEN 2
-            WHEN 'derived_unit' THEN 3
-            ELSE 99
-          END
-          `
-        );
-
-        const availableColumns = new Set(columnCheck.rows.map((row) => row.column_name));
-        if (availableColumns.has("id")) {
-          aiGeneratedKpiPrimaryKeyColumn = "id";
-        } else if (availableColumns.has("ai_generated_kpi_id")) {
-          aiGeneratedKpiPrimaryKeyColumn = "ai_generated_kpi_id";
-        } else {
-          throw new Error("public.ai_generated_kpi does not contain an id column.");
-        }
-
-        if (availableColumns.has("unit")) {
-          aiGeneratedKpiUnitColumn = "unit";
-        } else if (availableColumns.has("derived_unit")) {
-          aiGeneratedKpiUnitColumn = "derived_unit";
-        } else {
-          await pool.query(`
-            ALTER TABLE public.ai_generated_kpi
-            ADD COLUMN IF NOT EXISTS unit VARCHAR(80)
-          `);
-          aiGeneratedKpiUnitColumn = "unit";
-        }
       })().catch((error) => {
-        aiGeneratedKpiSchemaPromise = null;
+        generatorSetupPromise = null;
         throw error;
       });
     }
 
-    return aiGeneratedKpiSchemaPromise;
+    return generatorSetupPromise;
   };
 
   const loadActiveKpiCatalog = async ({ search = "", subjectId = null } = {}) => {
@@ -779,44 +731,32 @@ const registerAIGeneratedKpiRoutes = (
   };
 
   const loadGeneratedRows = async () => {
-    const result = await pool.query(`
-      SELECT ${aiGeneratedKpiPrimaryKeyColumn} AS id, kpi_name, kpi_explanation, kpi_sub_title, frequency, ${aiGeneratedKpiUnitColumn} AS unit
-      FROM public.ai_generated_kpi
-      ORDER BY ${aiGeneratedKpiPrimaryKeyColumn} DESC
-    `);
+    const result = await pool.query(
+      `
+      SELECT
+        kpi_id AS id,
+        kpi_id,
+        kpi_name,
+        kpi_explanation,
+        kpi_sub_title,
+        frequency,
+        unit
+      FROM public.kpi
+      WHERE
+        LOWER(COALESCE(NULLIF(BTRIM(type), ''), '')) = LOWER($1)
+        OR
+        LOWER(COALESCE(NULLIF(BTRIM(calculation_mode), ''), '')) = LOWER($2)
+        OR COALESCE(NULLIF(BTRIM(comments), ''), '') = $3
+      ORDER BY kpi_id DESC
+      `,
+      [
+        AI_GENERATED_KPI_TYPE,
+        AI_GENERATED_KPI_CALCULATION_MODE,
+        AI_GENERATED_KPI_COMMENT
+      ]
+    );
 
     return result.rows.map(serializeGeneratedRow);
-  };
-
-  const insertGeneratedRows = async (client, rows = []) => {
-    const inserted = [];
-
-    for (const row of rows) {
-      const result = await client.query(
-        `
-        INSERT INTO public.ai_generated_kpi (
-          kpi_name,
-          kpi_explanation,
-          kpi_sub_title,
-          frequency,
-          ${aiGeneratedKpiUnitColumn}
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING ${aiGeneratedKpiPrimaryKeyColumn} AS id, kpi_name, kpi_explanation, kpi_sub_title, frequency, ${aiGeneratedKpiUnitColumn} AS unit
-        `,
-        [
-          row.kpi_name,
-          row.kpi_explanation || null,
-          row.kpi_sub_title || null,
-          row.frequency || null,
-          row.unit || null
-        ]
-      );
-
-      inserted.push(serializeGeneratedRow(result.rows[0]));
-    }
-
-    return inserted;
   };
 
   const insertRowsIntoMainKpiTable = async (
@@ -864,12 +804,14 @@ const registerAIGeneratedKpiRoutes = (
           high_limit,
           low_limit,
           created_by_people_id,
-          kfs
+          kfs,
+          type
         )
         VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35
         )
         RETURNING
+          kpi_id AS id,
           kpi_id,
           kpi_name,
           kpi_sub_title,
@@ -896,7 +838,7 @@ const registerAIGeneratedKpiRoutes = (
           null,
           null,
           null,
-          "AI Derived KPI",
+          AI_GENERATED_KPI_CALCULATION_MODE,
           null,
           null,
           null,
@@ -907,11 +849,12 @@ const registerAIGeneratedKpiRoutes = (
           null,
           null,
           "Active",
-          "Generated automatically by Industrial KPI Generator. Derivation logic is stored in kpi_explanation.",
+          AI_GENERATED_KPI_COMMENT,
           null,
           null,
           null,
-          "AI Generated KPI"
+          "KPI",
+          AI_GENERATED_KPI_TYPE
         ]
       );
 
@@ -926,7 +869,7 @@ const registerAIGeneratedKpiRoutes = (
 
       if (typeof refreshKpiKnowledgeBaseForKpiId === "function") {
         await refreshKpiKnowledgeBaseForKpiId(client, insertedKpi.kpi_id, {
-          reason: "ai_generated_kpi_auto_inserted"
+          reason: "kpi_derived_generator_auto_inserted"
         });
       }
 
@@ -1076,15 +1019,14 @@ const registerAIGeneratedKpiRoutes = (
 
       client = await pool.connect();
       await client.query("BEGIN");
-      const insertedRows = await insertGeneratedRows(client, rowsToInsert);
       const insertedMainKpis = await insertRowsIntoMainKpiTable(client, rowsToInsert, {
         subjectId: normalizedSubjectId
       });
       await client.query("COMMIT");
 
       return {
-        count: insertedRows.length,
-        items: insertedRows,
+        count: insertedMainKpis.length,
+        items: insertedMainKpis.map(serializeGeneratedRow),
         skipped_duplicates: skippedDuplicates,
         catalog_count: catalogRows.length,
         inserted_into_kpi_count: insertedMainKpis.length,
@@ -1110,9 +1052,9 @@ const registerAIGeneratedKpiRoutes = (
 
     try {
       const result = await generateAndStoreRecommendations({
-        search: process.env.AI_GENERATED_KPI_CRON_SEARCH || "",
-        subjectId: process.env.AI_GENERATED_KPI_CRON_SUBJECT_ID || null,
-        limit: process.env.AI_GENERATED_KPI_CRON_LIMIT || DEFAULT_LIMIT,
+        search: HARD_CODED_CRON_SEARCH,
+        subjectId: HARD_CODED_CRON_SUBJECT_ID,
+        limit: HARD_CODED_CRON_LIMIT,
         allowEmptyInsert: true
       });
 
@@ -1176,7 +1118,7 @@ const registerAIGeneratedKpiRoutes = (
 
   app.get("/api/ai-generated-kpis/:id", async (req, res) => {
     try {
-      await ensureAIGeneratedKpiSchema();
+      await ensureAIGeneratedKpiSchema(); 
       const id = normalizeOptionalIntegerInput(req.params.id);
       if (!id) {
         throw createHttpError(400, "A valid generated KPI id is required.");
@@ -1184,12 +1126,23 @@ const registerAIGeneratedKpiRoutes = (
 
       const result = await pool.query(
         `
-        SELECT ${aiGeneratedKpiPrimaryKeyColumn} AS id, kpi_name, kpi_explanation, kpi_sub_title, frequency, ${aiGeneratedKpiUnitColumn} AS unit
-        FROM public.ai_generated_kpi
-        WHERE ${aiGeneratedKpiPrimaryKeyColumn} = $1
+        SELECT
+          kpi_id AS id,
+          kpi_name,
+          kpi_explanation,
+          kpi_sub_title,
+          frequency,
+          unit
+        FROM public.kpi
+        WHERE kpi_id = $1
+          AND (
+            LOWER(COALESCE(NULLIF(BTRIM(type), ''), '')) = LOWER($2)
+            OR LOWER(COALESCE(NULLIF(BTRIM(calculation_mode), ''), '')) = LOWER($3)
+            OR COALESCE(NULLIF(BTRIM(comments), ''), '') = $4
+          )
         LIMIT 1
         `,
-        [id]
+        [id, AI_GENERATED_KPI_TYPE, AI_GENERATED_KPI_CALCULATION_MODE, AI_GENERATED_KPI_COMMENT]
       );
 
       if (!result.rows.length) {
@@ -1207,13 +1160,13 @@ const registerAIGeneratedKpiRoutes = (
 
   app.post("/api/ai-generated-kpis/:id/approve", async (_req, res) => {
     res.status(501).json({
-      error: "Approve is not enabled in simplified ai_generated_kpi table mode."
+      error: "Approve is not enabled in direct KPI table mode."
     });
   });
 
   app.post("/api/ai-generated-kpis/:id/reject", async (_req, res) => {
     res.status(501).json({
-      error: "Reject is not enabled in simplified ai_generated_kpi table mode."
+      error: "Reject is not enabled in direct KPI table mode."
     });
   });
 
@@ -1237,18 +1190,16 @@ const registerAIGeneratedKpiRoutes = (
 
   ensureAIGeneratedKpiSchema()
     .then(() => {
-      console.log("[Industrial KPI Generator] Simplified table workflow is ready.");
+      console.log("[Industrial KPI Generator] Direct KPI table workflow is ready.");
     })
     .catch((error) => {
       console.error("[Industrial KPI Generator] Schema setup failed:", error.message);
     });
 
-  const cronEnabled = parseBooleanEnv(process.env.AI_GENERATED_KPI_CRON_ENABLED, false);
-  const cronExpression = String("0 0 6 * * 1").trim();
-  const cronTimezone = String(
-    process.env.AI_GENERATED_KPI_CRON_TIMEZONE || "Africa/Tunis"
-  ).trim();
-  const runOnStartup = parseBooleanEnv(process.env.AI_GENERATED_KPI_CRON_RUN_ON_STARTUP, false);
+  const cronEnabled = HARD_CODED_CRON_ENABLED;
+  const cronExpression = HARD_CODED_CRON_EXPRESSION;
+  const cronTimezone = HARD_CODED_CRON_TIMEZONE;
+  const runOnStartup = HARD_CODED_CRON_RUN_ON_STARTUP;
 
   if (cronScheduler && cronEnabled) {
     if (typeof cronScheduler.validate === "function" && !cronScheduler.validate(cronExpression)) {
